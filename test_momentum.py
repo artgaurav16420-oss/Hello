@@ -105,6 +105,14 @@ def test_regime_score_neutral_on_thin_history():
     assert compute_regime_score(idx) == 0.5
 
 
+def test_regime_score_neutral_below_vol_lookback_requirement():
+    idx = pd.DataFrame(
+        {"Close": np.linspace(100.0, 120.0, 252)},
+        index=pd.date_range("2020-01-01", periods=252),
+    )
+    assert compute_regime_score(idx) == 0.5
+
+
 def test_regime_score_bull_market():
     """Price well above SMA200 should give score > 0.5."""
     closes = np.linspace(80, 120, 400)      # steady uptrend

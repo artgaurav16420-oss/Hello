@@ -40,6 +40,7 @@ def compute_regime_score(
         max(REGIME_VOL_FLOOR, long_term_vol * REGIME_VOL_MULTIPLIER)
 
     where `long_term_vol` is the trailing 252-day annualised vol of the index.
+    A minimum of 253 closing prices is required (252 returns + 1 seed row).
     This prevents the penalty from triggering constantly during healthy
     small/mid-cap momentum rallies where sustained vols of 20-30% are normal.
     Config fields used:
@@ -50,7 +51,7 @@ def compute_regime_score(
 
     Returns 0.5 (neutral) on any data quality issue rather than raising.
     """
-    if idx_hist is None or len(idx_hist) < 200:
+    if idx_hist is None or len(idx_hist) < 253:
         return 0.5
     if "Close" not in idx_hist.columns:
         return 0.5
@@ -60,7 +61,7 @@ def compute_regime_score(
             "compute_regime_score: index not monotonic — deduplicating and continuing."
         )
         idx_hist = idx_hist[~idx_hist.index.duplicated(keep="last")]
-        if len(idx_hist) < 200:
+        if len(idx_hist) < 253:
             return 0.5
 
     close  = idx_hist["Close"]
