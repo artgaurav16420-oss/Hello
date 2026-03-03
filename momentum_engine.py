@@ -33,6 +33,7 @@ from sklearn.covariance import LedoitWolf
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
+EPSILON = 1e-6
 
 
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
@@ -473,7 +474,7 @@ def execute_rebalance(
             tail_n    = max(1, int(np.floor(T_sc * (1.0 - cfg.CVAR_ALPHA))))
             tail_mean = float(np.mean(np.sort(portfolio_losses)[-tail_n:]))
 
-            if tail_mean > cfg.CVAR_DAILY_LIMIT:
+            if tail_mean > cfg.CVAR_DAILY_LIMIT + EPSILON:
                 logger.error(
                     "execute_rebalance: POST-DECAY CVaR %.4f%% exceeds hard limit %.4f%%. "
                     "Liquidating all positions to cash — risk invariant cannot be "
@@ -583,10 +584,20 @@ class InstitutionalRiskEngine:
         prev_w:              Optional[np.ndarray] = None,
         exposure_multiplier: float                = 1.0,
         sector_labels:       Optional[np.ndarray] = None,
+        execution_date:      Optional[pd.Timestamp] = None,
     ) -> np.ndarray:
         m = len(expected_returns)
         if m == 0:
             return np.array([])
+
+        # Institutional T-1 guard: optimizer history must stop strictly before
+        # the execution date to prevent look-ahead leakage.
+        if execution_date is not None and not historical_returns.empty:
+            if historical_returns.index.max() >= pd.Timestamp(execution_date):
+                raise OptimizationError(
+                    "T-1 violation: historical_returns include execution_date.",
+                    OptimizationErrorType.DATA,
+                )
 
         # ── Input validation ──────────────────────────────────────────────────
         if len(prices) != m or len(adv_shares) != m:
@@ -828,21 +839,12 @@ class InstitutionalRiskEngine:
             t_cvar            = T_cvar,
         )
 
-        if physical_cvar > self.cfg.CVAR_DAILY_LIMIT:
-            # Allow a 10% tolerance for numerical noise (e.g. floating-point
-            # rounding in the scenario matrix). Hard-fail anything beyond that.
-            tolerance = self.cfg.CVAR_DAILY_LIMIT * 0.10
-            if physical_cvar > self.cfg.CVAR_DAILY_LIMIT + tolerance:
-                raise OptimizationError(
-                    f"Physical CVaR {physical_cvar:.4%} exceeds hard limit "
-                    f"{self.cfg.CVAR_DAILY_LIMIT:.4%} (solver reported {solver_cvar:.4%}, "
-                    f"slack={slack_value:.6f}). Refusing to deploy.",
-                    OptimizationErrorType.NUMERICAL,
-                )
-            logger.warning(
-                "Physical CVaR %.4f%% marginally exceeds limit %.4f%% "
-                "(within 10%% tolerance). Proceeding with caution.",
-                physical_cvar * 100, self.cfg.CVAR_DAILY_LIMIT * 100,
+        if physical_cvar > self.cfg.CVAR_DAILY_LIMIT + EPSILON:
+            raise OptimizationError(
+                f"Physical CVaR {physical_cvar:.4%} exceeds hard limit "
+                f"{self.cfg.CVAR_DAILY_LIMIT:.4%} (solver reported {solver_cvar:.4%}, "
+                f"slack={slack_value:.6f}). Refusing to deploy.",
+                OptimizationErrorType.NUMERICAL,
             )
 
-        return w_opt
+        return np.round(w_opt, 10)

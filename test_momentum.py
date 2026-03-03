@@ -210,19 +210,23 @@ def test_optimizer_adv_binding_count_populated():
 
 
 def test_optimizer_cvar_sentinel_deleverages():
-    """Optimizer must gracefully deleverage (not hard abort) when single-asset CVaR is wildly high."""
+    """Sentinel deleverage is allowed, but hard CVaR limit breaches must still abort."""
     n_days, m = 250, 5
     log_rets = _make_log_rets(n_days, m)
     # Inject massive daily loss to trip the EW-CVaR sentinel
-    log_rets.iloc[-20:, :] = -0.15 
-    
+    log_rets.iloc[-20:, :] = -0.15
+
     engine = _make_engine()
-    w_opt = engine.optimize(
-        np.ones(m)*0.01, log_rets, np.ones(m)*1e6, np.ones(m)*100, 1e6, exposure_multiplier=1.0
-    )
-    # Assert that weights were significantly scaled down due to CVaR sentinel (gamma *= 0.5)
-    # Normally max weights would sum near 1.0. With 0.5 penalty and FLOOR=0.25, it should be <= 0.6
-    assert np.sum(w_opt) < 0.6, "Sentinel should have triggered a deleverage multiplier."
+    with pytest.raises(OptimizationError) as exc_info:
+        engine.optimize(
+            np.ones(m) * 0.01,
+            log_rets,
+            np.ones(m) * 1e6,
+            np.ones(m) * 100,
+            1e6,
+            exposure_multiplier=1.0,
+        )
+    assert exc_info.value.error_type == OptimizationErrorType.NUMERICAL
 
 
 def test_portfolio_state_serialisation_roundtrip():
