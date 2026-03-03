@@ -469,6 +469,7 @@ def _run_scan(
         weights_sel = engine.optimize(
             expected_returns    = raw_daily[sel_idx],
             historical_returns  = log_rets[[active[i] for i in sel_idx]],
+            execution_date      = pd.Timestamp(end_date),
             adv_shares          = adv_arr[sel_idx],
             prices              = prices[sel_idx],
             portfolio_value     = pv,

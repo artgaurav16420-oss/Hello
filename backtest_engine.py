@@ -119,9 +119,14 @@ class BacktestEngine:
     ) -> None:
         cfg = self.engine.cfg
 
-        # T-1 history (exclude today to prevent look-ahead).
+        prev_idx = close.index.get_loc(date) - 1
+        if prev_idx < 0:
+            return
+        signal_date = close.index[prev_idx]
+
+        # Explicit T-1 history (exclude execution date to prevent look-ahead).
         hist_log_rets = (
-            np.log1p(returns.loc[:date].iloc[:-1])
+            np.log1p(returns.loc[:signal_date])
             .replace([np.inf, -np.inf], np.nan)
         )
 
@@ -139,7 +144,7 @@ class BacktestEngine:
         )
 
         _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
-        idx_slice    = idx_df.loc[:date].iloc[:-1] if _idx_ok else None
+        idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
         # Pass cfg so compute_regime_score uses the dynamic vol threshold (FIX G2).
         regime_score = compute_regime_score(idx_slice, cfg=cfg)
 
@@ -174,6 +179,7 @@ class BacktestEngine:
                 weights_sel = self.engine.optimize(
                     expected_returns    = raw_daily[sel_idx],
                     historical_returns  = hist_log_rets[[symbols[i] for i in sel_idx]],
+                    execution_date      = date,
                     adv_shares          = adv_vector[sel_idx],
                     prices              = prices_t[sel_idx],
                     portfolio_value     = pv,
@@ -207,7 +213,6 @@ class BacktestEngine:
             self.state.decay_rounds = 0
 
         if optimization_succeeded or apply_decay:
-        if optimization_succeeded or apply_decay:
             # FIX C4: pass scenario_losses for post-decay CVaR check.
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
@@ -216,6 +221,8 @@ class BacktestEngine:
                 date_context=date, trade_log=self.trades, apply_decay=apply_decay,
                 scenario_losses=_L,
             )
+            self._rebal_rows.append({
+                "date":              date,
                 "regime_score":       round(regime_score, 4),
                 "realised_cvar":      round(realised_cvar, 6),
                 "exposure_multiplier":round(self.state.exposure_multiplier, 4),
