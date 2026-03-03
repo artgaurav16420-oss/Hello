@@ -263,13 +263,27 @@ def _build_prev_weights(
 def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
     """
     Build the ADV (average daily volume) vector for sizing constraints.
-    Applies the T-1 slice (iloc[:-1]) before delegating to compute_single_adv.
+
+    Uses an explicit T-1 signal_date boundary to avoid implicit slicing.
     """
     adv = []
+    signal_date: Optional[pd.Timestamp] = None
+
+    if not volume.empty:
+        idx = volume.index
+        if date in idx:
+            pos = idx.get_loc(date)
+            if isinstance(pos, slice):
+                pos = pos.start
+            elif isinstance(pos, np.ndarray):
+                pos = int(pos[0]) if len(pos) else -1
+            if pos > 0:
+                signal_date = idx[pos - 1]
+
     for sym in symbols:
-        if sym in volume.columns:
+        if sym in volume.columns and signal_date is not None:
             try:
-                series = volume.loc[:date, sym].iloc[:-1]
+                series = volume.loc[:signal_date, sym]
                 adv.append(compute_single_adv(series))
             except Exception:
                 adv.append(0.0)

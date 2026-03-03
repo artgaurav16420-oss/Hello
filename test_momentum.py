@@ -200,6 +200,25 @@ def test_optimizer_rejects_prev_weights_length_mismatch():
     assert exc_info.value.error_type == OptimizationErrorType.DATA
 
 
+def test_optimizer_enforces_t_minus_one_execution_date_guard():
+    log_rets = _make_log_rets(120, 4)
+    engine   = _make_engine()
+    execution_date = log_rets.index.max()
+
+    with pytest.raises(OptimizationError) as exc_info:
+        engine.optimize(
+            np.array([0.001, 0.002, 0.0005, 0.0015]),
+            log_rets,
+            np.ones(4) * 1e6,
+            np.ones(4) * 200,
+            1_000_000.0,
+            exposure_multiplier=1.0,
+            execution_date=execution_date,
+        )
+
+    assert exc_info.value.error_type == OptimizationErrorType.DATA
+
+
 def test_optimizer_adv_binding_count_populated():
     """SolverDiagnostics.adv_binding_count must not always be zero."""
     n, m = 150, 3
