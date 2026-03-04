@@ -671,7 +671,7 @@ class InstitutionalRiskEngine:
         )
         sentinel = self.cfg.CVAR_DAILY_LIMIT * self.cfg.CVAR_SENTINEL_MULTIPLIER
 
-        if ew_cvar > sentinel:
+        if ew_cvar > sentinel + EPSILON:
             logger.warning(
                 "Selection ADV-weighted CVaR %.2f%% exceeds sentinel %.2f%%. "
                 "Forcing 50%% exposure reduction.",

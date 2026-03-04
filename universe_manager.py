@@ -371,11 +371,21 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         timeout = getattr(cfg, "SECTOR_FETCH_TIMEOUT", 8.0)
 
         def _fetch_one(s: str) -> tuple[str, str]:
+            # FIX: Suppress yfinance's own ERROR-level logger during .info fetch.
+            # yfinance logs HTTP 401 "Invalid Crumb" errors at ERROR level internally
+            # even when the exception is caught by application code. Temporarily
+            # muting it to CRITICAL prevents spurious ERROR lines in the app log.
+            import logging as _logging
+            _yf_log = _logging.getLogger("yfinance")
+            _prev   = _yf_log.level
+            _yf_log.setLevel(_logging.CRITICAL)
             try:
                 info = yf.Ticker(s + ".NS").info
                 return s, info.get("sector", "Unknown")
             except Exception:
                 return s, "Unknown"
+            finally:
+                _yf_log.setLevel(_prev)
 
         print(f"  \033[90mResolving metadata for {len(missing)} tickers...\033[0m")
 
@@ -387,10 +397,17 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                     sector = "Unknown"
                     try:
                         _, sector = future.result(timeout=timeout)
-                    except Exception:
-                        # Per-future serial failover for hanging requests.
+                    except TimeoutError:
+                        # FIX: A timed-out future must NOT trigger the serial failover.
+                        # The failover calls _fetch_one() without a timeout, turning a
+                        # controlled hang into an indefinite block. Mark as Unknown instead.
                         logger.debug(
-                            "[Universe] Sector hang for %s; triggering serial failover.", sym
+                            "[Universe] Sector fetch timed out for %s; defaulting to Unknown.", sym
+                        )
+                    except Exception:
+                        # Non-timeout failure: try once more serially (e.g. transient error).
+                        logger.debug(
+                            "[Universe] Sector fetch failed for %s; triggering serial failover.", sym
                         )
                         _, sector = _fetch_one(sym)
                     resolved[sym]       = sector

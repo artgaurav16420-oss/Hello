@@ -29,6 +29,18 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
+# FIX: Set yfinance's TZ cache to a known-clean directory before any download.
+# Without this, yfinance attempts to create its default cache folder and logs a
+# spurious WARNING when the path already exists as a file (common in containerised
+# environments). Pointing it at a subdirectory of our own CACHE_DIR avoids the
+# conflict entirely.
+try:
+    _YF_TZ_CACHE = os.path.join(CACHE_DIR, "_yf_tz_cache")
+    os.makedirs(_YF_TZ_CACHE, exist_ok=True)
+    yf.set_tz_cache_location(_YF_TZ_CACHE)
+except Exception:
+    pass  # Non-fatal: yfinance will fall back to in-memory TZ lookup.
+
 logger         = logging.getLogger(__name__)
 CACHE_DIR      = "data/cache"
 MANIFEST_FILE  = os.path.join(CACHE_DIR, "_manifest.json")
