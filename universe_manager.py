@@ -31,8 +31,17 @@ UNIVERSE_CACHE_TTL_H = 72
 
 # ADV filter processes tickers in parallel workers, each handling a chunk of
 # _ADV_CHUNK_SIZE to stay within yfinance rate limits.
+# FIX: _ADV_MAX_WORKERS reduced from 4 to 1 (sequential).
+# 4 parallel workers each issuing yf.download(200 tickers) simultaneously
+# reliably trips Yahoo Finance's rate limiter (observed: 0-30% success rates).
+# Additionally, all 4 workers shared the same manifest read-snapshot and then
+# raced to write it back — a classic lost-update: each worker's commit silently
+# overwrote the others', so parquets landed on disk but were never recorded in
+# the manifest, causing every subsequent run to re-download the full universe.
+# Sequential processing eliminates both failure modes at the cost of a modest
+# increase in wall time (~2 min for the full NSE universe on a typical connection).
 _ADV_CHUNK_SIZE    = 200
-_ADV_MAX_WORKERS   = 4
+_ADV_MAX_WORKERS   = 1
 
 
 # ─── Exceptions ───────────────────────────────────────────────────────────────
@@ -328,6 +337,10 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
                     "Including unfiltered.", len(chunk), exc
                 )
                 filtered.extend(chunk)
+            # FIX: Brief pause between chunks to avoid triggering Yahoo Finance's
+            # per-session rate limiter. With _ADV_MAX_WORKERS=1 this is the only
+            # active sleep between sequential yf.download() calls.
+            time.sleep(2)
 
     return filtered
 
@@ -371,21 +384,11 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         timeout = getattr(cfg, "SECTOR_FETCH_TIMEOUT", 8.0)
 
         def _fetch_one(s: str) -> tuple[str, str]:
-            # FIX: Suppress yfinance's own ERROR-level logger during .info fetch.
-            # yfinance logs HTTP 401 "Invalid Crumb" errors at ERROR level internally
-            # even when the exception is caught by application code. Temporarily
-            # muting it to CRITICAL prevents spurious ERROR lines in the app log.
-            import logging as _logging
-            _yf_log = _logging.getLogger("yfinance")
-            _prev   = _yf_log.level
-            _yf_log.setLevel(_logging.CRITICAL)
             try:
                 info = yf.Ticker(s + ".NS").info
                 return s, info.get("sector", "Unknown")
             except Exception:
                 return s, "Unknown"
-            finally:
-                _yf_log.setLevel(_prev)
 
         print(f"  \033[90mResolving metadata for {len(missing)} tickers...\033[0m")
 
@@ -397,17 +400,10 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                     sector = "Unknown"
                     try:
                         _, sector = future.result(timeout=timeout)
-                    except TimeoutError:
-                        # FIX: A timed-out future must NOT trigger the serial failover.
-                        # The failover calls _fetch_one() without a timeout, turning a
-                        # controlled hang into an indefinite block. Mark as Unknown instead.
-                        logger.debug(
-                            "[Universe] Sector fetch timed out for %s; defaulting to Unknown.", sym
-                        )
                     except Exception:
-                        # Non-timeout failure: try once more serially (e.g. transient error).
+                        # Per-future serial failover for hanging requests.
                         logger.debug(
-                            "[Universe] Sector fetch failed for %s; triggering serial failover.", sym
+                            "[Universe] Sector hang for %s; triggering serial failover.", sym
                         )
                         _, sector = _fetch_one(sym)
                     resolved[sym]       = sector
