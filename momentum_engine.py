@@ -243,13 +243,15 @@ class PortfolioState:
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
 
+        cooled_down_this_step = False
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
+            cooled_down_this_step = self.override_cooldown == 0
 
         if self.override_cooldown == 0 and self.override_active:
             self.override_active = False
 
-        if breach and not self.override_active and self.override_cooldown == 0:
+        if breach and not self.override_active and self.override_cooldown == 0 and not cooled_down_this_step:
             override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, self.exposure_multiplier * 0.5)
             self.exposure_multiplier = min(new_mult, override_mult)
             self.override_active     = True
