@@ -468,7 +468,9 @@ def _run_scan(
                     )
                     apply_decay = True
             else:
-                logger.error("Data error (not escalated): %s. Freezing state.", exc)
+                logger.warning("Data error (empty universe / thin history): %s. Resetting counters and freezing state.", exc)
+                state.consecutive_failures = 0
+                state.decay_rounds = 0
 
     # ── Gate-filtered decay target computation ────────────────────────────────
     _exhaust_decay = False
@@ -498,7 +500,7 @@ def _run_scan(
         )
         if _exhaust_decay:
             state.decay_rounds = 0
-            state.consecutive_failures = 0 # FIX: sticky counter bug
+            state.consecutive_failures = 0
 
     _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
 

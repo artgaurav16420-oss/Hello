@@ -560,30 +560,7 @@ def compute_book_cvar(
     hist_log_rets:  pd.DataFrame,
     cfg:            UltimateConfig,
 ) -> float:
-    """
-    Computes exact physical CVaR of the CURRENTLY HELD portfolio against the T-1 matrix.
-    Includes any suspended/ghost positions at their actual portfolio weights,
-    treating their daily missing returns safely as 0.0.
-    """
-    if not state.shares or hist_log_rets.empty:
-        return 0.0
-
-    active_idx = {sym: i for i, sym in enumerate(active_symbols)}
-    pv = state.cash
-    mtm_weights = {}
-
-    for sym, qty in state.shares.items():
-        if sym in active_idx:
-            px = float(prices[active_idx[sym]])
-        else:
-            px = float(state.last_known_prices.get(sym, 0.0))
-        val = qty * px
-        mtm_weights[sym] = val
-        pv += val
-
-    if pv <= 0:
-        return 0.0
-
+# ... existing code ...
     held_syms = list(mtm_weights.keys())
     T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
 
@@ -591,20 +568,19 @@ def compute_book_cvar(
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=0.0)
     rets = rets.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).iloc[-T_cvar:]
 
+    ghost_mask = np.array([s not in active_idx for s in held_syms])
+    if ghost_mask.any():
+        # Inject deterministic synthetic tail risk for ghosts (-2% daily mean, 4% daily vol)
+        rng = np.random.RandomState(42)
+        ghost_rets = rng.normal(-0.02, 0.04, size=(len(rets), ghost_mask.sum()))
+        ghost_cols = [s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost]
+        rets.loc[:, ghost_cols] = ghost_rets
+
     if len(rets) < 5:
         return 0.0
 
     w = np.array([mtm_weights[s] / pv for s in held_syms], dtype=float)
-    w = np.maximum(w, 0.0)
-
-    if float(w.sum()) < 1e-6:
-        return 0.0
-
-    losses = -(rets.values @ w)
-    tail_n = max(1, int(np.floor(len(losses) * (1.0 - cfg.CVAR_ALPHA))))
-    return float(np.mean(np.sort(losses)[-tail_n:]))
-
-
+# ... existing code ...
 def compute_decay_targets(
     state:          PortfolioState,
     sel_idx:        List[int],
@@ -621,12 +597,12 @@ def compute_decay_targets(
     sel_set = set(sel_idx)
     for i, sym in enumerate(active_symbols):
         if i in sel_set:
-            w = state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR
-            targets[i] = min(w, cfg.MAX_SINGLE_NAME_WEIGHT)
+            # Fix: Cap the pre-decay weight BEFORE scaling down
+            w_pre = min(state.weights.get(sym, 0.0), cfg.MAX_SINGLE_NAME_WEIGHT)
+            targets[i] = w_pre * cfg.DECAY_FACTOR
         else:
             targets[i] = 0.0
     return targets
-
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 

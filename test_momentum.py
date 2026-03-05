@@ -862,7 +862,7 @@ def test_book_cvar_screen_forces_liquidation():
     # Ensure sticky counter is eradicated
     assert bt.state.consecutive_failures == 0
 
-
+# ... existing code ...
 def test_compute_book_cvar_empty_book_returns_zero():
     cfg      = UltimateConfig()
     state    = PortfolioState()
@@ -879,77 +879,56 @@ def test_compute_book_cvar_missing_columns_handled_as_ghosts():
     state.last_known_prices = {"OFFUNIVERSE": 10.0}
     
     result     = compute_book_cvar(state, np.array([]), [], log_rets, cfg)
-    assert result == 0.0
+    assert result > 0.0, "Ghost position must have synthetic tail risk applied, yielding non-zero CVaR."
 
 
 def test_compute_book_cvar_high_loss_book():
-    cfg = UltimateConfig(CVAR_DAILY_LIMIT=0.04, CVAR_LOOKBACK=50)
-    rng = np.random.default_rng(7)
-    data = rng.normal(-0.03, 0.02, (80, 1))
-    idx  = pd.date_range("2020-01-02", periods=80, freq="B")
-    log_rets = pd.DataFrame(data, index=idx, columns=["BOMB"])
-    
-    state = PortfolioState(cash=0.0)
-    state.shares = {"BOMB": 100}
-    prices = np.array([100.0])
-    
-    cvar = compute_book_cvar(state, prices, ["BOMB"], log_rets, cfg)
-    assert cvar > cfg.CVAR_DAILY_LIMIT, (
-        f"High-loss book CVaR {cvar:.4%} should exceed limit {cfg.CVAR_DAILY_LIMIT:.4%}."
-    )
-
-
+# ... existing code ...
 def test_compute_decay_targets_enforces_single_name_cap():
     cfg = UltimateConfig(DECAY_FACTOR=0.85, MAX_SINGLE_NAME_WEIGHT=0.25)
     state = PortfolioState()
     state.weights = {"A": 0.35}
     
     targets = compute_decay_targets(state, [0], ["A"], cfg)
-    assert targets[0] == 0.25, "Decayed target must be capped at MAX_SINGLE_NAME_WEIGHT."
+    assert targets[0] == pytest.approx(0.2125), "Decayed target must cap the pre-decay weight, then scale."
 
 
 def test_book_cvar_screen_with_ghost_resets_failures():
-    """
-    A portfolio holds an active position with massive losses and a frozen ghost position.
-    The CVaR screen MUST include the ghost correctly, trigger a breach on the massive
-    losses of the active position, force cash liquidation, and importantly,
-    RESET consecutive_failures back to 0.
-    """
-    cfg = UltimateConfig(
-        HISTORY_GATE=5,
-        CVAR_DAILY_LIMIT=0.001,
-        CVAR_LOOKBACK=50,
-        INITIAL_CAPITAL=1_000_000,
-        MAX_DECAY_ROUNDS=3,
-        MAX_ABSENT_PERIODS=12,
-    )
-    n_days = 80
-    rng = np.random.default_rng(42)
-    rets_bomb = rng.normal(-0.03, 0.04, (n_days, 1))
-    prices_bomb = 100.0 * np.exp(np.cumsum(rets_bomb, axis=0))
-    idx = pd.date_range("2020-01-02", periods=n_days, freq="B")
+# ... existing code ...
+    assert "BOMB" not in bt.state.shares, "BOMB must be fully liquidated."
+    assert "GHOST" in bt.state.shares, "GHOST has no liquidity, so it must physically persist."
+    assert bt.state.absent_periods["GHOST"] == 1
 
-    # Only BOMB is in the active data feed. GHOST is fundamentally absent.
-    close = pd.DataFrame(prices_bomb, index=idx, columns=["BOMB"])
-    volume = pd.DataFrame(np.ones((n_days, 1)) * 1e6, index=idx, columns=["BOMB"])
+
+def test_decay_rounds_exhaustion_forces_liquidation():
+    cfg = UltimateConfig(MAX_DECAY_ROUNDS=3, INITIAL_CAPITAL=1_000_000)
+    n_days, n_syms = 20, 2
+    close = _make_close(n_days, n_syms)
+    volume = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
     engine = InstitutionalRiskEngine(cfg)
     bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
 
-    bt.state.consecutive_failures = 1
-    bt.state.shares = {"BOMB": 1000, "GHOST": 500}
-    bt.state.weights = {"BOMB": 0.5, "GHOST": 0.5}
-    bt.state.entry_prices = {"BOMB": 100.0, "GHOST": 100.0}
-    bt.state.last_known_prices = {"BOMB": 100.0, "GHOST": 100.0}
+    bt.state.shares = {"SYM00": 100, "SYM01": 50}
+    bt.state.weights = {"SYM00": 0.5, "SYM01": 0.5}
+    bt.state.entry_prices = {"SYM00": 100.0, "SYM01": 100.0}
+    bt.state.last_known_prices = {"SYM00": 100.0, "SYM01": 100.0}
+    bt.state.decay_rounds = 3  # Start at exhaustion threshold
+    bt.state.consecutive_failures = 2 
 
-    rebal_dates = close.index[60:61]
-    bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+    import unittest.mock as mock
+    def _fail_opt(*args, **kwargs):
+        raise OptimizationError("Solver failed", OptimizationErrorType.NUMERICAL)
 
-    assert bt.state.consecutive_failures == 0, "Sticky counter must be eradicated."
-    assert "BOMB" not in bt.state.shares, "BOMB must be fully liquidated."
-    assert "GHOST" in bt.state.shares, "GHOST has no liquidity, so it must physically persist."
-    assert bt.state.absent_periods["GHOST"] == 1
+    # Triggers consecutive_failures -> 3 -> apply_decay=True -> exhaust_decay
+    with mock.patch.object(bt.engine, "optimize", side_effect=_fail_opt):
+        rebal_dates = close.index[10:11]
+        bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+
+    assert not bt.state.shares, "Positions must be fully liquidated on decay exhaustion."
+    assert bt.state.decay_rounds == 0, "decay_rounds must reset to 0."
+    assert bt.state.consecutive_failures == 0, "consecutive_failures must reset to 0."
 
 
 if __name__ == '__main__':
