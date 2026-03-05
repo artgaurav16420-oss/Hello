@@ -7,3 +7,5 @@ yfinance
 requests
 beautifulsoup4
 pyarrow
+optuna
+pytest
