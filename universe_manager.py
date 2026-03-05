@@ -40,7 +40,13 @@ UNIVERSE_CACHE_TTL_H = 72
 # the manifest, causing every subsequent run to re-download the full universe.
 # Sequential processing eliminates both failure modes at the cost of a modest
 # increase in wall time (~2 min for the full NSE universe on a typical connection).
-_ADV_CHUNK_SIZE    = 200
+#
+# FIX (Minor #10): _ADV_CHUNK_SIZE aligned to data_cache._DOWNLOAD_CHUNK_SIZE (75).
+# The previous value of 200 caused each _process_adv_chunk call to internally
+# re-chunk into 3 × 75-ticker sub-batches inside load_or_fetch, adding an
+# unnecessary layer of indirection with no benefit.  Using 75 directly gives
+# a flat single-batch call per ADV chunk with the same per-chunk timeout guarantee.
+_ADV_CHUNK_SIZE    = 75
 _ADV_MAX_WORKERS   = 1
 
 
@@ -71,8 +77,10 @@ class UniverseFetchError(RuntimeError):
     """
     def __init__(self, message: str):
         super().__init__(message)
-        # Populated after _HARD_FLOOR_UNIVERSE is defined below.
-        self.fallback_universe: List[str] = []   # parallel chunk workers; keeps total connections manageable
+        # FIX (Quality #7): Removed stray comment fragment copied from the
+        # _ADV_MAX_WORKERS block that had nothing to do with this field.
+        self.fallback_universe: List[str] = []
+
 
 # ─── Survival Mode Circuit Breaker ───────────────────────────────────────────
 
@@ -135,10 +143,15 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
         resp.raise_for_status()
         return pd.read_csv(io.StringIO(resp.text))
     except requests.exceptions.HTTPError as he:
-        if he.response.status_code == 403:
+        # FIX (Quality #7): he.response can be None when the exception is raised
+        # programmatically (e.g. by middleware or test stubs); guard before access.
+        status = getattr(he.response, "status_code", None) if hasattr(he, "response") else None
+        if status == 403:
             logger.error("[Universe] Access Denied (403). NSE website is blocking requests.")
+        elif status is not None:
+            logger.error("[Universe] HTTP Error %d while reaching NSE.", status)
         else:
-            logger.error("[Universe] HTTP Error %d while reaching NSE.", he.response.status_code)
+            logger.error("[Universe] HTTP Error (no response object): %s", he)
         raise
     except Exception as exc:
         logger.error("[Universe] Failed to fetch CSV from %s: %s", url, exc)
@@ -383,7 +396,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         import yfinance as yf
         timeout = getattr(cfg, "SECTOR_FETCH_TIMEOUT", 8.0)
 
-        def _fetch_one(s: str) -> tuple[str, str]:
+        def _fetch_one(s: str) -> tuple:
             try:
                 info = yf.Ticker(s + ".NS").info
                 return s, info.get("sector", "Unknown")

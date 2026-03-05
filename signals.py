@@ -205,10 +205,12 @@ def generate_signals(
     adj_scores = np.clip((raw_daily - mu) / std, -cfg.Z_SCORE_CLIP, cfg.Z_SCORE_CLIP)
 
     # ── Per-asset gates ───────────────────────────────────────────────────────
+    # NOTE: Continuity bonus is intentionally applied AFTER all gates below.
+    # Applying it here (before gates) allowed zombie positions with ADV=0 or
+    # crashing prices to keep accumulating +CONTINUITY_BONUS on every bar,
+    # making marginal names borderline-pass gates they should clearly fail.
 
     for i, sym in enumerate(active):
-        if prev_weights.get(sym, 0.0) > 0.001:
-            adj_scores[i] += cfg.CONTINUITY_BONUS
         if int(log_rets[sym].notna().sum()) < cfg.HISTORY_GATE:
             adj_scores[i] = -np.inf
 
@@ -233,8 +235,16 @@ def generate_signals(
                     active[i], cfg.KNIFE_WINDOW, rn * 100,
                 )
 
-    # Map NaN → -inf before argsort so NaN assets cannot silently consume top-K slots.
+    # Map NaN → -inf before continuity bonus so NaN assets cannot silently
+    # benefit from the bonus.
     adj_scores = np.where(np.isfinite(adj_scores), adj_scores, -np.inf)
+
+    # CONTINUITY BONUS — applied only to positions that survived all gates above.
+    # A name that fails any gate is permanently at -inf; the bonus cannot rescue it.
+    # This prevents path-dependency from protecting illiquid or crashing positions.
+    for i, sym in enumerate(active):
+        if adj_scores[i] > -np.inf and prev_weights.get(sym, 0.0) > 0.001:
+            adj_scores[i] += cfg.CONTINUITY_BONUS
 
     sel_idx = [
         i for i in np.argsort(adj_scores)[-cfg.MAX_POSITIONS:]

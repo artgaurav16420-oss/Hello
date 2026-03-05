@@ -21,8 +21,9 @@ from momentum_engine import (
     OptimizationErrorType,
     PortfolioState,
     execute_rebalance,
+    compute_book_cvar,
     Trade,
-    to_ns,
+    EPSILON,
 )
 from signals import generate_signals, compute_regime_score, compute_single_adv
 
@@ -66,8 +67,11 @@ class BacktestEngine:
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = list(close.columns)
 
-        # O(1) membership tests for rapid daily simulation
-        rebal_set = set(rebalance_dates)
+        # O(1) membership tests for rapid daily simulation.
+        rebal_set  = set(rebalance_dates)
+        # FIX (Minor #9): symbols is constant for the life of the loop; build
+        # active_idx once here rather than rebuilding it on every trading day.
+        active_idx = {sym: i for i, sym in enumerate(symbols)}
 
         for date in close.index:
             if date < start_dt or date > end_dt:
@@ -76,20 +80,14 @@ class BacktestEngine:
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
 
-            active_idx = {sym: i for i, sym in enumerate(symbols)}
-            pv = self.state.cash + sum(
-                self.state.shares.get(sym, 0) * (
-                    float(close_t[sym])
-                    if (sym in active_idx and pd.notna(close_t[sym]))
-                    else self.state.last_known_prices.get(sym, 0.0)
-                )
-                for sym in self.state.shares
-            )
+            # FIX (Logic #3): The original code computed `pv` here but never
+            # passed it to _run_rebalance (which recomputes it internally).
+            # The dead variable has been removed to eliminate misleading code.
 
             if date in rebal_set:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
-                    pv, idx_df, sector_map,
+                    idx_df, sector_map,
                 )
 
             price_dict = {
@@ -98,7 +96,7 @@ class BacktestEngine:
                 if pd.notna(close_t[sym])
             }
             self.state.record_eod(price_dict)
-            post_pv = self.state.equity_hist[-1] if self.state.equity_hist else pv
+            post_pv = self.state.equity_hist[-1] if self.state.equity_hist else self.state.cash
 
             self._eq_dates.append(date)
             self._eq_vals.append(post_pv)
@@ -113,7 +111,6 @@ class BacktestEngine:
         returns:    pd.DataFrame,
         symbols:    List[str],
         prices_t:   np.ndarray,
-        pv:         float,
         idx_df,
         sector_map,
     ) -> None:
@@ -134,14 +131,16 @@ class BacktestEngine:
 
         # FIX #7: Replaced opaque double-for-in-comprehension with a readable
         # helper so the weight calculation is easy to audit and test.
-        prev_w_dict = _build_prev_weights(self.state, symbols, pv)
-
-        raw_daily, adj_scores, sel_idx = generate_signals(
-            hist_log_rets,
-            adv_vector,
-            cfg,
-            prev_weights=prev_w_dict,
+        close_t    = close.loc[date]
+        pv = self.state.cash + sum(
+            self.state.shares.get(sym, 0) * (
+                float(close_t[sym])
+                if (sym in close.columns and pd.notna(close_t[sym]))
+                else self.state.last_known_prices.get(sym, 0.0)
+            )
+            for sym in self.state.shares
         )
+        prev_w_dict = _build_prev_weights(self.state, symbols, pv)
 
         _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
         idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
@@ -169,58 +168,142 @@ class BacktestEngine:
         target_weights         = np.zeros(len(symbols))
         apply_decay            = False
         optimization_succeeded = False
+        sel_idx: List[int]     = []
+        _force_full_cash       = False
 
-        if sel_idx:
-            sel_syms      = [symbols[i] for i in sel_idx]
-            sector_labels = _build_sector_labels(sel_syms, sector_map)
-            prev_weights  = np.array([prev_w_dict.get(sym, 0.0) for sym in symbols])
-
-            try:
-                weights_sel = self.engine.optimize(
-                    expected_returns    = raw_daily[sel_idx],
-                    historical_returns  = hist_log_rets[[symbols[i] for i in sel_idx]],
-                    execution_date      = date,
-                    adv_shares          = adv_vector[sel_idx],
-                    prices              = prices_t[sel_idx],
-                    portfolio_value     = pv,
-                    prev_w              = prev_weights[sel_idx],
-                    exposure_multiplier = self.state.exposure_multiplier,
-                    sector_labels       = sector_labels,
+        # ── Book CVaR screen ──────────────────────────────────────────────────
+        # Check physical CVaR of the CURRENTLY HELD portfolio against the full-
+        # universe T-1 return history BEFORE running generate_signals or optimize.
+        # This is the correct pre-solve screen: it looks at the positions we
+        # actually own, including any that just failed liquidity/knife gates and
+        # are no longer in sel_idx. Those are the most dangerous names.
+        if self.state.weights:
+            book_cvar = compute_book_cvar(self.state.weights, hist_log_rets, cfg)
+            if book_cvar > cfg.CVAR_DAILY_LIMIT + EPSILON:
+                logger.warning(
+                    "[Backtest] Book CVaR %.4f%% exceeds limit %.4f%% on %s — "
+                    "skipping optimization, forcing immediate liquidation.",
+                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, date,
                 )
-                target_weights[sel_idx]  = weights_sel
-                self.state.consecutive_failures = 0
-                self.state.decay_rounds  = 0
-                optimization_succeeded   = True
+                self.state.consecutive_failures += 1
+                apply_decay      = True
+                _force_full_cash = True
 
-            except OptimizationError as oe:
-                if oe.error_type != OptimizationErrorType.DATA:
-                    self.state.consecutive_failures += 1
-                    logger.debug(
-                        "[Backtest] Solver failure #%d on %s: %s",
-                        self.state.consecutive_failures, date, oe,
+        # ── Signal generation + optimization ─────────────────────────────────
+        # FIX (Logic #2): generate_signals raises ValueError when log_rets is
+        # empty or all-NaN (e.g. warm-up window too short). Catch it here.
+        if not _force_full_cash:
+            try:
+                raw_daily, adj_scores, sel_idx = generate_signals(
+                    hist_log_rets,
+                    adv_vector,
+                    cfg,
+                    prev_weights=prev_w_dict,
+                )
+            except ValueError as ve:
+                logger.debug(
+                    "[Backtest] generate_signals raised ValueError on %s: %s — "
+                    "treating as empty universe for this bar.",
+                    date, ve,
+                )
+                self.state.decay_rounds         = 0
+                self.state.consecutive_failures = 0
+                return
+
+            if sel_idx:
+                sel_syms      = [symbols[i] for i in sel_idx]
+                sector_labels = _build_sector_labels(sel_syms, sector_map)
+                prev_weights  = np.array([prev_w_dict.get(sym, 0.0) for sym in symbols])
+
+                try:
+                    weights_sel = self.engine.optimize(
+                        expected_returns    = raw_daily[sel_idx],
+                        historical_returns  = hist_log_rets[[symbols[i] for i in sel_idx]],
+                        execution_date      = date,
+                        adv_shares          = adv_vector[sel_idx],
+                        prices              = prices_t[sel_idx],
+                        portfolio_value     = pv,
+                        prev_w              = prev_weights[sel_idx],
+                        exposure_multiplier = self.state.exposure_multiplier,
+                        sector_labels       = sector_labels,
                     )
-                    if self.state.consecutive_failures >= 2:
+                    target_weights[sel_idx]  = weights_sel
+                    self.state.consecutive_failures = 0
+                    self.state.decay_rounds  = 0
+                    optimization_succeeded   = True
+
+                except OptimizationError as oe:
+                    if oe.error_type != OptimizationErrorType.DATA:
+                        self.state.consecutive_failures += 1
                         logger.debug(
-                            "[Backtest] Applying %.0f%% deleverage on %s.",
-                            (1 - cfg.DECAY_FACTOR) * 100, date,
+                            "[Backtest] Solver failure #%d on %s: %s",
+                            self.state.consecutive_failures, date, oe,
                         )
-                        apply_decay = True
-        else:
-            # FIX #6: No optimization attempt this bar (e.g. empty candidate set)
-            # is NOT a solver failure. Reset decay_rounds so stale decay state
-            # from a previous failure sequence does not persist into a regime
-            # where the universe is simply temporarily empty.
-            self.state.decay_rounds = 0
+                        # FIX: threshold raised from 2 to 3.
+                        if self.state.consecutive_failures >= 3:
+                            logger.debug(
+                                "[Backtest] 3 consecutive solver failures on %s — "
+                                "triggering gate-filtered pro-rata liquidation.",
+                                date,
+                            )
+                            apply_decay = True
+            else:
+                # FIX #6 / Logic #10: empty candidate set is not a solver failure.
+                self.state.decay_rounds         = 0
+                self.state.consecutive_failures = 0
+
+        # ── Gate-filtered decay target computation ────────────────────────────
+        # When apply_decay=True, compute what we actually want to hold:
+        # — Force-full-cash cases (book CVaR breach, or decay rounds exhausted):
+        #     target_weights stays all-zeros; bypass execute_rebalance's decay
+        #     increment so decay_rounds resets cleanly to 0.
+        # — Normal gate-filtered case:
+        #     Positions in sel_idx → scaled by DECAY_FACTOR (gate-passing).
+        #     Positions NOT in sel_idx → 0 (force-closed this bar).
+        _exhaust_decay = False
+        if apply_decay and not optimization_succeeded:
+            if _force_full_cash or self.state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+                logger.warning(
+                    "[Backtest] %s on %s — forcing full liquidation to cash.",
+                    "Book CVaR breach" if _force_full_cash else
+                    f"MAX_DECAY_ROUNDS={cfg.MAX_DECAY_ROUNDS} exhausted",
+                    date,
+                )
+                _exhaust_decay = True
+                # target_weights stays all-zeros → full cash
+            else:
+                # Gate-filtered partial deleverage.
+                sel_idx_set = set(sel_idx)
+                sym_to_pos  = {s: i for i, s in enumerate(symbols)}
+                n_gated = sum(
+                    1 for s in self.state.shares
+                    if s in sym_to_pos and sym_to_pos[s] not in sel_idx_set
+                )
+                for i in sel_idx:
+                    sym = symbols[i]
+                    target_weights[i] = self.state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR
+                logger.debug(
+                    "[Backtest] Decay round %d/%d: scaling %d gate-passing, "
+                    "force-closing %d gated positions.",
+                    self.state.decay_rounds + 1, cfg.MAX_DECAY_ROUNDS,
+                    len(sel_idx), n_gated,
+                )
 
         if optimization_succeeded or apply_decay:
-            # FIX C4: pass scenario_losses for post-decay CVaR check.
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
             execute_rebalance(
                 self.state, target_weights, prices_t, symbols, cfg,
-                date_context=date, trade_log=self.trades, apply_decay=apply_decay,
-                scenario_losses=_L,
+                date_context=date, trade_log=self.trades,
+                # FIX: when exhausting/force-cash pass apply_decay=False so
+                # execute_rebalance does not increment decay_rounds again.
+                # We reset it explicitly below.
+                apply_decay    = apply_decay and not _exhaust_decay,
+                scenario_losses = None if _exhaust_decay else _L,
             )
+            if _exhaust_decay:
+                # Reset so the next successful optimization starts from a clean state.
+                self.state.decay_rounds = 0
             self._rebal_rows.append({
                 "date":              date,
                 "regime_score":       round(regime_score, 4),
@@ -428,7 +511,10 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
         if len(downside) > 1 and downside.std() > 0:
             sortino = (dr.mean() * periods_per_year) / (downside.std() * np.sqrt(periods_per_year))
         else:
-            sortino = sharpe  # Fallback if no downside volatility exists
+            # No downside volatility: Sortino is theoretically infinite.
+            # We return NaN rather than borrowing the Sharpe value, which would
+            # be semantically misleading (a finite ratio implies finite downside risk).
+            sortino = float("nan")
     else:
         sharpe  = 0.0
         sortino = 0.0
@@ -440,6 +526,6 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
         "max_dd":  round(max_dd,  2),
         "final":   round(final,   2),
         "sharpe":  round(sharpe,  2),
-        "sortino": round(sortino, 2),
+        "sortino": sortino if not np.isfinite(sortino) else round(sortino, 2),
         "calmar":  round(calmar,  2),
     }

@@ -21,6 +21,8 @@ from momentum_engine import (
     OptimizationErrorType,
     PortfolioState,
     execute_rebalance,
+    compute_book_cvar,
+    EPSILON,
     _ConstraintBuilder,
 )
 from backtest_engine import BacktestEngine, run_backtest, _compute_metrics, _build_adv_vector
@@ -331,8 +333,8 @@ def test_cvar_gross_exposure_normalisation():
     update_exposure must normalise by gross_exposure before the breach check.
     """
     cfg   = UltimateConfig()
-    high_asset_cvar = cfg.MAX_PORTFOLIO_RISK_PCT * 2.0  
-    portfolio_cvar  = high_asset_cvar * 0.5              
+    high_asset_cvar = cfg.MAX_PORTFOLIO_RISK_PCT * 2.0
+    portfolio_cvar  = high_asset_cvar * 0.5
 
     state = PortfolioState()
     state.exposure_multiplier = 1.0
@@ -340,6 +342,26 @@ def test_cvar_gross_exposure_normalisation():
 
     assert state.override_active is True, \
         "Override must trigger when asset-level CVaR is high even if portfolio CVaR is diluted by cash."
+
+
+def test_update_exposure_cash_only_no_override():
+    """
+    A 100% cash portfolio must NOT trip the CVaR override regardless of
+    historical CVaR, since there is nothing deployed to breach a risk limit.
+
+    FIX (Logic #5): Previously the 0.05 floor in the denominator could inflate
+    normalised_cvar by up to 20× for a cash-only portfolio, causing a spurious
+    override after any non-zero equity-history CVaR.
+    """
+    cfg   = UltimateConfig()
+    state = PortfolioState()
+    state.exposure_multiplier = 1.0
+    # Inject historical CVaR well above the limit.
+    large_cvar = cfg.MAX_PORTFOLIO_RISK_PCT * 3.0
+    # gross_exposure = 0 → nothing deployed.
+    state.update_exposure(0.5, large_cvar, cfg, gross_exposure=0.0)
+    assert state.override_active is False, \
+        "Cash-only portfolio must not trigger CVaR override."
 
 
 def test_execute_rebalance_pv_includes_stale_positions():
@@ -359,7 +381,7 @@ def test_execute_rebalance_pv_includes_stale_positions():
     target_weights = np.array([0.20])
 
     execute_rebalance(state, target_weights, prices_active, active_symbols, cfg)
-    
+
     assert "STALE" not in state.shares, "With MAX_ABSENT_PERIODS=1, one absence closes position."
 
 
@@ -379,12 +401,12 @@ def test_detect_and_apply_splits_fractional_cash():
     """A reverse split that drops fractional shares must return that value to Cash."""
     state = PortfolioState(cash=0.0)
     # Reverse split 1:2 means ratio is 0.5. 101 shares -> 50.5 -> rounds to 50.
-    state.shares = {"A": 101} 
+    state.shares = {"A": 101}
     state.last_known_prices = {"A": 100.0}
-    
+
     market_data = {"A": pd.DataFrame({"Close": [200.0]})}
     detect_and_apply_splits(state, market_data)
-    
+
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
     # 101 - (50 / 0.5) = 1.0 orphaned share worth 200.0
     assert state.cash == 200.0, "Fractional value must be safely routed to Cash."
@@ -399,8 +421,8 @@ def test_record_eod_flat_day_preserved():
     prices       = {"RELIANCE": 2500.0, "TCS": 3800.0}
 
     ps.record_eod(prices)
-    ps.record_eod(prices) # same PV → SHOULD append.
-    
+    ps.record_eod(prices)  # same PV → SHOULD append.
+
     assert len(ps.equity_hist) == 2, "Flat-days must be preserved, not dropped."
 
 
@@ -442,31 +464,38 @@ def test_data_cache_staleness_logic(tmp_path, monkeypatch):
     from data_cache import load_or_fetch
     monkeypatch.setattr("data_cache.CACHE_DIR", str(tmp_path))
     monkeypatch.setattr("data_cache.MANIFEST_FILE", str(tmp_path / "_manifest.json"))
-    
-    import json
-    # Mock a manifest that says fetched very recently (1 hour ago) BUT last_date is deeply stale
+
+    # FIX (Test #6): Write the manifest in the canonical versioned format that
+    # production code writes and reads. The previous test used a flat dict,
+    # which exercised the legacy-compat shim path instead of the normal path.
+    # If the shim is ever removed, the test would pass for the wrong reason.
     manifest = {
-        "TEST.NS": {
-            "fetched_at": (datetime.now() - timedelta(hours=1)).isoformat(),
-            "last_date": "2020-01-01",
-            "covered_start": "2019-01-01"
+        "schema_version": 1,
+        "entries": {
+            "TEST.NS": {
+                "fetched_at": (datetime.now() - timedelta(hours=1)).isoformat(),
+                "last_date": "2020-01-01",
+                "covered_start": "2019-01-01",
+            }
         }
     }
     with open(tmp_path / "_manifest.json", "w") as f:
         json.dump(manifest, f)
-        
+
     # Write dummy parquet so it doesn't fail the file-exists check
     dummy = pd.DataFrame({"Close": [100]}, index=pd.to_datetime(["2020-01-01"]))
     dummy.to_parquet(tmp_path / "TEST.NS.parquet")
-    
-    # We monkeypatch the _download_with_retry to observe if a download is forced
+
+    # We monkeypatch the _download_with_timeout to observe if a download is forced
     download_called = False
+
     def mock_download(*args, **kwargs):
         nonlocal download_called
         download_called = True
         return pd.DataFrame()
+
     monkeypatch.setattr("data_cache._download_with_timeout", mock_download)
-    
+
     load_or_fetch(["TEST"], "2020-01-01", "2020-01-10", force_refresh=False)
     assert download_called, "Cache must trigger re-download if last_date misses yesterday's business day."
 
@@ -476,11 +505,11 @@ def test_portfolio_state_backup_rotation(tmp_path, monkeypatch):
     monkeypatch.setattr("os.makedirs", lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     os.mkdir("data")
-    
+
     state = PortfolioState(cash=5000)
     for _ in range(4):
         save_portfolio_state(state, "test_backup")
-        
+
     assert os.path.exists("data/portfolio_state_test_backup.json")
     assert os.path.exists("data/portfolio_state_test_backup.json.bak.0")
     assert os.path.exists("data/portfolio_state_test_backup.json.bak.1")
@@ -506,8 +535,8 @@ def test_compute_metrics_sortino():
     idx = pd.date_range("2020-01-03", periods=104, freq="W-FRI")
     eq_vals = np.linspace(1_000_000, 1_200_000, 104)
     # Inject two sharp localized drops to ensure non-zero downside variance
-    eq_vals[10] -= 50_000 
-    eq_vals[50] -= 50_000 
+    eq_vals[10] -= 50_000
+    eq_vals[50] -= 50_000
     eq = pd.Series(eq_vals, index=idx)
     m = _compute_metrics(eq, 1_000_000.0)
     assert np.isfinite(m["sortino"])
@@ -701,7 +730,7 @@ def test_volume_no_lookahead():
 
     volume = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=idx, columns=cols)
     friday = idx[-1]
-    volume.loc[friday] = 1e12   
+    volume.loc[friday] = 1e12
 
     adv_fri = _build_adv_vector(cols, volume, friday)
 
@@ -740,7 +769,7 @@ def test_ghost_position_delists_after_max_absent_periods():
     state = PortfolioState(cash=500_000.0)
     state.shares            = {"DELISTED": 100}
     state.entry_prices      = {"DELISTED": 1000.0}
-    state.last_known_prices = {"DELISTED": 900.0}   
+    state.last_known_prices = {"DELISTED": 900.0}
     state.weights           = {"DELISTED": 0.10}
 
     target_empty = np.array([], dtype=float)
@@ -760,36 +789,63 @@ def test_ghost_position_delists_after_max_absent_periods():
         "Delisted position must be closed at last known price, not ₹0."
 
 
-def test_decay_rounds_cap_prevents_further_decay():
+def test_decay_rounds_increment_and_counter_reset():
     """
-    After MAX_DECAY_ROUNDS consecutive decays, weights must be held flat
-    rather than decayed further.
+    execute_rebalance increments decay_rounds by 1 per call when apply_decay=True.
+    Callers (not execute_rebalance) are responsible for MAX_DECAY_ROUNDS enforcement
+    and resetting to 0 after a force-cash exhaustion — this tests the primitive
+    counter behaviour in isolation.
     """
-    cfg   = UltimateConfig(MAX_DECAY_ROUNDS=2)
+    cfg   = UltimateConfig(MAX_DECAY_ROUNDS=3)
     state = PortfolioState(cash=1_000_000.0)
-    state.shares       = {"A": 100}
-    state.entry_prices = {"A": 1000.0}
+    state.shares            = {"A": 100}
+    state.entry_prices      = {"A": 1000.0}
     state.last_known_prices = {"A": 1000.0}
-    state.weights      = {"A": 0.10}
+    state.weights           = {"A": 0.10}
 
-    # Apply MAX_DECAY_ROUNDS rounds of decay.
-    for _ in range(cfg.MAX_DECAY_ROUNDS):
-        execute_rebalance(
-            state, np.array([0.0]), np.array([1000.0]), ["A"], cfg, apply_decay=True
-        )
+    # First decay call: caller computes gate-filtered targets (A passes, w × DECAY_FACTOR).
+    target_round1 = np.array([state.weights["A"] * cfg.DECAY_FACTOR])
+    execute_rebalance(state, target_round1, np.array([1000.0]), ["A"], cfg, apply_decay=True)
+    assert state.decay_rounds == 1
 
-    weight_at_cap = state.weights.get("A", 0.0)
+    # Second decay call.
+    target_round2 = np.array([state.weights.get("A", 0.0) * cfg.DECAY_FACTOR])
+    execute_rebalance(state, target_round2, np.array([1000.0]), ["A"], cfg, apply_decay=True)
+    assert state.decay_rounds == 2
 
-    # One more round — should NOT decay further.
+
+def test_gated_position_force_closed_on_first_decay_bar():
+    """
+    A position that fails gates (not in sel_idx) must be force-closed on the
+    FIRST decay bar, not protected and bled out over MAX_DECAY_ROUNDS calls.
+
+    The caller sets target_weight[gated_pos] = 0.0 (it is absent from sel_idx).
+    execute_rebalance must sell the entire position on that call.
+    """
+    cfg   = UltimateConfig(MAX_DECAY_ROUNDS=3)
+    state = PortfolioState(cash=500_000.0)
+    # Two positions: A passes gates, B fails (illiquid / falling knife).
+    state.shares            = {"A": 100, "B": 50}
+    state.entry_prices      = {"A": 1000.0, "B": 500.0}
+    state.last_known_prices = {"A": 1000.0, "B": 500.0}
+    state.weights           = {"A": 0.10, "B": 0.05}
+
+    # Caller gate-filtered targets: A scaled, B zeroed (failed gates).
+    targets  = np.array([state.weights["A"] * cfg.DECAY_FACTOR, 0.0])
+    prices   = np.array([1000.0, 500.0])
+    trade_log: list = []
     execute_rebalance(
-        state, np.array([0.0]), np.array([1000.0]), ["A"], cfg, apply_decay=True
+        state, targets, prices, ["A", "B"], cfg,
+        apply_decay=True, trade_log=trade_log,
     )
-    weight_after_cap = state.weights.get("A", 0.0)
 
-    assert state.decay_rounds == cfg.MAX_DECAY_ROUNDS, \
-        "decay_rounds must not exceed MAX_DECAY_ROUNDS."
-    assert abs(weight_at_cap - weight_after_cap) < 1e-8, \
-        "Weight must be held flat once MAX_DECAY_ROUNDS is reached."
+    # B must be gone after one decay bar.
+    assert "B" not in state.shares, "Gated position B must be force-closed on first decay bar."
+    assert "A" in state.shares,    "Gate-passing position A must still be held."
+
+    # A SELL trade for B must be in the log.
+    b_sells = [t for t in trade_log if t.symbol == "B" and t.direction == "SELL"]
+    assert b_sells, "A SELL trade for B must be recorded."
 
 
 def test_decay_rounds_reset_on_solver_success():
@@ -801,15 +857,153 @@ def test_decay_rounds_reset_on_solver_success():
     close   = _make_close(n_days, n_syms)
     volume  = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
-    
+
     engine = InstitutionalRiskEngine(cfg)
     bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
-    bt.state.decay_rounds = 3 # mock prior failures
-    
+    bt.state.decay_rounds = 3  # mock prior failures
+
     rebal_dates = close.index[20:25]
     bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
-    
-    assert bt.state.decay_rounds == 0, "BacktestEngine run loop must correctly zero decay_rounds upon optimization success"
+
+    assert bt.state.decay_rounds == 0, \
+        "BacktestEngine run loop must correctly zero decay_rounds upon optimization success."
+
+
+def test_consecutive_failures_reset_on_empty_universe():
+    """
+    When the candidate universe is empty (no sel_idx), consecutive_failures
+    must be reset to 0 — the empty universe is NOT a solver failure.
+
+    FIX (Logic #10): Previously only decay_rounds was reset in the empty-
+    universe branch; consecutive_failures was left elevated. The next genuine
+    solver failure would compare against the inflated count and could trigger
+    decay one rebalance too early.
+    """
+    cfg = UltimateConfig(HISTORY_GATE=5, INITIAL_CAPITAL=1_000_000)
+    n_days, n_syms = 50, 2
+    close   = _make_close(n_days, n_syms)
+    volume  = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
+    returns = close.pct_change(fill_method=None).clip(lower=-0.99)
+
+    engine = InstitutionalRiskEngine(cfg)
+    bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+    bt.state.consecutive_failures = 2
+
+    import backtest_engine as _be
+    original = _be.generate_signals
+
+    def _no_candidates(*args, **kwargs):
+        raw, scores, _ = original(*args, **kwargs)
+        return raw, scores, []
+
+    import unittest.mock as mock
+    with mock.patch("backtest_engine.generate_signals", side_effect=_no_candidates):
+        rebal_dates = close.index[20:25]
+        bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+
+    assert bt.state.consecutive_failures == 0, \
+        "Empty universe must reset consecutive_failures to 0."
+
+
+def test_book_cvar_screen_forces_liquidation():
+    """
+    compute_book_cvar fires on the FULL held book (including positions that
+    just failed gates and are absent from sel_idx).
+
+    Scenario:
+    - Portfolio holds position B which has a very large negative return series.
+    - B fails the falling-knife gate so it is NOT in sel_idx.
+    - Book CVaR of the held portfolio (A + B) exceeds CVAR_DAILY_LIMIT.
+    - BacktestEngine must detect this via compute_book_cvar BEFORE calling
+      generate_signals/optimize, set _force_full_cash=True, and liquidate both
+      A and B to cash on that rebalance bar.
+    """
+    cfg = UltimateConfig(
+        HISTORY_GATE=5,
+        CVAR_DAILY_LIMIT=0.001,   # 0.1% — trivially easy to breach
+        CVAR_LOOKBACK=50,
+        INITIAL_CAPITAL=1_000_000,
+        MAX_DECAY_ROUNDS=3,
+    )
+    n_days, n_syms = 80, 2
+    rng   = np.random.default_rng(0)
+    # Column 0 (A): small daily returns
+    # Column 1 (B): large crash returns — blows up CVaR
+    rets_a = rng.normal(0.0005, 0.005,  (n_days, 1))
+    rets_b = rng.normal(-0.03,  0.04,   (n_days, 1))
+    rets   = np.hstack([rets_a, rets_b])
+    prices_arr = 100.0 * np.exp(np.cumsum(rets, axis=0))
+    idx    = pd.date_range("2020-01-02", periods=n_days, freq="B")
+    cols   = ["SYM00", "SYM01"]
+    close  = pd.DataFrame(prices_arr, index=idx, columns=cols)
+    volume = pd.DataFrame(np.ones((n_days, 2)) * 1e6, index=idx, columns=cols)
+    returns = close.pct_change(fill_method=None).clip(lower=-0.99)
+
+    engine = InstitutionalRiskEngine(cfg)
+    bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+
+    # Pre-seed state: both positions held, B is the CVaR bomb.
+    bt.state.shares            = {"SYM00": 50, "SYM01": 50}
+    bt.state.weights           = {"SYM00": 0.30, "SYM01": 0.30}
+    bt.state.entry_prices      = {"SYM00": 100.0, "SYM01": 100.0}
+    bt.state.last_known_prices = {"SYM00": 100.0, "SYM01": 100.0}
+
+    # Run a single rebalance late enough to have history.
+    rebal_dates = close.index[60:61]
+    bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+
+    # After the book CVaR breach is detected, the engine must have liquidated
+    # to cash (both positions gone or sharply reduced).
+    total_held_notional = sum(
+        bt.state.shares.get(s, 0) * bt.state.last_known_prices.get(s, 100.0)
+        for s in ["SYM00", "SYM01"]
+    )
+    total_pv = bt.state.cash + total_held_notional
+    # Allow for slippage, but gross exposure must be near zero if CVaR was breached.
+    gross_exposure = total_held_notional / max(total_pv, 1.0)
+    assert gross_exposure < 0.15, (
+        f"Book CVaR breach should have forced near-full liquidation, "
+        f"but gross exposure is {gross_exposure:.1%}."
+    )
+
+
+def test_compute_book_cvar_empty_book_returns_zero():
+    """compute_book_cvar must return 0.0 for empty held_weights."""
+    cfg      = UltimateConfig()
+    log_rets = _make_log_rets(60, 3)
+    result   = compute_book_cvar({}, log_rets, cfg)
+    assert result == 0.0
+
+
+def test_compute_book_cvar_missing_columns_returns_zero():
+    """
+    compute_book_cvar must return 0.0 when no held symbol appears in
+    hist_log_rets columns (position not in universe history).
+    """
+    cfg        = UltimateConfig()
+    log_rets   = _make_log_rets(60, 3)
+    held       = {"OFFUNIVERSE": 0.50}
+    result     = compute_book_cvar(held, log_rets, cfg)
+    assert result == 0.0
+
+
+def test_compute_book_cvar_high_loss_book():
+    """
+    A book consisting entirely of a severely loss-making asset must produce
+    a CVaR well above any sane CVAR_DAILY_LIMIT.
+    """
+    cfg = UltimateConfig(CVAR_DAILY_LIMIT=0.04, CVAR_LOOKBACK=50)
+    rng = np.random.default_rng(7)
+    # Daily returns averaging -3% — extreme drawdown series.
+    data = rng.normal(-0.03, 0.02, (80, 1))
+    idx  = pd.date_range("2020-01-02", periods=80, freq="B")
+    log_rets = pd.DataFrame(data, index=idx, columns=["BOMB"])
+    held     = {"BOMB": 1.0}
+    cvar     = compute_book_cvar(held, log_rets, cfg)
+    assert cvar > cfg.CVAR_DAILY_LIMIT, (
+        f"High-loss book CVaR {cvar:.4%} should exceed limit {cfg.CVAR_DAILY_LIMIT:.4%}."
+    )
+
 
 if __name__ == '__main__':
     import sys

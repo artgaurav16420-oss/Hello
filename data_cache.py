@@ -13,6 +13,16 @@ exceeding 30 days, permanently excluding a stock even after its suspension
 lifted. The corrected logic forward-fills the gap with the last-traded price
 and records a `suspended` flag plus `max_gap_days` in the manifest, so
 downstream consumers can inspect suspension history without losing the data.
+
+Chunked downloading (FIX D1)
+-----------------------------
+A single yf.download() call for 500+ tickers reliably exceeds any reasonable
+wall-clock timeout (observed: 120 s exhausted with 0 tickers returned).
+load_or_fetch now splits `to_download` into chunks of _DOWNLOAD_CHUNK_SIZE
+tickers, each with its own per-chunk timeout (_CHUNK_TIMEOUT_S). The manifest
+is committed after each successful chunk so a mid-run interruption preserves
+all already-downloaded data. A short inter-chunk sleep avoids Yahoo Finance
+rate-limiting.
 """
 
 from __future__ import annotations
@@ -29,25 +39,30 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
-# FIX: Set yfinance's TZ cache to a known-clean directory before any download.
-# Without this, yfinance attempts to create its default cache folder and logs a
-# spurious WARNING when the path already exists as a file (common in containerised
-# environments). Pointing it at a subdirectory of our own CACHE_DIR avoids the
-# conflict entirely.
+logger         = logging.getLogger(__name__)
+
+# FIX (Bug #1): Constants defined BEFORE the yf TZ-cache block that references them.
+CACHE_DIR      = "data/cache"
+MANIFEST_FILE  = os.path.join(CACHE_DIR, "_manifest.json")
+SCHEMA_VERSION = 1
+
+# ── Chunked-download tunables ─────────────────────────────────────────────────
+# Empirically, yfinance handles ~50-100 NSE tickers reliably within 90 s.
+# Larger batches cause Yahoo's connection pool to stall mid-transfer.
+_DOWNLOAD_CHUNK_SIZE  = 75    # tickers per yf.download() call
+_CHUNK_TIMEOUT_S      = 90.0  # per-chunk wall-clock timeout (seconds)
+_INTER_CHUNK_SLEEP_S  = 2.0   # polite pause between chunks
+
+# Calendar-day gap threshold above which a stock is flagged as likely suspended.
+_SUSPENSION_GAP_DAYS = 30
+
+# FIX (Bug #1 continued): CACHE_DIR is now defined above, so this block works.
 try:
     _YF_TZ_CACHE = os.path.join(CACHE_DIR, "_yf_tz_cache")
     os.makedirs(_YF_TZ_CACHE, exist_ok=True)
     yf.set_tz_cache_location(_YF_TZ_CACHE)
 except Exception:
     pass  # Non-fatal: yfinance will fall back to in-memory TZ lookup.
-
-logger         = logging.getLogger(__name__)
-CACHE_DIR      = "data/cache"
-MANIFEST_FILE  = os.path.join(CACHE_DIR, "_manifest.json")
-SCHEMA_VERSION = 1
-
-# Calendar-day gap threshold above which a stock is flagged as likely suspended.
-_SUSPENSION_GAP_DAYS = 30
 
 
 # ─── Worker ───────────────────────────────────────────────────────────────────
@@ -56,6 +71,11 @@ def _yf_fetch_worker(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
     Downloads OHLCV data via yfinance with exponential-backoff retry on
     transient network failures. Raises on the third consecutive failure.
+
+    Note on 'database is locked': yfinance's SQLite TZ cache can raise this
+    when a previous run crashed mid-write. Pointing the cache at our own
+    directory (see _YF_TZ_CACHE above) isolates the file; if the lock persists
+    across reboots, delete data/cache/_yf_tz_cache/ and retry.
     """
     for attempt in range(3):
         try:
@@ -66,9 +86,11 @@ def _yf_fetch_worker(tickers: List[str], start: str, end: str) -> pd.DataFrame:
         except Exception as exc:
             if attempt == 2:
                 raise exc
-            logger.debug("[Cache] Download attempt %d failed; retrying.", attempt + 1)
-            time.sleep((2 ** attempt) + random.uniform(0, 1))
-    return pd.DataFrame()
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            logger.debug("[Cache] Download attempt %d failed (%s); retrying in %.1fs.",
+                         attempt + 1, exc, wait)
+            time.sleep(wait)
+    raise RuntimeError("_yf_fetch_worker: exhausted all 3 retries without returning or raising.")
 
 
 # ─── Manifest helpers ─────────────────────────────────────────────────────────
@@ -133,14 +155,10 @@ def _repair_suspension_gaps(
     suspended   : True if any gap exceeding the threshold was detected.
     max_gap     : Largest calendar-day gap observed (0 if index has < 2 rows).
 
-    Design note
-    -----------
-    Forward-filling on a business-day grid means the signal engine can compute
-    EWMAs and CVaR across the full history without NaN discontinuities. The
-    `suspended` flag in the manifest signals downstream consumers (e.g.
-    generate_signals) that this series has synthetic rows — they may choose to
-    apply an additional haircut or exclude the stock from ranking during the
-    flagged window.
+    Note: pd.bdate_range uses a fixed Mon–Fri calendar. NSE has additional
+    holidays that yfinance elides from raw data, so a small number of synthetic
+    rows may land on Indian market holidays. This is benign for signal math but
+    inflates the `rows` count in the manifest slightly.
     """
     if len(df) < 2:
         return df, False, 0
@@ -180,9 +198,9 @@ def _download_with_timeout(
             return future.result(timeout=timeout)
     except TimeoutError:
         logger.error(
-            "[Cache] Thread pool fetch timed out after %.1fs. "
+            "[Cache] Thread pool fetch timed out after %.1fs for %d tickers. "
             "Thread may still be running in background.",
-            timeout,
+            timeout, len(tickers),
         )
         return pd.DataFrame()
     except Exception as exc:
@@ -259,6 +277,49 @@ def _ingest_raw(raw: pd.DataFrame, to_download: List[str], fetch_start: str) -> 
     return sub_manifest
 
 
+# ─── Chunked batch downloader ─────────────────────────────────────────────────
+
+def _download_chunk(
+    chunk: List[str],
+    fetch_start: str,
+    required_end: str,
+    chunk_timeout: float,
+    adv_timeout: float,
+    chunk_idx: int,
+    total_chunks: int,
+) -> dict:
+    """
+    Download and ingest a single chunk of tickers. Returns a sub-manifest
+    dict for the tickers that succeeded. Performs one surgical retry pass
+    for any missed tickers in the chunk before returning.
+    """
+    logger.info(
+        "[Cache] Chunk %d/%d: downloading %d tickers ...",
+        chunk_idx, total_chunks, len(chunk),
+    )
+    raw = _download_with_timeout(chunk, fetch_start, required_end, chunk_timeout)
+    sub = _ingest_raw(raw, chunk, fetch_start)
+
+    missed = [t for t in chunk if t not in sub]
+    if missed and len(missed) <= 10:
+        logger.info("[Cache] Chunk %d/%d: surgical retry for %d missed ticker(s).",
+                    chunk_idx, total_chunks, len(missed))
+        for mt in missed:
+            raw_single = _download_with_timeout([mt], fetch_start, required_end, adv_timeout)
+            sub.update(_ingest_raw(raw_single, [mt], fetch_start))
+    elif missed:
+        logger.warning(
+            "[Cache] Chunk %d/%d: %d tickers missed and exceed surgical cap — skipping.",
+            chunk_idx, total_chunks, len(missed),
+        )
+
+    logger.info(
+        "[Cache] Chunk %d/%d: %d/%d tickers written to disk.",
+        chunk_idx, total_chunks, len(sub), len(chunk),
+    )
+    return sub
+
+
 # ─── Public Interface ─────────────────────────────────────────────────────────
 
 def load_or_fetch(
@@ -271,21 +332,27 @@ def load_or_fetch(
     """
     Main entry point for retrieving market data.
 
-    Checks the manifest for each ticker to determine staleness, loads fresh
-    data from disk where available, and downloads only what is missing or stale.
-    Implements a staged commit: the manifest is only updated for tickers that
-    were successfully validated and written to disk.
+    FIX D1: Large `to_download` lists are now split into chunks of
+    _DOWNLOAD_CHUNK_SIZE tickers. Each chunk is downloaded with its own
+    per-chunk timeout (_CHUNK_TIMEOUT_S), ingested, and committed to the
+    manifest before the next chunk starts. This replaces the previous single
+    giant batch call that reliably timed out for 300+ ticker universes.
+
+    The manifest is committed after each successful chunk so a mid-run
+    interruption (Ctrl-C, crash, network drop) preserves all already-
+    downloaded data and the next run will only fetch what is missing.
     """
-    yf_timeout = getattr(cfg, "YF_BATCH_TIMEOUT", 120.0)
+    chunk_timeout = getattr(cfg, "YF_CHUNK_TIMEOUT",  _CHUNK_TIMEOUT_S)
+    adv_timeout   = getattr(cfg, "YF_ADV_TIMEOUT",    60.0)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     full_manifest    = _load_manifest()
     manifest_entries = full_manifest["entries"]
 
-    standard_tickers = list({
+    standard_tickers = list(dict.fromkeys(
         t if (t.endswith(".NS") or t.startswith("^")) else t + ".NS"
         for t in tickers
-    })
+    ))
 
     if not required_start or str(required_start).strip() == "":
         required_start = "2020-01-01"
@@ -323,48 +390,50 @@ def load_or_fetch(
                 to_download.append(t)
 
     if to_download:
+        # FIX D1: Split into manageable chunks so each yf.download() call
+        # completes within the per-chunk timeout even for large universes.
+        chunks = [
+            to_download[i : i + _DOWNLOAD_CHUNK_SIZE]
+            for i in range(0, len(to_download), _DOWNLOAD_CHUNK_SIZE)
+        ]
+        total_chunks = len(chunks)
+
         logger.info(
-            "[Cache] Batch downloading %d tickers (%s → %s) ...",
-            len(to_download), fetch_start, required_end,
+            "[Cache] %d tickers to download → %d chunk(s) of ≤%d "
+            "(%s → %s, timeout %.0fs/chunk).",
+            len(to_download), total_chunks, _DOWNLOAD_CHUNK_SIZE,
+            fetch_start, required_end, chunk_timeout,
         )
-        raw = _download_with_timeout(to_download, fetch_start, required_end, yf_timeout)
 
-        success_sub_manifest = _ingest_raw(raw, to_download, fetch_start)
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            sub = _download_chunk(
+                chunk, fetch_start, required_end,
+                chunk_timeout, adv_timeout,
+                chunk_idx, total_chunks,
+            )
 
-        successful_tickers = list(success_sub_manifest.keys())
-        success_rate       = len(successful_tickers) / len(to_download) if to_download else 1.0
-        missing_tickers    = [t for t in to_download if t not in successful_tickers]
-
-        if missing_tickers:
-            if success_rate >= 0.8:
-                if len(missing_tickers) <= 10:
-                    logger.warning("[Cache] %d missed. Surgical retry...", len(missing_tickers))
-                    for mt in missing_tickers:
-                        raw_single = _download_with_timeout(
-                            [mt], fetch_start, required_end,
-                            getattr(cfg, "YF_ADV_TIMEOUT", 60.0),
+            # Commit each chunk to the manifest immediately so that a crash
+            # or keyboard-interrupt mid-run preserves all completed work.
+            if sub:
+                manifest_entries.update(sub)
+                _save_manifest(full_manifest)
+                for t in sub:
+                    try:
+                        market_data[t] = pd.read_parquet(
+                            os.path.join(CACHE_DIR, f"{t}.parquet")
                         )
-                        success_sub_manifest.update(_ingest_raw(raw_single, [mt], fetch_start))
-                else:
-                    logger.warning(
-                        "[Cache] %d missed tickers exceeds surgical cap. Skipping.",
-                        len(missing_tickers),
-                    )
-            else:
-                logger.error(
-                    "[Cache] Batch success %.1f%% < 80%%. Aborting retries.",
-                    success_rate * 100,
-                )
+                    except Exception:
+                        pass
 
-        if success_sub_manifest:
-            manifest_entries.update(success_sub_manifest)
-            _save_manifest(full_manifest)
+            # Polite inter-chunk pause to avoid Yahoo Finance rate-limiting.
+            if chunk_idx < total_chunks:
+                time.sleep(_INTER_CHUNK_SLEEP_S)
 
-            for t in success_sub_manifest:
-                try:
-                    market_data[t] = pd.read_parquet(os.path.join(CACHE_DIR, f"{t}.parquet"))
-                except Exception:
-                    pass
+        total_written = sum(1 for t in to_download if t in market_data)
+        logger.info(
+            "[Cache] Download complete: %d/%d tickers available.",
+            total_written, len(to_download),
+        )
 
     return market_data
 

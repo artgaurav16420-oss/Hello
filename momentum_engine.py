@@ -144,14 +144,14 @@ class UltimateConfig:
 
     # Portfolio construction
     INITIAL_CAPITAL:          float = 1_000_000.0
-    MAX_POSITIONS:            int   = 20
-    MAX_PORTFOLIO_RISK_PCT:   float = 0.12
+    MAX_POSITIONS:            int   = 10
+    MAX_PORTFOLIO_RISK_PCT:   float = 0.20
     MAX_ADV_PCT:              float = 0.05
     IMPACT_COEFF:             float = 5e-4
     SIGNAL_ANNUAL_FACTOR:     int   = 252
 
     # CVaR
-    CVAR_DAILY_LIMIT:         float = 0.022
+    CVAR_DAILY_LIMIT:         float = 0.040
     CVAR_ALPHA:               float = 0.95
     CVAR_LOOKBACK:            int   = 200
     CVAR_SENTINEL_MULTIPLIER: float = 2.5
@@ -159,7 +159,12 @@ class UltimateConfig:
 
     # Exposure management
     DELEVERAGING_LIMIT:       float = 0.10
-    MIN_EXPOSURE_FLOOR:       float = 0.25
+    # FIX: MIN_EXPOSURE_FLOOR raised from 0.25 to 0.40. At 0.25 the engine could
+    # drop to 25% gross exposure purely on a regime score of 0.3 — a normal reading
+    # during healthy small/mid-cap momentum phases with elevated but not dangerous vol.
+    # 0.40 prevents excessive de-risking on moderate regime signals while still
+    # allowing meaningful deleveraging in genuinely bad markets.
+    MIN_EXPOSURE_FLOOR:       float = 0.40
     CAPITAL_ELASTICITY:       float = 0.15
 
     # Signal / optimizer
@@ -169,11 +174,15 @@ class UltimateConfig:
     RISK_AVERSION:            float = 5.0
     SLACK_PENALTY:            float = 10.0
     DIMENSIONALITY_MULTIPLIER:int   = 3
-    MAX_SECTOR_WEIGHT:        float = 0.30
+    MAX_SECTOR_WEIGHT:        float = 1.0
 
     # Signal gates & scoring
     Z_SCORE_CLIP:             float = 3.0
     CONTINUITY_BONUS:         float = 0.15
+    # FIX: KNIFE_WINDOW extended from 7 to 20 days (one calendar month).
+    # 7 days was far too short for Indian mid/small-cap momentum: names regularly
+    # see -15% in 3 days then +60% in the next 10. A 20-day window catches
+    # genuine waterfall declines while ignoring normal retracement noise.
     KNIFE_WINDOW:             int   = 20
     KNIFE_THRESHOLD:          float = -0.15
 
@@ -183,12 +192,22 @@ class UltimateConfig:
     DECAY_FACTOR:             float = 0.85
     MIN_ADV_CRORES:           float = 100.0
 
+    # Single-name concentration cap (independent of sector constraint).
+    # Limits any individual position to this fraction of portfolio value.
+    # Sector cap alone is insufficient: a single name can consume 25–40% of
+    # a sector bucket legally while still being dangerously concentrated.
+    MAX_SINGLE_NAME_WEIGHT:   float = 0.25
+
     # Ghost position / data-glitch protection
-    MAX_ABSENT_PERIODS:       int   = 3
+    # FIX: MAX_ABSENT_PERIODS raised from 3 to 12. Many NSE ASM/GSM suspensions
+    # run 60–180+ trading days. At 3 periods we were force-closing at stale prices
+    # after just ~3 weeks, booking phantom losses on stocks that are merely suspended.
+    MAX_ABSENT_PERIODS:       int   = 12
     MAX_DECAY_ROUNDS:         int   = 3
 
     # Network / data
-    YF_BATCH_TIMEOUT:         float = 120.0
+    YF_BATCH_TIMEOUT:         float = 120.0   # legacy; superseded by YF_CHUNK_TIMEOUT
+    YF_CHUNK_TIMEOUT:         float = 90.0    # per-chunk timeout for chunked downloads
     YF_ADV_TIMEOUT:           float = 60.0
     SECTOR_FETCH_TIMEOUT:     float = 8.0
 
@@ -234,6 +253,29 @@ class PortfolioState:
         new_mult = self.exposure_multiplier + float(
             np.clip(target - self.exposure_multiplier, -cfg.DELEVERAGING_LIMIT, cfg.DELEVERAGING_LIMIT)
         )
+
+        # FIX (Logic #5): A cash-only portfolio (gross_exposure ≈ 0) would
+        # inflate normalised_cvar by up to 20× through the 0.05 floor, causing
+        # any residual historical CVaR to trigger the override even though the
+        # portfolio is already fully de-risked. We now skip the breach check
+        # entirely when the portfolio is effectively in cash.
+        if gross_exposure < 0.01:
+            # Nothing deployed — cannot meaningfully breach a risk limit.
+            # Still drain the cooldown so the override lifts naturally after the
+            # configured number of cash-only periods, allowing re-entry.
+            self.exposure_multiplier = float(
+                np.clip(new_mult, cfg.MIN_EXPOSURE_FLOOR, 1.0)
+            )
+            if self.override_cooldown > 0:
+                self.override_cooldown -= 1
+            # FIX (Critical #1): The previous guard was `if not self.override_active`
+            # — a tautology that never cleared an *active* override.  A portfolio
+            # that de-risked to cash correctly (the expected post-breach path) would
+            # stay permanently locked at MIN_EXPOSURE_FLOOR regardless of regime.
+            # Drop the guard: once cooldown reaches 0, always clear the override.
+            if self.override_cooldown == 0:
+                self.override_active = False
+            return
 
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
@@ -433,22 +475,19 @@ def execute_rebalance(
         elif sym not in symbols_to_force_close:
             pv += n_shares * state.last_known_prices.get(sym, 0.0)
 
-    hold_flat = False
     if apply_decay:
-        if state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
-            logger.warning(
-                "execute_rebalance: MAX_DECAY_ROUNDS=%d reached — holding positions "
-                "flat instead of applying further %.0f%% decay.",
-                cfg.MAX_DECAY_ROUNDS, (1 - cfg.DECAY_FACTOR) * 100,
-            )
-            hold_flat   = True
-            apply_decay = False
-        else:
-            state.decay_rounds += 1
-            logger.info(
-                "execute_rebalance: decay round %d/%d (factor=%.2f).",
-                state.decay_rounds, cfg.MAX_DECAY_ROUNDS, cfg.DECAY_FACTOR,
-            )
+        # FIX: Decay no longer overrides target_weights inside execute_rebalance.
+        # Callers now compute gate-filtered targets BEFORE calling this function:
+        # — positions that passed all signal gates → scaled by DECAY_FACTOR
+        # — positions that failed gates (illiquid / falling knife) → zeroed out
+        # — after MAX_DECAY_ROUNDS → all positions zeroed out (full cash)
+        # This eliminates the original "delay-loss amplifier" where bad positions
+        # were protected and slowly bled out while bypassing all gates.
+        state.decay_rounds += 1
+        logger.info(
+            "execute_rebalance: decay round %d/%d — executing caller gate-filtered targets.",
+            state.decay_rounds, cfg.MAX_DECAY_ROUNDS,
+        )
 
     new_weights:      Dict[str, float] = {}
     new_shares:       Dict[str, int]   = {}
@@ -456,20 +495,16 @@ def execute_rebalance(
     total_slippage = actual_notional = 0.0
 
     # ── FIX C4: Post-decay CVaR revalidation ─────────────────────────────────
-    # Scaling weights by DECAY_FACTOR does not re-run the optimizer, so the
-    # risk invariant is not guaranteed. If scenario losses are available, compute
-    # the physical CVaR of the post-decay weight vector before executing trades.
-    # If breached, liquidate all positions to cash rather than deploying a
-    # portfolio whose CVaR we cannot certify.
-    if apply_decay and scenario_losses is not None and not hold_flat:
-        decayed_w = np.array(
-            [state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR for sym in active_symbols],
-            dtype=float,
-        )
-        gross_w = float(np.sum(decayed_w))
+    # With the new design, target_weights already contains gate-filtered targets
+    # computed by the caller. Validate the physical CVaR of these proposed weights
+    # before executing. If breached, liquidate all positions to cash rather than
+    # deploying a portfolio whose CVaR we cannot certify.
+    if apply_decay and scenario_losses is not None:
+        decay_check_w = np.maximum(target_weights[:len(active_symbols)], 0.0).astype(float)
+        gross_w = float(np.sum(decay_check_w))
 
         if gross_w > 1e-6 and scenario_losses.shape[1] == len(active_symbols):
-            portfolio_losses = scenario_losses @ decayed_w
+            portfolio_losses = scenario_losses @ decay_check_w
             T_sc      = len(portfolio_losses)
             tail_n    = max(1, int(np.floor(T_sc * (1.0 - cfg.CVAR_ALPHA))))
             tail_mean = float(np.mean(np.sort(portfolio_losses)[-tail_n:]))
@@ -477,8 +512,8 @@ def execute_rebalance(
             if tail_mean > cfg.CVAR_DAILY_LIMIT + EPSILON:
                 logger.error(
                     "execute_rebalance: POST-DECAY CVaR %.4f%% exceeds hard limit %.4f%%. "
-                    "Liquidating all positions to cash — risk invariant cannot be "
-                    "satisfied by decay scaling alone.",
+                    "Liquidating all positions to cash — gate-filtered targets still "
+                    "cannot satisfy the risk invariant.",
                     tail_mean * 100, cfg.CVAR_DAILY_LIMIT * 100,
                 )
                 exit_slip_rate = (cfg.SLIPPAGE_BPS / 2) / 10_000
@@ -499,12 +534,7 @@ def execute_rebalance(
                 return round(total_slippage, 10)
 
     for i, sym in enumerate(active_symbols):
-        if hold_flat:
-            w = round(state.weights.get(sym, 0.0), 10)
-        elif apply_decay:
-            w = round(state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR, 10)
-        else:
-            w = round(float(target_weights[i]), 10)
+        w = round(float(target_weights[i]), 10)
 
         if not np.isfinite(w):
             w = 0.0
@@ -548,12 +578,27 @@ def execute_rebalance(
     for sym in symbols_to_force_close:
         close_price = state.last_known_prices.get(sym, 0.0)
         n_shares    = state.shares.get(sym, 0)
-        if n_shares > 0 and close_price > 0:
-            slip            = n_shares * close_price * exit_slip
-            total_slippage += slip
-            pv             += n_shares * close_price
-            if trade_log is not None and date_context is not None:
-                trade_log.append(Trade(sym, date_context, -n_shares, close_price, slip, "SELL"))
+        if n_shares > 0:
+            if close_price > 0:
+                slip            = n_shares * close_price * exit_slip
+                total_slippage += slip
+                pv             += n_shares * close_price
+                if trade_log is not None and date_context is not None:
+                    trade_log.append(Trade(sym, date_context, -n_shares, close_price, slip, "SELL"))
+            else:
+                # FIX (Logic #4): If no last-known price exists the position
+                # cannot be liquidated at a meaningful price. Log at ERROR level
+                # so the silent ₹0 vaporisation is always visible in production
+                # logs. The position is still removed from state to prevent it
+                # from accumulating indefinitely.
+                logger.error(
+                    "execute_rebalance: force-close of %s (%d shares) has no last "
+                    "known price — position removed at ₹0. This likely indicates a "
+                    "data feed gap on a delisted security; verify manually.",
+                    sym, n_shares,
+                )
+                if trade_log is not None and date_context is not None:
+                    trade_log.append(Trade(sym, date_context, -n_shares, 0.0, 0.0, "SELL"))
         state.absent_periods.pop(sym, None)
 
     for sym in list(new_entry_prices):
@@ -565,6 +610,60 @@ def execute_rebalance(
     state.entry_prices = new_entry_prices
     state.cash         = max(0.0, round(pv - actual_notional - total_slippage, 10))
     return round(total_slippage, 10)
+
+
+# ─── Book CVaR helper ─────────────────────────────────────────────────────────
+
+def compute_book_cvar(
+    held_weights:  Dict[str, float],
+    hist_log_rets: pd.DataFrame,
+    cfg:           "UltimateConfig",
+) -> float:
+    """
+    Physical CVaR of the CURRENTLY HELD portfolio against the full-universe
+    T-1 log-return matrix.
+
+    This is the correct pre-OSQP screen: it checks the positions you actually
+    OWN, not the candidate sel_idx slice that optimize() receives. The two can
+    diverge significantly — held positions that just failed the liquidity or
+    knife gate are the exact names most likely to already be violating CVaR,
+    and they are never in sel_idx.
+
+    Parameters
+    ----------
+    held_weights  : state.weights (full held book, symbol → weight)
+    hist_log_rets : T-1-sliced log-return matrix, columns = full universe symbols
+    cfg           : UltimateConfig (CVAR_ALPHA, CVAR_LOOKBACK)
+
+    Returns 0.0 on any data-quality or empty-book situation.
+    """
+    if not held_weights or hist_log_rets.empty:
+        return 0.0
+
+    # Intersect held positions with available history columns.
+    common = [s for s in held_weights if s in hist_log_rets.columns]
+    if not common:
+        return 0.0
+
+    T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
+    rets   = (
+        hist_log_rets[common]
+        .replace([np.inf, -np.inf], np.nan)
+        .ffill()
+        .dropna()
+        .iloc[-T_cvar:]
+    )
+    if len(rets) < 5:
+        return 0.0
+
+    w = np.array([held_weights[s] for s in common], dtype=float)
+    w = np.maximum(w, 0.0)
+    if float(w.sum()) < 1e-6:
+        return 0.0
+
+    losses  = -(rets.values @ w)                    # positive = portfolio loss
+    tail_n  = max(1, int(np.floor(len(losses) * (1.0 - cfg.CVAR_ALPHA))))
+    return float(np.mean(np.sort(losses)[-tail_n:]))
 
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
@@ -683,6 +782,12 @@ class InstitutionalRiskEngine:
         adv_limit = np.clip(
             (adv_shares * prices * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40
         )
+        # Single-name concentration cap (independent of sector constraint).
+        # Review finding: sector cap alone is insufficient — a single name can
+        # consume 25–40% of a sector bucket legally while still being dangerously
+        # concentrated. Clip adv_limit so no individual position can exceed
+        # MAX_SINGLE_NAME_WEIGHT regardless of ADV or sector allocation.
+        adv_limit = np.minimum(adv_limit, self.cfg.MAX_SINGLE_NAME_WEIGHT)
         l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
         u_gamma = min(1.0, gamma * (1.0 + self.cfg.CAPITAL_ELASTICITY))
 

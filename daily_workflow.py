@@ -28,9 +28,11 @@ from momentum_engine import (
     OptimizationErrorType,
     PortfolioState,
     execute_rebalance,
+    compute_book_cvar,
     to_ns,
     to_bare,
     Trade,
+    EPSILON,
 )
 from universe_manager import (
     fetch_nse_equity_universe,
@@ -66,6 +68,15 @@ class C:
 
 
 logger = logging.getLogger(__name__)
+
+# FIX (Quality #9): The Screener.in screen ID is now read from an environment
+# variable (SCREENER_URL) so it can be changed without modifying source code.
+# A sensible default is provided as a fallback, but operators should set the
+# variable in their environment or .env file to pin their own screen.
+_DEFAULT_SCREENER_URL = os.environ.get(
+    "SCREENER_URL",
+    "https://www.screener.in/screens/3506127/hello/",
+)
 
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
@@ -183,12 +194,12 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
 
 def _get_custom_universe() -> List[str]:
     """Automatically gets universe from Screener.in URL or local fallback."""
-    # Hardcoded Screener URL
-    saved_url = "https://www.screener.in/screens/3506127/hello/"
+    # FIX (Bug #2): Removed the duplicate print/logger block. The header
+    # and URL are now printed exactly once.
+    # FIX (Quality #9): URL is read from _DEFAULT_SCREENER_URL (env-configurable)
+    # rather than being hardcoded inline.
+    saved_url = _DEFAULT_SCREENER_URL
 
-    print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
-    logger.info("[Screener] Fetching universe from: %s", saved_url)
-    
     print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
     logger.info("[Screener] Fetching universe from: %s", saved_url)
 
@@ -354,7 +365,7 @@ def _run_scan(
     state:    PortfolioState,
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
-) -> tuple[PortfolioState, dict]:
+) -> tuple:
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
 
@@ -436,52 +447,91 @@ def _run_scan(
     optimization_succeeded = False
     total_slippage       = 0.0
     trade_log: List[Trade] = []
+    sel_idx: List[int]   = []   # initialised here so decay block always has it
+    _force_full_cash     = False
 
-    try:
-        raw_daily, adj_scores, sel_idx = generate_signals(
-            log_rets, adv_arr, cfg, prev_weights=state.weights
-        )
-        if not sel_idx:
-            raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
-
-        sel_syms      = [active[i] for i in sel_idx]
-        sector_map    = get_sector_map(sel_syms, cfg=cfg)
-        unique_sectors = sorted(set(sector_map.values()))
-        sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
-        sector_labels  = np.array([sec_idx[sector_map[sym]] for sym in sel_syms], dtype=int)
-
-        weights_sel = engine.optimize(
-            expected_returns    = raw_daily[sel_idx],
-            historical_returns  = log_rets[[active[i] for i in sel_idx]],
-            execution_date      = pd.Timestamp(end_date),
-            adv_shares          = adv_arr[sel_idx],
-            prices              = prices[sel_idx],
-            portfolio_value     = pv,
-            prev_w              = prev_w_arr[sel_idx],
-            exposure_multiplier = state.exposure_multiplier,
-            sector_labels       = sector_labels,
-        )
-        weights[sel_idx]               = weights_sel
-        state.consecutive_failures     = 0
-        state.decay_rounds             = 0
-        optimization_succeeded         = True
-
-    except OptimizationError as exc:
-        if exc.error_type != OptimizationErrorType.DATA:
+    # ── Book CVaR screen ──────────────────────────────────────────────────────
+    # Check physical CVaR of the current held book BEFORE calling generate_signals
+    # or optimize. This looks at positions we actually own — including any that
+    # just failed liquidity/knife gates and are absent from sel_idx.
+    if state.weights:
+        book_cvar = compute_book_cvar(state.weights, log_rets, cfg)
+        if book_cvar > cfg.CVAR_DAILY_LIMIT + EPSILON:
+            logger.warning(
+                "[Scan] Book CVaR %.4f%% exceeds limit %.4f%% — "
+                "skipping optimization, forcing immediate liquidation.",
+                book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100,
+            )
             state.consecutive_failures += 1
-            logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
-            if state.consecutive_failures >= 2:
-                logger.warning(
-                    "Regime decay: forcing -%.0f%% exposure reduction.",
-                    (1 - cfg.DECAY_FACTOR) * 100,
-                )
-                apply_decay = True
+            apply_decay      = True
+            _force_full_cash = True
+
+    if not _force_full_cash:
+        try:
+            raw_daily, adj_scores, sel_idx = generate_signals(
+                log_rets, adv_arr, cfg, prev_weights=state.weights
+            )
+            if not sel_idx:
+                raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
+            sel_syms      = [active[i] for i in sel_idx]
+            sector_map    = get_sector_map(sel_syms, cfg=cfg)
+            unique_sectors = sorted(set(sector_map.values()))
+            sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
+            sector_labels  = np.array([sec_idx[sector_map[sym]] for sym in sel_syms], dtype=int)
+
+            weights_sel = engine.optimize(
+                expected_returns    = raw_daily[sel_idx],
+                historical_returns  = log_rets[[active[i] for i in sel_idx]],
+                execution_date      = pd.Timestamp(end_date),
+                adv_shares          = adv_arr[sel_idx],
+                prices              = prices[sel_idx],
+                portfolio_value     = pv,
+                prev_w              = prev_w_arr[sel_idx],
+                exposure_multiplier = state.exposure_multiplier,
+                sector_labels       = sector_labels,
+            )
+            weights[sel_idx]               = weights_sel
+            state.consecutive_failures     = 0
+            state.decay_rounds             = 0
+            optimization_succeeded         = True
+
+        except (OptimizationError, ValueError) as exc:
+            is_data_error = isinstance(exc, ValueError) or (
+                isinstance(exc, OptimizationError) and exc.error_type == OptimizationErrorType.DATA
+            )
+            if not is_data_error:
+                state.consecutive_failures += 1
+                logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
+                # FIX: threshold raised from 2 to 3.
+                if state.consecutive_failures >= 3:
+                    logger.warning(
+                        "3 consecutive solver failures — triggering gate-filtered "
+                        "pro-rata liquidation (%.0f%% of gate-passing positions).",
+                        cfg.DECAY_FACTOR * 100,
+                    )
+                    apply_decay = True
+            else:
+                logger.error("Data error (not escalated): %s. Freezing state.", exc)
+
+    # ── Gate-filtered decay target computation ────────────────────────────────
+    _exhaust_decay = False
+    if apply_decay and not optimization_succeeded:
+        if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+            logger.warning(
+                "[Scan] %s — forcing full liquidation to cash.",
+                "Book CVaR breach" if _force_full_cash else
+                f"MAX_DECAY_ROUNDS={cfg.MAX_DECAY_ROUNDS} exhausted",
+            )
+            _exhaust_decay = True
+            # weights stays all-zeros → full cash
         else:
-            logger.error("Data error (not escalated): %s. Freezing state.", exc)
+            # sel_idx: gate-passing positions → scale by DECAY_FACTOR.
+            # Non-gate positions remain 0 → force-closed by execute_rebalance.
+            for i in sel_idx:
+                sym = active[i]
+                weights[i] = state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR
 
     if optimization_succeeded or apply_decay:
-        # FIX C4: Build scenario_losses for post-decay physical CVaR revalidation.
-        # Uses the same T_cvar window as the optimizer.
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
         _scenario_losses = -(
             log_rets.iloc[-_T_cvar:]
@@ -491,8 +541,12 @@ def _run_scan(
         total_slippage = execute_rebalance(
             state, weights, prices, active, cfg,
             date_context=pd.Timestamp(end_date), trade_log=trade_log,
-            apply_decay=apply_decay, scenario_losses=_scenario_losses,
+            # FIX: bypass decay increment when exhausting/force-cash.
+            apply_decay    = apply_decay and not _exhaust_decay,
+            scenario_losses = None if _exhaust_decay else _scenario_losses,
         )
+        if _exhaust_decay:
+            state.decay_rounds = 0
 
     _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
 
@@ -551,7 +605,22 @@ def _run_scan(
 
 # ─── Status display ───────────────────────────────────────────────────────────
 
-def _print_status(state: PortfolioState, label: str, market_data: dict) -> None:
+def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Optional[UltimateConfig] = None) -> None:
+    """
+    Display the current portfolio status table and risk diagnostics.
+
+    Parameters
+    ----------
+    cfg : Optional[UltimateConfig]
+        When provided, realised_cvar is computed with cfg.CVAR_MIN_HISTORY as
+        the minimum observation threshold, matching the engine's behaviour exactly.
+        FIX (Quality #8): Previously used the default min_obs=30 regardless of
+        config, causing the displayed CVaR to differ from the engine's value for
+        the first cfg.CVAR_MIN_HISTORY observations.
+    """
+    if cfg is None:
+        cfg = UltimateConfig()
+
     print(f"\n  {C.GRY}╭{'─' * 88}╮{C.RST}")
     print(f"  {C.GRY}│{C.BLD}  STATUS — {label}  {C.RST}{C.GRY}{' ' * (75 - len(label))}│{C.RST}")
     print(f"  {C.GRY}╰{'─' * 88}╯{C.RST}")
@@ -567,14 +636,22 @@ def _print_status(state: PortfolioState, label: str, market_data: dict) -> None:
         if ns in market_data and not market_data[ns].empty:
             prices_now[sym] = float(market_data[ns]["Close"].iloc[-1])
 
-    mtm = sum(state.shares[s] * prices_now.get(s, 0.0) for s in active)
+    mtm = sum(
+        # FIX (Logic #3): Fall back to last_known_prices for positions that have
+        # no live quote in the current market_data snapshot (e.g. delisted,
+        # dropped from a stale fetch, or outside the data window). Using 0.0
+        # previously understated the true portfolio value and made held positions
+        # appear to have zero weight in the status table.
+        state.shares[s] * (prices_now.get(s) or state.last_known_prices.get(s, 0.0))
+        for s in active
+    )
     pv  = mtm + state.cash
 
     rows      = []
     total_pnl = 0.0
     for sym in active:
         shares   = state.shares[sym]
-        price    = prices_now.get(sym, float("nan"))
+        price    = prices_now.get(sym) or state.last_known_prices.get(sym, float("nan"))
         entry    = state.entry_prices.get(sym, float("nan"))
         notional = shares * price if np.isfinite(price) else 0.0
         weight   = notional / pv if pv > 0 else 0.0
@@ -622,7 +699,9 @@ def _print_status(state: PortfolioState, label: str, market_data: dict) -> None:
     )
     print(f"  {C.GRY}└──────────────┴─────────┴───────────┴───────────┴────────┴─────────────┴─────────────┘{C.RST}")
 
-    cvar        = state.realised_cvar()
+    # FIX (Quality #8): Use cfg.CVAR_MIN_HISTORY so the displayed value matches
+    # the threshold used by the engine, not a hardcoded default of 30.
+    cvar        = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
     cvar_color  = C.RED if cvar > 0.12 else C.GRN
     print(f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}")
     print(f"  {C.YLW}⚡{C.RST} Exposure Multiplier : {C.BLD}{state.exposure_multiplier:.3f}{C.RST}")
@@ -759,7 +838,7 @@ def main_menu() -> None:
             preview      = copy.deepcopy(states["nse_total"])
             preview, mkt = _run_scan(_universe, preview, "NSE TOTAL MKT SCAN", cfg)
             mkt_cache["nse_total"] = mkt
-            _print_status(preview, "PREVIEW — NSE TOTAL", mkt)
+            _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nse_total"] = preview
                 save_portfolio_state(preview, "nse_total")
@@ -779,7 +858,7 @@ def main_menu() -> None:
             preview      = copy.deepcopy(states["nifty"])
             preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg)
             mkt_cache["nifty"] = mkt
-            _print_status(preview, "PREVIEW — NIFTY 500", mkt)
+            _print_status(preview, "PREVIEW — NIFTY 500", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nifty"] = preview
                 save_portfolio_state(preview, "nifty")
@@ -804,7 +883,7 @@ def main_menu() -> None:
             preview      = copy.deepcopy(states["custom"])
             preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg)
             mkt_cache["custom"] = mkt
-            _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt)
+            _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["custom"] = preview
                 save_portfolio_state(preview, "custom")
