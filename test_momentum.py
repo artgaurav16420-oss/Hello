@@ -1,6 +1,6 @@
 """
-test_momentum.py — Full Deterministic Parity Test Suite
-========================================================
+test_momentum.py — Full Deterministic Parity Test Suite v11.46
+==============================================================
 Every test either asserts a real invariant or does not exist.
 """
 
@@ -269,6 +269,7 @@ def test_portfolio_state_serialisation_roundtrip():
     ps.equity_hist          = [1_000_000.0, 990_000.0, 1_010_000.0]
     ps.override_active      = True
     ps.override_cooldown    = 3
+    ps.dividend_ledger      = {"RELIANCE": "2024-01-01:10.5"}
 
     ps2 = PortfolioState.from_dict(ps.to_dict())
     assert ps2.weights              == ps.weights
@@ -278,6 +279,7 @@ def test_portfolio_state_serialisation_roundtrip():
     assert abs(ps2.exposure_multiplier - ps.exposure_multiplier) < 1e-9
     assert ps2.override_active      == ps.override_active
     assert ps2.override_cooldown    == ps.override_cooldown
+    assert ps2.dividend_ledger      == ps.dividend_ledger
 
 
 def test_portfolio_state_from_dict_bool_string_parsing():

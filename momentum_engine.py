@@ -1,5 +1,5 @@
 """
-momentum_engine.py — Institutional Risk Engine v11.45
+momentum_engine.py — Institutional Risk Engine v11.46
 =====================================================
 CVaR-constrained Mean-Variance Optimizer with full Transaction Cost formulation.
 
@@ -236,7 +236,6 @@ class PortfolioState:
             )
             if self.override_cooldown > 0:
                 self.override_cooldown -= 1
-            # FIX (I-08): Make override clearance strictly contingent on it being active 
             if self.override_cooldown == 0 and self.override_active:
                 self.override_active = False
             return
@@ -247,8 +246,6 @@ class PortfolioState:
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
 
-        # FIX (I-01): Decouple recovery from breach flag. If cooldown expires, clear override. 
-        # If the CVaR is still in breach, the conditional below will immediately re-trigger it.
         if self.override_cooldown == 0 and self.override_active:
             self.override_active = False
 

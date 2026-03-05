@@ -1,5 +1,5 @@
 """
-signals.py — Deterministic Regime & Momentum Kernel v11.45
+signals.py — Deterministic Regime & Momentum Kernel v11.46
 =========================================================
 Generates momentum Z-scores, handles liquidity filtering, calculates
 macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.

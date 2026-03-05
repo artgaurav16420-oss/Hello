@@ -1,6 +1,6 @@
 """
-optimizer.py — Institutional Bayesian Walk-Forward Optimizer
-============================================================
+optimizer.py — Institutional Bayesian Walk-Forward Optimizer v11.46
+===================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Implements strict Out-of-Sample (OOS) validation to prevent curve-fitting.
 
@@ -18,7 +18,7 @@ import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
 
-# Local imports from your v11.48 architecture
+# Local imports from your v11.46 architecture
 from momentum_engine import UltimateConfig, OptimizationError
 from backtest_engine import run_backtest
 from data_cache import load_or_fetch

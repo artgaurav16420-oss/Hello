@@ -1,5 +1,5 @@
 """
-data_cache.py — Persistent Atomic Downloader v11.45
+data_cache.py — Persistent Atomic Downloader v11.46
 ===================================================
 Robustly manages downloading, parsing, and persisting yfinance data.
 

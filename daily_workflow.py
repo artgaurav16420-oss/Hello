@@ -1,5 +1,5 @@
 """
-daily_workflow.py — Ultimate Momentum v11.45
+daily_workflow.py — Ultimate Momentum v11.46
 ============================================
 Interactive CLI for live scanning, status display, and backtesting.
 Features robust capital management, direct Screener.in web scraping,
@@ -46,7 +46,7 @@ from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-__version__ = "11.45"
+__version__ = "11.46"
 
 BACKUP_GENERATIONS = 3
 
@@ -248,7 +248,6 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
             
-        # FIX (I-05): Full history dividend sweep integration
         if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns:
             dividends = row["Dividends"][row["Dividends"] > 0]
             if not dividends.empty:
@@ -313,7 +312,6 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
     state_file = f"data/portfolio_state_{name}.json"
     tmp_file   = f"{state_file}.tmp"
     try:
-        # FIX (I-02/I-09): Backup rotation correctly shifts all generations
         for i in range(BACKUP_GENERATIONS - 1, -1, -1):
             src, dst = f"{state_file}.bak.{i}", f"{state_file}.bak.{i+1}"
             if os.path.exists(src):
@@ -363,7 +361,7 @@ def _run_scan(
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
 
-    cfg    = cfg_override if cfg_override else UltimateConfig()
+    cfg    = cfg_override if cfg_override else load_optimized_config()
     engine = InstitutionalRiskEngine(cfg)
     state.equity_hist_cap = cfg.EQUITY_HIST_CAP
 
@@ -769,7 +767,7 @@ def main_menu() -> None:
 
         if c == "1":
             _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
-            cfg = UltimateConfig()
+            cfg = load_optimized_config()
             try:
                 _universe = fetch_nse_equity_universe(cfg=cfg)
             except UniverseFetchError as e:
@@ -789,7 +787,7 @@ def main_menu() -> None:
 
         elif c == "2":
             _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
-            cfg = UltimateConfig()
+            cfg = load_optimized_config()
             try:
                 _universe = get_nifty500()
             except UniverseFetchError as e:
@@ -817,7 +815,7 @@ def main_menu() -> None:
             logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
             _check_and_prompt_initial_capital(states["custom"], "CUSTOM SCREENER", "custom")
 
-            custom_cfg = UltimateConfig()
+            custom_cfg = load_optimized_config()
             if len(universe) < 100:
                 custom_cfg.MAX_POSITIONS = 8
 
@@ -862,7 +860,8 @@ def main_menu() -> None:
                 initial_universe = get_nifty500()
 
             data       = load_or_fetch(initial_universe + ["^NSEI", "^CRSLDX"], start, end)
-            print_backtest_results(run_backtest(data, universe_identifier, start, end))
+            bt_cfg     = load_optimized_config()
+            print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
 
         elif c == "5":
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:

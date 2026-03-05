@@ -1,5 +1,5 @@
 """
-backtest_engine.py — Deterministic Walk-Forward Engine v11.45
+backtest_engine.py — Deterministic Walk-Forward Engine v11.46
 =============================================================
 Weekly rebalance cadence with full equity ledger, CVaR risk management,
 and sector-diversified portfolio construction.
@@ -125,11 +125,8 @@ class BacktestEngine:
             .replace([np.inf, -np.inf], np.nan)
         )
 
-        # FIX (I-04, I-10): Replaced bare volume with unified exact notional calculation vector.
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        # FIX (I-03): Compute PV & Exposure exclusively utilizing T-1 prices inside signal window
-        # rather than using current T+0 execution day's Close, avoiding optimization lookahead bias.
         signal_close = close.loc[signal_date]
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
@@ -392,12 +389,7 @@ def run_backtest(
                 union_universe.update(historical_members)
 
         if not union_universe:
-            logger.warning("Historical integration failed to yield symbols. Using current universe.")
-            from universe_manager import get_nifty500, fetch_nse_equity_universe
-            if selected_universe_type == "nifty500":
-                union_universe.update(get_nifty500())
-            else:
-                union_universe.update(fetch_nse_equity_universe())
+            raise RuntimeError("HISTORICAL PARQUET MISSING — Backtests will contain survivorship bias!")
 
     close_d, volume_d = {}, {}
     for sym in union_universe:
