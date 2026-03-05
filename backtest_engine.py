@@ -127,11 +127,11 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        signal_close = close.loc[signal_date]
+        execution_close = close.loc[date]
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
-                float(signal_close[sym])
-                if (sym in close.columns and pd.notna(signal_close[sym]))
+                float(execution_close[sym])
+                if (sym in close.columns and pd.notna(execution_close[sym]))
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -149,8 +149,8 @@ class BacktestEngine:
 
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
-                float(signal_close[sym])
-                if pd.notna(signal_close[sym])
+                float(execution_close[sym])
+                if pd.notna(execution_close[sym])
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
