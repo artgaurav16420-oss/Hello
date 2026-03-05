@@ -348,6 +348,31 @@ def test_update_exposure_cash_only_no_override():
         "Cash-only portfolio must not trigger CVaR override."
 
 
+def test_update_exposure_sustained_cvar_breach_recovery():
+    """
+    A sustained CVaR breach must successfully clear and immediately re-trigger 
+    the override, rather than permanently locking up the state.
+    """
+    cfg   = UltimateConfig()
+    state = PortfolioState()
+    state.exposure_multiplier = 1.0
+    breach_cvar = cfg.MAX_PORTFOLIO_RISK_PCT * 2.0
+    
+    # Run for 12 periods with a sustained CVaR breach
+    trigger_periods = []
+    for period in range(1, 13):
+        state.update_exposure(0.5, breach_cvar, cfg, gross_exposure=1.0)
+        
+        # The cooldown should reset to 4 on periods 1, 6, and 11
+        if state.override_cooldown == 4:
+            trigger_periods.append(period)
+            
+    assert trigger_periods == [1, 6, 11], \
+        f"Sustained breach failed to reliably cycle override flag. Triggered on: {trigger_periods}"
+    assert state.override_active is True, "Override must remain active at the end of the sustained stress test."
+    assert state.exposure_multiplier >= cfg.MIN_EXPOSURE_FLOOR, "Exposure must not cascade below the defined floor."
+
+
 def test_execute_rebalance_pv_includes_stale_positions():
     cfg   = UltimateConfig(MAX_ABSENT_PERIODS=1)
     state = PortfolioState(cash=500_000.0)
@@ -570,7 +595,7 @@ def test_e2e_ledger_parity():
                 np.log1p(returns.loc[:date].iloc[:-1])
                 .replace([np.inf, -np.inf], np.nan)
             )
-            adv_vector = _build_adv_vector(symbols, volume, date)
+            adv_vector = _build_adv_vector(symbols, close, volume, date)
             pv         = live_state.cash + sum(
                 live_state.shares.get(s, 0) * close_t[s] for s in symbols
             )
@@ -693,14 +718,15 @@ def test_volume_no_lookahead():
     idx  = pd.date_range("2020-01-02", periods=n_days, freq="B")
 
     volume = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=idx, columns=cols)
+    close  = pd.DataFrame(np.ones((n_days, n_syms)) * 100.0, index=idx, columns=cols)
     friday = idx[-1]
     volume.loc[friday] = 1e12
 
-    adv_fri = _build_adv_vector(cols, volume, friday)
+    adv_fri = _build_adv_vector(cols, close, volume, friday)
 
-    expected_ma = float(
-        volume.loc[:friday, cols[0]].iloc[:-1].rolling(20, min_periods=1).mean().iloc[-1]
-    )
+    expected_notional = close.loc[:friday, cols[0]].iloc[:-1] * volume.loc[:friday, cols[0]].iloc[:-1]
+    expected_ma = float(expected_notional.rolling(20, min_periods=1).mean().iloc[-1])
+    
     assert abs(adv_fri[0] - expected_ma) < 1.0, \
         f"ADV {adv_fri[0]:.0f} does not match T-1 rolling mean {expected_ma:.0f} — lookahead present."
 

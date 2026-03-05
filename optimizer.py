@@ -22,7 +22,7 @@ from optuna.samplers import TPESampler
 from momentum_engine import UltimateConfig, OptimizationError
 from backtest_engine import run_backtest
 from data_cache import load_or_fetch
-from universe_manager import get_nifty500
+from universe_manager import get_nifty500, fetch_nse_equity_universe
 
 # Suppress solver/sklearn warnings during the thousands of iterations
 warnings.filterwarnings("ignore")
@@ -98,8 +98,6 @@ class MomentumObjective:
         calmar = cagr / max_dd
 
         # 6. Continuous Penalty for Drawdown Breaches
-        # If we just return -999, the Bayesian solver loses the mathematical gradient.
-        # Instead, we apply a continuous penalty so it knows which direction to adjust.
         if max_dd > MAX_DD_CAP:
             penalty = (max_dd - MAX_DD_CAP) * 0.5
             calmar -= penalty
@@ -112,12 +110,14 @@ def pre_load_data(universe_type: str) -> dict:
     """Loads data into RAM once to accelerate thousands of backtests."""
     logger.info("Initializing Data Pre-fetch phase...")
     
-    # We load the current Nifty 500 as a proxy for the optimization run.
-    # (The backtester will still attempt to use historical parquets if available).
+    # FIX (I-06): Replaced hardcoded fallback branch to ensure the full equity 
+    # universe loads accurately when targeted by the optimization wrapper.
     if universe_type == "nifty500":
         base_universe = get_nifty500()
+    elif universe_type == "nse_total":
+        base_universe = fetch_nse_equity_universe()
     else:
-        # Fallback/default mapping
+        logger.warning(f"Unknown universe_type '{universe_type}', falling back to nifty500")
         base_universe = get_nifty500() 
         
     # Ensure index data is present for regime scoring

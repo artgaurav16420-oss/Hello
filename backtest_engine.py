@@ -1,11 +1,11 @@
 """
-backtest_engine.py — Deterministic Walk-Forward Engine v11.44
+backtest_engine.py — Deterministic Walk-Forward Engine v11.45
 =============================================================
 Weekly rebalance cadence with full equity ledger, CVaR risk management,
 and sector-diversified portfolio construction.
 
 Now properly integrated with Impact-Aligned Execution and Historical Constituents
-to eliminate Survivorship Bias.
+to eliminate Survivorship Bias. Fixes Look-Ahead PV/ADV computation biases.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from momentum_engine import (
 from signals import (
     generate_signals,
     compute_regime_score,
-    compute_single_adv,
     SignalGenerationError,
 )
 from universe_manager import get_historical_universe
@@ -126,13 +125,16 @@ class BacktestEngine:
             .replace([np.inf, -np.inf], np.nan)
         )
 
-        adv_vector = _build_adv_vector(symbols, volume, date)
+        # FIX (I-04, I-10): Replaced bare volume with unified exact notional calculation vector.
+        adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        close_t = close.loc[date]
+        # FIX (I-03): Compute PV & Exposure exclusively utilizing T-1 prices inside signal window
+        # rather than using current T+0 execution day's Close, avoiding optimization lookahead bias.
+        signal_close = close.loc[signal_date]
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
-                float(close_t[sym])
-                if (sym in close.columns and pd.notna(close_t[sym]))
+                float(signal_close[sym])
+                if (sym in close.columns and pd.notna(signal_close[sym]))
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -150,8 +152,8 @@ class BacktestEngine:
 
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
-                float(close.loc[date, sym])
-                if pd.notna(close.loc[date, sym])
+                float(signal_close[sym])
+                if pd.notna(signal_close[sym])
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -168,6 +170,8 @@ class BacktestEngine:
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
         if self.state.shares:
+            # Note: We use prices_t here as this screens for current stress limits against 
+            # execution constraints immediately prior to submission.
             book_cvar = compute_book_cvar(self.state, prices_t, symbols, hist_log_rets, cfg)
             if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 logger.warning(
@@ -274,7 +278,6 @@ class BacktestEngine:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
             
-            # ── FIX: Institutional Impact Alignment passed to executor ──
             execute_rebalance(
                 self.state, target_weights, prices_t, symbols, cfg,
                 adv_shares     = adv_vector,
@@ -322,7 +325,7 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
     return result
 
 
-def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
+def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
     adv = []
     signal_date: Optional[pd.Timestamp] = None
 
@@ -338,10 +341,16 @@ def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timesta
                 signal_date = idx[pos - 1]
 
     for sym in symbols:
-        if sym in volume.columns and signal_date is not None:
+        if sym in volume.columns and sym in close.columns and signal_date is not None:
             try:
-                series = volume.loc[:signal_date, sym]
-                adv.append(compute_single_adv(series))
+                c_series = close.loc[:signal_date, sym]
+                v_series = volume.loc[:signal_date, sym]
+                notional = (c_series * v_series).replace(0, np.nan).ffill().fillna(0)
+                if notional.empty:
+                    adv.append(0.0)
+                else:
+                    val = float(notional.rolling(20, min_periods=1).mean().iloc[-1])
+                    adv.append(val if np.isfinite(val) else 0.0)
             except Exception:
                 adv.append(0.0)
         else:
@@ -377,8 +386,6 @@ def run_backtest(
     if not union_universe:
         selected_universe_type = universe_type or "nse_total"
 
-        # ── FIX: Historical Constituents ──
-        # Rebuilds the universe tracking point-in-time list to avoid Survivorship Bias
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
             if historical_members:

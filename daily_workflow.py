@@ -1,5 +1,5 @@
 """
-daily_workflow.py — Ultimate Momentum v11.44
+daily_workflow.py — Ultimate Momentum v11.45
 ============================================
 Interactive CLI for live scanning, status display, and backtesting.
 Features robust capital management, direct Screener.in web scraping,
@@ -46,7 +46,9 @@ from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-__version__ = "11.44"
+__version__ = "11.45"
+
+BACKUP_GENERATIONS = 3
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -81,8 +83,6 @@ def load_optimized_config() -> UltimateConfig:
             for k, v in best_params.items():
                 setattr(cfg, k, v)
     return cfg
-
-# Then pass this `cfg` into _run_scan()
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
     """Build a professional text meter to show long-running stage progress."""
@@ -248,23 +248,25 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
             
-        # FIX: Dividend Sweep Integration
+        # FIX (I-05): Full history dividend sweep integration
         if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns:
-            div = float(row["Dividends"].iloc[-1])
-            if div > 0:
+            dividends = row["Dividends"][row["Dividends"] > 0]
+            if not dividends.empty:
                 shares_held = state.shares.get(sym, 0)
                 if shares_held > 0:
-                    div_date = pd.Timestamp(row.index[-1]).strftime("%Y-%m-%d")
-                    event_id = f"{div_date}:{div:.8f}"
-                    if state.dividend_ledger.get(sym) != event_id:
-                        state.cash = round(state.cash + (div * shares_held), 10)
-                        state.dividend_ledger[sym] = event_id
-                        logger.info(
-                            "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares). Added to cash.",
-                            sym,
-                            div,
-                            shares_held,
-                        )
+                    last_event_id = state.dividend_ledger.get(sym, "")
+                    last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
+                    
+                    for div_date, div_val in dividends.items():
+                        div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
+                        if div_date_str > last_event_date:
+                            div_val_float = float(div_val)
+                            state.cash = round(state.cash + (div_val_float * shares_held), 10)
+                            state.dividend_ledger[sym] = f"{div_date_str}:{div_val_float:.8f}"
+                            logger.info(
+                                "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares) on %s. Added to cash.",
+                                sym, div_val_float, shares_held, div_date_str
+                            )
 
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
@@ -311,7 +313,8 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
     state_file = f"data/portfolio_state_{name}.json"
     tmp_file   = f"{state_file}.tmp"
     try:
-        for i in range(1, -1, -1):
+        # FIX (I-02/I-09): Backup rotation correctly shifts all generations
+        for i in range(BACKUP_GENERATIONS - 1, -1, -1):
             src, dst = f"{state_file}.bak.{i}", f"{state_file}.bak.{i+1}"
             if os.path.exists(src):
                 shutil.copy2(src, dst)
@@ -339,7 +342,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
 def load_portfolio_state(name: str) -> PortfolioState:
     state_file = f"data/portfolio_state_{name}.json"
-    backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(3)]
+    backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
     for path in backups:
         if os.path.exists(path):
             try:
@@ -501,7 +504,7 @@ def _run_scan(
     _exhaust_decay = False
     if apply_decay and not optimization_succeeded:
         if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
-            target = np.zeros(len(symbols), dtype=float)
+            target = np.zeros(len(active), dtype=float)
             logger.warning(
                 "[Scan] %s — forcing full liquidation to cash.",
                 "Book CVaR breach" if _force_full_cash else
@@ -520,7 +523,7 @@ def _run_scan(
         )
         total_slippage = execute_rebalance(
             state, weights, prices, active, cfg,
-            adv_shares=adv_arr, # FIX: Impact parity passed to execute_rebalance
+            adv_shares=adv_arr,
             date_context=pd.Timestamp(end_date), trade_log=trade_log,
             apply_decay    = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _scenario_losses,
@@ -843,9 +846,6 @@ def main_menu() -> None:
                 print(f"  {C.RED}{exc}{C.RST}")
                 continue
 
-            # Note: The backtest engine is now configured to take 'universe_type' 
-            # as a string identifier ("nifty500", "nse_total", "custom") to leverage
-            # the point-in-time get_historical_universe() function.
             if bt_c == "1":
                 universe_identifier = "nse_total"
             elif bt_c == "3":
@@ -855,8 +855,6 @@ def main_menu() -> None:
 
             end        = datetime.today().strftime("%Y-%m-%d")
             
-            # Fetch a broad superset of data based on the starting universe + index 
-            # to feed the backtester. 
             initial_universe = get_historical_universe(universe_identifier, pd.Timestamp(start))
             if not initial_universe and bt_c == "3":
                 initial_universe = _get_custom_universe()

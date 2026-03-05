@@ -1,5 +1,5 @@
 """
-signals.py — Deterministic Regime & Momentum Kernel v11.44
+signals.py — Deterministic Regime & Momentum Kernel v11.45
 =========================================================
 Generates momentum Z-scores, handles liquidity filtering, calculates
 macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.
@@ -71,22 +71,22 @@ def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['Ultima
     return round(float(base_score), 10)
 
 
-def compute_single_adv(series: pd.Series) -> float:
+def compute_single_adv(df: pd.DataFrame) -> float:
     """
-    Robust calculation of Average Daily Volume (ADV) for a single asset.
-    Handles NaN padding and protects against single-day volume anomalies.
+    Robust calculation of Average Daily Notional Volume (ADV) for a single asset.
+    Handles NaN padding and computes 20-day MA of (Close * Volume) 
+    Fixes the I-10 asymmetric floor bug and unit incoherence.
     """
     try:
-        clean_series = series.replace(0, np.nan).ffill().fillna(0)
-        if clean_series.empty:
+        if "Close" not in df.columns or "Volume" not in df.columns:
             return 0.0
             
-        # Take minimum of 20-day moving average and the most recent day.
-        # This prevents a massive single-day block trade from artificially inflating ADV.
-        ma_20 = float(clean_series.rolling(20, min_periods=1).mean().iloc[-1])
-        last_val = float(clean_series.iloc[-1])
-        
-        adv_val = min(ma_20, last_val)
+        notional = (df["Close"] * df["Volume"]).replace(0, np.nan).ffill().fillna(0)
+        if notional.empty:
+            return 0.0
+            
+        # Take 20-day moving average strictly to ensure unit coherence against limit bounds
+        adv_val = float(notional.rolling(20, min_periods=1).mean().iloc[-1])
         return adv_val if np.isfinite(adv_val) else 0.0
     except Exception as exc:
         logger.debug("[Signals] ADV calculation failed: %s", exc)
@@ -100,8 +100,8 @@ def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
     adv_list = []
     for symbol in active_symbols:
         ns_sym = to_ns(symbol)
-        if ns_sym in market_data and "Volume" in market_data[ns_sym]:
-            adv_val = compute_single_adv(market_data[ns_sym]["Volume"])
+        if ns_sym in market_data:
+            adv_val = compute_single_adv(market_data[ns_sym])
             adv_list.append(adv_val)
         else:
             adv_list.append(0.0)
@@ -141,7 +141,6 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
                     df = data[ns_sym]
                     if "Close" in df.columns and "Volume" in df.columns:
                         notional_volume = df["Close"] * df["Volume"]
-                        # 20-day moving average of notional volume
                         adv = notional_volume.rolling(20, min_periods=1).mean().iloc[-1]
                         if adv >= min_adv_volume:
                             valid_in_chunk.append(symbol)

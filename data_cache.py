@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import time
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -143,8 +144,10 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
         if missing_mask.any():
             n_missing = missing_mask.sum()
             
-            # FIX: Use seeded RandomState for exact determinism across live/backtest
-            rng = np.random.RandomState(42)
+            # FIX (I-07): Use a hash derived RandomState seed unique to the ticker. 
+            # Ensures perfectly deterministic results per ticker while decoupling across assets.
+            seed = int(hashlib.md5(ticker.encode()).hexdigest()[:8], 16) % (2**31)
+            rng = np.random.RandomState(seed)
             noise_rets = rng.normal(0, hist_vol, n_missing)
             
             # Forward fill as a baseline
@@ -240,7 +243,7 @@ def load_or_fetch(
                     if df.empty:
                         continue
                         
-                    # Fix: Handle suspension gaps with deterministic noise
+                    # Handle suspension gaps with deterministic noise
                     df, suspended, max_gap = _repair_suspension_gaps(df, ticker)
                     
                     parquet_path = os.path.join(CACHE_DIR, f"{ticker}.parquet")
