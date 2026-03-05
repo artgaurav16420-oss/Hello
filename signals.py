@@ -1,17 +1,14 @@
 """
-signals.py — Deterministic Regime & Momentum Kernel
-=====================================================
-Multi-timeframe EWMA momentum with volatility-adjusted regime scoring.
+signals.py — Deterministic Regime & Momentum Kernel v11.44
+=========================================================
+Generates momentum Z-scores, handles liquidity filtering, calculates
+macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.
 """
 
 from __future__ import annotations
 
-# NOTE: UltimateConfig is imported under TYPE_CHECKING to avoid a circular
-# import (momentum_engine → signals → momentum_engine). The `from __future__
-# import annotations` directive at the top of this file makes all annotations
-# lazy strings at runtime, so UltimateConfig is never evaluated at import time.
-# DO NOT remove `from __future__ import annotations` without updating this block.
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -23,232 +20,216 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def compute_regime_score(
-    idx_hist: Optional[pd.DataFrame],
-    cfg: "Optional[UltimateConfig]" = None,
-) -> float:
+def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['UltimateConfig'] = None) -> float:
     """
-    Deterministic regime score in [0, 1].
-
-    Combines a logistic transform of price-vs-SMA200 with a 20-day realised
-    volatility overlay that shaves points when recent vol is elevated.
-    Caller must pass T-1 sliced history to prevent look-ahead.
-
-    FIX G2: The volatility penalty threshold is now dynamic rather than the
-    previous hardcoded 18%. The threshold is computed as:
-
-        max(REGIME_VOL_FLOOR, long_term_vol * REGIME_VOL_MULTIPLIER)
-
-    where `long_term_vol` is the trailing 252-day annualised vol of the index.
-    A minimum of 253 closing prices is required (252 returns + 1 seed row).
-    This prevents the penalty from triggering constantly during healthy
-    small/mid-cap momentum rallies where sustained vols of 20-30% are normal.
-    Config fields used:
-        REGIME_VOL_FLOOR       = 0.18  (absolute minimum, guards against very
-                                         low-vol regimes where the multiplier
-                                         would set an impossibly low threshold)
-        REGIME_VOL_MULTIPLIER  = 1.5   (penalty at 1.5× trailing long-term vol)
-
-    Returns 0.5 (neutral) on any data quality issue rather than raising.
+    Computes a macroeconomic regime score bounded [0, 1].
+    
+    High score -> Risk-on (upward trend, low volatility)
+    Low score -> Risk-off (downward trend, high volatility)
     """
     if idx_hist is None or len(idx_hist) < 253:
+        logger.debug("[Signals] Insufficient index history for regime. Defaulting to 0.5")
         return 0.5
-    if "Close" not in idx_hist.columns:
+        
+    close_series = idx_hist["Close"]
+    
+    # 1. Trend component (Distance from 200-day SMA)
+    sma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+    last_price = float(close_series.iloc[-1])
+    
+    if sma200 <= 0 or not np.isfinite(sma200):
         return 0.5
-
-    if not idx_hist.index.is_monotonic_increasing:
-        logger.warning(
-            "compute_regime_score: index not monotonic — deduplicating and continuing."
-        )
-        idx_hist = idx_hist[~idx_hist.index.duplicated(keep="last")]
-        if len(idx_hist) < 253:
-            return 0.5
-
-    close  = idx_hist["Close"]
-    sma200 = float(close.rolling(200).mean().iloc[-1])
-    last   = float(close.iloc[-1])
-
-    if sma200 <= 0 or not np.isfinite(sma200) or not np.isfinite(last):
-        return 0.5
-
-    score = 1.0 / (1.0 + np.exp(-20.0 * (last / sma200 - 1.0)))
-
-    # ── FIX G2: Dynamic volatility penalty threshold ──────────────────────────
-    # Compute 20-day short-term vol (same as original).
-    rets_20 = close.pct_change(fill_method=None).tail(20)
-
-    if len(rets_20) == 20:
-        vol_20 = float(rets_20.std() * np.sqrt(252))
-
-        # Resolve threshold from config or fall back to original fixed value.
-        if cfg is not None:
-            vol_floor      = float(getattr(cfg, "REGIME_VOL_FLOOR",      0.18))
-            vol_multiplier = float(getattr(cfg, "REGIME_VOL_MULTIPLIER",  1.5))
+        
+    trend_deviation = (last_price / sma200) - 1.0
+    # Sigmoid function maps deviation to [0, 1] bounded score
+    base_score = 1.0 / (1.0 + np.exp(-20.0 * trend_deviation))
+    
+    # 2. Volatility penalty component
+    returns_20d = close_series.pct_change(fill_method=None).tail(20)
+    
+    if len(returns_20d) == 20:
+        vol_20d = float(returns_20d.std() * np.sqrt(252))
+        
+        vol_floor = float(getattr(cfg, "REGIME_VOL_FLOOR", 0.18)) if cfg else 0.18
+        vol_mult = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
+        
+        all_returns = close_series.pct_change(fill_method=None).dropna()
+        if len(all_returns) >= 252:
+            long_term_vol = float(all_returns.tail(252).std() * np.sqrt(252))
         else:
-            vol_floor      = 0.18
-            vol_multiplier = 1.5
-
-        # Long-term index vol as benchmark: use 252-day window when available,
-        # otherwise fall back to full history so early warm-up still works.
-        rets_all    = close.pct_change(fill_method=None).dropna()
-        window_rets = rets_all.tail(252) if len(rets_all) >= 252 else rets_all
-        long_term_vol = float(window_rets.std() * np.sqrt(252)) if len(window_rets) > 1 else vol_floor
-
-        vol_threshold = max(vol_floor, long_term_vol * vol_multiplier)
-
-        # Multiplicative decay preserves proportional effect across [0, 1],
-        # avoiding boundary distortion of absolute subtraction.
-        if vol_20 > vol_threshold:
-            score *= 0.85
-            logger.debug(
-                "compute_regime_score: vol penalty applied "
-                "(vol_20=%.1f%% > threshold=%.1f%% = max(floor=%.1f%%, %.1f%%×LT=%.1f%%))",
-                vol_20 * 100, vol_threshold * 100,
-                vol_floor * 100, vol_multiplier, long_term_vol * 100,
-            )
-
-    return round(float(score), 10)
+            long_term_vol = vol_floor
+            
+        # If current 20-day volatility spikes above the dynamic threshold, apply penalty
+        dynamic_threshold = max(vol_floor, long_term_vol * vol_mult)
+        if vol_20d > dynamic_threshold:
+            logger.debug("[Signals] Regime Volatility Spike detected (%.2f > %.2f). Applying penalty.", vol_20d, dynamic_threshold)
+            base_score *= 0.85
+            
+    return round(float(base_score), 10)
 
 
 def compute_single_adv(series: pd.Series) -> float:
     """
-    Core ADV calculation logic shared by both the daily engine and backtester
-    to strictly enforce mathematical parity.
-
-    Note: For live use, pass the full volume series directly. For backtesting,
-    the caller (backtest_engine._build_adv_vector) is responsible for applying
-    the T-1 slice *before* calling this function — this function is intentionally
-    slice-agnostic to remain composable.
+    Robust calculation of Average Daily Volume (ADV) for a single asset.
+    Handles NaN padding and protects against single-day volume anomalies.
     """
     try:
         clean_series = series.replace(0, np.nan).ffill().fillna(0)
         if clean_series.empty:
             return 0.0
-        ma20 = float(clean_series.rolling(20, min_periods=1).mean().iloc[-1])
-        last = float(clean_series.iloc[-1])
-        val  = min(ma20, last)
-        return val if np.isfinite(val) else 0.0
-    except Exception:
+            
+        # Take minimum of 20-day moving average and the most recent day.
+        # This prevents a massive single-day block trade from artificially inflating ADV.
+        ma_20 = float(clean_series.rolling(20, min_periods=1).mean().iloc[-1])
+        last_val = float(clean_series.iloc[-1])
+        
+        adv_val = min(ma_20, last_val)
+        return adv_val if np.isfinite(adv_val) else 0.0
+    except Exception as exc:
+        logger.debug("[Signals] ADV calculation failed: %s", exc)
         return 0.0
 
 
-def compute_adv(market_data: dict, active: List[str]) -> np.ndarray:
-    """
-    Compute 20-day average daily volume (in shares) for each symbol.
-
-    Live use only — no T-1 slice is applied here. For backtesting, use
-    backtest_engine._build_adv_vector, which performs the T-1 slice before
-    delegating to compute_single_adv.
-    """
+def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
+    """Vectorized application of compute_single_adv across active universe."""
     from momentum_engine import to_ns
-
-    adv = []
-    for sym in active:
-        ns = to_ns(sym)
-        if ns in market_data:
-            adv.append(compute_single_adv(market_data[ns]["Volume"]))
+    
+    adv_list = []
+    for symbol in active_symbols:
+        ns_sym = to_ns(symbol)
+        if ns_sym in market_data and "Volume" in market_data[ns_sym]:
+            adv_val = compute_single_adv(market_data[ns_sym]["Volume"])
+            adv_list.append(adv_val)
         else:
-            adv.append(0.0)
-    return np.array(adv, dtype=float)
+            adv_list.append(0.0)
+            
+    return np.array(adv_list, dtype=float)
+
+
+def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
+    """
+    Helper for Universe Manager.
+    Filters a raw list of tickers down to those meeting the minimum ADV liquidity threshold.
+    """
+    from momentum_engine import UltimateConfig
+    from data_cache import load_or_fetch
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    if cfg is None:
+        cfg = UltimateConfig()
+        
+    end_date = datetime.today().strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
+    
+    chunk_size = 75
+    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    
+    filtered_tickers = []
+    min_adv_volume = cfg.MIN_ADV_CRORES * 1e7
+    
+    def process_chunk(chunk: List[str]) -> List[str]:
+        valid_in_chunk = []
+        try:
+            # Load short history for liquidity validation
+            data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
+            for symbol in chunk:
+                ns_sym = symbol + ".NS"
+                if ns_sym in data:
+                    df = data[ns_sym]
+                    if "Close" in df.columns and "Volume" in df.columns:
+                        notional_volume = df["Close"] * df["Volume"]
+                        # 20-day moving average of notional volume
+                        adv = notional_volume.rolling(20, min_periods=1).mean().iloc[-1]
+                        if adv >= min_adv_volume:
+                            valid_in_chunk.append(symbol)
+        except Exception as exc:
+            logger.error("[Signals] Error processing ADV chunk: %s", exc)
+        return valid_in_chunk
+
+    logger.info("[Signals] Filtering %d tickers against ₹%dCr ADV minimum...", len(tickers), cfg.MIN_ADV_CRORES)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(process_chunk, chunk): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            filtered_tickers.extend(future.result())
+            
+    return filtered_tickers
 
 
 def generate_signals(
     log_rets:     pd.DataFrame,
     adv_arr:      np.ndarray,
-    cfg:          "UltimateConfig",
+    cfg:          'UltimateConfig',
     prev_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """
-    Score assets by blended multi-timeframe EWMA momentum.
-
-    Parameters
-    ----------
-    log_rets     : T × N log-return DataFrame; caller must pass T-1 slice.
-    adv_arr      : N-length array of average daily volume in shares (T-1 slice).
-                   Must be the same length as log_rets.columns. Assets with
-                   ADV == 0 are disqualified before ranking.
-    cfg          : UltimateConfig containing all tunable signal parameters.
-    prev_weights : Dict[symbol → current weight] for continuity bonus.
-
-    Returns
-    -------
-    raw_daily  : Raw blended score per asset (N-length float array).
-    adj_scores : Cross-sectionally z-scored, clipped, bonus-adjusted scores.
-    sel_idx    : Indices of top-ranked assets (after all gates applied).
+    Core momentum generation engine.
+    Computes blended fast/slow exponentially weighted returns, applies historical
+    and liquidity gates, and attaches a dispersion-normalized continuity bonus
+    to reduce portfolio turnover friction.
     """
-    if prev_weights is None:
-        prev_weights = {}
+    if log_rets.empty:
+        raise ValueError("Cannot generate signals: log_rets dataframe is empty.")
+        
+    active_symbols = list(log_rets.columns)
+    
+    # 1. Base Signal Calculation (Blended EWMA)
+    fast_ema = log_rets.ewm(halflife=cfg.HALFLIFE_FAST).mean().iloc[-1].values
+    slow_ema = log_rets.ewm(halflife=cfg.HALFLIFE_SLOW).mean().iloc[-1].values
+    
+    raw_daily_momentum = 0.5 * fast_ema + 0.5 * slow_ema
+    
+    # Cross-sectional Z-score standardization
+    mu_cross = np.nanmean(raw_daily_momentum)
+    std_cross = max(np.nanstd(raw_daily_momentum), 1e-8)
+    
+    adj_scores = np.clip(
+        (raw_daily_momentum - mu_cross) / std_cross, 
+        -cfg.Z_SCORE_CLIP, 
+        cfg.Z_SCORE_CLIP
+    )
 
-    if log_rets.empty or log_rets.isna().all().all():
-        raise ValueError("generate_signals: log_rets contains no valid data.")
-
-    active = list(log_rets.columns)
-
-    if len(adv_arr) != len(active):
-        raise ValueError(
-            f"generate_signals: adv_arr length {len(adv_arr)} != "
-            f"log_rets columns {len(active)}. Caller must align arrays before calling."
-        )
-
-    fast = log_rets.ewm(
-        halflife=cfg.HALFLIFE_FAST, min_periods=max(1, cfg.HALFLIFE_FAST // 2)
-    ).mean().iloc[-1].values.astype(float)
-
-    slow = log_rets.ewm(
-        halflife=cfg.HALFLIFE_SLOW, min_periods=max(1, cfg.HALFLIFE_SLOW // 2)
-    ).mean().iloc[-1].values.astype(float)
-
-    raw_daily = 0.5 * fast + 0.5 * slow
-
-    mu  = float(np.nanmean(raw_daily))
-    std = float(max(np.nanstd(raw_daily), 1e-8))
-    adj_scores = np.clip((raw_daily - mu) / std, -cfg.Z_SCORE_CLIP, cfg.Z_SCORE_CLIP)
-
-    # ── Per-asset gates ───────────────────────────────────────────────────────
-    # NOTE: Continuity bonus is intentionally applied AFTER all gates below.
-    # Applying it here (before gates) allowed zombie positions with ADV=0 or
-    # crashing prices to keep accumulating +CONTINUITY_BONUS on every bar,
-    # making marginal names borderline-pass gates they should clearly fail.
-
-    for i, sym in enumerate(active):
-        if int(log_rets[sym].notna().sum()) < cfg.HISTORY_GATE:
+    # 2. Hard Gates (Disqualification)
+    for i, sym in enumerate(active_symbols):
+        # Gate A: Minimum History Requirement
+        valid_history_days = int(log_rets[sym].notna().sum())
+        if valid_history_days < cfg.HISTORY_GATE:
             adj_scores[i] = -np.inf
-
-    # LIQUIDITY GATE
-    for i, adv_val in enumerate(adv_arr):
-        if not np.isfinite(adv_val) or adv_val <= 0:
+            
+        # Gate B: Liquidity / ADV Requirement
+        if not np.isfinite(adv_arr[i]) or adv_arr[i] <= 0:
             adj_scores[i] = -np.inf
-            logger.debug(
-                "Liquidity gate: %s disqualified (ADV=%.0f).",
-                active[i],
-                adv_val if np.isfinite(adv_val) else float("nan"),
-            )
-
-    # FALLING KNIFE GATE
+            
+    # Gate C: Falling Knife Protection
     if len(log_rets) >= cfg.KNIFE_WINDOW:
-        ret_nd = log_rets.iloc[-cfg.KNIFE_WINDOW:].sum().values
-        for i, rn in enumerate(ret_nd):
-            if np.isfinite(rn) and rn < cfg.KNIFE_THRESHOLD:
+        # Sum of log returns represents total cumulative return over the window
+        recent_cumulative_returns = log_rets.iloc[-cfg.KNIFE_WINDOW:].sum().values
+        for i, cumulative_ret in enumerate(recent_cumulative_returns):
+            if cumulative_ret < cfg.KNIFE_THRESHOLD:
                 adj_scores[i] = -np.inf
-                logger.debug(
-                    "Falling knife gate: %s disqualified (%dd log-ret=%.2f%%).",
-                    active[i], cfg.KNIFE_WINDOW, rn * 100,
-                )
 
-    # Map NaN → -inf before continuity bonus so NaN assets cannot silently
-    # benefit from the bonus.
-    adj_scores = np.where(np.isfinite(adj_scores), adj_scores, -np.inf)
+    # 3. FIX: Dispersion-Normalized Continuity Bonus
+    # Standardizing the bonus against the current cross-sectional dispersion
+    # ensures it isn't over-dominant in tight low-vol markets or invisible in wide high-vol ones.
+    valid_mask = np.isfinite(adj_scores)
+    
+    if prev_weights and valid_mask.any():
+        # Calculate standard deviation only among assets that survived the gates
+        current_dispersion = max(np.nanstd(adj_scores[valid_mask]), 0.1)
+        normalized_bonus = cfg.CONTINUITY_BONUS * current_dispersion
+        
+        for i, sym in enumerate(active_symbols):
+            if valid_mask[i] and prev_weights.get(sym, 0.0) > 0.001:
+                adj_scores[i] += normalized_bonus
 
-    # CONTINUITY BONUS — applied only to positions that survived all gates above.
-    # A name that fails any gate is permanently at -inf; the bonus cannot rescue it.
-    # This prevents path-dependency from protecting illiquid or crashing positions.
-    for i, sym in enumerate(active):
-        if adj_scores[i] > -np.inf and prev_weights.get(sym, 0.0) > 0.001:
-            adj_scores[i] += cfg.CONTINUITY_BONUS
-
-    sel_idx = [
-        i for i in np.argsort(adj_scores)[-cfg.MAX_POSITIONS:]
-        if adj_scores[i] > -np.inf
+    # 4. Final Selection
+    # Sort and pick the top N elements (ignoring those assigned -inf)
+    sorted_indices = np.argsort(adj_scores)
+    top_n_indices = sorted_indices[-cfg.MAX_POSITIONS:]
+    
+    selected_indices = [
+        int(idx) for idx in top_n_indices 
+        if adj_scores[idx] > -np.inf
     ]
-
-    return raw_daily, adj_scores, sel_idx
+    
+    return raw_daily_momentum, adj_scores, selected_indices

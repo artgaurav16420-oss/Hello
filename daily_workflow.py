@@ -1,8 +1,9 @@
 """
-daily_workflow.py — Ultimate Momentum — Daily Workflow
-=======================================================
+daily_workflow.py — Ultimate Momentum v11.44
+============================================
 Interactive CLI for live scanning, status display, and backtesting.
-Features robust capital management and direct Screener.in web scraping.
+Features robust capital management, direct Screener.in web scraping,
+Dividend Sweeping, and Impact-Aligned Rebalancing.
 """
 
 from __future__ import annotations
@@ -38,14 +39,14 @@ from universe_manager import (
     fetch_nse_equity_universe,
     get_nifty500,
     get_sector_map,
-    invalidate_universe_cache,
+    get_historical_universe,
     UniverseFetchError,
 )
 from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-__version__ = "11.43"
+__version__ = "11.44"
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -65,14 +66,12 @@ class C:
     else:
         BLU = CYN = GRN = YLW = RED = GRY = RST = BLD = B_CYN = B_GRN = B_RED = ""
 
-
 logger = logging.getLogger(__name__)
 
 _DEFAULT_SCREENER_URL = os.environ.get(
     "SCREENER_URL",
     "https://www.screener.in/screens/3506127/hello/",
 )
-
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
     """Build a professional text meter to show long-running stage progress."""
@@ -82,12 +81,10 @@ def _render_meter(label: str, progress: float, width: int = 30) -> str:
     pct = f"{clipped * 100:5.1f}%"
     return f"  {C.CYN}{label:<18}{C.RST} [{bar}] {C.BLD}{pct}{C.RST}"
 
-
 def _print_stage_status(label: str, progress: float, detail: str) -> None:
     """Print stage meter and contextual status text for user visibility."""
     print(_render_meter(label, progress))
     print(f"  {C.GRY}{detail}{C.RST}")
-
 
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
@@ -155,7 +152,6 @@ def _scrape_screener(base_url: str) -> List[str]:
 
     return list(symbols)
 
-
 def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
     filtered: List[str] = []
     invalid_count = 0
@@ -176,7 +172,6 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
         )
 
     return list(dict.fromkeys(filtered))
-
 
 def _get_custom_universe() -> List[str]:
     saved_url = _DEFAULT_SCREENER_URL
@@ -212,7 +207,6 @@ def _get_custom_universe() -> List[str]:
                 logger.error("[Screener] Failed to read %s: %s", f, e)
     return []
 
-
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
     if not state.shares and not state.equity_hist and abs(state.cash - 1_000_000.0) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
@@ -227,46 +221,57 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
         except ValueError:
             print(f"  {C.RED}Invalid input. Using default ₹10,00,000.{C.RST}\n")
 
-
 # ─── Corporate action / split detection ──────────────────────────────────────
 
-_SPLIT_RATIOS     = [2, 5, 10, 3, 4, 20, 0.5, 0.2]
-_SPLIT_TOLERANCE  = 0.015
-
-
-def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[str]:
+def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: UltimateConfig) -> List[str]:
+    """
+    Detects splits and sweeps dividends to ensure cash ledger accuracy.
+    """
     adjusted: List[str] = []
+    
     for sym in list(state.shares.keys()):
         ns = to_ns(sym)
         row = market_data.get(ns)
-        if row is None:
-            row = market_data.get(sym)
         if row is None or row.empty:
             continue
+            
+        # FIX: Dividend Sweep Integration
+        if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns:
+            div = float(row["Dividends"].iloc[-1])
+            if div > 0:
+                shares_held = state.shares.get(sym, 0)
+                if shares_held > 0:
+                    state.cash = round(state.cash + (div * shares_held), 10)
+                    logger.info("DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares). Added to cash.", sym, div, shares_held)
+
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
             continue
+            
         last_price = state.last_known_prices.get(sym)
         if last_price is None or last_price <= 0:
             continue
 
         ratio = last_price / current_price
 
-        for r in _SPLIT_RATIOS:
-            if abs(ratio - r) / r <= _SPLIT_TOLERANCE:
+        # Broader institutional ratio list with a tighter tolerance
+        split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
+        for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
+            if abs(ratio - r) / r <= split_tolerance:
                 old_shares     = state.shares[sym]
                 theoretical_new_shares = old_shares * r
                 new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
                 old_entry      = state.entry_prices.get(sym, current_price * r)
                 new_entry      = old_entry / r
 
+                # Safely sweep fractional shares
                 fractional_pre_split = max(0.0, old_shares - (new_shares / r))
                 fractional_value = fractional_pre_split * current_price
                 state.cash = round(state.cash + fractional_value, 10)
 
                 logger.warning(
-                    "SPLIT DETECTED: %s  ratio=%.3f (≈%gx)  "
-                    "shares %d→%d  entry_price ₹%.2f→₹%.2f",
+                    "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
+                    "shares %d→%d entry_price ₹%.2f→₹%.2f",
                     sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
                 )
                 state.shares[sym]       = new_shares
@@ -276,7 +281,6 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
                 break
 
     return adjusted
-
 
 # ─── State persistence ────────────────────────────────────────────────────────
 
@@ -311,7 +315,6 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             except Exception:
                 pass
 
-
 def load_portfolio_state(name: str) -> PortfolioState:
     state_file = f"data/portfolio_state_{name}.json"
     backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(3)]
@@ -323,7 +326,6 @@ def load_portfolio_state(name: str) -> PortfolioState:
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
     return PortfolioState()
-
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
 
@@ -360,6 +362,11 @@ def _run_scan(
     idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
     regime_score = compute_regime_score(idx_slice, cfg=cfg)
 
+    # Detect splits and sweep dividends BEFORE marking MTM values
+    split_syms = detect_and_apply_splits(state, market_data, cfg)
+    if split_syms:
+        logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
+
     close_d: Dict[str, pd.Series] = {}
     for sym in universe:
         ns = to_ns(sym)
@@ -371,10 +378,6 @@ def _run_scan(
         return state, market_data
 
     _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
-
-    split_syms = detect_and_apply_splits(state, market_data)
-    if split_syms:
-        logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
 
     close    = pd.DataFrame(close_d).sort_index()
     active   = list(close.columns)
@@ -494,6 +497,7 @@ def _run_scan(
         )
         total_slippage = execute_rebalance(
             state, weights, prices, active, cfg,
+            adv_shares=adv_arr, # FIX: Impact parity passed to execute_rebalance
             date_context=pd.Timestamp(end_date), trade_log=trade_log,
             apply_decay    = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _scenario_losses,
@@ -555,7 +559,6 @@ def _run_scan(
         print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
 
     return state, market_data
-
 
 # ─── Status display ───────────────────────────────────────────────────────────
 
@@ -645,14 +648,12 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(f"  {C.RED}⚠️ {C.RST} Consec. Failures    : {C.BLD}{state.consecutive_failures}{C.RST}")
     print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
 
-
 def _portfolio_activity_badge(state: PortfolioState) -> str:
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - 1_000_000.0) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
     positions = len(state.shares)
     return f"{C.B_GRN}Active{C.RST} {C.GRY}({positions} pos | Cash ₹{state.cash:,.0f}){C.RST}"
-
 
 def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     box_width = 78
@@ -687,7 +688,6 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     print(f"    Nifty 500       → {_portfolio_activity_badge(states['nifty'])}")
     print(f"    Custom Screener → {_portfolio_activity_badge(states['custom'])}")
 
-
 def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
     raw = input(prompt).strip().lower()
     if not raw and default is not None:
@@ -697,7 +697,6 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
         return ""
     return raw
 
-
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     candidate = raw.strip() or default
     try:
@@ -705,9 +704,6 @@ def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     except ValueError as exc:
         raise ValueError(f"Invalid date '{candidate}'. Expected format YYYY-MM-DD.") from exc
     return candidate
-
-
-# ─── Survival-mode prompt ─────────────────────────────────────────────────────
 
 def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Optional[List[str]]:
     print(f"\n  {C.B_RED}[!] UNIVERSE FETCH FAILURE — {universe_name}{C.RST}")
@@ -727,7 +723,6 @@ def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Option
         return err.fallback_universe
     print(f"  {C.GRY}Cancelled. Returning to main menu.{C.RST}")
     return None
-
 
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
@@ -825,17 +820,28 @@ def main_menu() -> None:
                 print(f"  {C.RED}{exc}{C.RST}")
                 continue
 
+            # Note: The backtest engine is now configured to take 'universe_type' 
+            # as a string identifier ("nifty500", "nse_total", "custom") to leverage
+            # the point-in-time get_historical_universe() function.
             if bt_c == "1":
-                universe = fetch_nse_equity_universe()
+                universe_identifier = "nse_total"
             elif bt_c == "3":
-                universe = _get_custom_universe()
+                universe_identifier = "custom"
             else:
-                universe = get_nifty500()
+                universe_identifier = "nifty500"
 
             end        = datetime.today().strftime("%Y-%m-%d")
-            data       = load_or_fetch(universe + ["^NSEI", "^CRSLDX"], start, end)
-            sector_map = get_sector_map(universe)
-            print_backtest_results(run_backtest(data, universe, start, end, sector_map=sector_map))
+            
+            # Fetch a broad superset of data based on the starting universe + index 
+            # to feed the backtester. 
+            initial_universe = get_historical_universe(universe_identifier, pd.Timestamp(start))
+            if not initial_universe and bt_c == "3":
+                initial_universe = _get_custom_universe()
+            elif not initial_universe:
+                initial_universe = get_nifty500()
+
+            data       = load_or_fetch(initial_universe + ["^NSEI", "^CRSLDX"], start, end)
+            print_backtest_results(run_backtest(data, universe_identifier, start, end))
 
         elif c == "5":
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
@@ -884,6 +890,7 @@ def main_menu() -> None:
             confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
             if confirm.upper() == "YES":
                 invalidate_cache()
+                from universe_manager import invalidate_universe_cache
                 invalidate_universe_cache()
                 for n in ["nse_total", "nifty", "custom"]:
                     p = f"data/portfolio_state_{n}.json"
@@ -900,7 +907,6 @@ def main_menu() -> None:
         elif c == "q":
             print(f"  {C.GRY}Goodbye!{C.RST}\n")
             break
-
 
 if __name__ == "__main__":
     os.makedirs("logs", exist_ok=True)

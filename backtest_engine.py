@@ -1,8 +1,11 @@
 """
-backtest_engine.py — Deterministic Walk-Forward Engine
-=======================================================
+backtest_engine.py — Deterministic Walk-Forward Engine v11.44
+=============================================================
 Weekly rebalance cadence with full equity ledger, CVaR risk management,
 and sector-diversified portfolio construction.
+
+Now properly integrated with Impact-Aligned Execution and Historical Constituents
+to eliminate Survivorship Bias.
 """
 
 from __future__ import annotations
@@ -26,9 +29,9 @@ from momentum_engine import (
     Trade,
 )
 from signals import generate_signals, compute_regime_score, compute_single_adv
+from universe_manager import get_historical_universe
 
 logger = logging.getLogger(__name__)
-
 
 # ─── Results container ────────────────────────────────────────────────────────
 
@@ -38,7 +41,6 @@ class BacktestResults:
     trades:       List[Trade]
     metrics:      Dict
     rebal_log:    pd.DataFrame   # one row per rebalance date
-
 
 # ─── Engine ───────────────────────────────────────────────────────────────────
 
@@ -50,7 +52,7 @@ class BacktestEngine:
         self.trades:  List[Trade]  = []
         self._eq_dates: list       = []
         self._eq_vals:  list       = []
-        self._rebal_rows: list     = []   # accumulated rebalance log rows
+        self._rebal_rows: list     = []
 
     def run(
         self,
@@ -104,8 +106,8 @@ class BacktestEngine:
         returns:    pd.DataFrame,
         symbols:    List[str],
         prices_t:   np.ndarray,
-        idx_df,
-        sector_map,
+        idx_df:     Optional[pd.DataFrame],
+        sector_map: Optional[dict],
     ) -> None:
         cfg = self.engine.cfg
 
@@ -121,7 +123,7 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, volume, date)
 
-        close_t    = close.loc[date]
+        close_t = close.loc[date]
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
                 float(close_t[sym])
@@ -242,7 +244,6 @@ class BacktestEngine:
                     date,
                 )
                 _exhaust_decay = True
-                # target_weights stays all-zeros → full cash
             else:
                 target_weights = compute_decay_targets(self.state, sel_idx, symbols, cfg)
                 sel_idx_set = set(sel_idx)
@@ -261,15 +262,19 @@ class BacktestEngine:
         if optimization_succeeded or apply_decay:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
+            
+            # ── FIX: Institutional Impact Alignment passed to executor ──
             execute_rebalance(
                 self.state, target_weights, prices_t, symbols, cfg,
-                date_context=date, trade_log=self.trades,
+                adv_shares     = adv_vector,
+                date_context   = date, 
+                trade_log      = self.trades,
                 apply_decay    = apply_decay and not _exhaust_decay,
                 scenario_losses = None if _exhaust_decay else _L,
             )
             if _exhaust_decay:
                 self.state.decay_rounds = 0
-                self.state.consecutive_failures = 0 # FIX: sticky counter bug
+                self.state.consecutive_failures = 0
 
             self._rebal_rows.append({
                 "date":               date,
@@ -281,14 +286,9 @@ class BacktestEngine:
                 "apply_decay":        apply_decay,
             })
 
-
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def _build_prev_weights(
-    state:   PortfolioState,
-    symbols: List[str],
-    pv:      float,
-) -> Dict[str, float]:
+def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) -> Dict[str, float]:
     result: Dict[str, float] = {}
     if pv <= 0:
         return result
@@ -341,19 +341,39 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def run_backtest(
-    market_data: dict,
-    universe:    List[str],
-    start_date:  str,
-    end_date:    str,
-    cfg:         Optional[UltimateConfig] = None,
-    sector_map:  Optional[dict]           = None,
+    market_data:   dict,
+    universe_type: str,
+    start_date:    str,
+    end_date:      str,
+    cfg:           Optional[UltimateConfig] = None,
+    sector_map:    Optional[dict]           = None,
 ) -> BacktestResults:
     if cfg is None:
         cfg = UltimateConfig()
 
-    close_d  = {}
-    volume_d = {}
-    for sym in universe:
+    all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
+    
+    # ── FIX: Historical Constituents ──
+    # Rebuilds the universe tracking point-in-time list to avoid Survivorship Bias
+    union_universe = set()
+    for d in all_target_dates:
+        # get_historical_universe safely returns the known universe as of date `d`
+        historical_members = get_historical_universe(universe_type, d)
+        if historical_members:
+            union_universe.update(historical_members)
+
+    # If the historical universe file doesn't exist, union_universe might be empty here.
+    # The get_historical_universe logic defaults to warning the user and returning the current universe.
+    if not union_universe:
+        logger.warning("Historical integration failed to yield symbols. Using current universe.")
+        from universe_manager import get_nifty500, fetch_nse_equity_universe
+        if universe_type == "nifty500":
+            union_universe.update(get_nifty500())
+        else:
+            union_universe.update(fetch_nse_equity_universe())
+
+    close_d, volume_d = {}, {}
+    for sym in union_universe:
         if not sym:
             continue
         key = sym if sym.endswith(".NS") else sym + ".NS"
@@ -363,16 +383,15 @@ def run_backtest(
         volume_d[sym] = market_data[key]["Volume"]
 
     if not close_d:
-        raise ValueError("No valid symbols found in market_data for the given universe.")
+        raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
 
     close   = pd.DataFrame(close_d).sort_index()
     volume  = pd.DataFrame(volume_d).sort_index()
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
-    all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
-    trading_index    = pd.DatetimeIndex(close.index).sort_values()
-
-    idx   = trading_index.get_indexer(all_target_dates, method="backfill")
+    trading_index = pd.DatetimeIndex(close.index).sort_values()
+    idx           = trading_index.get_indexer(all_target_dates, method="backfill")
+    
     valid = []
     for target, resolved_pos in zip(all_target_dates, idx):
         if resolved_pos < 0 or resolved_pos >= len(trading_index):
@@ -381,8 +400,7 @@ def run_backtest(
         t_iso = target.isocalendar()
         r_iso = resolved.isocalendar()
         if r_iso[0] != t_iso[0] or r_iso[1] != t_iso[1]:
-            logger.debug("Calendar guard: %s -> %s crosses ISO week boundary, skipping.",
-                         target.date(), resolved.date())
+            logger.debug("Calendar guard: %s -> %s crosses ISO week boundary, skipping.", target.date(), resolved.date())
             continue
         valid.append(resolved)
 
@@ -419,18 +437,21 @@ def run_backtest(
         rebal_log    = rebal_log,
     )
 
-
 def print_backtest_results(results: BacktestResults) -> None:
     m = results.metrics
+    if not m:
+        print("\n  \033[31m[!] Backtest returned no metrics. Check date range.\033[0m")
+        return
+
     print(f"\n  \033[1;36mBACKTEST RESULTS\033[0m")
     print(f"  \033[90m{chr(9472)*65}\033[0m")
     print(
-        f"  \033[1mFinal:\033[0m \033[32m₹{m['final']:,.0f}\033[0m  "
-        f"\033[1mCAGR:\033[0m {m['cagr']:.2f}%  "
-        f"\033[1mSharpe:\033[0m {m['sharpe']:.2f}  "
-        f"\033[1mSortino:\033[0m {m['sortino']:.2f}  "
-        f"\033[1mMaxDD:\033[0m {m['max_dd']:.2f}%  "
-        f"\033[1mCalmar:\033[0m {m['calmar']:.2f}"
+        f"  \033[1mFinal:\033[0m \033[32m₹{m.get('final', 0):,.0f}\033[0m  "
+        f"\033[1mCAGR:\033[0m {m.get('cagr', 0):.2f}%  "
+        f"\033[1mSharpe:\033[0m {m.get('sharpe', 0):.2f}  "
+        f"\033[1mSortino:\033[0m {m.get('sortino', 0):.2f}  "
+        f"\033[1mMaxDD:\033[0m {m.get('max_dd', 0):.2f}%  "
+        f"\033[1mCalmar:\033[0m {m.get('calmar', 0):.2f}"
     )
     print(f"  \033[90m{chr(9472)*65}\033[0m\n")
 

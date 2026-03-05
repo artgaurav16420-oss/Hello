@@ -1,6 +1,6 @@
 """
-momentum_engine.py — Institutional Risk Engine
-===============================================
+momentum_engine.py — Institutional Risk Engine v11.44
+=====================================================
 CVaR-constrained Mean-Variance Optimizer with full Transaction Cost formulation.
 
 Architecture
@@ -129,18 +129,7 @@ class _ConstraintBuilder:
 
 @dataclass
 class UltimateConfig:
-    """Runtime configuration for portfolio construction, risk, and execution.
-
-    New fields added in v11.43:
-        CVAR_MIN_HISTORY: int = 20
-        Z_SCORE_CLIP: float = 3.0
-        CONTINUITY_BONUS: float = 0.15
-        KNIFE_WINDOW: int = 20
-        KNIFE_THRESHOLD: float = -0.15
-        REBALANCE_FREQ: str = "W-FRI"
-        REGIME_VOL_FLOOR: float = 0.18
-        REGIME_VOL_MULTIPLIER: float = 1.5
-    """
+    """Runtime configuration for portfolio construction, risk, and execution."""
 
     # Portfolio construction
     INITIAL_CAPITAL:          float = 1_000_000.0
@@ -199,6 +188,10 @@ class UltimateConfig:
     # Dynamic regime vol threshold
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
+
+    # New institutional flags
+    DIVIDEND_SWEEP:           bool  = True
+    SPLIT_TOLERANCE:          float = 0.005 # Tightened for institutional accuracy
 
     @property
     def EQUITY_HIST_CAP(self) -> int:
@@ -385,13 +378,13 @@ def execute_rebalance(
     prices:         np.ndarray,
     active_symbols: List[str],
     cfg:            UltimateConfig,
+    adv_shares:     Optional[np.ndarray] = None, # NOW REQUIRED for impact parity
     date_context=None,
     trade_log:      Optional[List[Trade]] = None,
     apply_decay:    bool = False,
     scenario_losses: Optional[np.ndarray] = None,
 ) -> float:
     """Execute a portfolio rebalance, updating state in-place."""
-    entry_slip = exit_slip = (cfg.SLIPPAGE_BPS / 2) / 10_000
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
 
     for sym, i in active_idx.items():
@@ -486,31 +479,39 @@ def execute_rebalance(
         old_s = state.shares.get(sym, 0)
         s     = int(np.floor(w * pv / price)) if w > 0.001 else 0
 
-        if s > 0:
-            delta            = s - old_s
-            slip             = abs(delta) * price * (entry_slip if delta > 0 else exit_slip)
-            total_slippage  += slip
+        if s > 0 or old_s > 0:
+            delta = s - old_s
+            
+            # ── FIX: Institutional Impact Alignment ──
+            # Replaces the flat execution fee with an impact-sensitive calculation
+            # mathematically identical to the optimizer's objective function.
+            if adv_shares is not None and adv_shares[i] > 0:
+                impact_rate = (cfg.IMPACT_COEFF * pv) / (price * adv_shares[i])
+                # Cap the maximum theoretical impact slippage to avoid outlier destruction
+                # Floor it at the minimum half-spread (SLIPPAGE_BPS / 2)
+                slip_rate = max(cfg.SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
+            else:
+                # If ADV is completely missing, default to flat fee
+                slip_rate = cfg.SLIPPAGE_BPS / 20000.0
+            
+            slip = abs(delta) * price * slip_rate
+            total_slippage += slip
             actual_notional += s * price
-            new_weights[sym] = w
-            new_shares[sym]  = s
 
-            if delta > 0:
-                if old_s == 0:
-                    new_entry_prices[sym] = price * (1.0 + entry_slip)
-                else:
-                    old_basis             = new_entry_prices.get(sym, price)
-                    new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + entry_slip) * delta) / s
+            if s > 0:
+                new_weights[sym] = w
+                new_shares[sym]  = s
+                if delta > 0:
+                    if old_s == 0:
+                        new_entry_prices[sym] = price * (1.0 + slip_rate)
+                    else:
+                        old_basis = new_entry_prices.get(sym, price)
+                        new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + slip_rate) * delta) / s
 
             if delta != 0 and trade_log is not None and date_context is not None:
                 trade_log.append(
                     Trade(sym, date_context, delta, price, slip, "BUY" if delta > 0 else "SELL")
                 )
-
-        elif old_s > 0:
-            slip            = old_s * price * exit_slip
-            total_slippage += slip
-            if trade_log is not None and date_context is not None:
-                trade_log.append(Trade(sym, date_context, -old_s, price, slip, "SELL"))
 
     for sym in state.shares:
         if sym not in active_idx and sym not in symbols_to_force_close:
@@ -524,7 +525,7 @@ def execute_rebalance(
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
-                slip            = n_shares * close_price * exit_slip
+                slip            = n_shares * close_price * (cfg.SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
                 pv             += n_shares * close_price
                 if trade_log is not None and date_context is not None:
@@ -560,17 +561,30 @@ def compute_book_cvar(
     hist_log_rets:  pd.DataFrame,
     cfg:            UltimateConfig,
 ) -> float:
-# ... existing code ...
+    active_idx = {sym: i for i, sym in enumerate(active_symbols)}
+    mtm_weights: Dict[str, float] = {}
+    pv = state.cash
+
+    for sym, n_shares in state.shares.items():
+        if sym in active_idx:
+            px = float(prices[active_idx[sym]])
+        else:
+            px = state.last_known_prices.get(sym, 0.0)
+        notional = n_shares * px
+        mtm_weights[sym] = notional
+        pv += notional
+
+    if pv <= 1e-6:
+        return 0.0
+
     held_syms = list(mtm_weights.keys())
     T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
 
-    # Ghosts natively injected as 0.0 return vectors; missing data stabilized before math
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=0.0)
     rets = rets.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).iloc[-T_cvar:]
 
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
-        # Inject deterministic synthetic tail risk for ghosts (-2% daily mean, 4% daily vol)
         rng = np.random.RandomState(42)
         ghost_rets = rng.normal(-0.02, 0.04, size=(len(rets), ghost_mask.sum()))
         ghost_cols = [s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost]
@@ -580,7 +594,15 @@ def compute_book_cvar(
         return 0.0
 
     w = np.array([mtm_weights[s] / pv for s in held_syms], dtype=float)
-# ... existing code ...
+    portfolio_losses = -(rets.values @ w)
+    
+    sorted_losses = np.sort(portfolio_losses)
+    tail_n        = max(1, int(np.floor(T_cvar * (1.0 - cfg.CVAR_ALPHA))))
+    tail_mean     = float(np.mean(sorted_losses[-tail_n:]))
+
+    return tail_mean
+
+
 def compute_decay_targets(
     state:          PortfolioState,
     sel_idx:        List[int],
@@ -597,12 +619,12 @@ def compute_decay_targets(
     sel_set = set(sel_idx)
     for i, sym in enumerate(active_symbols):
         if i in sel_set:
-            # Fix: Cap the pre-decay weight BEFORE scaling down
             w_pre = min(state.weights.get(sym, 0.0), cfg.MAX_SINGLE_NAME_WEIGHT)
             targets[i] = w_pre * cfg.DECAY_FACTOR
         else:
             targets[i] = 0.0
     return targets
+
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 

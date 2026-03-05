@@ -1,94 +1,41 @@
 """
-universe_manager.py — Universe Fetching & Caching
-==================================================
-Official NSE CSV source with chunked ADV filter, persistent JSON cache,
-and static sector map for the most liquid NSE constituents.
+universe_manager.py — Universe Fetching & Caching v11.45
+========================================================
+Robust fetching of NSE/Nifty 500 universes, sector mappings, and
+point-in-time historical constituents to eliminate backtest survivorship bias.
+Now strictly enforces operator awareness if historical data is missing.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import time
-import io
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
 CACHE_DIR            = "data/cache"
 UNIVERSE_CACHE_FILE  = os.path.join(CACHE_DIR, "_universe_cache.json")
-# FIX (Gemini): Increased from 24h to 72h. The NSE equity list and Nifty 500
-# constituents change infrequently (typically on monthly rebalances). Serving a
-# slightly stale local cache for up to 3 days is far safer than hitting
-# archives.nseindia.com on every daily run and risking a 403 hard-fallback to
-# the 50-stock survival floor.
 UNIVERSE_CACHE_TTL_H = 72
-
-# ADV filter processes tickers in parallel workers, each handling a chunk of
-# _ADV_CHUNK_SIZE to stay within yfinance rate limits.
-# FIX: _ADV_MAX_WORKERS reduced from 4 to 1 (sequential).
-# 4 parallel workers each issuing yf.download(200 tickers) simultaneously
-# reliably trips Yahoo Finance's rate limiter (observed: 0-30% success rates).
-# Additionally, all 4 workers shared the same manifest read-snapshot and then
-# raced to write it back — a classic lost-update: each worker's commit silently
-# overwrote the others', so parquets landed on disk but were never recorded in
-# the manifest, causing every subsequent run to re-download the full universe.
-# Sequential processing eliminates both failure modes at the cost of a modest
-# increase in wall time (~2 min for the full NSE universe on a typical connection).
-#
-# FIX (Minor #10): _ADV_CHUNK_SIZE aligned to data_cache._DOWNLOAD_CHUNK_SIZE (75).
-# The previous value of 200 caused each _process_adv_chunk call to internally
-# re-chunk into 3 × 75-ticker sub-batches inside load_or_fetch, adding an
-# unnecessary layer of indirection with no benefit.  Using 75 directly gives
-# a flat single-batch call per ADV chunk with the same per-chunk timeout guarantee.
-_ADV_CHUNK_SIZE    = 75
-_ADV_MAX_WORKERS   = 1
-
-
-# ─── Exceptions ───────────────────────────────────────────────────────────────
+_ADV_CHUNK_SIZE      = 75
+_ADV_MAX_WORKERS     = 1
 
 class UniverseFetchError(RuntimeError):
-    """
-    Raised when the live universe fetch fails AND there is no usable cache.
-
-    FIX C3: Replaces the previous silent fallback to _HARD_FLOOR_UNIVERSE.
-
-    Silently switching from a 500-stock to a 48-stock universe is a hidden
-    regime shift that materially alters strategy behaviour (turnover, sector
-    exposure, liquidity profile) with no signal to the operator. Raising here
-    forces the caller (CLI menu, scheduler, or test harness) to make an
-    explicit, logged decision about whether to proceed with a degraded universe.
-
-    The hard-floor list remains accessible via `UniverseFetchError.fallback_universe`
-    so callers that genuinely want survival-mode behaviour can opt in consciously:
-
-        try:
-            tickers = fetch_nse_equity_universe()
-        except UniverseFetchError as e:
-            if operator_confirms_survival_mode():
-                tickers = e.fallback_universe
-            else:
-                raise
-    """
+    """Raised when primary and secondary universe data sources fail."""
     def __init__(self, message: str):
         super().__init__(message)
-        # FIX (Quality #7): Removed stray comment fragment copied from the
-        # _ADV_MAX_WORKERS block that had nothing to do with this field.
         self.fallback_universe: List[str] = []
 
-
-# ─── Survival Mode Circuit Breaker ───────────────────────────────────────────
-
-# FIX #9: Hardcoded Nifty 50 floor for survival mode. This list was verified
-# against the NSE index composition on 2025-07-01. Index constituents change
-# periodically — re-verify this list if you update the codebase after a
-# significant index rebalance. Constituents here are the 49 most liquid names
-# from the official Nifty 50 at that date (LTIM replaces SHREECEM post-rebalance).
+# Hardcoded fallback list if all network and cache layers fail.
 _HARD_FLOOR_UNIVERSE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL", "HINDUNILVR",
     "ITC", "SBIN", "LTIM", "BAJFINANCE", "HCLTECH", "MARUTI", "SUNPHARMA",
@@ -100,63 +47,64 @@ _HARD_FLOOR_UNIVERSE = [
     "DIVISLAB", "TATACONSUM",
 ]
 
-# fmt: off
-STATIC_NSE_SECTORS: Dict[str, str] = {
-    # Energy
-    "RELIANCE":   "Energy",    "ONGC":       "Energy",     "COALINDIA":  "Energy",
-    "BPCL":       "Energy",    "IOC":         "Energy",
-    # Financials
-    "HDFCBANK":   "Financials","ICICIBANK":  "Financials", "KOTAKBANK":  "Financials",
-    "SBIN":       "Financials","AXISBANK":   "Financials", "BAJFINANCE": "Financials",
-    "BAJAJFINSV": "Financials","INDUSINDBK": "Financials",
-    # IT
-    "TCS":        "IT",        "INFY":       "IT",         "HCLTECH":    "IT",
-    "WIPRO":      "IT",        "TECHM":      "IT",         "LTIM":       "IT",
-    # Consumer
-    "HINDUNILVR": "Consumer",  "ITC":        "Consumer",   "NESTLEIND":  "Consumer",
-    "TITAN":      "Consumer",  "ASIANPAINT": "Consumer",   "TATACONSUM": "Consumer",
-    # Telecom
-    "BHARTIARTL": "Telecom",
-    # Auto
-    "MARUTI":     "Auto",      "TATAMOTORS": "Auto",       "M&M":        "Auto",
-    "BAJAJ-AUTO": "Auto",      "EICHERMOT":  "Auto",       "HEROMOTOCO": "Auto",
-}
-# fmt: on
+# ─── Historical Universe Logic (Survivorship Bias Fix) ────────────────────────
 
-
-# ─── Helper: Requests-Buffered CSV Fetch ─────────────────────────────────────
-
-def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
-    """Fetches a CSV from a URL with browser-like headers and explicit HTTP error telemetry."""
-    try:
-        import requests
-    except ImportError:
-        logger.error("[Universe] Missing 'requests' library. Please install it to fetch live data.")
-        raise
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept":     "text/csv",
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return pd.read_csv(io.StringIO(resp.text))
-    except requests.exceptions.HTTPError as he:
-        # FIX (Quality #7): he.response can be None when the exception is raised
-        # programmatically (e.g. by middleware or test stubs); guard before access.
-        status = getattr(he.response, "status_code", None) if hasattr(he, "response") else None
-        if status == 403:
-            logger.error("[Universe] Access Denied (403). NSE website is blocking requests.")
-        elif status is not None:
-            logger.error("[Universe] HTTP Error %d while reaching NSE.", status)
-        else:
-            logger.error("[Universe] HTTP Error (no response object): %s", he)
-        raise
-    except Exception as exc:
-        logger.error("[Universe] Failed to fetch CSV from %s: %s", url, exc)
-        raise
-
+def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
+    """
+    Attempts to load the exact constituents for a specific historical date.
+    
+    If no historical record exists for the requested universe/date, falls back 
+    to the current active universe and issues a survivorship bias warning.
+    """
+    hist_file = f"data/historical_{universe_type}.parquet"
+    
+    # FIX: Explicit operator warning to prevent silent fallback to survivorship bias
+    if not os.path.exists(hist_file):
+        logger.error("HISTORICAL PARQUET MISSING: %s", hist_file)
+        logger.error("Run the one-time historical builder script or backtests will have survivorship bias!")
+    else:
+        try:
+            df = pd.read_parquet(hist_file)
+            
+            # Find the closest available manifest date preceding the requested date
+            available_dates = df.index.unique()
+            valid_dates = available_dates[available_dates <= date]
+            
+            if len(valid_dates) > 0:
+                target_date = valid_dates.max()
+                constituents = df.loc[target_date, "tickers"]
+                
+                # Handle case where the parquet stores a single list vs a series of lists
+                if isinstance(constituents, pd.Series):
+                    return constituents.iloc[0].tolist()
+                elif isinstance(constituents, np.ndarray):
+                    return constituents.tolist()
+                else:
+                    return list(constituents)
+            else:
+                logger.warning(
+                    "[Universe] No historical data prior to %s found in %s.", 
+                    date.strftime("%Y-%m-%d"), hist_file
+                )
+        except Exception as exc:
+            logger.error(
+                "[Universe] Historical load failed for %s on %s: %s", 
+                universe_type, date.strftime("%Y-%m-%d"), exc
+            )
+    
+    logger.warning(
+        "[Universe] %s: No historical record found for %s. Using CURRENT universe. "
+        "WARNING: Backtest results will contain survivorship bias.", 
+        universe_type, date.strftime("%Y-%m-%d")
+    )
+    
+    # Fallback to current universe mappings
+    if universe_type == "nifty500":
+        return get_nifty500()
+    elif universe_type == "nse_total":
+        return fetch_nse_equity_universe()
+    else:
+        return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────
 
@@ -164,279 +112,190 @@ def _load_universe_cache() -> dict:
     if not os.path.exists(UNIVERSE_CACHE_FILE):
         return {}
     try:
-        with open(UNIVERSE_CACHE_FILE) as f:
-            return json.load(f)
-    except Exception:
+        with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as exc:
+        logger.warning("[Universe] Cache load failed, starting fresh: %s", exc)
         return {}
-
 
 def _save_universe_cache(data: dict) -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = UNIVERSE_CACHE_FILE + ".tmp"
+    temp_file = UNIVERSE_CACHE_FILE + ".tmp"
     try:
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, UNIVERSE_CACHE_FILE)
+        with open(temp_file, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2)
+        os.replace(temp_file, UNIVERSE_CACHE_FILE)
     except Exception as exc:
-        logger.warning("[Universe] Cache write failed: %s", exc)
-
+        logger.error("[Universe] Failed to save cache: %s", exc)
 
 def invalidate_universe_cache() -> None:
+    """Force clears the local universe JSON cache."""
     if os.path.exists(UNIVERSE_CACHE_FILE):
-        os.remove(UNIVERSE_CACHE_FILE)
+        try:
+            os.remove(UNIVERSE_CACHE_FILE)
+            logger.info("[Universe] Cache invalidated.")
+        except OSError as e:
+            logger.error("[Universe] Failed to invalidate cache: %s", e)
 
+# ─── Network Fetchers ─────────────────────────────────────────────────────────
 
-# ─── Core Interface ───────────────────────────────────────────────────────────
+def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
+    """Helper to fetch NSE CSVs masking as a standard browser."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/csv,application/csv",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None) -> List[str]:
-    """Fetches the total NSE equity universe with survival-mode circuit breaker."""
+    """Fetches the entire NSE actively traded equity list, minus illiquid names."""
     cache = _load_universe_cache()
     entry = cache.get("total_equity", {})
-
+    
     if entry:
-        fetched_at = datetime.fromisoformat(entry["fetched_at"])
-        if datetime.now() - fetched_at < timedelta(hours=UNIVERSE_CACHE_TTL_H):
+        fetched_time = datetime.fromisoformat(entry["fetched_at"])
+        if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
             return entry["tickers"]
-
-    url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+            
     try:
-        df = _fetch_csv_with_headers(url)
-        # Standardize column names to handle potential NSE schema shifts.
-        df.columns = [c.strip().upper() for c in df.columns]
-        tickers = df[df["SERIES"] == "EQ"]["SYMBOL"].unique().tolist()
-
-        if not tickers:
-            raise ValueError("NSE CSV returned zero 'EQ' series symbols.")
-
-        tickers = _apply_adv_filter(tickers, cfg)
-
+        logger.info("[Universe] Fetching fresh NSE total equity master...")
+        df = _fetch_csv_with_headers("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
+        df.columns = [col.strip().upper() for col in df.columns]
+        
+        # Filter for active Equity series only (exclude ETFs, bonds, etc)
+        equity_df = df[df["SERIES"] == "EQ"]
+        tickers = equity_df["SYMBOL"].unique().tolist()
+        
+        # Apply strict ADV liquidity filter
+        from signals import _apply_adv_filter
+        logger.info("[Universe] Applying liquidity filters to %d symbols...", len(tickers))
+        liquid_tickers = _apply_adv_filter(tickers, cfg)
+        
         cache["total_equity"] = {
             "fetched_at": datetime.now().isoformat(),
-            "tickers":    tickers,
+            "tickers": liquid_tickers
         }
         _save_universe_cache(cache)
-        return tickers
-
-    except Exception:
+        return liquid_tickers
+        
+    except Exception as exc:
+        logger.error("[Universe] NSE master fetch failed: %s", exc)
         if entry:
-            logger.warning("[Universe] Live fetch failed. Using stale cache for Total Equity.")
+            logger.warning("[Universe] Using stale cache for NSE Total Equity.")
             return entry["tickers"]
-        logger.error("[Universe] CRITICAL: Live fetch and cache failed. Raising UniverseFetchError.")
-        err = UniverseFetchError(
-            "[Universe] NSE equity fetch failed and no usable cache exists. "
-            "Silently switching to the 48-stock floor is a hidden regime shift. "
-            "Inspect UniverseFetchError.fallback_universe and decide explicitly."
-        )
-        err.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise err
-
+            
+        error = UniverseFetchError("Failed to fetch NSE Total Equity from origin.")
+        error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
+        raise error
 
 def get_nifty500() -> List[str]:
-    """Fetches the Nifty 500 universe with survival-mode fallback."""
+    """Fetches the current Nifty 500 index constituents."""
     cache = _load_universe_cache()
     entry = cache.get("nifty500", {})
-
+    
     if entry:
-        fetched_at = datetime.fromisoformat(entry["fetched_at"])
-        if datetime.now() - fetched_at < timedelta(hours=UNIVERSE_CACHE_TTL_H):
+        fetched_time = datetime.fromisoformat(entry["fetched_at"])
+        if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
             return entry["tickers"]
-
-    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+            
     try:
-        df = _fetch_csv_with_headers(url)
-        df.columns = [c.strip().upper() for c in df.columns]
+        logger.info("[Universe] Fetching fresh Nifty 500 constituents...")
+        df = _fetch_csv_with_headers("https://archives.nseindia.com/content/indices/ind_nifty500list.csv")
+        df.columns = [col.strip().upper() for col in df.columns]
+        
         tickers = df["SYMBOL"].unique().tolist()
-
-        if not tickers:
-            raise ValueError("Nifty 500 CSV returned zero symbols.")
-
+        
         cache["nifty500"] = {
             "fetched_at": datetime.now().isoformat(),
-            "tickers":    tickers,
+            "tickers": tickers
         }
         _save_universe_cache(cache)
         return tickers
-
-    except Exception:
+        
+    except Exception as exc:
+        logger.error("[Universe] Nifty 500 fetch failed: %s", exc)
         if entry:
-            logger.warning("[Universe] Live fetch failed. Using stale cache for Nifty 500.")
+            logger.warning("[Universe] Using stale cache for Nifty 500.")
             return entry["tickers"]
-        logger.error("[Universe] CRITICAL: Nifty 500 fetch failed and no usable cache exists. Raising UniverseFetchError.")
-        err = UniverseFetchError(
-            "[Universe] Nifty 500 fetch failed and no usable cache exists. "
-            "Silently switching to the 48-stock floor is a hidden regime shift. "
-            "Inspect UniverseFetchError.fallback_universe and decide explicitly."
-        )
-        err.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise err
-
-
-# ─── Liquidity Filtering ──────────────────────────────────────────────────────
-
-def _process_adv_chunk(chunk: List[str], start_dt: str, end_dt: str, cfg) -> List[str]:
-    """
-    Worker: fetch ADV data for one chunk and return tickers that pass the filter.
-    Called in parallel by _apply_adv_filter.
-    """
-    from data_cache import load_or_fetch
-
-    for attempt in range(3):
-        try:
-            data    = load_or_fetch(chunk, start_dt, end_dt, cfg=cfg)
-            passing = []
-            for sym in chunk:
-                ns_sym = sym + ".NS"
-                if ns_sym in data:
-                    df      = data[ns_sym]
-                    adv_val = (df["Close"] * df["Volume"]).rolling(20, min_periods=1).mean().iloc[-1]
-                    if adv_val >= (cfg.MIN_ADV_CRORES * 1e7):
-                        passing.append(sym)
-            return passing
-        except Exception as exc:
-            logger.debug(
-                "[Universe] ADV chunk attempt %d failed: %s", attempt + 1, exc
-            )
-            time.sleep((2 ** attempt) + 0.5)
-
-    # FIX #5: All retries exhausted. Include entire chunk unfiltered as a
-    # failsafe to prevent silent universe truncation on transient network
-    # failures. Illiquid names admitted here will still be blocked by the
-    # liquidity gate in generate_signals() (ADV == 0 → adj_score = -inf),
-    # EXCEPT in decay mode where generate_signals is bypassed. Log at ERROR
-    # level so this failure is always visible in production logs.
-    logger.error(
-        "[Universe] ADV chunk failed all retries (%d tickers). "
-        "Including unfiltered as failsafe — ADV gate skipped for this chunk. "
-        "NOTE: decay mode bypasses signal-level liquidity gate; monitor positions.",
-        len(chunk),
-    )
-    return chunk
-
-
-def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
-    """
-    Filters a broad universe down to institutionally liquid names.
-
-    FIX #4: Chunks are processed in parallel using ThreadPoolExecutor
-    (_ADV_MAX_WORKERS workers) to avoid blocking the main thread for
-    several minutes on a full NSE universe of ~2,000 tickers.
-    """
-    from momentum_engine import UltimateConfig
-
-    if cfg is None:
-        cfg = UltimateConfig()
-
-    end_dt   = datetime.today().strftime("%Y-%m-%d")
-    start_dt = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
-
-    chunks = [
-        tickers[i : i + _ADV_CHUNK_SIZE]
-        for i in range(0, len(tickers), _ADV_CHUNK_SIZE)
-    ]
-
-    filtered: List[str] = []
-    with ThreadPoolExecutor(max_workers=_ADV_MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_process_adv_chunk, chunk, start_dt, end_dt, cfg): chunk
-            for chunk in chunks
-        }
-        for future in as_completed(futures):
-            try:
-                filtered.extend(future.result())
-            except Exception as exc:
-                chunk = futures[future]
-                logger.error(
-                    "[Universe] Unexpected error processing ADV chunk (%d tickers): %s. "
-                    "Including unfiltered.", len(chunk), exc
-                )
-                filtered.extend(chunk)
-            # FIX: Brief pause between chunks to avoid triggering Yahoo Finance's
-            # per-session rate limiter. With _ADV_MAX_WORKERS=1 this is the only
-            # active sleep between sequential yf.download() calls.
-            time.sleep(2)
-
-    return filtered
-
-
-# ─── Sector Resolution ───────────────────────────────────────────────────────
+            
+        error = UniverseFetchError("Failed to fetch Nifty 500 from origin.")
+        error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
+        raise error
 
 def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict[str, str]:
     """
-    Resolves sector labels for a list of tickers.
-
-    Resolution order: (1) static map, (2) persistent cache, (3) live yfinance
-    fetch with parallel threads and serial failover. Results from step 3 are
-    committed back to the cache atomically.
+    Retrieves sector classifications for a list of tickers.
+    Uses static fallback mapping, then local cache, then threads out to yfinance.
     """
-    from data_cache import CACHE_DIR  # noqa: F401 — imported for side-effect of availability check
-
-    # 1. Static known mapping.
-    resolved = {
-        t.replace(".NS", ""): STATIC_NSE_SECTORS[t.replace(".NS", "")]
-        for t in tickers
-        if t.replace(".NS", "") in STATIC_NSE_SECTORS
-    }
-
-    missing = [t.replace(".NS", "") for t in tickers if t.replace(".NS", "") not in resolved]
-    if not missing:
-        return {t: resolved[t.replace(".NS", "")] for t in tickers}
-
-    # 2. Persistent cache lookup.
-    cached_sectors: Dict[str, str] = {}
-    if use_cache:
-        cache        = _load_universe_cache()
+    from daily_workflow import STATIC_NSE_SECTORS
+    
+    resolved_map = {}
+    missing_tickers = []
+    
+    # 1. Resolve via static hardcoded map
+    for ticker in tickers:
+        bare_ticker = ticker.replace(".NS", "")
+        if bare_ticker in STATIC_NSE_SECTORS:
+            resolved_map[bare_ticker] = STATIC_NSE_SECTORS[bare_ticker]
+        else:
+            missing_tickers.append(bare_ticker)
+            
+    # 2. Resolve via JSON cache
+    if missing_tickers and use_cache:
+        cache = _load_universe_cache()
         sector_cache = cache.get("sector_map", {}).get("sectors", {})
-        for sym in list(missing):
-            if sym in sector_cache:
-                resolved[sym] = sector_cache[sym]
-                missing.remove(sym)
-
-    # 3. Live yfinance fetch for anything still unresolved.
-    if missing:
+        
+        still_missing = []
+        for bare_ticker in missing_tickers:
+            if bare_ticker in sector_cache:
+                resolved_map[bare_ticker] = sector_cache[bare_ticker]
+            else:
+                still_missing.append(bare_ticker)
+        missing_tickers = still_missing
+        
+    # 3. Resolve via yfinance network fetch
+    if missing_tickers:
+        logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
         import yfinance as yf
-        timeout = getattr(cfg, "SECTOR_FETCH_TIMEOUT", 8.0)
-
-        def _fetch_one(s: str) -> tuple:
+        
+        def _fetch_single_sector(sym: str) -> Tuple[str, str]:
             try:
-                info = yf.Ticker(s + ".NS").info
-                return s, info.get("sector", "Unknown")
-            except Exception:
-                return s, "Unknown"
-
-        print(f"  \033[90mResolving metadata for {len(missing)} tickers...\033[0m")
-
+                ns_sym = sym + ".NS"
+                ticker_obj = yf.Ticker(ns_sym)
+                info = ticker_obj.info
+                # Some assets are ETFs or missing standard equity fields
+                sector = info.get("sector", "Unknown")
+                return sym, sector
+            except Exception as e:
+                logger.debug("Failed to fetch sector for %s: %s", sym, e)
+                return sym, "Unknown"
+                
+        # Threaded fetch to overcome network latency
         with ThreadPoolExecutor(max_workers=8) as pool:
-            future_to_sym = {pool.submit(_fetch_one, sym): sym for sym in missing}
-            try:
-                for future in as_completed(future_to_sym, timeout=timeout + 2.0):
-                    sym    = future_to_sym[future]
-                    sector = "Unknown"
-                    try:
-                        _, sector = future.result(timeout=timeout)
-                    except Exception:
-                        # Per-future serial failover for hanging requests.
-                        logger.debug(
-                            "[Universe] Sector hang for %s; triggering serial failover.", sym
-                        )
-                        _, sector = _fetch_one(sym)
-                    resolved[sym]       = sector
-                    cached_sectors[sym] = sector
-            except TimeoutError:
-                # Tickers not yet processed default to 'Unknown'; logged for visibility.
-                logger.warning(
-                    "[Universe] Global timeout reached during sector resolution. "
-                    "Remaining tickers will default to 'Unknown'."
-                )
-
-        # Atomic staged commit of newly resolved sectors to cache.
-        if use_cache and cached_sectors:
-            cache       = _load_universe_cache()
-            current_map = cache.get("sector_map", {}).get("sectors", {})
-            current_map.update(cached_sectors)
+            future_to_sym = {pool.submit(_fetch_single_sector, sym): sym for sym in missing_tickers}
+            for future in as_completed(future_to_sym):
+                sym, sector = future.result()
+                resolved_map[sym] = sector
+                
+        # Update cache with newly found sectors
+        if use_cache:
+            cache = _load_universe_cache()
+            existing_sector_cache = cache.get("sector_map", {}).get("sectors", {})
+            existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
+            
             cache["sector_map"] = {
                 "fetched_at": datetime.now().isoformat(),
-                "sectors":    current_map,
+                "sectors": existing_sector_cache
             }
             _save_universe_cache(cache)
-
-    return {t: resolved.get(t.replace(".NS", ""), "Unknown") for t in tickers}
+            
+    # Format the return dictionary to match exactly the requested input tickers
+    final_map = {}
+    for ticker in tickers:
+        bare_ticker = ticker.replace(".NS", "")
+        final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
+        
+    return final_map
