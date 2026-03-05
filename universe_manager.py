@@ -1,9 +1,10 @@
 """
-universe_manager.py — Universe Fetching & Caching v11.45
+universe_manager.py — Universe Fetching & Caching v11.48
 ========================================================
 Robust fetching of NSE/Nifty 500 universes, sector mappings, and
 point-in-time historical constituents to eliminate backtest survivorship bias.
-Now strictly enforces operator awareness if historical data is missing.
+Now strictly enforces operator awareness if historical data is missing
+and robustly handles PyArrow/FastParquet list deserialization quirks.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -127,10 +128,12 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                 target_date = valid_dates.max()
                 constituents = df.loc[target_date, "tickers"]
                 
-                # Handle case where the parquet stores a single list vs a series of lists
+                # FIX: Robustly handle Parquet PyArrow/FastParquet list deserialization
                 if isinstance(constituents, pd.Series):
-                    return constituents.iloc[0].tolist()
-                elif isinstance(constituents, np.ndarray):
+                    val = constituents.iloc[0]
+                    # If it's a numpy array, .tolist() works. If it's a native list, list() wraps it safely.
+                    return val.tolist() if hasattr(val, "tolist") else list(val)
+                elif hasattr(constituents, "tolist"):
                     return constituents.tolist()
                 else:
                     return list(constituents)
