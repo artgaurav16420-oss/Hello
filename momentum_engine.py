@@ -243,6 +243,9 @@ class PortfolioState:
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
 
+        # DESIGN CHOICE: cooled_down_this_step prevents same-period clear-and-refire.
+        # This intentionally provides the portfolio one "free" period at reduced exposure
+        # to assess recovery before the next breach cycle rigidly locks it again.
         cooled_down_this_step = False
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
