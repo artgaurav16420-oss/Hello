@@ -31,9 +31,10 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # Configure local logger
 logger = logging.getLogger("Optimizer")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter("\033[90m[%(asctime)s]\033[0m %(message)s", "%H:%M:%S"))
-logger.addHandler(handler)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("\033[90m[%(asctime)s]\033[0m %(message)s", "%H:%M:%S"))
+    logger.addHandler(handler)
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
@@ -134,7 +135,9 @@ def pre_load_data(universe_type: str) -> dict:
 
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
     """Exports the winning configuration so daily_workflow.py can use it."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    output_dir = os.path.dirname(filepath)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     with open(filepath, "w") as f:
         json.dump(best_params, f, indent=4)
     logger.info(f"Saved optimal parameters to {filepath}")
@@ -166,6 +169,12 @@ def run_optimization():
         show_progress_bar=True,
         catch=(Exception,)
     )
+
+    if not study.best_trials:
+        raise RuntimeError(
+            "Optimization finished with no completed trials. "
+            "Widen the search space or reduce hard constraints."
+        )
 
     best_params = study.best_params
     best_is_calmar = study.best_value
