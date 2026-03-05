@@ -103,6 +103,33 @@ def invalidate_cache() -> None:
             logger.error("[Cache] Failed to invalidate cache: %s", e)
 
 
+def _is_valid_dataframe(df: pd.DataFrame) -> bool:
+    """
+    Strict structural validation gate applied before any data is written to disk.
+
+    Blocks ingestion of corrupted yfinance payloads that would otherwise propagate
+    silently into the cache and corrupt downstream CVaR and signal calculations.
+
+    Checks:
+    - Minimum row count (5) to exclude stub responses.
+    - Unique, monotonically increasing DatetimeIndex — yfinance occasionally
+      returns duplicate or out-of-order dates on partial trading sessions.
+    - 'Close' column present and not entirely NaN — the only column the entire
+      engine is guaranteed to use; a fully-null Close is unusable.
+    """
+    if df is None or df.empty or len(df) < 5:
+        return False
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return False
+    if not df.index.is_unique:
+        return False
+    if not df.index.is_monotonic_increasing:
+        return False
+    if "Close" not in df.columns or df["Close"].isnull().all():
+        return False
+    return True
+
+
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame, bool, int]:
     """
     Detects long gaps (e.g. from ASM/GSM regulatory suspensions) and injects 
@@ -242,7 +269,18 @@ def load_or_fetch(
                     df.dropna(how='all', inplace=True)
                     if df.empty:
                         continue
-                        
+
+                    # Structural validation before anything touches disk.
+                    # Catches non-unique/non-monotonic indexes and all-NaN Close
+                    # columns that dropna(how='all') cannot detect.
+                    if not _is_valid_dataframe(df):
+                        logger.warning(
+                            "[Cache] Structural validation failed for %s "
+                            "(non-monotonic index, duplicate dates, or null Close). Skipping.",
+                            ticker
+                        )
+                        continue
+
                     # Handle suspension gaps with deterministic noise
                     df, suspended, max_gap = _repair_suspension_gaps(df, ticker)
                     
