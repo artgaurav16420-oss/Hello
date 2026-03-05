@@ -73,6 +73,17 @@ _DEFAULT_SCREENER_URL = os.environ.get(
     "https://www.screener.in/screens/3506127/hello/",
 )
 
+def load_optimized_config() -> UltimateConfig:
+    cfg = UltimateConfig()
+    if os.path.exists("data/optimal_cfg.json"):
+        with open("data/optimal_cfg.json", "r") as f:
+            best_params = json.load(f)
+            for k, v in best_params.items():
+                setattr(cfg, k, v)
+    return cfg
+
+# Then pass this `cfg` into _run_scan()
+
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
     """Build a professional text meter to show long-running stage progress."""
     clipped = max(0.0, min(1.0, progress))
