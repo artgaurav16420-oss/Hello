@@ -28,7 +28,12 @@ from momentum_engine import (
     compute_decay_targets,
     Trade,
 )
-from signals import generate_signals, compute_regime_score, compute_single_adv
+from signals import (
+    generate_signals,
+    compute_regime_score,
+    compute_single_adv,
+    SignalGenerationError,
+)
 from universe_manager import get_historical_universe
 
 logger = logging.getLogger(__name__)
@@ -173,6 +178,7 @@ class BacktestEngine:
                 self.state.consecutive_failures += 1
                 apply_decay      = True
                 _force_full_cash = True
+                _activate_override_on_stress(self.state, cfg)
 
         # ── Signal generation + optimization ─────────────────────────────────
         if not _force_full_cash:
@@ -183,7 +189,7 @@ class BacktestEngine:
                     cfg,
                     prev_weights=prev_w_dict,
                 )
-            except ValueError as ve:
+            except SignalGenerationError as ve:
                 logger.debug(
                     "[Backtest] generate_signals raised ValueError on %s: %s — "
                     "treating as empty universe for this bar.",
@@ -230,13 +236,17 @@ class BacktestEngine:
                             )
                             apply_decay = True
             else:
-                self.state.decay_rounds         = 0
-                self.state.consecutive_failures = 0
+                if self.state.shares:
+                    apply_decay = True
+                else:
+                    self.state.decay_rounds         = 0
+                    self.state.consecutive_failures = 0
 
         # ── Gate-filtered decay target computation ────────────────────────────
         _exhaust_decay = False
         if apply_decay and not optimization_succeeded:
             if _force_full_cash or self.state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+                target_weights = np.zeros(len(symbols), dtype=float)
                 logger.warning(
                     "[Backtest] %s on %s — forcing full liquidation to cash.",
                     "Book CVaR breach" if _force_full_cash else
@@ -244,6 +254,7 @@ class BacktestEngine:
                     date,
                 )
                 _exhaust_decay = True
+                _activate_override_on_stress(self.state, cfg)
             else:
                 target_weights = compute_decay_targets(self.state, sel_idx, symbols, cfg)
                 sel_idx_set = set(sel_idx)
@@ -285,6 +296,14 @@ class BacktestEngine:
                 "n_positions":        len(self.state.shares),
                 "apply_decay":        apply_decay,
             })
+
+
+def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
+    """Activate exposure override after hard risk events (breach/exhaustion)."""
+    state.override_active = True
+    state.override_cooldown = max(state.override_cooldown, 4)
+    state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -342,35 +361,36 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
 
 def run_backtest(
     market_data:   dict,
-    universe_type: str,
-    start_date:    str,
-    end_date:      str,
+    universe_type: Optional[str] = None,
+    start_date:    str = "2020-01-01",
+    end_date:      str = "2020-12-31",
     cfg:           Optional[UltimateConfig] = None,
     sector_map:    Optional[dict]           = None,
+    universe:      Optional[List[str]]      = None,
 ) -> BacktestResults:
     if cfg is None:
         cfg = UltimateConfig()
 
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
-    
-    # ── FIX: Historical Constituents ──
-    # Rebuilds the universe tracking point-in-time list to avoid Survivorship Bias
-    union_universe = set()
-    for d in all_target_dates:
-        # get_historical_universe safely returns the known universe as of date `d`
-        historical_members = get_historical_universe(universe_type, d)
-        if historical_members:
-            union_universe.update(historical_members)
 
-    # If the historical universe file doesn't exist, union_universe might be empty here.
-    # The get_historical_universe logic defaults to warning the user and returning the current universe.
+    union_universe = set(universe or [])
     if not union_universe:
-        logger.warning("Historical integration failed to yield symbols. Using current universe.")
-        from universe_manager import get_nifty500, fetch_nse_equity_universe
-        if universe_type == "nifty500":
-            union_universe.update(get_nifty500())
-        else:
-            union_universe.update(fetch_nse_equity_universe())
+        selected_universe_type = universe_type or "nse_total"
+
+        # ── FIX: Historical Constituents ──
+        # Rebuilds the universe tracking point-in-time list to avoid Survivorship Bias
+        for d in all_target_dates:
+            historical_members = get_historical_universe(selected_universe_type, d)
+            if historical_members:
+                union_universe.update(historical_members)
+
+        if not union_universe:
+            logger.warning("Historical integration failed to yield symbols. Using current universe.")
+            from universe_manager import get_nifty500, fetch_nse_equity_universe
+            if selected_universe_type == "nifty500":
+                union_universe.update(get_nifty500())
+            else:
+                union_universe.update(fetch_nse_equity_universe())
 
     close_d, volume_d = {}, {}
     for sym in union_universe:
@@ -390,7 +410,7 @@ def run_backtest(
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
     trading_index = pd.DatetimeIndex(close.index).sort_values()
-    idx           = trading_index.get_indexer(all_target_dates, method="backfill")
+    idx           = trading_index.get_indexer(all_target_dates, method="pad")
     
     valid = []
     for target, resolved_pos in zip(all_target_dates, idx):

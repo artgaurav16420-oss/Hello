@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+class SignalGenerationError(ValueError):
+    """Raised when signal generation cannot proceed due to invalid input data."""
+
 
 def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['UltimateConfig'] = None) -> float:
     """
@@ -169,7 +172,7 @@ def generate_signals(
     to reduce portfolio turnover friction.
     """
     if log_rets.empty:
-        raise ValueError("Cannot generate signals: log_rets dataframe is empty.")
+        raise SignalGenerationError("no valid data: log_rets dataframe is empty")
         
     active_symbols = list(log_rets.columns)
     

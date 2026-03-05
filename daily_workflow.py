@@ -233,6 +233,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         ns = to_ns(sym)
         row = market_data.get(ns)
         if row is None or row.empty:
+            row = market_data.get(sym)
+        if row is None or row.empty:
             continue
             
         # FIX: Dividend Sweep Integration
@@ -488,6 +490,7 @@ def _run_scan(
     _exhaust_decay = False
     if apply_decay and not optimization_succeeded:
         if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+            target = np.zeros(len(symbols), dtype=float)
             logger.warning(
                 "[Scan] %s — forcing full liquidation to cash.",
                 "Book CVaR breach" if _force_full_cash else

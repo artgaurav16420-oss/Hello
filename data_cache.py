@@ -34,7 +34,7 @@ _DOWNLOAD_CHUNK_SIZE = 75
 _SUSPENSION_GAP_DAYS = 30
 
 
-def _yf_fetch_worker(tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+def _download_with_timeout(tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
     """
     Attempts to download a chunk of tickers via yfinance with exponential backoff.
     auto_adjust=True guarantees that all historical data handles corporate actions (splits).
@@ -217,7 +217,7 @@ def load_or_fetch(
         ]
         
         for chunk in chunks:
-            raw_data = _yf_fetch_worker(chunk, padded_start, required_end)
+            raw_data = _download_with_timeout(chunk, padded_start, required_end)
             if raw_data is None or raw_data.empty:
                 logger.warning("[Cache] Received empty response for chunk starting with %s", chunk[0])
                 continue

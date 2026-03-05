@@ -47,6 +47,59 @@ _HARD_FLOOR_UNIVERSE = [
     "DIVISLAB", "TATACONSUM",
 ]
 
+# Static sector map for tier-1 liquid NSE names used as a deterministic
+# fallback when network lookups are unavailable.
+STATIC_NSE_SECTORS: Dict[str, str] = {
+    "RELIANCE": "Energy",
+    "TCS": "Information Technology",
+    "HDFCBANK": "Financial Services",
+    "ICICIBANK": "Financial Services",
+    "INFY": "Information Technology",
+    "BHARTIARTL": "Telecommunications",
+    "HINDUNILVR": "FMCG",
+    "ITC": "FMCG",
+    "SBIN": "Financial Services",
+    "LTIM": "Information Technology",
+    "BAJFINANCE": "Financial Services",
+    "HCLTECH": "Information Technology",
+    "MARUTI": "Automobile and Auto Components",
+    "SUNPHARMA": "Healthcare",
+    "ADANIENT": "Industrials",
+    "KOTAKBANK": "Financial Services",
+    "TITAN": "Consumer Durables",
+    "ONGC": "Energy",
+    "TATAMOTORS": "Automobile and Auto Components",
+    "NTPC": "Power",
+    "AXISBANK": "Financial Services",
+    "ADANIPORTS": "Services",
+    "ASIANPAINT": "Consumer Durables",
+    "COALINDIA": "Energy",
+    "BAJAJFINSV": "Financial Services",
+    "JSWSTEEL": "Metals & Mining",
+    "M&M": "Automobile and Auto Components",
+    "POWERGRID": "Power",
+    "TATASTEEL": "Metals & Mining",
+    "ULTRACEMCO": "Construction Materials",
+    "GRASIM": "Construction Materials",
+    "HINDALCO": "Metals & Mining",
+    "NESTLEIND": "FMCG",
+    "INDUSINDBK": "Financial Services",
+    "TECHM": "Information Technology",
+    "WIPRO": "Information Technology",
+    "CIPLA": "Healthcare",
+    "HDFCLIFE": "Financial Services",
+    "SBILIFE": "Financial Services",
+    "DRREDDY": "Healthcare",
+    "HEROMOTOCO": "Automobile and Auto Components",
+    "EICHERMOT": "Automobile and Auto Components",
+    "BPCL": "Energy",
+    "BAJAJ-AUTO": "Automobile and Auto Components",
+    "BRITANNIA": "FMCG",
+    "APOLLOHOSP": "Healthcare",
+    "DIVISLAB": "Healthcare",
+    "TATACONSUM": "FMCG",
+}
+
 # ─── Historical Universe Logic (Survivorship Bias Fix) ────────────────────────
 
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
@@ -230,8 +283,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     Retrieves sector classifications for a list of tickers.
     Uses static fallback mapping, then local cache, then threads out to yfinance.
     """
-    from daily_workflow import STATIC_NSE_SECTORS
-    
     resolved_map = {}
     missing_tickers = []
     
