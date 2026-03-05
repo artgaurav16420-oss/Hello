@@ -29,10 +29,10 @@ from momentum_engine import (
     PortfolioState,
     execute_rebalance,
     compute_book_cvar,
+    compute_decay_targets,
     to_ns,
     to_bare,
     Trade,
-    EPSILON,
 )
 from universe_manager import (
     fetch_nse_equity_universe,
@@ -45,7 +45,6 @@ from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-# FIX #8: Align version with UltimateConfig docstring (was "11.42").
 __version__ = "11.43"
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
@@ -69,10 +68,6 @@ class C:
 
 logger = logging.getLogger(__name__)
 
-# FIX (Quality #9): The Screener.in screen ID is now read from an environment
-# variable (SCREENER_URL) so it can be changed without modifying source code.
-# A sensible default is provided as a fallback, but operators should set the
-# variable in their environment or .env file to pin their own screen.
 _DEFAULT_SCREENER_URL = os.environ.get(
     "SCREENER_URL",
     "https://www.screener.in/screens/3506127/hello/",
@@ -97,7 +92,6 @@ def _print_stage_status(label: str, progress: float, detail: str) -> None:
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
 def _scrape_screener(base_url: str) -> List[str]:
-    """Handles pagination to scrape all tickers from a public Screener.in URL."""
     try:
         import requests
         from bs4 import BeautifulSoup
@@ -150,17 +144,11 @@ def _scrape_screener(base_url: str) -> List[str]:
                 symbols.add(sym)
                 page_symbols += 1
 
-        # Stop when there are no symbols at all on the page.
-        if page_symbols == 0:
-            break
-
-        # Some screens ignore `?page=` and keep returning page 1 forever.
-        # If a page adds no new symbols, pagination is effectively done.
-        if len(symbols) == before_count:
+        if page_symbols == 0 or len(symbols) == before_count:
             break
 
         page += 1
-        time.sleep(1)  # RATE LIMITING: Prevent IP bans from Screener.in
+        time.sleep(1)
 
     if page > max_pages:
         logger.warning("[Screener] Reached pagination safety limit (%d pages).", max_pages)
@@ -169,7 +157,6 @@ def _scrape_screener(base_url: str) -> List[str]:
 
 
 def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
-    """Remove symbols that cannot map cleanly to NSE Yahoo tickers."""
     filtered: List[str] = []
     invalid_count = 0
 
@@ -177,7 +164,6 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
         sym = raw.strip().upper()
         if not sym:
             continue
-        # Ignore BSE-only numeric codes like 543542 that become 543542.NS and fail.
         if sym.isdigit():
             invalid_count += 1
             continue
@@ -193,11 +179,6 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
 
 
 def _get_custom_universe() -> List[str]:
-    """Automatically gets universe from Screener.in URL or local fallback."""
-    # FIX (Bug #2): Removed the duplicate print/logger block. The header
-    # and URL are now printed exactly once.
-    # FIX (Quality #9): URL is read from _DEFAULT_SCREENER_URL (env-configurable)
-    # rather than being hardcoded inline.
     saved_url = _DEFAULT_SCREENER_URL
 
     print(f"\n  {C.B_CYN}── Custom Screener Integration ──{C.RST}")
@@ -219,9 +200,6 @@ def _get_custom_universe() -> List[str]:
                     tickers = [t for t in tickers if t not in ("SYMBOL", "TICKER", "")]
                     tickers = _filter_valid_custom_tickers(tickers)
                     if tickers:
-                        # FIX G4: Require explicit acknowledgement before proceeding
-                        # with stale local data. Silent fallback could mean running the
-                        # strategy against an outdated universe without the user realising.
                         print(f"\n  {C.YLW}[!] Web scrape failed. Found local fallback: {f}{C.RST}")
                         print(f"  {C.YLW}    This file may be stale. Universe: {len(tickers)} tickers.{C.RST}")
                         confirm = input(f"  {C.CYN}Proceed with local data? (y/n): {C.RST}").strip().lower()
@@ -236,7 +214,6 @@ def _get_custom_universe() -> List[str]:
 
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    """Prompts for real-world capital if the portfolio is brand new."""
     if not state.shares and not state.equity_hist and abs(state.cash - 1_000_000.0) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
         try:
@@ -253,12 +230,6 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
 
 # ─── Corporate action / split detection ──────────────────────────────────────
 
-# FIX #2: Tightened split tolerance from 4% to 1.5%.
-# The original 4% window was wide enough to trigger on large single-day moves in
-# volatile NSE small-caps, especially if last_known_prices was stale after a cache
-# miss. At 1.5% the only plausible price ratio that falls within the window is a
-# genuine split. yfinance auto_adjust=True already handles splits on the price
-# series, so this detection is a safety net for live-portfolio share counts only.
 _SPLIT_RATIOS     = [2, 5, 10, 3, 4, 20, 0.5, 0.2]
 _SPLIT_TOLERANCE  = 0.015
 
@@ -269,7 +240,6 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
         ns = to_ns(sym)
         row = market_data.get(ns)
         if row is None:
-            # Unit tests and offline stubs may provide bare symbols instead of .NS.
             row = market_data.get(sym)
         if row is None or row.empty:
             continue
@@ -290,8 +260,6 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict) -> List[st
                 old_entry      = state.entry_prices.get(sym, current_price * r)
                 new_entry      = old_entry / r
 
-                # Broker cash-in-lieu on reverse splits is based on the orphaned
-                # pre-split quantity that cannot be converted into whole shares.
                 fractional_pre_split = max(0.0, old_shares - (new_shares / r))
                 fractional_value = fractional_pre_split * current_price
                 state.cash = round(state.cash + fractional_value, 10)
@@ -337,7 +305,6 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             os.close(dir_fd)
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
-        # DEFENSIVE FIX: Scrub dangling tmp file if JSON serialization crashes mid-flight
         if os.path.exists(tmp_file):
             try:
                 os.remove(tmp_file)
@@ -391,7 +358,6 @@ def _run_scan(
         idx_df = market_data.get("^NSEI")
 
     idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
-    # Pass cfg so compute_regime_score uses the dynamic vol threshold (FIX G2).
     regime_score = compute_regime_score(idx_slice, cfg=cfg)
 
     close_d: Dict[str, pd.Series] = {}
@@ -430,11 +396,6 @@ def _run_scan(
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
     _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
 
-    # FIX #1: Pass cfg.CVAR_MIN_HISTORY as min_obs so the live scan warm-up
-    # period matches the backtest exactly. The original call used the default
-    # min_obs=30, while the backtest used cfg.CVAR_MIN_HISTORY (default: 20),
-    # causing the exposure multiplier to diverge between live and backtest modes
-    # for the first 10 equity history observations.
     state.update_exposure(
         regime_score,
         state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY),
@@ -447,16 +408,13 @@ def _run_scan(
     optimization_succeeded = False
     total_slippage       = 0.0
     trade_log: List[Trade] = []
-    sel_idx: List[int]   = []   # initialised here so decay block always has it
+    sel_idx: List[int]   = []
     _force_full_cash     = False
 
     # ── Book CVaR screen ──────────────────────────────────────────────────────
-    # Check physical CVaR of the current held book BEFORE calling generate_signals
-    # or optimize. This looks at positions we actually own — including any that
-    # just failed liquidity/knife gates and are absent from sel_idx.
-    if state.weights:
-        book_cvar = compute_book_cvar(state.weights, log_rets, cfg)
-        if book_cvar > cfg.CVAR_DAILY_LIMIT + EPSILON:
+    if state.shares:
+        book_cvar = compute_book_cvar(state, prices, active, log_rets, cfg)
+        if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
             logger.warning(
                 "[Scan] Book CVaR %.4f%% exceeds limit %.4f%% — "
                 "skipping optimization, forcing immediate liquidation.",
@@ -502,7 +460,6 @@ def _run_scan(
             if not is_data_error:
                 state.consecutive_failures += 1
                 logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
-                # FIX: threshold raised from 2 to 3.
                 if state.consecutive_failures >= 3:
                     logger.warning(
                         "3 consecutive solver failures — triggering gate-filtered "
@@ -523,13 +480,8 @@ def _run_scan(
                 f"MAX_DECAY_ROUNDS={cfg.MAX_DECAY_ROUNDS} exhausted",
             )
             _exhaust_decay = True
-            # weights stays all-zeros → full cash
         else:
-            # sel_idx: gate-passing positions → scale by DECAY_FACTOR.
-            # Non-gate positions remain 0 → force-closed by execute_rebalance.
-            for i in sel_idx:
-                sym = active[i]
-                weights[i] = state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR
+            weights = compute_decay_targets(state, sel_idx, active, cfg)
 
     if optimization_succeeded or apply_decay:
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
@@ -541,12 +493,12 @@ def _run_scan(
         total_slippage = execute_rebalance(
             state, weights, prices, active, cfg,
             date_context=pd.Timestamp(end_date), trade_log=trade_log,
-            # FIX: bypass decay increment when exhausting/force-cash.
             apply_decay    = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _scenario_losses,
         )
         if _exhaust_decay:
             state.decay_rounds = 0
+            state.consecutive_failures = 0 # FIX: sticky counter bug
 
     _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
 
@@ -606,18 +558,6 @@ def _run_scan(
 # ─── Status display ───────────────────────────────────────────────────────────
 
 def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Optional[UltimateConfig] = None) -> None:
-    """
-    Display the current portfolio status table and risk diagnostics.
-
-    Parameters
-    ----------
-    cfg : Optional[UltimateConfig]
-        When provided, realised_cvar is computed with cfg.CVAR_MIN_HISTORY as
-        the minimum observation threshold, matching the engine's behaviour exactly.
-        FIX (Quality #8): Previously used the default min_obs=30 regardless of
-        config, causing the displayed CVaR to differ from the engine's value for
-        the first cfg.CVAR_MIN_HISTORY observations.
-    """
     if cfg is None:
         cfg = UltimateConfig()
 
@@ -637,11 +577,6 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
             prices_now[sym] = float(market_data[ns]["Close"].iloc[-1])
 
     mtm = sum(
-        # FIX (Logic #3): Fall back to last_known_prices for positions that have
-        # no live quote in the current market_data snapshot (e.g. delisted,
-        # dropped from a stale fetch, or outside the data window). Using 0.0
-        # previously understated the true portfolio value and made held positions
-        # appear to have zero weight in the status table.
         state.shares[s] * (prices_now.get(s) or state.last_known_prices.get(s, 0.0))
         for s in active
     )
@@ -699,8 +634,6 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     )
     print(f"  {C.GRY}└──────────────┴─────────┴───────────┴───────────┴────────┴─────────────┴─────────────┘{C.RST}")
 
-    # FIX (Quality #8): Use cfg.CVAR_MIN_HISTORY so the displayed value matches
-    # the threshold used by the engine, not a hardcoded default of 30.
     cvar        = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
     cvar_color  = C.RED if cvar > 0.12 else C.GRN
     print(f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}")
@@ -712,7 +645,6 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
 
 
 def _portfolio_activity_badge(state: PortfolioState) -> str:
-    """Compact portfolio activity badge for menu cards."""
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - 1_000_000.0) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
@@ -721,7 +653,6 @@ def _portfolio_activity_badge(state: PortfolioState) -> str:
 
 
 def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
-    """Render a richer command palette for daily operations."""
     box_width = 78
 
     def _menu_box_line(text: str = "") -> str:
@@ -756,7 +687,6 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
 
 
 def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
-    """Prompt for menu input with validation and optional default."""
     raw = input(prompt).strip().lower()
     if not raw and default is not None:
         return default
@@ -767,7 +697,6 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
 
 
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
-    """Return validated ISO date (YYYY-MM-DD), falling back to default for blank input."""
     candidate = raw.strip() or default
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
@@ -779,17 +708,6 @@ def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
 # ─── Survival-mode prompt ─────────────────────────────────────────────────────
 
 def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Optional[List[str]]:
-    """
-    FIX C3: Explicit operator prompt when a universe fetch fails completely.
-
-    Presents the error, the size of the fallback universe, and requires a
-    conscious 'y' before proceeding with the Nifty 50 hard floor. Returns
-    the fallback list on confirmation, or None to abort back to the main menu.
-
-    This prevents the strategy from silently switching from a 500-stock to a
-    48-stock universe — a material regime shift in sector exposure, turnover,
-    and liquidity that should never happen without operator awareness.
-    """
     print(f"\n  {C.B_RED}[!] UNIVERSE FETCH FAILURE — {universe_name}{C.RST}")
     print(f"  {C.RED}{err}{C.RST}")
     n = len(err.fallback_universe)
@@ -983,7 +901,6 @@ def main_menu() -> None:
 
 
 if __name__ == "__main__":
-    # ── Professional logging: console + file ───────────────────────────────
     os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(

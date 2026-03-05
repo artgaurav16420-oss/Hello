@@ -22,8 +22,8 @@ from momentum_engine import (
     PortfolioState,
     execute_rebalance,
     compute_book_cvar,
+    compute_decay_targets,
     Trade,
-    EPSILON,
 )
 from signals import generate_signals, compute_regime_score, compute_single_adv
 
@@ -67,10 +67,7 @@ class BacktestEngine:
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = list(close.columns)
 
-        # O(1) membership tests for rapid daily simulation.
         rebal_set  = set(rebalance_dates)
-        # FIX (Minor #9): symbols is constant for the life of the loop; build
-        # active_idx once here rather than rebuilding it on every trading day.
         active_idx = {sym: i for i, sym in enumerate(symbols)}
 
         for date in close.index:
@@ -79,10 +76,6 @@ class BacktestEngine:
 
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
-
-            # FIX (Logic #3): The original code computed `pv` here but never
-            # passed it to _run_rebalance (which recomputes it internally).
-            # The dead variable has been removed to eliminate misleading code.
 
             if date in rebal_set:
                 self._run_rebalance(
@@ -121,7 +114,6 @@ class BacktestEngine:
             return
         signal_date = close.index[prev_idx]
 
-        # Explicit T-1 history (exclude execution date to prevent look-ahead).
         hist_log_rets = (
             np.log1p(returns.loc[:signal_date])
             .replace([np.inf, -np.inf], np.nan)
@@ -129,8 +121,6 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, volume, date)
 
-        # FIX #7: Replaced opaque double-for-in-comprehension with a readable
-        # helper so the weight calculation is easy to audit and test.
         close_t    = close.loc[date]
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
@@ -144,10 +134,8 @@ class BacktestEngine:
 
         _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
         idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
-        # Pass cfg so compute_regime_score uses the dynamic vol threshold (FIX G2).
         regime_score = compute_regime_score(idx_slice, cfg=cfg)
 
-        # Guard: only use realised CVaR once enough history has accumulated.
         if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
             realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
         else:
@@ -172,14 +160,9 @@ class BacktestEngine:
         _force_full_cash       = False
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
-        # Check physical CVaR of the CURRENTLY HELD portfolio against the full-
-        # universe T-1 return history BEFORE running generate_signals or optimize.
-        # This is the correct pre-solve screen: it looks at the positions we
-        # actually own, including any that just failed liquidity/knife gates and
-        # are no longer in sel_idx. Those are the most dangerous names.
-        if self.state.weights:
-            book_cvar = compute_book_cvar(self.state.weights, hist_log_rets, cfg)
-            if book_cvar > cfg.CVAR_DAILY_LIMIT + EPSILON:
+        if self.state.shares:
+            book_cvar = compute_book_cvar(self.state, prices_t, symbols, hist_log_rets, cfg)
+            if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 logger.warning(
                     "[Backtest] Book CVaR %.4f%% exceeds limit %.4f%% on %s — "
                     "skipping optimization, forcing immediate liquidation.",
@@ -190,8 +173,6 @@ class BacktestEngine:
                 _force_full_cash = True
 
         # ── Signal generation + optimization ─────────────────────────────────
-        # FIX (Logic #2): generate_signals raises ValueError when log_rets is
-        # empty or all-NaN (e.g. warm-up window too short). Catch it here.
         if not _force_full_cash:
             try:
                 raw_daily, adj_scores, sel_idx = generate_signals(
@@ -239,7 +220,6 @@ class BacktestEngine:
                             "[Backtest] Solver failure #%d on %s: %s",
                             self.state.consecutive_failures, date, oe,
                         )
-                        # FIX: threshold raised from 2 to 3.
                         if self.state.consecutive_failures >= 3:
                             logger.debug(
                                 "[Backtest] 3 consecutive solver failures on %s — "
@@ -248,18 +228,10 @@ class BacktestEngine:
                             )
                             apply_decay = True
             else:
-                # FIX #6 / Logic #10: empty candidate set is not a solver failure.
                 self.state.decay_rounds         = 0
                 self.state.consecutive_failures = 0
 
         # ── Gate-filtered decay target computation ────────────────────────────
-        # When apply_decay=True, compute what we actually want to hold:
-        # — Force-full-cash cases (book CVaR breach, or decay rounds exhausted):
-        #     target_weights stays all-zeros; bypass execute_rebalance's decay
-        #     increment so decay_rounds resets cleanly to 0.
-        # — Normal gate-filtered case:
-        #     Positions in sel_idx → scaled by DECAY_FACTOR (gate-passing).
-        #     Positions NOT in sel_idx → 0 (force-closed this bar).
         _exhaust_decay = False
         if apply_decay and not optimization_succeeded:
             if _force_full_cash or self.state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
@@ -272,16 +244,13 @@ class BacktestEngine:
                 _exhaust_decay = True
                 # target_weights stays all-zeros → full cash
             else:
-                # Gate-filtered partial deleverage.
+                target_weights = compute_decay_targets(self.state, sel_idx, symbols, cfg)
                 sel_idx_set = set(sel_idx)
                 sym_to_pos  = {s: i for i, s in enumerate(symbols)}
                 n_gated = sum(
                     1 for s in self.state.shares
                     if s in sym_to_pos and sym_to_pos[s] not in sel_idx_set
                 )
-                for i in sel_idx:
-                    sym = symbols[i]
-                    target_weights[i] = self.state.weights.get(sym, 0.0) * cfg.DECAY_FACTOR
                 logger.debug(
                     "[Backtest] Decay round %d/%d: scaling %d gate-passing, "
                     "force-closing %d gated positions.",
@@ -295,17 +264,15 @@ class BacktestEngine:
             execute_rebalance(
                 self.state, target_weights, prices_t, symbols, cfg,
                 date_context=date, trade_log=self.trades,
-                # FIX: when exhausting/force-cash pass apply_decay=False so
-                # execute_rebalance does not increment decay_rounds again.
-                # We reset it explicitly below.
                 apply_decay    = apply_decay and not _exhaust_decay,
                 scenario_losses = None if _exhaust_decay else _L,
             )
             if _exhaust_decay:
-                # Reset so the next successful optimization starts from a clean state.
                 self.state.decay_rounds = 0
+                self.state.consecutive_failures = 0 # FIX: sticky counter bug
+
             self._rebal_rows.append({
-                "date":              date,
+                "date":               date,
                 "regime_score":       round(regime_score, 4),
                 "realised_cvar":      round(realised_cvar, 6),
                 "exposure_multiplier":round(self.state.exposure_multiplier, 4),
@@ -322,13 +289,6 @@ def _build_prev_weights(
     symbols: List[str],
     pv:      float,
 ) -> Dict[str, float]:
-    """
-    Compute current mark-to-market weights using T-1 (last known) prices.
-
-    Using last_known_prices instead of today's execution price prevents a
-    subtle look-ahead bias where today's close would be used to determine
-    the starting weight before today's rebalance decision is made.
-    """
     result: Dict[str, float] = {}
     if pv <= 0:
         return result
@@ -344,11 +304,6 @@ def _build_prev_weights(
 
 
 def _build_adv_vector(symbols: List[str], volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
-    """
-    Build the ADV (average daily volume) vector for sizing constraints.
-
-    Uses an explicit T-1 signal_date boundary to avoid implicit slicing.
-    """
     adv = []
     signal_date: Optional[pd.Timestamp] = None
 
@@ -414,12 +369,6 @@ def run_backtest(
     volume  = pd.DataFrame(volume_d).sort_index()
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
-    # FIX C2: Calendar alignment - forward-only resolution with same-week guard.
-    # The original method=pad (look-behind) maps a holiday Friday to the PRECEDING
-    # Thursday. In live execution the rebalance occurs on the FOLLOWING Monday,
-    # creating a 1-3 day temporal asymmetry. Corrected: use backfill (look-forward)
-    # plus a same-ISO-week guard that skips the rebalance entirely if the resolved
-    # session falls outside the target week, matching live no-rebal-week behaviour.
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
     trading_index    = pd.DatetimeIndex(close.index).sort_values()
 
@@ -447,10 +396,6 @@ def run_backtest(
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
     bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map)
 
-    # FIX #3: equity_curve is weekly-sampled (rebalance dates only) for display.
-    # metrics are intentionally computed on the full daily series for statistical
-    # accuracy (Sharpe, Sortino, max-drawdown all need daily granularity).
-    # The discrepancy is documented here to prevent misinterpretation.
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
 
@@ -468,9 +413,9 @@ def run_backtest(
     )
 
     return BacktestResults(
-        equity_curve = eq_weekly,          # weekly-sampled for charting
+        equity_curve = eq_weekly,
         trades       = bt.trades,
-        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL),  # daily for accuracy
+        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL),
         rebal_log    = rebal_log,
     )
 
@@ -511,9 +456,6 @@ def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
         if len(downside) > 1 and downside.std() > 0:
             sortino = (dr.mean() * periods_per_year) / (downside.std() * np.sqrt(periods_per_year))
         else:
-            # No downside volatility: Sortino is theoretically infinite.
-            # We return NaN rather than borrowing the Sharpe value, which would
-            # be semantically misleading (a finite ratio implies finite downside risk).
             sortino = float("nan")
     else:
         sharpe  = 0.0
