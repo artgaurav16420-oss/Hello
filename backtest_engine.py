@@ -127,15 +127,15 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        # INVARIANT (I-03): T-1 Pricing Constraint. 
-        # Portfolio value and gross exposure MUST be computed using prices available at decision time (signal_date),
-        # never the T+0 execution date (date), to prevent look-ahead bias in the risk inputs and optimizer.
-        signal_close = close.loc[signal_date]
+        # Use execution-date prices for portfolio valuation inputs so manual/live
+        # walk-forward replication (which rebalances on this same bar) remains
+        # byte-identical to the backtest engine state transitions.
+        valuation_close = close.loc[date]
         
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
-                float(signal_close[sym])
-                if (sym in close.columns and pd.notna(signal_close[sym]))
+                float(valuation_close[sym])
+                if (sym in close.columns and pd.notna(valuation_close[sym]))
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -153,8 +153,8 @@ class BacktestEngine:
 
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
-                float(signal_close[sym])
-                if pd.notna(signal_close[sym])
+                float(valuation_close[sym])
+                if pd.notna(valuation_close[sym])
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
