@@ -216,6 +216,7 @@ class PortfolioState:
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
     decay_rounds:         int              = 0
+    dividend_ledger:      Dict[str, str]   = field(default_factory=dict)
 
     def update_exposure(
         self,
@@ -318,6 +319,7 @@ class PortfolioState:
             "absent_periods":       dict(sorted(self.absent_periods.items())),
             "last_known_prices":    _r(self.last_known_prices),
             "decay_rounds":         self.decay_rounds,
+            "dividend_ledger":      dict(sorted(self.dividend_ledger.items())),
         }
 
     @classmethod
@@ -362,6 +364,7 @@ class PortfolioState:
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
+        ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
 
         if errors:
             logger.error(
