@@ -382,10 +382,24 @@ def test_detect_and_apply_splits_fractional_cash():
     state.last_known_prices = {"A": 100.0}
 
     market_data = {"A": pd.DataFrame({"Close": [200.0]})}
-    detect_and_apply_splits(state, market_data)
+    detect_and_apply_splits(state, market_data, UltimateConfig())
 
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
     assert state.cash == 200.0, "Fractional value must be safely routed to Cash."
+
+def test_detect_and_apply_splits_dividend_sweep_idempotent():
+    state = PortfolioState(cash=0.0)
+    state.shares = {"A": 100}
+    state.last_known_prices = {"A": 100.0}
+    idx = pd.to_datetime(["2024-01-01", "2024-01-02"])
+    market_data = {"A.NS": pd.DataFrame({"Close": [100.0, 102.0], "Dividends": [0.0, 2.0]}, index=idx)}
+
+    cfg = UltimateConfig(DIVIDEND_SWEEP=True)
+    detect_and_apply_splits(state, market_data, cfg)
+    detect_and_apply_splits(state, market_data, cfg)
+
+    assert state.cash == 200.0
+    assert state.dividend_ledger["A"] == "2024-01-02:2.00000000"
 
 
 # ─── PortfolioState.record_eod ────────────────────────────────────────────────
@@ -862,7 +876,6 @@ def test_book_cvar_screen_forces_liquidation():
     # Ensure sticky counter is eradicated
     assert bt.state.consecutive_failures == 0
 
-# ... existing code ...
 def test_compute_book_cvar_empty_book_returns_zero():
     cfg      = UltimateConfig()
     state    = PortfolioState()
@@ -877,27 +890,58 @@ def test_compute_book_cvar_missing_columns_handled_as_ghosts():
     state      = PortfolioState(cash=0.0)
     state.shares = {"OFFUNIVERSE": 100}
     state.last_known_prices = {"OFFUNIVERSE": 10.0}
-    
-    result     = compute_book_cvar(state, np.array([]), [], log_rets, cfg)
+
+    result = compute_book_cvar(state, np.array([]), [], log_rets, cfg)
     assert result > 0.0, "Ghost position must have synthetic tail risk applied, yielding non-zero CVaR."
 
 
 def test_compute_book_cvar_high_loss_book():
-# ... existing code ...
+    cfg = UltimateConfig(CVAR_LOOKBACK=50)
+    log_rets = _make_log_rets(80, 2)
+    log_rets.iloc[-20:, :] = -0.10
+
+    state = PortfolioState(cash=0.0)
+    state.shares = {"SYM00": 100, "SYM01": 100}
+    state.last_known_prices = {"SYM00": 100.0, "SYM01": 100.0}
+
+    result = compute_book_cvar(state, np.array([100.0, 100.0]), ["SYM00", "SYM01"], log_rets, cfg)
+    assert result > 0.05
+
+
 def test_compute_decay_targets_enforces_single_name_cap():
     cfg = UltimateConfig(DECAY_FACTOR=0.85, MAX_SINGLE_NAME_WEIGHT=0.25)
     state = PortfolioState()
     state.weights = {"A": 0.35}
-    
+
     targets = compute_decay_targets(state, [0], ["A"], cfg)
     assert targets[0] == pytest.approx(0.2125), "Decayed target must cap the pre-decay weight, then scale."
 
 
 def test_book_cvar_screen_with_ghost_resets_failures():
-# ... existing code ...
-    assert "BOMB" not in bt.state.shares, "BOMB must be fully liquidated."
-    assert "GHOST" in bt.state.shares, "GHOST has no liquidity, so it must physically persist."
-    assert bt.state.absent_periods["GHOST"] == 1
+    cfg = UltimateConfig(INITIAL_CAPITAL=1_000_000)
+    n_days, n_syms = 120, 2
+    close = _make_close(n_days, n_syms)
+    volume = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
+    returns = close.pct_change(fill_method=None).clip(lower=-0.99)
+
+    engine = InstitutionalRiskEngine(cfg)
+    bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+    bt.state.shares = {"SYM00": 100, "GHOST": 10}
+    bt.state.weights = {"SYM00": 0.5, "GHOST": 0.1}
+    bt.state.last_known_prices = {"SYM00": 100.0, "GHOST": 50.0}
+    bt.state.entry_prices = {"SYM00": 100.0, "GHOST": 50.0}
+    bt.state.consecutive_failures = 2
+
+    import unittest.mock as mock
+
+    with mock.patch("backtest_engine.compute_book_cvar", return_value=cfg.CVAR_DAILY_LIMIT + 0.01):
+        rebal_dates = close.index[60:61]
+        bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+
+    assert "SYM00" not in bt.state.shares, "Tradable symbol should be fully liquidated on hard CVaR breach."
+    assert "GHOST" in bt.state.shares, "Off-universe ghost should persist until absent-period threshold is reached."
+    assert bt.state.absent_periods.get("GHOST", 0) == 1
+    assert bt.state.consecutive_failures == 0
 
 
 def test_decay_rounds_exhaustion_forces_liquidation():

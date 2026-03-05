@@ -241,8 +241,17 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             if div > 0:
                 shares_held = state.shares.get(sym, 0)
                 if shares_held > 0:
-                    state.cash = round(state.cash + (div * shares_held), 10)
-                    logger.info("DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares). Added to cash.", sym, div, shares_held)
+                    div_date = pd.Timestamp(row.index[-1]).strftime("%Y-%m-%d")
+                    event_id = f"{div_date}:{div:.8f}"
+                    if state.dividend_ledger.get(sym) != event_id:
+                        state.cash = round(state.cash + (div * shares_held), 10)
+                        state.dividend_ledger[sym] = event_id
+                        logger.info(
+                            "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares). Added to cash.",
+                            sym,
+                            div,
+                            shares_held,
+                        )
 
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
