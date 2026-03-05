@@ -461,9 +461,10 @@ def execute_rebalance(
                     if px > 0 and n_shares > 0:
                         slip = n_shares * px * exit_slip_rate
                         total_slippage += slip
-                        if trade_log is not None and date_context is not None:
+                        if trade_log is not None:
+                            tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
                             trade_log.append(
-                                Trade(sym, date_context, -n_shares, px, slip, "SELL")
+                                Trade(sym, tdate, -n_shares, px, slip, "SELL")
                             )
                 state.weights      = {}
                 state.shares       = {}
@@ -511,9 +512,10 @@ def execute_rebalance(
                         old_basis = new_entry_prices.get(sym, price)
                         new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + slip_rate) * delta) / s
 
-            if delta != 0 and trade_log is not None and date_context is not None:
+            if delta != 0 and trade_log is not None:
+                tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
                 trade_log.append(
-                    Trade(sym, date_context, delta, price, slip, "BUY" if delta > 0 else "SELL")
+                    Trade(sym, tdate, delta, price, slip, "BUY" if delta > 0 else "SELL")
                 )
 
     for sym in state.shares:
@@ -531,8 +533,9 @@ def execute_rebalance(
                 slip            = n_shares * close_price * (cfg.SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
                 pv             += n_shares * close_price
-                if trade_log is not None and date_context is not None:
-                    trade_log.append(Trade(sym, date_context, -n_shares, close_price, slip, "SELL"))
+                if trade_log is not None:
+                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                    trade_log.append(Trade(sym, tdate, -n_shares, close_price, slip, "SELL"))
             else:
                 logger.error(
                     "execute_rebalance: force-close of %s (%d shares) has no last "
@@ -540,8 +543,9 @@ def execute_rebalance(
                     "data feed gap on a delisted security; verify manually.",
                     sym, n_shares,
                 )
-                if trade_log is not None and date_context is not None:
-                    trade_log.append(Trade(sym, date_context, -n_shares, 0.0, 0.0, "SELL"))
+                if trade_log is not None:
+                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                    trade_log.append(Trade(sym, tdate, -n_shares, 0.0, 0.0, "SELL"))
         state.absent_periods.pop(sym, None)
 
     for sym in list(new_entry_prices):
