@@ -127,11 +127,15 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        execution_close = close.loc[date]
+        # INVARIANT (I-03): T-1 Pricing Constraint. 
+        # Portfolio value and gross exposure MUST be computed using prices available at decision time (signal_date),
+        # never the T+0 execution date (date), to prevent look-ahead bias in the risk inputs and optimizer.
+        signal_close = close.loc[signal_date]
+        
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
-                float(execution_close[sym])
-                if (sym in close.columns and pd.notna(execution_close[sym]))
+                float(signal_close[sym])
+                if (sym in close.columns and pd.notna(signal_close[sym]))
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -149,8 +153,8 @@ class BacktestEngine:
 
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
-                float(execution_close[sym])
-                if pd.notna(execution_close[sym])
+                float(signal_close[sym])
+                if pd.notna(signal_close[sym])
                 else self.state.last_known_prices.get(sym, 0.0)
             )
             for sym in self.state.shares
@@ -167,8 +171,8 @@ class BacktestEngine:
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
         if self.state.shares:
-            # Note: We use prices_t here as this screens for current stress limits against 
-            # execution constraints immediately prior to submission.
+            # Note: We use prices_t here (T+0) as this screens for current stress limits against 
+            # execution constraints immediately prior to order submission.
             book_cvar = compute_book_cvar(self.state, prices_t, symbols, hist_log_rets, cfg)
             if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 logger.warning(
