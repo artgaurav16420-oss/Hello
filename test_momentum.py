@@ -20,6 +20,7 @@ from momentum_engine import (
     OptimizationError,
     OptimizationErrorType,
     PortfolioState,
+    Trade,
     execute_rebalance,
     compute_book_cvar,
     compute_decay_targets,
@@ -117,6 +118,28 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
 
     assert small_bonus == pytest.approx(0.00375, abs=1e-6)
     assert large_bonus == pytest.approx(0.015, abs=1e-6)
+
+def test_continuity_bonus_respects_max_scalar_cap():
+    """When CONTINUITY_BONUS exceeds CONTINUITY_MAX_SCALAR the cap clamps the bonus."""
+    base_col = np.linspace(-0.01, 0.01, 120)
+    log_rets = pd.DataFrame(
+        np.column_stack([base_col, base_col, base_col]), columns=["A", "B", "C"]
+    )
+    adv = np.ones(3) * 1e6
+
+    # cfg_capped:   CONTINUITY_BONUS=0.30 > cap=0.20  → effective bonus = 0.20 * dispersion
+    # cfg_uncapped: CONTINUITY_BONUS=0.20 = cap=0.20  → effective bonus = 0.20 * dispersion
+    cfg_capped   = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3, CONTINUITY_BONUS=0.30, CONTINUITY_MAX_SCALAR=0.20)
+    cfg_uncapped = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3, CONTINUITY_BONUS=0.20, CONTINUITY_MAX_SCALAR=0.20)
+
+    _, scores_capped,   _ = generate_signals(log_rets, adv, cfg_capped,   prev_weights={"A": 0.10})
+    _, scores_uncapped, _ = generate_signals(log_rets, adv, cfg_uncapped, prev_weights={"A": 0.10})
+
+    # Both configs produce the same bonus for A (cap clips 0.30 → 0.20)
+    assert scores_capped[0] == pytest.approx(scores_uncapped[0], abs=1e-9)
+    # A still outscores C (zero prev weight) under both configs
+    assert scores_capped[0] > scores_capped[2]
+
 
 def test_generate_signals_blocks_empty_input():
     """A completely empty array should trip the defensive barrier before math crash."""
@@ -633,6 +656,24 @@ def test_compute_metrics_sortino():
     m = _compute_metrics(eq, 1_000_000.0)
     assert np.isfinite(m["sortino"])
     assert m["sortino"] > 0
+
+
+def test_compute_metrics_with_trades_computes_hit_rate_and_turnover():
+    """hit_rate and turnover are computed correctly from a non-empty trade list."""
+    idx = pd.date_range("2020-01-03", periods=52, freq="W-FRI")
+    eq  = pd.Series(1_000_000.0 * np.exp(np.linspace(0, 0.10, 52)), index=idx)
+
+    buy_win  = Trade("SYM01", idx[0],   10, 100.0, 0.0, "BUY")
+    sell_win = Trade("SYM01", idx[5],  -10, 120.0, 0.0, "SELL")   # +₹200 profit
+    buy_loss = Trade("SYM02", idx[1],   5,  200.0, 0.0, "BUY")
+    sell_loss= Trade("SYM02", idx[6],  -5,  180.0, 0.0, "SELL")   # -₹100 loss
+
+    m = _compute_metrics(eq, 1_000_000.0, trades=[buy_win, sell_win, buy_loss, sell_loss])
+
+    # 1 winning round-trip out of 2 → 50 %
+    assert m["hit_rate"] == pytest.approx(50.0)
+    # turnover = (buy_notional + sell_notional) / 2 / avg_equity > 0
+    assert m["turnover"] > 0.0
 
 
 def test_run_backtest_rebalance_dates_pad_to_prior_trading_day():
