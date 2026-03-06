@@ -114,19 +114,20 @@ class MomentumObjective:
 def pre_load_data(universe_type: str) -> dict:
     """Loads data into RAM once to accelerate thousands of backtests."""
     logger.info("Initializing Data Pre-fetch phase...")
+    normalized_universe = (universe_type or "").strip().lower()
     
     # FIX (I-06): Replaced hardcoded fallback branch to ensure the full equity 
     # universe loads accurately when targeted by the optimization wrapper.
-    if universe_type == "nifty500":
+    if normalized_universe == "nifty500":
         base_universe = get_nifty500()
-    elif universe_type == "nse_total":
+    elif normalized_universe == "nse_total":
         base_universe = fetch_nse_equity_universe()
     else:
         logger.warning(f"Unknown universe_type '{universe_type}', falling back to nifty500")
         base_universe = get_nifty500() 
         
     # Ensure index data is present for regime scoring
-    symbols_to_fetch = base_universe + ["^NSEI", "^CRSLDX"]
+    symbols_to_fetch = list(dict.fromkeys(base_universe + ["^NSEI", "^CRSLDX"]))
     
     logger.info(f"Fetching {len(symbols_to_fetch)} symbols from {TRAIN_START} to {TEST_END}...")
     market_data = load_or_fetch(

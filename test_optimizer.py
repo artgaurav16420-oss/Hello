@@ -115,3 +115,26 @@ def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
         payload = json.load(fh)
 
     assert payload == {"HALFLIFE_FAST": 34}
+
+
+def test_pre_load_data_normalizes_universe_type_and_deduplicates_tickers(monkeypatch):
+    monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-12-31")
+    monkeypatch.setattr(optimizer, "fetch_nse_equity_universe", lambda: ["ABC", "^NSEI", "ABC"])
+
+    captured = {}
+
+    def _fake_load_or_fetch(*, tickers, required_start, required_end):
+        captured["tickers"] = tickers
+        captured["required_start"] = required_start
+        captured["required_end"] = required_end
+        return {"ok": True}
+
+    monkeypatch.setattr(optimizer, "load_or_fetch", _fake_load_or_fetch)
+
+    result = optimizer.pre_load_data("  NSE_TOTAL ")
+
+    assert result == {"ok": True}
+    assert captured["required_start"] == "2020-01-01"
+    assert captured["required_end"] == "2020-12-31"
+    assert captured["tickers"] == ["ABC", "^NSEI", "^CRSLDX"]
