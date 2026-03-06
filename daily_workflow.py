@@ -725,13 +725,14 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     print(f"    Custom Screener → {_portfolio_activity_badge(states['custom'])}")
 
 def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
-    raw = input(prompt).strip().lower()
-    if not raw and default is not None:
-        return default
-    if raw not in valid:
-        print(f"  {C.RED}Invalid choice. Valid options: {', '.join(valid)}{C.RST}")
-        return ""
-    return raw
+    while True:
+        raw = input(prompt).strip().lower()
+        if not raw and default is not None:
+            return default
+        if raw not in valid:
+            print(f"  {C.RED}Invalid choice. Valid options: {', '.join(valid)}{C.RST}")
+            continue
+        return raw
 
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     candidate = raw.strip() or default

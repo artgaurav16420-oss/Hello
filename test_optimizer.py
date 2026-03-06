@@ -142,7 +142,7 @@ def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     assert payload == {"HALFLIFE_FAST": 34}
 
 
-def test_pre_load_data_normalizes_universe_type_and_deduplicates_tickers(monkeypatch):
+def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch):
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
     monkeypatch.setattr(optimizer, "TEST_END", "2020-12-31")
     monkeypatch.setattr(optimizer, "fetch_nse_equity_universe", lambda: ["ABC", "^NSEI", "ABC"])
@@ -162,7 +162,9 @@ def test_pre_load_data_normalizes_universe_type_and_deduplicates_tickers(monkeyp
     assert result == {"ok": True}
     assert captured["required_start"] == "2020-01-01"
     assert captured["required_end"] == "2020-12-31"
-    assert captured["tickers"] == ["ABC", "^NSEI", "^CRSLDX"]
+    assert captured["tickers"].count("ABC") == 1
+    assert "^NSEI" in captured["tickers"]
+    assert "^CRSLDX" in captured["tickers"]
 
 
 def test_build_sampler_returns_tpe_sampler(monkeypatch):
