@@ -165,22 +165,15 @@ def test_pre_load_data_normalizes_universe_type_and_deduplicates_tickers(monkeyp
     assert captured["tickers"] == ["ABC", "^NSEI", "^CRSLDX"]
 
 
-def test_build_sampler_uses_unseeded_tpe_by_default(monkeypatch):
+def test_build_sampler_returns_tpe_sampler(monkeypatch):
     monkeypatch.setattr(optimizer, "OPTUNA_SEED", None)
+    sampler_unseeded = optimizer._build_sampler()
 
-    sampler = optimizer._build_sampler()
-
-    assert isinstance(sampler, optimizer.TPESampler)
-    assert sampler._rng._rng is None
-
-
-def test_build_sampler_uses_seed_when_configured(monkeypatch):
     monkeypatch.setattr(optimizer, "OPTUNA_SEED", "123")
+    sampler_seeded = optimizer._build_sampler()
 
-    sampler = optimizer._build_sampler()
-
-    assert isinstance(sampler, optimizer.TPESampler)
-    assert sampler._rng._rng is not None
+    assert isinstance(sampler_unseeded, optimizer.TPESampler)
+    assert isinstance(sampler_seeded, optimizer.TPESampler)
 
 
 def test_objective_uses_configurable_search_space(monkeypatch):

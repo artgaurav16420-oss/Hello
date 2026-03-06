@@ -36,6 +36,7 @@ from signals import (
 from universe_manager import get_historical_universe
 
 logger = logging.getLogger(__name__)
+_REBALANCE_SNAP_WINDOW_DAYS = 3
 
 # ─── Results container ────────────────────────────────────────────────────────
 
@@ -337,7 +338,11 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
             if isinstance(pos, slice):
                 pos = pos.start
             elif isinstance(pos, np.ndarray):
-                pos = int(pos[0]) if len(pos) else -1
+                if pos.dtype == bool:
+                    matches = np.flatnonzero(pos)
+                    pos = int(matches[0]) if len(matches) else -1
+                else:
+                    pos = int(pos[0]) if len(pos) else -1
             if pos > 0:
                 signal_date = idx[pos - 1]
 
@@ -393,7 +398,10 @@ def run_backtest(
                 union_universe.update(historical_members)
 
         if not union_universe:
-            raise RuntimeError("HISTORICAL PARQUET MISSING — Backtests will contain survivorship bias!")
+            raise RuntimeError(
+                "No historical constituents resolved across requested backtest dates; "
+                "verify universe snapshots or date range."
+            )
 
     close_d, volume_d = {}, {}
     for sym in union_universe:
@@ -413,19 +421,18 @@ def run_backtest(
     returns = close.pct_change(fill_method=None).clip(lower=-0.99)
 
     trading_index = pd.DatetimeIndex(close.index).sort_values()
-    idx           = trading_index.get_indexer(all_target_dates, method="pad")
-    
     valid = []
-    for target, resolved_pos in zip(all_target_dates, idx):
-        if resolved_pos < 0 or resolved_pos >= len(trading_index):
+    for target in all_target_dates:
+        lower_bound = target - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
+        eligible = trading_index[(trading_index <= target) & (trading_index >= lower_bound)]
+        if len(eligible) == 0:
+            logger.debug(
+                "Calendar guard: no prior trading day within %d days of %s; deferring rebalance.",
+                _REBALANCE_SNAP_WINDOW_DAYS,
+                target.date(),
+            )
             continue
-        resolved = trading_index[resolved_pos]
-        t_iso = target.isocalendar()
-        r_iso = resolved.isocalendar()
-        if r_iso[0] != t_iso[0] or r_iso[1] != t_iso[1]:
-            logger.debug("Calendar guard: %s -> %s crosses ISO week boundary, skipping.", target.date(), resolved.date())
-            continue
-        valid.append(resolved)
+        valid.append(eligible[-1])
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
@@ -498,7 +505,7 @@ def _compute_metrics(eq: pd.Series, initial: float, periods_per_year: int = 252)
         if len(downside) > 1 and downside.std() > 0:
             sortino = (dr.mean() * ppy) / (downside.std() * np.sqrt(ppy))
         else:
-            sortino = float("nan")
+            sortino = np.nan
     else:
         sharpe  = 0.0
         sortino = 0.0

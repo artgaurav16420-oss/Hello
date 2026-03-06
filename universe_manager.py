@@ -140,16 +140,25 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
             if len(valid_dates) > 0:
                 target_date = valid_dates.max()
                 constituents = df.loc[target_date, "tickers"]
-                
-                # FIX: Robustly handle Parquet PyArrow/FastParquet list deserialization
+
+                def _coerce_members(value) -> List[str]:
+                    if isinstance(value, str):
+                        return [value]
+                    if hasattr(value, "tolist"):
+                        converted = value.tolist()
+                        return converted if isinstance(converted, list) else [converted]
+                    if isinstance(value, (list, tuple, set)):
+                        return list(value)
+                    return [value]
+
+                # Handle duplicate snapshot rows by unioning all ticker lists deterministically.
                 if isinstance(constituents, pd.Series):
-                    val = constituents.iloc[0]
-                    # If it's a numpy array, .tolist() works. If it's a native list, list() wraps it safely.
-                    return val.tolist() if hasattr(val, "tolist") else list(val)
-                elif hasattr(constituents, "tolist"):
-                    return constituents.tolist()
-                else:
-                    return list(constituents)
+                    merged: List[str] = []
+                    for cell in constituents.values:
+                        merged.extend(_coerce_members(cell))
+                    return sorted({str(t).strip() for t in merged if str(t).strip()})
+
+                return sorted({str(t).strip() for t in _coerce_members(constituents) if str(t).strip()})
             else:
                 logger.warning(
                     "[Universe] No historical data prior to %s found in %s.", 

@@ -117,11 +117,11 @@ def test_regime_score_neutral_below_vol_lookback_requirement():
 
 
 
-def test_regime_score_uses_configurable_trend_steepness():
+def test_regime_score_uses_configurable_sigmoid_steepness():
     closes = np.concatenate([np.linspace(100, 102, 200), np.linspace(102, 103, 60)])
     idx = pd.DataFrame({"Close": closes}, index=pd.date_range("2021-01-01", periods=len(closes), freq="B"))
-    low = compute_regime_score(idx, cfg=UltimateConfig(REGIME_TREND_STEEPNESS=5.0))
-    high = compute_regime_score(idx, cfg=UltimateConfig(REGIME_TREND_STEEPNESS=40.0))
+    low = compute_regime_score(idx, cfg=UltimateConfig(REGIME_SIGMOID_STEEPNESS=5.0))
+    high = compute_regime_score(idx, cfg=UltimateConfig(REGIME_SIGMOID_STEEPNESS=40.0))
     assert high > low
 
 def test_regime_score_bull_market():
@@ -279,6 +279,7 @@ def test_portfolio_state_serialisation_roundtrip():
     ps.override_active      = True
     ps.override_cooldown    = 3
     ps.dividend_ledger      = {"RELIANCE": "2024-01-01:10.5"}
+    ps.last_known_volatility = {"RELIANCE": 0.021, "TCS": 0.035}
 
     ps2 = PortfolioState.from_dict(ps.to_dict())
     assert ps2.weights              == ps.weights
@@ -289,6 +290,40 @@ def test_portfolio_state_serialisation_roundtrip():
     assert ps2.override_active      == ps.override_active
     assert ps2.override_cooldown    == ps.override_cooldown
     assert ps2.dividend_ledger      == ps.dividend_ledger
+    assert ps2.last_known_volatility == ps.last_known_volatility
+
+
+def test_execute_rebalance_does_not_mutate_prices_input():
+    cfg = UltimateConfig()
+    state = PortfolioState(cash=1_000_000.0)
+    prices = np.array([100.0, np.nan])
+    execute_rebalance(
+        state,
+        target_weights=np.zeros(2),
+        prices=prices,
+        active_symbols=["A", "B"],
+        cfg=cfg,
+    )
+    assert np.isnan(prices[1])
+
+
+def test_compute_book_cvar_deterministic_for_ghost_positions_after_reload():
+    cfg = UltimateConfig(CVAR_LOOKBACK=60)
+    active_symbols = ["LIVE"]
+    prices = np.array([100.0])
+    idx = pd.date_range("2021-01-01", periods=80, freq="B")
+    hist_log_rets = pd.DataFrame({"LIVE": np.linspace(-0.01, 0.01, len(idx))}, index=idx)
+
+    state = PortfolioState(cash=100_000.0)
+    state.shares = {"LIVE": 10, "GHOST_B": 7, "GHOST_A": 5}
+    state.last_known_prices = {"LIVE": 100.0, "GHOST_A": 80.0, "GHOST_B": 120.0}
+    state.last_known_volatility = {"GHOST_A": 0.03, "GHOST_B": 0.02}
+
+    first = compute_book_cvar(state, prices, active_symbols, hist_log_rets, cfg)
+    reloaded = PortfolioState.from_dict(state.to_dict())
+    second = compute_book_cvar(reloaded, prices, active_symbols, hist_log_rets, cfg)
+
+    assert first == pytest.approx(second, rel=0, abs=1e-12)
 
 
 def test_portfolio_state_from_dict_bool_string_parsing():
@@ -334,6 +369,12 @@ def test_update_exposure_cvar_breach():
     assert state.override_active      is True
     assert state.override_cooldown    == 4
     assert state.exposure_multiplier  < 0.5 + 1e-9, "CVaR breach must halve exposure."
+
+
+def test_slippage_bps_setter_rejects_non_numeric_values():
+    cfg = UltimateConfig()
+    with pytest.raises(ValueError, match="must be numeric"):
+        cfg.SLIPPAGE_BPS = "not-a-number"
 
 
 def test_cvar_gross_exposure_normalisation():
@@ -622,6 +663,8 @@ def test_e2e_ledger_parity():
                 .replace([np.inf, -np.inf], np.nan)
             )
             adv_vector = _build_adv_vector(symbols, close, volume, date)
+            if live_state.shares:
+                compute_book_cvar(live_state, prices_t, symbols, hist_log_rets, cfg)
             pv         = live_state.cash + sum(
                 live_state.shares.get(s, 0) * close_t[s] for s in symbols
             )
