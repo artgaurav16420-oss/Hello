@@ -14,12 +14,12 @@ import pandas as pd
 
 def bootstrap_historical_parquet(
     output_path: str = "data/historical_nifty500.parquet",
-    tickers: list[str] | None = None,
+    default_tickers: list[str] | None = None,
 ) -> Path:
     """Create a minimal historical parquet with DatetimeIndex + tickers list column."""
-    default_tickers = tickers or ["RELIANCE", "TCS", "HDFCBANK"]
+    tickers = default_tickers or ["RELIANCE", "TCS", "HDFCBANK"]
     idx = pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date")
-    df = pd.DataFrame({"tickers": [default_tickers]}, index=idx)
+    df = pd.DataFrame({"tickers": [tickers]}, index=idx)
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,8 +28,12 @@ def bootstrap_historical_parquet(
 
 
 def main() -> None:
-    path = bootstrap_historical_parquet()
-    print(f"[+] Bootstrap complete: {path}")
+    outputs = [
+        bootstrap_historical_parquet("data/historical_nifty500.parquet"),
+        bootstrap_historical_parquet("data/historical_nse_total.parquet"),
+    ]
+    for path in outputs:
+        print(f"[+] Bootstrap complete: {path}")
 
 
 if __name__ == "__main__":

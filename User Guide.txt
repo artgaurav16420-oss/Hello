@@ -31,3 +31,7 @@ Production Notes (v11.46+)
 4) Reproducible environments
 - Install from `requirements-lock.txt` for reproducible dependency versions:
   - `pip install -r requirements-lock.txt`
+
+5) Paper mode and bootstrap helper
+- For safe dry-runs, start the dashboard with `python daily_workflow.py --paper` to disable portfolio state file writes, and if you are setting up backtests for the first time run `python historical_builder.py` to bootstrap both required historical universe files (`data/historical_nifty500.parquet` and `data/historical_nse_total.parquet`).
+
