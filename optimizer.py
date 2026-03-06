@@ -49,7 +49,6 @@ N_TRIALS       = 100    # Number of Bayesian iterations
 # draws down >25% in calm pre-crash markets has a structural problem.
 # OOS (2020-present) contains the COVID crash: 40% is the appropriate cap
 # since Nifty itself fell 38%. Manual intervention handles true black swans.
-MAX_DD_CAP     = 25.0   # In-sample hard cap — strict, IS is calm regime
 OOS_MAX_DD_CAP = 40.0   # OOS cap — lenient, OOS contains COVID
 
 # Search space bounds are configurable to support high-risk/high-turnover variants.
@@ -72,6 +71,37 @@ def _build_sampler() -> TPESampler:
     return TPESampler(seed=int(OPTUNA_SEED))
 
 # ─── Objective Function ───────────────────────────────────────────────────────
+
+def _iter_wfo_slices(train_start: str, train_end: str):
+    start = pd.Timestamp(train_start)
+    end = pd.Timestamp(train_end)
+    stop_year = max(end.year, pd.Timestamp(TEST_START).year)
+    years = list(range(start.year + 2, stop_year + 1))
+    for y in years:
+        oos_start = pd.Timestamp(f"{y}-01-01")
+        oos_end = pd.Timestamp(f"{y}-12-31")
+        yield (start.strftime("%Y-%m-%d"), (oos_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), oos_start.strftime("%Y-%m-%d"), oos_end.strftime("%Y-%m-%d"))
+
+
+def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
+    cagr = float(metrics.get("cagr", 0.0))
+    max_dd = abs(float(metrics.get("max_dd", 100.0)))
+    turnover = float(metrics.get("turnover", 0.0))
+    turnover_drag = turnover * 15.0  # 15 bps per 1x turnover as CAGR percentage drag
+    cagr_net = cagr - turnover_drag
+    if abs(cagr) < 1e-12 and max_dd == 0.0:
+        return 0.0
+
+    avg_cvar = 0.0
+    avg_positions = 0.0
+    if rebal_log is not None and not rebal_log.empty:
+        avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", 0.0), errors="coerce").fillna(0.0).mean())
+        avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
+
+    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
+    exposure_penalty = 1.0 if avg_positions >= 1.0 else 0.5
+    return (cagr_net / risk_penalty) - exposure_penalty
+
 
 class MomentumObjective:
     def __init__(self, market_data: dict, universe_type: str, search_space: dict | None = None):
@@ -108,38 +138,37 @@ class MomentumObjective:
             "CVAR_DAILY_LIMIT", cvar_min, cvar_max, step=cvar_step
         )
 
-        # 4. Execute the In-Sample Backtest
+        # 4. Walk-forward evaluation on expanding windows
+        scores = []
         try:
-            results = run_backtest(
-                market_data=self.market_data,
-                universe_type=self.universe_type,
-                start_date=TRAIN_START,
-                end_date=TRAIN_END,
-                cfg=cfg
-            )
+            for wf_train_start, wf_train_end, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
+                _ = run_backtest(
+                    market_data=self.market_data,
+                    universe_type=self.universe_type,
+                    start_date=wf_train_start,
+                    end_date=wf_train_end,
+                    cfg=cfg
+                )
+                oos = run_backtest(
+                    market_data=self.market_data,
+                    universe_type=self.universe_type,
+                    start_date=wf_oos_start,
+                    end_date=wf_oos_end,
+                    cfg=cfg
+                )
+                score = _fitness_from_metrics(oos.metrics, getattr(oos, "rebal_log", pd.DataFrame()))
+                if not pd.notna(score):
+                    raise optuna.TrialPruned()
+                scores.append(float(score))
         except OptimizationError:
-            # If the solver structurally fails on these params, prune the trial
             raise optuna.TrialPruned()
         except Exception as e:
             logger.warning(f"Trial failed due to internal error: {e}")
             raise optuna.TrialPruned()
 
-        metrics = results.metrics
-        cagr = metrics.get("cagr", 0.0)
-        max_dd = abs(metrics.get("max_dd", 100.0))
-
-        # 6. Hard prune if IS drawdown exceeds the pre-COVID cap.
-        # IS window (2018-2019) has no crash, so >25% DD is a real structural fail.
-        if max_dd > MAX_DD_CAP:
+        if not scores:
             raise optuna.TrialPruned()
-
-        # 5. Objective Calculation (Calmar Ratio)
-        if max_dd == 0:
-            return 0.0
-
-        calmar = cagr / max_dd
-
-        return calmar
+        return float(sum(scores) / len(scores))
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
 

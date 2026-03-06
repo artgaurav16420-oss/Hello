@@ -42,7 +42,8 @@ def test_optimizer_logger_does_not_duplicate_handlers_on_reload():
 
 def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
     class _Result:
-        metrics = {"cagr": 0.0, "max_dd": 0.0}
+        metrics = {"cagr": 0.0, "max_dd": 0.0, "turnover": 0.0}
+        rebal_log = None
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
@@ -109,9 +110,10 @@ def test_objective_logs_unexpected_errors_as_warning_and_prunes(monkeypatch, cap
     assert "Trial failed due to internal error" in caplog.text
 
 
-def test_objective_prunes_trial_when_drawdown_exceeds_cap(monkeypatch):
+def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch):
     class _Result:
-        metrics = {"cagr": 10.0, "max_dd": 30.0}
+        metrics = {"cagr": 10.0, "max_dd": 30.0, "turnover": 0.0}
+        rebal_log = None
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
@@ -126,8 +128,7 @@ def test_objective_prunes_trial_when_drawdown_exceeds_cap(monkeypatch):
         }
     )
 
-    with pytest.raises(optuna.TrialPruned):
-        objective(trial)
+    assert isinstance(objective(trial), float)
 
 
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
@@ -180,7 +181,8 @@ def test_build_sampler_returns_tpe_sampler(monkeypatch):
 
 def test_objective_uses_configurable_search_space(monkeypatch):
     class _Result:
-        metrics = {"cagr": 10.0, "max_dd": 5.0}
+        metrics = {"cagr": 10.0, "max_dd": 5.0, "turnover": 0.0}
+        rebal_log = None
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
@@ -204,7 +206,7 @@ def test_objective_uses_configurable_search_space(monkeypatch):
         }
     )
 
-    assert objective(trial) == 2.0
+    assert round(objective(trial), 6) == round((10.0 / 6.0) - 0.5, 6)
 
 
 def test_run_optimization_passes_parallel_jobs_to_optuna(monkeypatch):

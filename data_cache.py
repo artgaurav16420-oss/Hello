@@ -19,7 +19,10 @@ import os
 import random
 import time
 import hashlib
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +36,124 @@ CACHE_DIR = "data/cache"
 MANIFEST_FILE = os.path.join(CACHE_DIR, "_manifest.json")
 _DOWNLOAD_CHUNK_SIZE = 75
 _SUSPENSION_GAP_DAYS = 30
+
+
+class DataProvider(ABC):
+    """Strategy interface for market-data providers."""
+
+    @abstractmethod
+    def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        raise NotImplementedError
+
+
+class YFinanceProvider(DataProvider):
+    def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        return yf.download(
+            tickers,
+            start=start,
+            end=end,
+            group_by="ticker",
+            progress=False,
+            auto_adjust=False,
+        )
+
+
+class SecondaryProvider(DataProvider):
+    """AlphaVantage fallback provider with basic rate-limit throttling."""
+
+    _URL = "https://www.alphavantage.co/query"
+
+    def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        api_key = os.getenv("FALLBACK_API_KEY", "").strip()
+        if not api_key:
+            logger.warning("[Cache][Fallback] FALLBACK_API_KEY not set; skipping secondary provider.")
+            return None
+
+        min_interval = float(os.getenv("FALLBACK_MIN_INTERVAL_SEC", "12"))
+        last_call_ts = 0.0
+        ticker_frames: Dict[str, pd.DataFrame] = {}
+
+        for ticker in tickers:
+            av_symbol = self._map_symbol(ticker)
+            elapsed = time.time() - last_call_ts
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+            try:
+                frame = self._download_single(av_symbol, api_key)
+                last_call_ts = time.time()
+            except Exception as exc:
+                logger.warning("[Cache][Fallback] %s fetch failed: %s", ticker, exc)
+                frame = None
+
+            if frame is None:
+                continue
+
+            filtered = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
+            if filtered.empty:
+                continue
+            ticker_frames[ticker] = filtered
+
+            # AlphaVantage free tier is burst-limited; add a cool-down between symbols.
+            time.sleep(0.05)
+
+        if not ticker_frames:
+            return None
+
+        if len(ticker_frames) == 1:
+            only = next(iter(ticker_frames.values()))
+            return _normalize_history_index(only)
+
+        combined = pd.concat(ticker_frames, axis=1)
+        return _normalize_history_index(combined)
+
+    def _download_single(self, symbol: str, api_key: str) -> Optional[pd.DataFrame]:
+        params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED",
+            "symbol": symbol,
+            "outputsize": "full",
+            "apikey": api_key,
+        }
+        response = requests.get(self._URL, params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+
+        # Explicit handling for provider-side throttling / temporary errors.
+        if "Note" in payload or "Information" in payload:
+            msg = payload.get("Note") or payload.get("Information")
+            logger.warning("[Cache][Fallback] Rate-limit/notice for %s: %s", symbol, msg)
+            return None
+
+        series = payload.get("Time Series (Daily)")
+        if not isinstance(series, dict) or not series:
+            err = payload.get("Error Message", "empty time series")
+            logger.warning("[Cache][Fallback] Invalid payload for %s: %s", symbol, err)
+            return None
+
+        rows = []
+        for d, item in series.items():
+            rows.append(
+                {
+                    "Date": pd.Timestamp(d),
+                    "Open": float(item.get("1. open", np.nan)),
+                    "High": float(item.get("2. high", np.nan)),
+                    "Low": float(item.get("3. low", np.nan)),
+                    "Close": float(item.get("4. close", np.nan)),
+                    "Adj Close": float(item.get("5. adjusted close", np.nan)),
+                    "Volume": float(item.get("6. volume", np.nan)),
+                }
+            )
+
+        df = pd.DataFrame(rows).set_index("Date").sort_index()
+        return _normalize_history_index(df)
+
+    @staticmethod
+    def _map_symbol(ticker: str) -> str:
+        # AlphaVantage expects NSE symbols as "XYZ.NSE".
+        if ticker.startswith("^"):
+            return ticker
+        bare = ticker[:-3] if ticker.endswith(".NS") else ticker
+        return f"{bare}.NSE"
 
 
 def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -66,7 +187,12 @@ def _extract_ticker_frame(raw_data: pd.DataFrame, ticker: str) -> Optional[pd.Da
     return _normalize_history_index(raw_data.copy())
 
 
-def _download_with_timeout(tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+def _download_with_timeout(
+    tickers: List[str],
+    start: str,
+    end: str,
+    provider: Optional[DataProvider] = None,
+) -> Optional[pd.DataFrame]:
     """
     Attempts to download a chunk of tickers via yfinance with exponential backoff.
     auto_adjust=True guarantees that all historical data handles corporate actions (splits).
@@ -74,14 +200,8 @@ def _download_with_timeout(tickers: List[str], start: str, end: str) -> Optional
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            df = yf.download(
-                tickers, 
-                start=start, 
-                end=end, 
-                group_by="ticker", 
-                progress=False, 
-                auto_adjust=True
-            )
+            active_provider = provider or YFinanceProvider()
+            df = active_provider.download(tickers, start, end)
             return df
         except Exception as exc:
             logger.debug("[Cache] yfinance download attempt %d failed: %s", attempt + 1, exc)
@@ -158,6 +278,8 @@ def _is_valid_dataframe(df: pd.DataFrame) -> bool:
         return False
     if "Close" not in df.columns or df["Close"].isnull().all():
         return False
+    if "Adj Close" not in df.columns or df["Adj Close"].isnull().all():
+        return False
     if "Volume" not in df.columns or df["Volume"].isnull().all():
         return False
     return True
@@ -227,6 +349,13 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
     return df, is_suspended, max_gap
 
 
+def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Adj Close" not in out.columns:
+        out["Adj Close"] = out["Close"]
+    return out
+
+
 def load_or_fetch(
     tickers: List[str], 
     required_start: str, 
@@ -279,6 +408,8 @@ def load_or_fetch(
                 logger.debug("[Cache] Corrupted parquet for %s: %s", ticker, exc)
                 tickers_to_download.append(ticker)
                 
+    providers: List[DataProvider] = [YFinanceProvider(), SecondaryProvider()]
+
     # 2. Download missing tickers in chunks
     if tickers_to_download:
         logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
@@ -288,7 +419,14 @@ def load_or_fetch(
         ]
         
         for chunk in chunks:
-            raw_data = _download_with_timeout(chunk, padded_start, required_end)
+            raw_data = None
+            for provider in providers:
+                try:
+                    raw_data = _download_with_timeout(chunk, padded_start, required_end, provider=provider)
+                except TypeError:
+                    raw_data = _download_with_timeout(chunk, padded_start, required_end)
+                if raw_data is not None and not raw_data.empty:
+                    break
             if raw_data is None or raw_data.empty:
                 logger.warning("[Cache] Received empty response for chunk starting with %s", chunk[0])
                 continue
@@ -302,6 +440,7 @@ def load_or_fetch(
                     df.dropna(how='all', inplace=True)
                     if df.empty:
                         continue
+                    df = _ensure_price_columns(df)
 
                     # Structural validation before anything touches disk.
                     # Catches non-unique/non-monotonic indexes and all-NaN Close
@@ -314,8 +453,13 @@ def load_or_fetch(
                         )
                         continue
 
-                    # Handle suspension gaps with deterministic noise
-                    df, suspended, max_gap = _repair_suspension_gaps(df, ticker)
+                    simulate_halts = bool(getattr(cfg, "SIMULATE_HALTS", False))
+                    if simulate_halts:
+                        df, suspended, max_gap = _repair_suspension_gaps(df, ticker)
+                        if suspended:
+                            logger.warning("[Cache] Synthetic halt simulation applied to %s", ticker)
+                    else:
+                        suspended, max_gap = False, 0
                     
                     parquet_path = os.path.join(CACHE_DIR, f"{ticker}.parquet")
                     df.to_parquet(parquet_path)

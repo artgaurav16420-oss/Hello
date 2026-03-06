@@ -507,13 +507,13 @@ def test_record_eod_flat_day_preserved():
     assert len(ps.equity_hist) == 2, "Flat-days must be preserved, not dropped."
 
 
-def test_record_eod_cap_respected():
+def test_record_eod_history_grows_without_truncation():
     ps                 = PortfolioState(cash=1_000_000.0)
     ps.equity_hist_cap = 10
     for i in range(20):
         ps.cash = 1_000_000.0 + i * 100.0
         ps.record_eod({})
-    assert len(ps.equity_hist) == 10
+    assert len(ps.equity_hist) == 20
     assert ps.equity_hist[-1] == round(1_000_000.0 + 19 * 100.0, 10)
 
 
@@ -648,6 +648,7 @@ def test_e2e_ledger_parity():
     bt.run(close, volume, returns, rebal_dates, close.index[25].strftime("%Y-%m-%d"))
 
     live_state  = PortfolioState(cash=cfg.INITIAL_CAPITAL)
+    live_state.equity_hist_cap = cfg.EQUITY_HIST_CAP
     live_engine = InstitutionalRiskEngine(cfg)
 
     for date in close.index:
