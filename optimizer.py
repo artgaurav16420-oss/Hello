@@ -10,6 +10,7 @@ Requires: pip install optuna
 import json
 import logging
 import os
+import tempfile
 import sys
 import warnings
 
@@ -143,8 +144,20 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
     output_dir = os.path.dirname(filepath)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with open(filepath, "w") as f:
-        json.dump(best_params, f, indent=4)
+
+    # Write atomically to avoid partial/truncated JSON if the process is interrupted.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=output_dir or None,
+        delete=False,
+    ) as tmp_file:
+        json.dump(best_params, tmp_file, indent=4)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+        temp_path = tmp_file.name
+
+    os.replace(temp_path, filepath)
     logger.info(f"Saved optimal parameters to {filepath}")
 
 
