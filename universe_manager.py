@@ -136,9 +136,13 @@ _SECTOR_MAP_CACHE_LOCK = threading.Lock()
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
     """
     Attempts to load the exact constituents for a specific historical date.
-    
-    If no historical record exists for the requested universe/date, falls back 
-    to the current active universe and issues a survivorship bias warning.
+
+    Load order:
+    1) Historical parquet snapshots.
+    2) Point-in-time CSV snapshots (from historical_builder.py).
+
+    If neither source has a valid record, returns an empty list and issues
+    a survivorship-bias warning.
     """
     hist_file = f"data/historical_{universe_type}.parquet"
 
@@ -147,9 +151,8 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     if not os.path.exists(hist_file):
         if not _MISSING_PARQUET_WARNED.get(universe_type):
             logger.error(
-                "HISTORICAL PARQUET MISSING: %s — all %s backtests will use the "
-                "current universe (survivorship bias). Run the one-time historical "
-                "builder script before optimizing.",
+                "HISTORICAL PARQUET MISSING: %s — attempting point-in-time CSV fallback "
+                "for %s. Run historical_builder.py to regenerate parquet snapshots.",
                 hist_file, universe_type,
             )
             _MISSING_PARQUET_WARNED[universe_type] = True
@@ -194,19 +197,19 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                 universe_type, date.strftime("%Y-%m-%d"), exc
             )
     
-    # Warn once that we're falling back to current universe — not once per date.
-    if not _NO_RECORD_WARNED.get(universe_type):
-        logger.warning(
-            "[Universe] %s: No point-in-time historical record found. Falling back "
-            "to current universe for ALL missing dates (survivorship bias active).",
-            universe_type,
-        )
-        _NO_RECORD_WARNED[universe_type] = True
-
     # Fallback to point-in-time local CSV snapshot; never fallback to current constituents.
     csv_members = _load_pit_universe_from_csv(universe_type, date)
     if csv_members:
         return csv_members
+
+    # Warn once only when both parquet and CSV are unavailable for the date.
+    if not _NO_RECORD_WARNED.get(universe_type):
+        logger.warning(
+            "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
+            "Returning empty universe (survivorship bias risk if caller falls back).",
+            universe_type,
+        )
+        _NO_RECORD_WARNED[universe_type] = True
     return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────

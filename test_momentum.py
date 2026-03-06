@@ -94,6 +94,30 @@ def test_generate_signals_continuity_bonus():
     assert scores[0] > scores[1], "Held asset must receive continuity bonus."
 
 
+
+
+def test_generate_signals_continuity_decay_scales_with_prev_weight():
+    """Continuity bonus should scale from 25% to 100% with previous holding size."""
+    base_col = np.linspace(-0.01, 0.01, 120)
+    log_rets = pd.DataFrame(
+        np.column_stack([base_col, base_col, base_col]), columns=["SMALL", "LARGE", "NONE"]
+    )
+    adv = np.ones(3) * 1e6
+    cfg = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3)
+
+    _, scores, _ = generate_signals(
+        log_rets,
+        adv,
+        cfg,
+        prev_weights={"SMALL": 0.01, "LARGE": 0.10, "NONE": 0.0},
+    )
+
+    small_bonus = float(scores[0] - scores[2])
+    large_bonus = float(scores[1] - scores[2])
+
+    assert small_bonus == pytest.approx(0.00375, abs=1e-6)
+    assert large_bonus == pytest.approx(0.015, abs=1e-6)
+
 def test_generate_signals_blocks_empty_input():
     """A completely empty array should trip the defensive barrier before math crash."""
     cfg = UltimateConfig()
@@ -1074,3 +1098,14 @@ def test_decay_rounds_exhaustion_forces_liquidation():
 if __name__ == '__main__':
     import sys
     sys.exit(pytest.main([__file__, '-v']))
+
+
+def test_volume_first_day_adv_is_zero_no_lookahead():
+    cols = ["SYM00", "SYM01"]
+    idx = pd.date_range("2020-01-02", periods=5, freq="B")
+    close = pd.DataFrame(np.ones((5, 2)) * 100.0, index=idx, columns=cols)
+    volume = pd.DataFrame(np.ones((5, 2)) * 1e6, index=idx, columns=cols)
+
+    adv_day0 = _build_adv_vector(cols, close, volume, idx[0])
+
+    assert np.allclose(adv_day0, 0.0)
