@@ -190,18 +190,24 @@ def generate_signals(
     active_symbols = list(log_rets.columns)
     
     # 1. Base Signal Calculation (Blended EWMA)
-    fast_ema = log_rets.ewm(halflife=cfg.HALFLIFE_FAST).mean().iloc[-1].values
-    slow_ema = log_rets.ewm(halflife=cfg.HALFLIFE_SLOW).mean().iloc[-1].values
-    
+    signal_lag_days = max(int(getattr(cfg, "SIGNAL_LAG_DAYS", 0)), 0)
+    if signal_lag_days > 0 and len(log_rets) > signal_lag_days:
+        signal_log_rets = log_rets.iloc[:-signal_lag_days]
+    else:
+        signal_log_rets = log_rets
+
+    fast_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_FAST).mean().iloc[-1].values
+    slow_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_SLOW).mean().iloc[-1].values
+
     raw_daily_momentum = 0.5 * fast_ema + 0.5 * slow_ema
-    
+
     # Cross-sectional Z-score standardization
     mu_cross = np.nanmean(raw_daily_momentum)
     std_cross = max(np.nanstd(raw_daily_momentum), 1e-8)
-    
+
     adj_scores = np.clip(
-        (raw_daily_momentum - mu_cross) / std_cross, 
-        -cfg.Z_SCORE_CLIP, 
+        (raw_daily_momentum - mu_cross) / std_cross,
+        -cfg.Z_SCORE_CLIP,
         cfg.Z_SCORE_CLIP
     )
 
