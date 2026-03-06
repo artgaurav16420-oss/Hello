@@ -7,6 +7,7 @@ Implements strict Out-of-Sample (OOS) validation to prevent curve-fitting.
 Requires: pip install optuna
 """
 
+import argparse
 import json
 import logging
 import os
@@ -51,30 +52,61 @@ N_TRIALS       = 100    # Number of Bayesian iterations
 MAX_DD_CAP     = 25.0   # In-sample hard cap — strict, IS is calm regime
 OOS_MAX_DD_CAP = 40.0   # OOS cap — lenient, OOS contains COVID
 
+# Search space bounds are configurable to support high-risk/high-turnover variants.
+SEARCH_SPACE_BOUNDS = {
+    "HALFLIFE_FAST": (10, 40),
+    "HALFLIFE_SLOW": (50, 120),
+    "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
+    "RISK_AVERSION": (2.0, 15.0, 0.5),
+    "CVAR_DAILY_LIMIT": (0.025, 0.06, 0.005),
+}
+
+# Runtime knobs: use all cores by default and allow optional deterministic seed.
+N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "-1"))
+OPTUNA_SEED = os.getenv("OPTUNA_SEED")
+
+
+def _build_sampler() -> TPESampler:
+    if OPTUNA_SEED in (None, ""):
+        return TPESampler()
+    return TPESampler(seed=int(OPTUNA_SEED))
+
 # ─── Objective Function ───────────────────────────────────────────────────────
 
 class MomentumObjective:
-    def __init__(self, market_data: dict, universe_type: str):
+    def __init__(self, market_data: dict, universe_type: str, search_space: dict | None = None):
         self.market_data = market_data
         self.universe_type = universe_type
+        self.search_space = search_space or SEARCH_SPACE_BOUNDS
 
     def __call__(self, trial: optuna.Trial) -> float:
         # 1. Base Configuration
         cfg = UltimateConfig()
 
         # 2. Define the Search Space (Group A: Alpha & Turnover)
-        cfg.HALFLIFE_FAST = trial.suggest_int("HALFLIFE_FAST", 10, 40)
-        cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", 50, 120)
+        halflife_fast_min, halflife_fast_max = self.search_space["HALFLIFE_FAST"]
+        halflife_slow_min, halflife_slow_max = self.search_space["HALFLIFE_SLOW"]
+        cfg.HALFLIFE_FAST = trial.suggest_int("HALFLIFE_FAST", halflife_fast_min, halflife_fast_max)
+        cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max)
         
         # Logical Constraint: Fast must be strictly faster than slow
         if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
             raise optuna.TrialPruned()
             
-        cfg.CONTINUITY_BONUS = trial.suggest_float("CONTINUITY_BONUS", 0.05, 0.30, step=0.01)
+        continuity_min, continuity_max, continuity_step = self.search_space["CONTINUITY_BONUS"]
+        cfg.CONTINUITY_BONUS = trial.suggest_float(
+            "CONTINUITY_BONUS", continuity_min, continuity_max, step=continuity_step
+        )
 
         # 3. Define the Search Space (Group B: Risk Matrix)
-        cfg.RISK_AVERSION    = trial.suggest_float("RISK_AVERSION", 2.0, 15.0, step=0.5)
-        cfg.CVAR_DAILY_LIMIT = trial.suggest_float("CVAR_DAILY_LIMIT", 0.025, 0.06, step=0.005)
+        risk_aversion_min, risk_aversion_max, risk_aversion_step = self.search_space["RISK_AVERSION"]
+        cvar_min, cvar_max, cvar_step = self.search_space["CVAR_DAILY_LIMIT"]
+        cfg.RISK_AVERSION = trial.suggest_float(
+            "RISK_AVERSION", risk_aversion_min, risk_aversion_max, step=risk_aversion_step
+        )
+        cfg.CVAR_DAILY_LIMIT = trial.suggest_float(
+            "CVAR_DAILY_LIMIT", cvar_min, cvar_max, step=cvar_step
+        )
 
         # 4. Execute the In-Sample Backtest
         try:
@@ -89,7 +121,7 @@ class MomentumObjective:
             # If the solver structurally fails on these params, prune the trial
             raise optuna.TrialPruned()
         except Exception as e:
-            logger.debug(f"Trial failed unexpectedly: {e}")
+            logger.warning(f"Trial failed due to internal error: {e}")
             raise optuna.TrialPruned()
 
         metrics = results.metrics
@@ -161,20 +193,20 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
     logger.info(f"Saved optimal parameters to {filepath}")
 
 
-def run_optimization():
+def run_optimization(universe_type: str = "nifty500"):
     print(f"\n\033[1;36m=== INSTITUTIONAL WALK-FORWARD OPTIMIZER ===\033[0m")
     print(f"\033[90mIn-Sample (Train) : {TRAIN_START} to {TRAIN_END}\033[0m")
     print(f"\033[90mOut-of-Sample     : {TEST_START} to {TEST_END}\033[0m")
     print(f"\033[90mTrials            : {N_TRIALS}\033[0m\n")
 
-    universe_type = "nifty500"
+    logger.info(f"Optimization universe: {universe_type}")
     market_data = pre_load_data(universe_type)
 
     # 1. Setup Optuna Study
     study = optuna.create_study(
         study_name="Momentum_Risk_Parity",
         direction="maximize",
-        sampler=TPESampler(seed=42) # Seeded for reproducibility
+        sampler=_build_sampler(),
     )
     
     objective = MomentumObjective(market_data, universe_type)
@@ -185,6 +217,7 @@ def run_optimization():
         objective, 
         n_trials=N_TRIALS, 
         show_progress_bar=True,
+        n_jobs=N_JOBS,
         catch=(Exception,)
     )
 
@@ -239,5 +272,16 @@ def run_optimization():
     except Exception as e:
         print(f"\n\033[1;31m[FAIL]\033[0m OOS Validation threw an exception: {e}")
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Bayesian optimizer for momentum strategy.")
+    parser.add_argument(
+        "--universe",
+        default="nifty500",
+        help="Universe to optimize against (e.g., nifty500, nse_total).",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    run_optimization()
+    args = _parse_args()
+    run_optimization(universe_type=args.universe)
