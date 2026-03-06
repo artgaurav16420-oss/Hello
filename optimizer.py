@@ -243,7 +243,11 @@ def run_optimization(universe_type: str = "nifty500"):
     
     # Construct a new config using the best parameters
     oos_cfg = UltimateConfig()
+    valid_fields = UltimateConfig.__dataclass_fields__
     for k, v in best_params.items():
+        if k not in valid_fields:
+            logger.warning("[Config] Ignoring unknown/stale optimized parameter during OOS validation: %s", k)
+            continue
         setattr(oos_cfg, k, v)
 
     logger.info(f"Running unseen data ({TEST_START} to {TEST_END})...")

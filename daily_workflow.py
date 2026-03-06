@@ -292,8 +292,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 new_entry      = old_entry / r
 
                 # Safely sweep fractional shares
-                pre_split_fractional_shares = max(0.0, old_shares - (new_shares / r))
-                fractional_value = pre_split_fractional_shares * current_price
+                fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
+                fractional_value = fractional_new_shares * current_price
                 state.cash = round(state.cash + fractional_value, 10)
 
                 logger.warning(
@@ -507,7 +507,7 @@ def _run_scan(
     _exhaust_decay = False
     if apply_decay and not optimization_succeeded:
         if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
-            target = np.zeros(len(active), dtype=float)
+            weights = np.zeros(len(active), dtype=float)
             logger.warning(
                 "[Scan] %s — forcing full liquidation to cash.",
                 "Book CVaR breach" if _force_full_cash else
