@@ -346,7 +346,7 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
             if pos > 0:
                 signal_date = idx[pos - 1]
             else:
-                signal_date = idx[0]
+                signal_date = idx[0]  # first trading day in dataset — use itself (no lookahead)
 
     for sym in symbols:
         if sym in volume.columns and sym in close.columns and signal_date is not None:
