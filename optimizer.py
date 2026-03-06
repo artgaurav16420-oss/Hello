@@ -271,8 +271,13 @@ def run_optimization(universe_type: str = "nifty500"):
         if m.get('calmar', 0) > 1.0 and abs(m.get('max_dd', 100)) <= OOS_MAX_DD_CAP:
             print("\n\033[1;32m[PASS]\033[0m Strategy parameters survived Out-of-Sample verification without structural decay.")
         else:
-            print("\n\033[1;31m[FAIL]\033[0m Parameters degraded severely Out-of-Sample. The model is overfitted to the training data.")
+            raise RuntimeError(
+                "OOS Validation Failed: Parameters degraded severely Out-of-Sample. "
+                "The model is overfitted."
+            )
 
+    except RuntimeError:
+        raise
     except Exception as e:
         print(f"\n\033[1;31m[FAIL]\033[0m OOS Validation threw an exception: {e}")
 

@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -107,6 +108,7 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 # preventing thousands of identical lines from flooding optimizer output.
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
+_SECTOR_MAP_CACHE_LOCK = threading.Lock()
 
 
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
@@ -361,15 +363,16 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 
         # Update cache with newly found sectors
         if use_cache:
-            cache = _load_universe_cache()
-            existing_sector_cache = cache.get("sector_map", {}).get("sectors", {})
-            existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
-            
-            cache["sector_map"] = {
-                "fetched_at": datetime.now().isoformat(),
-                "sectors": existing_sector_cache
-            }
-            _save_universe_cache(cache)
+            with _SECTOR_MAP_CACHE_LOCK:
+                cache = _load_universe_cache()
+                existing_sector_cache = cache.get("sector_map", {}).get("sectors", {})
+                existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
+
+                cache["sector_map"] = {
+                    "fetched_at": datetime.now().isoformat(),
+                    "sectors": existing_sector_cache
+                }
+                _save_universe_cache(cache)
             
     # Format the return dictionary to match exactly the requested input tickers
     final_map = {}

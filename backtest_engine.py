@@ -345,6 +345,8 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
                     pos = int(pos[0]) if len(pos) else -1
             if pos > 0:
                 signal_date = idx[pos - 1]
+            else:
+                signal_date = idx[0]
 
     for sym in symbols:
         if sym in volume.columns and sym in close.columns and signal_date is not None:
@@ -463,7 +465,7 @@ def run_backtest(
     return BacktestResults(
         equity_curve = eq_weekly,
         trades       = bt.trades,
-        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR),
+        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
         rebal_log    = rebal_log,
     )
 
@@ -488,9 +490,23 @@ def print_backtest_results(results: BacktestResults) -> None:
     print(f"  \033[90m{chr(9472)*65}\033[0m\n")
 
 
-def _compute_metrics(eq: pd.Series, initial: float, periods_per_year: int = 252) -> Dict:
+def _compute_metrics(
+    eq: pd.Series,
+    initial: float,
+    periods_per_year: int = 252,
+    trades: Optional[List[Trade]] = None,
+) -> Dict:
     if eq.empty:
-        return {"cagr": 0.0, "max_dd": 0.0, "final": initial, "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0}
+        return {
+            "cagr": 0.0,
+            "max_dd": 0.0,
+            "final": initial,
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "calmar": 0.0,
+            "hit_rate": 0.0,
+            "turnover": 0.0,
+        }
 
     final  = float(eq.iloc[-1])
     n_periods = max(len(eq) - 1, 1)
@@ -514,6 +530,47 @@ def _compute_metrics(eq: pd.Series, initial: float, periods_per_year: int = 252)
 
     calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
 
+    hit_rate = 0.0
+    turnover = 0.0
+    if trades:
+        buy_trades = [t for t in trades if t.direction == "BUY" and t.delta_shares > 0]
+        sell_trades = [t for t in trades if t.direction == "SELL" and t.delta_shares < 0]
+
+        round_trip_pnls: List[float] = []
+        buy_queue: Dict[str, List[tuple[int, float]]] = {}
+
+        for trade in trades:
+            if trade.delta_shares == 0:
+                continue
+
+            qty = abs(int(trade.delta_shares))
+            price = float(trade.exec_price)
+
+            if trade.direction == "BUY" and trade.delta_shares > 0:
+                buy_queue.setdefault(trade.symbol, []).append((qty, price))
+            elif trade.direction == "SELL" and trade.delta_shares < 0:
+                lots = buy_queue.setdefault(trade.symbol, [])
+                remaining = qty
+                while remaining > 0 and lots:
+                    lot_qty, lot_px = lots[0]
+                    matched = min(remaining, lot_qty)
+                    round_trip_pnls.append((price - lot_px) * matched)
+                    remaining -= matched
+                    lot_qty -= matched
+                    if lot_qty == 0:
+                        lots.pop(0)
+                    else:
+                        lots[0] = (lot_qty, lot_px)
+
+        if round_trip_pnls:
+            hit_rate = (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0
+
+        total_buy_notional = sum(t.delta_shares * t.exec_price for t in buy_trades)
+        total_sell_notional = sum(abs(t.delta_shares) * t.exec_price for t in sell_trades)
+        avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
+        if avg_equity > 0:
+            turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
+
     return {
         "cagr":    round(cagr,    2),
         "max_dd":  round(max_dd,  2),
@@ -521,4 +578,6 @@ def _compute_metrics(eq: pd.Series, initial: float, periods_per_year: int = 252)
         "sharpe":  round(sharpe,  2),
         "sortino": sortino if not np.isfinite(sortino) else round(sortino, 2),
         "calmar":  round(calmar,  2),
+        "hit_rate": round(hit_rate, 2),
+        "turnover": round(turnover, 4),
     }

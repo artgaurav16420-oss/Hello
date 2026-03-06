@@ -8,6 +8,7 @@ Dividend Sweeping, and Impact-Aligned Rebalancing.
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import logging
@@ -49,6 +50,7 @@ from signals import generate_signals, compute_adv, compute_regime_score
 __version__ = "11.46"
 
 BACKUP_GENERATIONS = 3
+PAPER_MODE = False
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -312,6 +314,10 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 # ─── State persistence ────────────────────────────────────────────────────────
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
+    if PAPER_MODE:
+        print(f"  {C.YLW}[!] Paper mode active. State will not be saved.{C.RST}")
+        return
+
     os.makedirs("data", exist_ok=True)
     state_file = f"data/portfolio_state_{name}.json"
     tmp_file   = f"{state_file}.tmp"
@@ -945,7 +951,21 @@ def main_menu() -> None:
             print(f"  {C.GRY}Goodbye!{C.RST}\n")
             break
 
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ultimate Momentum daily workflow")
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help="Enable paper trading mode (disables portfolio state file writes).",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = _parse_args()
+    PAPER_MODE = bool(args.paper)
+
     os.makedirs("logs", exist_ok=True)
 
     logging.basicConfig(
@@ -959,4 +979,6 @@ if __name__ == "__main__":
     )
 
     logger.info("Ultimate Momentum v%s started", __version__)
+    if PAPER_MODE:
+        logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
