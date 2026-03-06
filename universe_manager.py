@@ -103,6 +103,12 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 
 # ─── Historical Universe Logic (Survivorship Bias Fix) ────────────────────────
 
+# Module-level flags so each warning fires at most once per process,
+# preventing thousands of identical lines from flooding optimizer output.
+_MISSING_PARQUET_WARNED: Dict[str, bool] = {}
+_NO_RECORD_WARNED: Dict[str, bool] = {}
+
+
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
     """
     Attempts to load the exact constituents for a specific historical date.
@@ -111,11 +117,18 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     to the current active universe and issues a survivorship bias warning.
     """
     hist_file = f"data/historical_{universe_type}.parquet"
-    
-    # FIX: Explicit operator warning to prevent silent fallback to survivorship bias
+
+    # Warn once per missing parquet file (not once per date) to keep optimizer
+    # output readable. The warning is still ERROR level so it's never silent.
     if not os.path.exists(hist_file):
-        logger.error("HISTORICAL PARQUET MISSING: %s", hist_file)
-        logger.error("Run the one-time historical builder script or backtests will have survivorship bias!")
+        if not _MISSING_PARQUET_WARNED.get(universe_type):
+            logger.error(
+                "HISTORICAL PARQUET MISSING: %s — all %s backtests will use the "
+                "current universe (survivorship bias). Run the one-time historical "
+                "builder script before optimizing.",
+                hist_file, universe_type,
+            )
+            _MISSING_PARQUET_WARNED[universe_type] = True
     else:
         try:
             df = pd.read_parquet(hist_file)
@@ -148,12 +161,15 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                 universe_type, date.strftime("%Y-%m-%d"), exc
             )
     
-    logger.warning(
-        "[Universe] %s: No historical record found for %s. Using CURRENT universe. "
-        "WARNING: Backtest results will contain survivorship bias.", 
-        universe_type, date.strftime("%Y-%m-%d")
-    )
-    
+    # Warn once that we're falling back to current universe — not once per date.
+    if not _NO_RECORD_WARNED.get(universe_type):
+        logger.warning(
+            "[Universe] %s: No point-in-time historical record found. Falling back "
+            "to current universe for ALL missing dates (survivorship bias active).",
+            universe_type,
+        )
+        _NO_RECORD_WARNED[universe_type] = True
+
     # Fallback to current universe mappings
     if universe_type == "nifty500":
         return get_nifty500()

@@ -39,12 +39,17 @@ if not logger.handlers:
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2018-01-01"
-TRAIN_END   = "2021-12-31"
-TEST_START  = "2022-01-01"
+TRAIN_END   = "2019-12-31"   # 2 pre-COVID years — optimizer never sees the crash
+TEST_START  = "2020-01-01"   # OOS starts Jan 2020: COVID is the first real stress test
 TEST_END    = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-N_TRIALS    = 100       # Number of Bayesian iterations
-MAX_DD_CAP  = 25.0      # Hard cap on acceptable Maximum Drawdown (%)
+N_TRIALS       = 100    # Number of Bayesian iterations
+# IS (2018-2019) is pre-COVID: 25% is a realistic strict cap — a strategy that
+# draws down >25% in calm pre-crash markets has a structural problem.
+# OOS (2020-present) contains the COVID crash: 40% is the appropriate cap
+# since Nifty itself fell 38%. Manual intervention handles true black swans.
+MAX_DD_CAP     = 25.0   # In-sample hard cap — strict, IS is calm regime
+OOS_MAX_DD_CAP = 40.0   # OOS cap — lenient, OOS contains COVID
 
 # ─── Objective Function ───────────────────────────────────────────────────────
 
@@ -69,7 +74,7 @@ class MomentumObjective:
 
         # 3. Define the Search Space (Group B: Risk Matrix)
         cfg.RISK_AVERSION    = trial.suggest_float("RISK_AVERSION", 2.0, 15.0, step=0.5)
-        cfg.CVAR_DAILY_LIMIT = trial.suggest_float("CVAR_DAILY_LIMIT", 0.02, 0.06, step=0.005)
+        cfg.CVAR_DAILY_LIMIT = trial.suggest_float("CVAR_DAILY_LIMIT", 0.025, 0.06, step=0.005)
 
         # 4. Execute the In-Sample Backtest
         try:
@@ -97,10 +102,10 @@ class MomentumObjective:
             
         calmar = cagr / max_dd
 
-        # 6. Continuous Penalty for Drawdown Breaches
+        # 6. Hard prune if IS drawdown exceeds the pre-COVID cap.
+        # IS window (2018-2019) has no crash, so >25% DD is a real structural fail.
         if max_dd > MAX_DD_CAP:
-            penalty = (max_dd - MAX_DD_CAP) * 0.5
-            calmar -= penalty
+            raise optuna.TrialPruned()
 
         return calmar
 
@@ -213,7 +218,7 @@ def run_optimization():
         print(f"\033[1mOOS Calmar:\033[0m {m.get('calmar', 0):.2f}")
         
         # Institutional Validation Heuristic
-        if m.get('calmar', 0) > 1.0 and abs(m.get('max_dd', 100)) <= MAX_DD_CAP:
+        if m.get('calmar', 0) > 1.0 and abs(m.get('max_dd', 100)) <= OOS_MAX_DD_CAP:
             print("\n\033[1;32m[PASS]\033[0m Strategy parameters survived Out-of-Sample verification without structural decay.")
         else:
             print("\n\033[1;31m[FAIL]\033[0m Parameters degraded severely Out-of-Sample. The model is overfitted to the training data.")
