@@ -777,10 +777,35 @@ class InstitutionalRiskEngine:
                 f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
             )
 
+        # FIX (Bug-C — Zero-Vol Crash, Part 1): Replace zero-volatility columns
+        # (flatlined / circuit-breaker stocks) before fitting LedoitWolf.
+        # A zero-vol column produces an all-zero covariance row/column.  That makes
+        # np.trace(Sigma) ≈ 0, so the proportional ridge below would also be ≈ 0,
+        # leaving Sigma_reg singular and causing osqp.setup() to fail.
+        # Stocks that flatline should be caught by the ADV gate in signals.py, but
+        # this guard ensures a solver crash is impossible even if they slip through.
+        col_stds = clean_rets.std()
+        zero_vol_cols = col_stds[col_stds < 1e-10].index.tolist()
+        if zero_vol_cols:
+            logger.warning(
+                "[Optimizer] %d zero-volatility asset(s) detected before covariance "
+                "estimation: %s. Injecting minimum-noise surrogate to prevent a "
+                "singular matrix. Verify that ADV / history gates are filtering "
+                "circuit-breaker stocks correctly.",
+                len(zero_vol_cols), zero_vol_cols,
+            )
+            clean_rets = clean_rets.copy()
+            _zvol_rng = np.random.RandomState(42)
+            for _col in zero_vol_cols:
+                clean_rets[_col] = _zvol_rng.normal(0.0, 1e-6, len(clean_rets))
+
         lw = LedoitWolf()
         lw.fit(clean_rets)
         Sigma     = lw.covariance_
-        ridge     = 1e-8 * float(np.trace(Sigma))
+        # FIX (Bug-C — Zero-Vol Crash, Part 2): Guarantee a non-zero ridge even
+        # when trace(Sigma) ≈ 0.  Use the larger of the proportional value and a
+        # dimension-scaled absolute floor so regularisation is always meaningful.
+        ridge     = max(1e-8 * float(np.trace(Sigma)), 1e-8 * m)
         Sigma_reg = Sigma + ridge * np.eye(m)
 
         gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))

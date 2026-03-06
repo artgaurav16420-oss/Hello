@@ -378,7 +378,14 @@ def _run_scan(
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
-    all_syms   = list({to_ns(t) for t in universe} | {"^NSEI", "^CRSLDX"})
+    # FIX (Bug-D — Delisting Crash / PV Gap): Always include currently-held symbols
+    # in the fetch batch, even if they have been dropped from the scan universe
+    # (e.g. delisted, merged, or fallen below the ADV floor).  Without this,
+    # a held-but-absent stock never receives a price update, its market value is
+    # silently omitted from the PV calculation, and the position-sizer deploys
+    # too much of the available cash budget on the next rebalance.
+    held_syms  = {to_ns(s) for s in state.shares.keys()}
+    all_syms   = list({to_ns(t) for t in universe} | held_syms | {"^NSEI", "^CRSLDX"})
     _print_stage_status(
         "Download",
         0.35,
@@ -422,6 +429,22 @@ def _run_scan(
         for sym in state.shares
         if sym in active_idx
     )
+    # FIX (Bug-D — Delisting PV Gap): Include held stocks that are absent from the
+    # current scan universe (possibly delisted / suspended) at their last-known
+    # price.  Omitting them under-counts total equity, causing the optimizer to
+    # over-deploy cash and breach position-size limits on the next trade.
+    for _absent_sym in state.shares:
+        if _absent_sym not in active_idx:
+            _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
+            if _fallback_px > 0:
+                mtm_notional += state.shares[_absent_sym] * _fallback_px
+                logger.warning(
+                    "[Scan] Held symbol '%s' absent from current market data "
+                    "(possibly delisted/suspended). Using last-known price ₹%.2f "
+                    "for PV calculation. Position will be force-closed after "
+                    "%d consecutive absent periods.",
+                    _absent_sym, _fallback_px, cfg.MAX_ABSENT_PERIODS,
+                )
     pv = mtm_notional + state.cash
     initial_cash = state.cash
     initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
@@ -883,8 +906,24 @@ def main_menu() -> None:
             elif not historical_union:
                 historical_union.update(get_nifty500())
 
-            data       = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end)
-            print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
+            data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end)
+            # FIX (Bug-A — Survivorship Bias Guard): run_backtest raises RuntimeError
+            # when no point-in-time historical universe files are found, intentionally
+            # refusing to fall back to the current Nifty 500 constituents (which
+            # would silently inflate CAGR by 3-5% p.a. via survivorship bias).
+            # Catch that error here so the CLI loop stays alive and guide the user.
+            try:
+                print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
+            except RuntimeError as exc:
+                print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
+                print(f"  {C.RED}{exc}{C.RST}")
+                print(f"\n  {C.YLW}This safeguard prevents silently survivorship-biased backtests.{C.RST}")
+                print(f"  {C.YLW}Backtesting with today's index members over-states CAGR by ~3-5%{C.RST}")
+                print(f"  {C.YLW}p.a. because it excludes companies that were delisted or demoted.{C.RST}")
+                print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
+                print(f"  {C.BLD}    python historical_builder.py{C.RST}")
+                print(f"  {C.GRY}Required files:{C.RST}")
+                print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
 
         elif c == "5":
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:

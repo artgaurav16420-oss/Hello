@@ -312,12 +312,23 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
         # Create a complete business day timeline covering the entire range
         bday_idx = pd.bdate_range(df.index[0], df.index[-1])
         
-        # Capture historical volatility before the gap if possible
-        daily_rets = df["Close"].pct_change().dropna()
-        if len(daily_rets) > 10:
-            hist_vol = daily_rets.std()
+        # FIX (Bug-B — Lookahead Bias): Compute volatility STRICTLY from price data
+        # that existed BEFORE the first detected gap.  Using the full series would
+        # leak future volatility regimes into the imputed past prices — e.g.,
+        # computing vol from 2019-2024 data to fill a 2018 suspension gap inflates
+        # apparent risk during backtests and pollutes CVaR estimates.
+        _gap_days_tmp = df.index.to_series().diff().dt.days
+        _first_gap_positions = np.where(_gap_days_tmp.values > _SUSPENSION_GAP_DAYS)[0]
+        if len(_first_gap_positions) > 0:
+            _pre_gap_close = df["Close"].iloc[: _first_gap_positions[0]]
         else:
-            hist_vol = 0.02 # fallback to 2% daily volatility
+            _pre_gap_close = df["Close"]
+
+        _pre_gap_rets = _pre_gap_close.pct_change().dropna()
+        if len(_pre_gap_rets) > 10:
+            hist_vol = float(_pre_gap_rets.std())
+        else:
+            hist_vol = 0.02  # fallback 2 % daily vol when insufficient pre-gap history
             
         # Reindex to fill the gap with NaNs
         df = df.reindex(bday_idx)
