@@ -45,7 +45,8 @@ def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['Ultima
         
     trend_deviation = (last_price / sma200) - 1.0
     # Sigmoid function maps deviation to [0, 1] bounded score
-    base_score = 1.0 / (1.0 + np.exp(-20.0 * trend_deviation))
+    trend_steepness = float(getattr(cfg, "REGIME_TREND_STEEPNESS", 20.0)) if cfg else 20.0
+    base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
     
     # 2. Volatility penalty component
     returns_20d = close_series.pct_change(fill_method=None).tail(20)

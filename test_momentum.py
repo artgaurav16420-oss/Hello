@@ -115,6 +115,15 @@ def test_regime_score_neutral_below_vol_lookback_requirement():
     assert compute_regime_score(idx) == 0.5
 
 
+
+
+def test_regime_score_uses_configurable_trend_steepness():
+    closes = np.concatenate([np.linspace(100, 102, 200), np.linspace(102, 103, 60)])
+    idx = pd.DataFrame({"Close": closes}, index=pd.date_range("2021-01-01", periods=len(closes), freq="B"))
+    low = compute_regime_score(idx, cfg=UltimateConfig(REGIME_TREND_STEEPNESS=5.0))
+    high = compute_regime_score(idx, cfg=UltimateConfig(REGIME_TREND_STEEPNESS=40.0))
+    assert high > low
+
 def test_regime_score_bull_market():
     """Price well above SMA200 should give score > 0.5."""
     closes = np.linspace(80, 120, 400)      # steady uptrend
@@ -374,6 +383,21 @@ def test_update_exposure_sustained_cvar_breach_recovery():
     assert state.override_active is True, "Override must remain active at the end of the sustained stress test."
     assert state.exposure_multiplier >= cfg.MIN_EXPOSURE_FLOOR, "Exposure must not cascade below the defined floor."
 
+
+
+
+def test_execute_rebalance_fractional_sweep_never_overspends():
+    cfg = UltimateConfig(INITIAL_CAPITAL=1_000_000)
+    state = PortfolioState(cash=1_000_000.0)
+    symbols = ["A", "B", "C"]
+    prices = np.array([100.0, 130.0, 180.0], dtype=float)
+    targets = np.array([0.3333, 0.3333, 0.3334], dtype=float)
+
+    execute_rebalance(state, targets, prices, symbols, cfg)
+
+    invested = sum(state.shares.get(s, 0) * prices[i] for i, s in enumerate(symbols))
+    assert invested <= 1_000_000.0 + 1e-6
+    assert state.cash >= 0.0
 
 def test_execute_rebalance_pv_includes_stale_positions():
     cfg   = UltimateConfig(MAX_ABSENT_PERIODS=1)

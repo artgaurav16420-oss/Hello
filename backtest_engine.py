@@ -456,7 +456,7 @@ def run_backtest(
     return BacktestResults(
         equity_curve = eq_weekly,
         trades       = bt.trades,
-        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL),
+        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR),
         rebal_log    = rebal_log,
     )
 
@@ -479,26 +479,24 @@ def print_backtest_results(results: BacktestResults) -> None:
     print(f"  \033[90m{chr(9472)*65}\033[0m\n")
 
 
-def _compute_metrics(eq: pd.Series, initial: float) -> Dict:
+def _compute_metrics(eq: pd.Series, initial: float, periods_per_year: int = 252) -> Dict:
     if eq.empty:
         return {"cagr": 0.0, "max_dd": 0.0, "final": initial, "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0}
 
     final  = float(eq.iloc[-1])
-    span   = (eq.index[-1] - eq.index[0]).days
-    years  = max(span / 365.25, 0.1)
-    cagr   = ((final / initial) ** (1.0 / years) - 1.0) * 100.0
+    n_periods = max(len(eq) - 1, 1)
+    cagr   = ((final / initial) ** (periods_per_year / n_periods) - 1.0) * 100.0
     dd     = (eq / eq.cummax() - 1.0) * 100.0
     max_dd = float(dd.min())
 
     dr = eq.pct_change(fill_method=None).dropna()
     if len(dr) > 1 and dr.std() > 0:
-        avg_days_between = span / len(dr)
-        periods_per_year = 365.25 / avg_days_between
-        sharpe = (dr.mean() * periods_per_year) / (dr.std() * np.sqrt(periods_per_year))
+        ppy = float(periods_per_year)
+        sharpe = (dr.mean() * ppy) / (dr.std() * np.sqrt(ppy))
 
         downside = dr[dr < 0]
         if len(downside) > 1 and downside.std() > 0:
-            sortino = (dr.mean() * periods_per_year) / (downside.std() * np.sqrt(periods_per_year))
+            sortino = (dr.mean() * ppy) / (downside.std() * np.sqrt(ppy))
         else:
             sortino = float("nan")
     else:
