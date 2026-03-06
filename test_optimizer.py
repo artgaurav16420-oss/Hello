@@ -82,3 +82,15 @@ def test_objective_prunes_trial_on_optimization_error(monkeypatch):
 
     with pytest.raises(optuna.TrialPruned):
         objective(trial)
+
+
+def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
+    output_path = tmp_path / "optimal_cfg.json"
+    output_path.write_text('{"old": 1}', encoding="utf-8")
+
+    optimizer.save_optimal_config({"HALFLIFE_FAST": 34}, str(output_path))
+
+    with output_path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    assert payload == {"HALFLIFE_FAST": 34}
