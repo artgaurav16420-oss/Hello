@@ -363,7 +363,7 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
             if pos > 0:
                 signal_date = idx[pos - 1]
             else:
-                signal_date = idx[0]  # first trading day in dataset — use itself (no lookahead)
+                signal_date = None  # first trading day in dataset — no prior bar, keep lookahead-free
 
     for sym in symbols:
         if sym in volume.columns and sym in close.columns and signal_date is not None:
@@ -540,6 +540,10 @@ def print_backtest_results(results: BacktestResults) -> None:
         f"\033[1mSortino:\033[0m {sortino_display}  "
         f"\033[1mMaxDD:\033[0m {m.get('max_dd', 0):.2f}%  "
         f"\033[1mCalmar:\033[0m {m.get('calmar', 0):.2f}"
+    )
+    print(
+        f"  \033[1mHitRate:\033[0m {m.get('hit_rate', 0):.2f}%  "
+        f"\033[1mTurnover:\033[0m {m.get('turnover', 0):.4f}x"
     )
     print(f"  \033[90m{chr(9472)*65}\033[0m\n")
 

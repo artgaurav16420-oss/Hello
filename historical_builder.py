@@ -134,6 +134,13 @@ def bootstrap_historical_parquet(
 ) -> Path:
     """Create a minimal historical parquet with DatetimeIndex + tickers list column."""
     tickers = default_tickers or ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
+    if default_tickers is None:
+        logger.warning(
+            "[HistoricalBuilder] Bootstrapping %s with a 3-ticker stub universe only (%s). "
+            "Use build_historical_csv outputs for full PIT backtests.",
+            output_path,
+            ", ".join(tickers),
+        )
     idx = pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date")
     df = pd.DataFrame({"tickers": [tickers]}, index=idx)
 

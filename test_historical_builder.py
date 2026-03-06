@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pandas as pd
 
 import historical_builder as hb
@@ -34,3 +35,13 @@ def test_build_historical_csv_uses_fallback_when_master_missing(tmp_path, monkey
     assert not out.empty
     assert out["date"].nunique() > 12
     assert out["ticker"].str.endswith(".NS").all()
+
+
+def test_bootstrap_historical_parquet_warns_stub_content(tmp_path, monkeypatch, caplog):
+    monkeypatch.chdir(tmp_path)
+    caplog.set_level(logging.WARNING)
+
+    out = hb.bootstrap_historical_parquet("data/historical_nifty500.parquet")
+
+    assert out.exists()
+    assert "3-ticker stub universe" in caplog.text
