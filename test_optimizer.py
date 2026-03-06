@@ -214,7 +214,7 @@ def test_run_optimization_passes_parallel_jobs_to_optuna(monkeypatch):
     monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
 
     class _Result:
-        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.0}
+        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
@@ -254,7 +254,7 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
     monkeypatch.setattr(optimizer, "pre_load_data", _fake_pre_load_data)
 
     class _Result:
-        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.0}
+        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 

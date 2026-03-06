@@ -464,6 +464,11 @@ def execute_rebalance(
             state.decay_rounds, cfg.MAX_DECAY_ROUNDS,
         )
 
+    capped_targets = np.array(target_weights, dtype=float, copy=True)
+    capped_targets = np.where(np.isfinite(capped_targets), capped_targets, 0.0)
+    capped_targets = np.clip(capped_targets, 0.0, cfg.MAX_SINGLE_NAME_WEIGHT)
+    target_weights = capped_targets
+
     new_weights:      Dict[str, float] = {}
     new_shares:       Dict[str, int]   = {}
     new_entry_prices: Dict[str, float] = dict(state.entry_prices)
