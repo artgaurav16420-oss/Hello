@@ -163,6 +163,7 @@ class UltimateConfig:
     # Signal gates & scoring
     Z_SCORE_CLIP:             float = 3.0
     CONTINUITY_BONUS:         float = 0.15
+    CONTINUITY_DISPERSION_FLOOR: float = 0.1
     KNIFE_WINDOW:             int   = 20
     KNIFE_THRESHOLD:          float = -0.15
 
@@ -190,7 +191,6 @@ class UltimateConfig:
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
-    REGIME_TREND_STEEPNESS: float = 20.0
 
     # Ghost risk synthesis
     GHOST_VOL_LOOKBACK:       int   = 20
@@ -208,7 +208,10 @@ class UltimateConfig:
 
     @SLIPPAGE_BPS.setter
     def SLIPPAGE_BPS(self, value: float) -> None:
-        self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
+        try:
+            self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
 
     @property
     def EQUITY_HIST_CAP(self) -> int:
@@ -342,6 +345,7 @@ class PortfolioState:
             "equity_hist_cap":      self.equity_hist_cap,
             "absent_periods":       dict(sorted(self.absent_periods.items())),
             "last_known_prices":    _r(self.last_known_prices),
+            "last_known_volatility":_r(self.last_known_volatility),
             "decay_rounds":         self.decay_rounds,
             "dividend_ledger":      dict(sorted(self.dividend_ledger.items())),
         }
@@ -415,14 +419,15 @@ def execute_rebalance(
 ) -> float:
     """Execute a portfolio rebalance, updating state in-place."""
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
+    local_prices = np.array(prices, dtype=float, copy=True)
 
     for sym, i in active_idx.items():
-        px = float(prices[i])
+        px = float(local_prices[i])
         if np.isfinite(px) and px > 0:
             state.last_known_prices[sym] = px
         else:
             px = float(state.last_known_prices.get(sym, 0.0))
-        prices[i] = px
+        local_prices[i] = px
         state.absent_periods.pop(sym, None)
 
     symbols_to_force_close: List[str] = []
@@ -448,7 +453,7 @@ def execute_rebalance(
     pv = state.cash
     for sym, n_shares in state.shares.items():
         if sym in active_idx:
-            pv += n_shares * float(prices[active_idx[sym]])
+            pv += n_shares * float(local_prices[active_idx[sym]])
         elif sym not in symbols_to_force_close:
             pv += n_shares * state.last_known_prices.get(sym, 0.0)
 
@@ -508,7 +513,7 @@ def execute_rebalance(
         w = round(float(target_weights[i]), 10)
         if not np.isfinite(w):
             w = 0.0
-        price = max(float(prices[i]), 1e-6)
+        price = max(float(local_prices[i]), 1e-6)
         s = int(np.floor(w * pv / price)) if w > 0.001 else 0
         desired_shares[sym] = s
         base_notional += s * price
@@ -534,7 +539,7 @@ def execute_rebalance(
         w = round(float(target_weights[i]), 10)
         if not np.isfinite(w):
             w = 0.0
-        price = max(float(prices[i]), 1e-6)
+        price = max(float(local_prices[i]), 1e-6)
         old_s = state.shares.get(sym, 0)
         s = desired_shares.get(sym, 0)
 
@@ -654,7 +659,7 @@ def compute_book_cvar(
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
         rng = np.random.RandomState(42)
-        ghost_cols = [s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost]
+        ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
         for sym in ghost_cols:
             ghost_vol = state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK)
             ghost_vol = float(max(1e-4, ghost_vol))

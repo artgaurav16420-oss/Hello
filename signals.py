@@ -45,7 +45,7 @@ def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['Ultima
         
     trend_deviation = (last_price / sma200) - 1.0
     # Sigmoid function maps deviation to [0, 1] bounded score
-    trend_steepness = float(getattr(cfg, "REGIME_TREND_STEEPNESS", 20.0)) if cfg else 20.0
+    trend_steepness = float(getattr(cfg, "REGIME_SIGMOID_STEEPNESS", 10.0)) if cfg else 10.0
     base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
     
     # 2. Volatility penalty component
@@ -118,6 +118,7 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
     from momentum_engine import UltimateConfig
     from data_cache import load_or_fetch
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from universe_manager import _ADV_MAX_WORKERS
     
     if cfg is None:
         cfg = UltimateConfig()
@@ -140,18 +141,16 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
                 ns_sym = symbol + ".NS"
                 if ns_sym in data:
                     df = data[ns_sym]
-                    if "Close" in df.columns and "Volume" in df.columns:
-                        notional_volume = df["Close"] * df["Volume"]
-                        adv = notional_volume.rolling(20, min_periods=1).mean().iloc[-1]
-                        if adv >= min_adv_volume:
-                            valid_in_chunk.append(symbol)
+                    adv = compute_single_adv(df)
+                    if adv >= min_adv_volume:
+                        valid_in_chunk.append(symbol)
         except Exception as exc:
             logger.error("[Signals] Error processing ADV chunk: %s", exc)
         return valid_in_chunk
 
     logger.info("[Signals] Filtering %d tickers against ₹%dCr ADV minimum...", len(tickers), cfg.MIN_ADV_CRORES)
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, int(_ADV_MAX_WORKERS))) as pool:
         futures = {pool.submit(process_chunk, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
             filtered_tickers.extend(future.result())
@@ -206,9 +205,9 @@ def generate_signals(
     # Gate C: Falling Knife Protection
     if len(log_rets) >= cfg.KNIFE_WINDOW:
         # Sum of log returns represents total cumulative return over the window
-        recent_cumulative_returns = log_rets.iloc[-cfg.KNIFE_WINDOW:].sum().values
+        recent_cumulative_returns = log_rets.iloc[-cfg.KNIFE_WINDOW:].sum(min_count=1).values
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
-            if cumulative_ret < cfg.KNIFE_THRESHOLD:
+            if np.isfinite(cumulative_ret) and cumulative_ret < cfg.KNIFE_THRESHOLD:
                 adj_scores[i] = -np.inf
 
     # 3. FIX: Dispersion-Normalized Continuity Bonus
@@ -218,7 +217,7 @@ def generate_signals(
     
     if prev_weights and valid_mask.any():
         # Calculate standard deviation only among assets that survived the gates
-        current_dispersion = max(np.nanstd(adj_scores[valid_mask]), 0.1)
+        current_dispersion = max(np.nanstd(adj_scores[valid_mask]), cfg.CONTINUITY_DISPERSION_FLOOR)
         normalized_bonus = cfg.CONTINUITY_BONUS * current_dispersion
         
         for i, sym in enumerate(active_symbols):

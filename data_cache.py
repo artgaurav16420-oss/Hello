@@ -158,6 +158,8 @@ def _is_valid_dataframe(df: pd.DataFrame) -> bool:
         return False
     if "Close" not in df.columns or df["Close"].isnull().all():
         return False
+    if "Volume" not in df.columns or df["Volume"].isnull().all():
+        return False
     return True
 
 
@@ -211,8 +213,13 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
             # Forward fill as a baseline
             df["Close"] = df["Close"].ffill()
             
-            # Perturb the baseline with the synthetic noise so the price isn't perfectly flat.
-            df.loc[missing_mask, "Close"] *= (1.0 + noise_rets)
+            # Build a deterministic random walk for suspended periods so variance compounds over time.
+            missing_idx = df.index[missing_mask]
+            anchor_prices = (
+                df["Close"].shift(1).reindex(missing_idx).ffill().fillna(df["Close"].dropna().iloc[0])
+            )
+            walk_returns = np.cumprod(1.0 + noise_rets)
+            df.loc[missing_idx, "Close"] = anchor_prices.values * walk_returns
             
             # Zero out volume for the days it didn't trade
             df["Volume"] = df["Volume"].fillna(0)

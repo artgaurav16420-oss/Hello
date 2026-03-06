@@ -80,7 +80,11 @@ def load_optimized_config() -> UltimateConfig:
     if os.path.exists("data/optimal_cfg.json"):
         with open("data/optimal_cfg.json", "r") as f:
             best_params = json.load(f)
+            valid_fields = UltimateConfig.__dataclass_fields__
             for k, v in best_params.items():
+                if k not in valid_fields:
+                    logger.warning("[Config] Ignoring unknown/stale optimized parameter: %s", k)
+                    continue
                 setattr(cfg, k, v)
     return cfg
 
@@ -288,8 +292,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 new_entry      = old_entry / r
 
                 # Safely sweep fractional shares
-                fractional_pre_split = max(0.0, old_shares - (new_shares / r))
-                fractional_value = fractional_pre_split * current_price
+                pre_split_fractional_shares = max(0.0, old_shares - (new_shares / r))
+                fractional_value = pre_split_fractional_shares * current_price
                 state.cash = round(state.cash + fractional_value, 10)
 
                 logger.warning(
@@ -449,6 +453,7 @@ def _run_scan(
             state.consecutive_failures += 1
             apply_decay      = True
             _force_full_cash = True
+            _activate_override_on_stress(state, cfg)
 
     if not _force_full_cash:
         try:
@@ -583,6 +588,13 @@ def _run_scan(
         print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
 
     return state, market_data
+
+
+def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
+    """Activate exposure override immediately after hard risk events."""
+    state.override_active = True
+    state.override_cooldown = max(state.override_cooldown, 4)
+    state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 # ─── Status display ───────────────────────────────────────────────────────────
 
@@ -853,14 +865,18 @@ def main_menu() -> None:
 
             end        = datetime.today().strftime("%Y-%m-%d")
             
-            initial_universe = get_historical_universe(universe_identifier, pd.Timestamp(start))
-            if not initial_universe and bt_c == "3":
-                initial_universe = _get_custom_universe()
-            elif not initial_universe:
-                initial_universe = get_nifty500()
+            bt_cfg = load_optimized_config()
+            all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
+            historical_union = set()
+            for target_date in all_target_dates:
+                historical_union.update(get_historical_universe(universe_identifier, target_date))
 
-            data       = load_or_fetch(initial_universe + ["^NSEI", "^CRSLDX"], start, end)
-            bt_cfg     = load_optimized_config()
+            if not historical_union and bt_c == "3":
+                historical_union.update(_get_custom_universe())
+            elif not historical_union:
+                historical_union.update(get_nifty500())
+
+            data       = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end)
             print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
 
         elif c == "5":
