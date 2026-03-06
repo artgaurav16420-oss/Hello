@@ -23,7 +23,11 @@ class SignalGenerationError(ValueError):
     """Raised when signal generation cannot proceed due to invalid input data."""
 
 
-def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['UltimateConfig'] = None) -> float:
+def compute_regime_score(
+    idx_hist: Optional[pd.DataFrame],
+    cfg: Optional['UltimateConfig'] = None,
+    universe_close_hist: Optional[pd.DataFrame] = None,
+) -> float:
     """
     Computes a macroeconomic regime score bounded [0, 1].
     
@@ -51,25 +55,35 @@ def compute_regime_score(idx_hist: Optional[pd.DataFrame], cfg: Optional['Ultima
     # 2. Volatility penalty component
     returns_20d = close_series.pct_change(fill_method=None).tail(20)
     
+    vol_component = 0.5
     if len(returns_20d) == 20:
         vol_20d = float(returns_20d.std() * np.sqrt(252))
-        
+
         vol_floor = float(getattr(cfg, "REGIME_VOL_FLOOR", 0.18)) if cfg else 0.18
         vol_mult = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
-        
+
         all_returns = close_series.pct_change(fill_method=None).dropna()
         if len(all_returns) >= 252:
             long_term_vol = float(all_returns.tail(252).std() * np.sqrt(252))
         else:
             long_term_vol = vol_floor
-            
-        # If current 20-day volatility spikes above the dynamic threshold, apply penalty
+
         dynamic_threshold = max(vol_floor, long_term_vol * vol_mult)
         if vol_20d > dynamic_threshold:
             logger.debug("[Signals] Regime Volatility Spike detected (%.2f > %.2f). Applying penalty.", vol_20d, dynamic_threshold)
             base_score *= 0.85
-            
-    return round(float(base_score), 10)
+        vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
+
+    breadth_component = 0.5
+    if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= 200:
+        sma200 = universe_close_hist.rolling(200).mean().iloc[-1]
+        last = universe_close_hist.iloc[-1]
+        valid = (sma200 > 0) & sma200.notna() & last.notna()
+        if valid.any():
+            breadth_component = float((last[valid] > sma200[valid]).mean())
+
+    composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
+    return round(float(np.clip(composite, 0.0, 1.0)), 10)
 
 
 def compute_single_adv(df: pd.DataFrame) -> float:
@@ -216,13 +230,15 @@ def generate_signals(
     valid_mask = np.isfinite(adj_scores)
     
     if prev_weights and valid_mask.any():
-        # Calculate standard deviation only among assets that survived the gates
         current_dispersion = max(np.nanstd(adj_scores[valid_mask]), cfg.CONTINUITY_DISPERSION_FLOOR)
-        normalized_bonus = cfg.CONTINUITY_BONUS * current_dispersion
-        
+        cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * current_dispersion
+
         for i, sym in enumerate(active_symbols):
-            if valid_mask[i] and prev_weights.get(sym, 0.0) > 0.001:
-                adj_scores[i] += normalized_bonus
+            prev_w = float(prev_weights.get(sym, 0.0))
+            if valid_mask[i] and prev_w > 0.001:
+                decay = float(np.clip(prev_w / max(getattr(cfg, "CONTINUITY_MAX_HOLD_WEIGHT", 0.10), 1e-6), 0.25, 1.0))
+                adj_scores[i] += base_bonus * decay
 
     # 4. Final Selection
     # Sort and pick the top N elements (ignoring those assigned -inf)

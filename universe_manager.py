@@ -104,6 +104,28 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 
 # ─── Historical Universe Logic (Survivorship Bias Fix) ────────────────────────
 
+
+def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
+    csv_path = f"data/historical_{universe_type}.csv"
+    if not os.path.exists(csv_path):
+        return []
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return []
+    date_col = "date" if "date" in df.columns else ("snapshot_date" if "snapshot_date" in df.columns else None)
+    tick_col = "ticker" if "ticker" in df.columns else ("symbol" if "symbol" in df.columns else None)
+    if date_col is None or tick_col is None:
+        return []
+    d = pd.Timestamp(date).normalize()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    subset = df[df[date_col] <= d]
+    if subset.empty:
+        return []
+    last_d = subset[date_col].max()
+    tickers = subset.loc[subset[date_col] == last_d, tick_col].dropna().astype(str).str.strip()
+    return sorted({t for t in tickers if t})
+
 # Module-level flags so each warning fires at most once per process,
 # preventing thousands of identical lines from flooding optimizer output.
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
@@ -181,13 +203,11 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
         )
         _NO_RECORD_WARNED[universe_type] = True
 
-    # Fallback to current universe mappings
-    if universe_type == "nifty500":
-        return get_nifty500()
-    elif universe_type == "nse_total":
-        return fetch_nse_equity_universe()
-    else:
-        return []
+    # Fallback to point-in-time local CSV snapshot; never fallback to current constituents.
+    csv_members = _load_pit_universe_from_csv(universe_type, date)
+    if csv_members:
+        return csv_members
+    return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────
 

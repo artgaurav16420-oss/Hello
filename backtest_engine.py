@@ -69,6 +69,10 @@ class BacktestEngine:
         end_date:        Optional[str] = None,
         idx_df:          Optional[pd.DataFrame] = None,
         sector_map:      Optional[dict]         = None,
+        open_px:         Optional[pd.DataFrame] = None,
+        high_px:         Optional[pd.DataFrame] = None,
+        low_px:          Optional[pd.DataFrame] = None,
+        dividends:       Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         start_dt = pd.Timestamp(start_date)
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
@@ -84,10 +88,19 @@ class BacktestEngine:
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
 
+            if dividends is not None and date in dividends.index and self.engine.cfg.DIVIDEND_SWEEP:
+                div_row = dividends.loc[date]
+                for sym, shares in self.state.shares.items():
+                    if shares <= 0 or sym not in div_row.index:
+                        continue
+                    div_val = div_row[sym]
+                    if pd.notna(div_val) and float(div_val) > 0:
+                        self.state.cash = round(self.state.cash + float(div_val) * shares, 10)
+
             if date in rebal_set:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
-                    idx_df, sector_map,
+                    idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
                 )
 
             price_dict = {
@@ -113,6 +126,9 @@ class BacktestEngine:
         prices_t:   np.ndarray,
         idx_df:     Optional[pd.DataFrame],
         sector_map: Optional[dict],
+        open_px:    Optional[pd.DataFrame] = None,
+        high_px:    Optional[pd.DataFrame] = None,
+        low_px:     Optional[pd.DataFrame] = None,
     ) -> None:
         cfg = self.engine.cfg
 
@@ -137,7 +153,7 @@ class BacktestEngine:
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
                 if (sym in close.columns and pd.notna(valuation_close[sym]))
-                else self.state.last_known_prices.get(sym, 0.0)
+                else _ffill_price(self.state, sym)
             )
             for sym in self.state.shares
         )
@@ -156,7 +172,7 @@ class BacktestEngine:
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
                 if pd.notna(valuation_close[sym])
-                else self.state.last_known_prices.get(sym, 0.0)
+                else _ffill_price(self.state, sym)
             )
             for sym in self.state.shares
             if sym in symbols
@@ -216,7 +232,7 @@ class BacktestEngine:
                         historical_returns  = hist_log_rets[[symbols[i] for i in sel_idx]],
                         execution_date      = date,
                         adv_shares          = adv_vector[sel_idx],
-                        prices              = prices_t[sel_idx],
+                        prices              = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)[sel_idx],
                         portfolio_value     = pv,
                         prev_w              = prev_weights[sel_idx],
                         exposure_multiplier = self.state.exposure_multiplier,
@@ -280,8 +296,9 @@ class BacktestEngine:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
             
+            exec_prices = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)
             execute_rebalance(
-                self.state, target_weights, prices_t, symbols, cfg,
+                self.state, target_weights, exec_prices, symbols, cfg,
                 adv_shares     = adv_vector,
                 date_context   = date, 
                 trade_log      = self.trades,
@@ -353,11 +370,12 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
             try:
                 c_series = close.loc[:signal_date, sym]
                 v_series = volume.loc[:signal_date, sym]
-                notional = (c_series * v_series).replace(0, np.nan).ffill().fillna(0)
-                if notional.empty:
+                notional = (c_series * v_series).replace(0, np.nan).ffill().dropna()
+                lookback = notional.tail(20)
+                if lookback.empty:
                     adv.append(0.0)
                 else:
-                    val = float(notional.rolling(20, min_periods=1).mean().iloc[-1])
+                    val = float(lookback.mean())
                     adv.append(val if np.isfinite(val) else 0.0)
             except Exception:
                 adv.append(0.0)
@@ -373,6 +391,31 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
     sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
     return np.array([sec_idx[sector_map.get(sym, "Unknown")] for sym in sel_syms], dtype=int)
 
+
+
+def _ffill_price(state: PortfolioState, sym: str) -> float:
+    px = state.last_known_prices.get(sym)
+    return float(px) if px is not None and np.isfinite(px) else 0.0
+
+
+def _execution_prices(
+    symbols: List[str],
+    date: pd.Timestamp,
+    close_prices: np.ndarray,
+    open_px: Optional[pd.DataFrame],
+    high_px: Optional[pd.DataFrame],
+    low_px: Optional[pd.DataFrame],
+) -> np.ndarray:
+    if open_px is not None and date in open_px.index:
+        opens = open_px.loc[date].reindex(symbols).values.astype(float)
+        if np.isfinite(opens).any():
+            return np.where(np.isfinite(opens) & (opens > 0), opens, close_prices)
+    if high_px is not None and low_px is not None and date in high_px.index and date in low_px.index:
+        highs = high_px.loc[date].reindex(symbols).values.astype(float)
+        lows = low_px.loc[date].reindex(symbols).values.astype(float)
+        vwap = (highs + lows + close_prices) / 3.0
+        return np.where(np.isfinite(vwap) & (vwap > 0), vwap, close_prices)
+    return close_prices
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -405,22 +448,33 @@ def run_backtest(
                 "verify universe snapshots or date range."
             )
 
-    close_d, volume_d = {}, {}
+    close_d, close_adj_d, open_d, high_d, low_d, div_d, volume_d = {}, {}, {}, {}, {}, {}, {}
     for sym in union_universe:
         if not sym:
             continue
         key = sym if sym.endswith(".NS") else sym + ".NS"
         if key not in market_data:
             continue
-        close_d[sym]  = market_data[key]["Close"].ffill()
-        volume_d[sym] = market_data[key]["Volume"]
+        row = market_data[key]
+        close_d[sym]  = row["Close"].ffill()
+        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
+        open_d[sym] = row.get("Open", row["Close"]).ffill()
+        high_d[sym] = row.get("High", row["Close"]).ffill()
+        low_d[sym] = row.get("Low", row["Close"]).ffill()
+        div_d[sym] = row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
+        volume_d[sym] = row["Volume"]
 
     if not close_d:
         raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
 
     close   = pd.DataFrame(close_d).sort_index()
+    close_adj = pd.DataFrame(close_adj_d).sort_index()
+    open_px = pd.DataFrame(open_d).sort_index()
+    high_px = pd.DataFrame(high_d).sort_index()
+    low_px = pd.DataFrame(low_d).sort_index()
+    dividends = pd.DataFrame(div_d).sort_index().fillna(0.0)
     volume  = pd.DataFrame(volume_d).sort_index()
-    returns = close.pct_change(fill_method=None).clip(lower=-0.99)
+    returns = close_adj.pct_change(fill_method=None).clip(lower=-0.99)
 
     trading_index = pd.DatetimeIndex(close.index).sort_values()
     valid = []
@@ -444,7 +498,7 @@ def run_backtest(
 
     engine = InstitutionalRiskEngine(cfg)
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
-    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map)
+    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends)
 
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]

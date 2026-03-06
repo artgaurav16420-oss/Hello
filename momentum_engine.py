@@ -164,6 +164,8 @@ class UltimateConfig:
     Z_SCORE_CLIP:             float = 3.0
     CONTINUITY_BONUS:         float = 0.15
     CONTINUITY_DISPERSION_FLOOR: float = 0.1
+    CONTINUITY_MAX_SCALAR:    float = 0.20
+    CONTINUITY_MAX_HOLD_WEIGHT: float = 0.10
     KNIFE_WINDOW:             int   = 20
     KNIFE_THRESHOLD:          float = -0.15
 
@@ -215,7 +217,7 @@ class UltimateConfig:
 
     @property
     def EQUITY_HIST_CAP(self) -> int:
-        return self.CVAR_LOOKBACK + 50
+        return 0
 
 
 # ─── Portfolio state ──────────────────────────────────────────────────────────
@@ -322,8 +324,6 @@ class PortfolioState:
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        if len(self.equity_hist) > self.equity_hist_cap:
-            self.equity_hist = self.equity_hist[-self.equity_hist_cap:]
 
     def to_dict(self) -> dict:
         def _r(v):
