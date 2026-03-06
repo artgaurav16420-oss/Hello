@@ -188,6 +188,12 @@ class UltimateConfig:
     # Dynamic regime vol threshold
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
+    REGIME_SIGMOID_STEEPNESS: float = 10.0
+
+    # Ghost risk synthesis
+    GHOST_VOL_LOOKBACK:       int   = 20
+    GHOST_RET_DRIFT:          float = -0.02
+    GHOST_VOL_FALLBACK:       float = 0.04
 
     # New institutional flags
     DIVIDEND_SWEEP:           bool  = True
@@ -215,6 +221,7 @@ class PortfolioState:
     equity_hist_cap:      int              = 250
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
+    last_known_volatility:Dict[str, float] = field(default_factory=dict)
     decay_rounds:         int              = 0
     dividend_ledger:      Dict[str, str]   = field(default_factory=dict)
 
@@ -225,7 +232,7 @@ class PortfolioState:
         cfg:            UltimateConfig,
         gross_exposure: float = 1.0,
     ) -> None:
-        target   = 1.0 / (1.0 + np.exp(-10.0 * (regime_score - 0.5)))
+        target   = 1.0 / (1.0 + np.exp(-cfg.REGIME_SIGMOID_STEEPNESS * (regime_score - 0.5)))
         new_mult = self.exposure_multiplier + float(
             np.clip(target - self.exposure_multiplier, -cfg.DELEVERAGING_LIMIT, cfg.DELEVERAGING_LIMIT)
         )
@@ -369,6 +376,7 @@ class PortfolioState:
         ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             250)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
+        ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
         ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
 
@@ -392,6 +400,7 @@ def execute_rebalance(
     trade_log:      Optional[List[Trade]] = None,
     apply_decay:    bool = False,
     scenario_losses: Optional[np.ndarray] = None,
+    conviction_scores: Optional[np.ndarray] = None,
 ) -> float:
     """Execute a portfolio rebalance, updating state in-place."""
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
@@ -480,14 +489,43 @@ def execute_rebalance(
                 state.consecutive_failures = 0
                 return round(total_slippage, 10)
 
+    desired_shares: Dict[str, int] = {}
+    valid_targets: List[Tuple[int, str, float, float]] = []
+    base_notional = 0.0
+
     for i, sym in enumerate(active_symbols):
         w = round(float(target_weights[i]), 10)
+        if not np.isfinite(w):
+            w = 0.0
+        price = max(float(prices[i]), 1e-6)
+        s = int(np.floor(w * pv / price)) if w > 0.001 else 0
+        desired_shares[sym] = s
+        base_notional += s * price
+        if s > 0:
+            score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
+            valid_targets.append((i, sym, price, score))
 
+    residual_cash = max(0.0, pv - base_notional)
+    if valid_targets:
+        ranked = sorted(valid_targets, key=lambda x: x[3], reverse=True)
+        cheapest = min(x[2] for x in ranked)
+        while residual_cash >= cheapest:
+            bought_any = False
+            for _, sym, price, _ in ranked:
+                if residual_cash >= price:
+                    desired_shares[sym] += 1
+                    residual_cash -= price
+                    bought_any = True
+            if not bought_any:
+                break
+
+    for i, sym in enumerate(active_symbols):
+        w = round(float(target_weights[i]), 10)
         if not np.isfinite(w):
             w = 0.0
         price = max(float(prices[i]), 1e-6)
         old_s = state.shares.get(sym, 0)
-        s     = int(np.floor(w * pv / price)) if w > 0.001 else 0
+        s = desired_shares.get(sym, 0)
 
         if s > 0 or old_s > 0:
             delta = s - old_s
@@ -591,12 +629,25 @@ def compute_book_cvar(
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=0.0)
     rets = rets.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).iloc[-T_cvar:]
 
+    vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
+    if not hist_log_rets.empty:
+        rolling_vol = (
+            hist_log_rets.replace([np.inf, -np.inf], np.nan)
+            .iloc[-vol_window:]
+            .std()
+            .dropna()
+        )
+        for sym, vol in rolling_vol.items():
+            state.last_known_volatility[str(sym)] = float(max(vol, 1e-4))
+
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
         rng = np.random.RandomState(42)
-        ghost_rets = rng.normal(-0.02, 0.04, size=(len(rets), ghost_mask.sum()))
         ghost_cols = [s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost]
-        rets.loc[:, ghost_cols] = ghost_rets
+        for sym in ghost_cols:
+            ghost_vol = state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK)
+            ghost_vol = float(max(1e-4, ghost_vol))
+            rets.loc[:, sym] = rng.normal(cfg.GHOST_RET_DRIFT, ghost_vol, size=len(rets))
 
     if len(rets) < 5:
         return 0.0
