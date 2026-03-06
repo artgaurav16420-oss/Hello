@@ -36,7 +36,7 @@ from signals import (
 from universe_manager import get_historical_universe
 
 logger = logging.getLogger(__name__)
-_REBALANCE_SNAP_WINDOW_DAYS = 3
+_REBALANCE_SNAP_WINDOW_DAYS = 5
 
 # ─── Results container ────────────────────────────────────────────────────────
 
@@ -475,11 +475,13 @@ def print_backtest_results(results: BacktestResults) -> None:
 
     print(f"\n  \033[1;36mBACKTEST RESULTS\033[0m")
     print(f"  \033[90m{chr(9472)*65}\033[0m")
+    sortino = m.get('sortino', 0)
+    sortino_display = f"{sortino:.2f}" if np.isfinite(sortino) else "N/A"
     print(
         f"  \033[1mFinal:\033[0m \033[32m₹{m.get('final', 0):,.0f}\033[0m  "
         f"\033[1mCAGR:\033[0m {m.get('cagr', 0):.2f}%  "
         f"\033[1mSharpe:\033[0m {m.get('sharpe', 0):.2f}  "
-        f"\033[1mSortino:\033[0m {m.get('sortino', 0):.2f}  "
+        f"\033[1mSortino:\033[0m {sortino_display}  "
         f"\033[1mMaxDD:\033[0m {m.get('max_dd', 0):.2f}%  "
         f"\033[1mCalmar:\033[0m {m.get('calmar', 0):.2f}"
     )

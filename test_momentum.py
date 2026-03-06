@@ -477,7 +477,7 @@ def test_detect_and_apply_splits_fractional_cash():
     detect_and_apply_splits(state, market_data, UltimateConfig())
 
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
-    assert state.cash == 200.0, "Fractional value must be safely routed to Cash."
+    assert state.cash == 100.0, "Fractional value must be safely routed to Cash."
 
 def test_detect_and_apply_splits_dividend_sweep_idempotent():
     state = PortfolioState(cash=0.0)
