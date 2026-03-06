@@ -168,7 +168,8 @@ class UltimateConfig:
 
     # Timing & Execution
     REBALANCE_FREQ:           str   = "W-FRI"
-    SLIPPAGE_BPS:             float = 20.0
+    ROUND_TRIP_SLIPPAGE_BPS:  float = 20.0
+    """Round-trip transaction cost in basis points (buy+sell). One-way default = bps/2."""
     DECAY_FACTOR:             float = 0.85
     MIN_ADV_CRORES:           float = 100.0
 
@@ -189,6 +190,7 @@ class UltimateConfig:
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
+    REGIME_TREND_STEEPNESS: float = 20.0
 
     # Ghost risk synthesis
     GHOST_VOL_LOOKBACK:       int   = 20
@@ -198,6 +200,15 @@ class UltimateConfig:
     # New institutional flags
     DIVIDEND_SWEEP:           bool  = True
     SPLIT_TOLERANCE:          float = 0.005 # Tightened for institutional accuracy
+
+    @property
+    def SLIPPAGE_BPS(self) -> float:
+        """Backward-compatible alias for ROUND_TRIP_SLIPPAGE_BPS."""
+        return self.ROUND_TRIP_SLIPPAGE_BPS
+
+    @SLIPPAGE_BPS.setter
+    def SLIPPAGE_BPS(self, value: float) -> None:
+        self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
 
     @property
     def EQUITY_HIST_CAP(self) -> int:
@@ -470,7 +481,7 @@ def execute_rebalance(
                     "cannot satisfy the risk invariant.",
                     tail_mean * 100, cfg.CVAR_DAILY_LIMIT * 100,
                 )
-                exit_slip_rate = (cfg.SLIPPAGE_BPS / 2) / 10_000
+                exit_slip_rate = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
                 for sym, n_shares in state.shares.items():
                     px = state.last_known_prices.get(sym, 0.0)
                     if px > 0 and n_shares > 0:
@@ -533,9 +544,9 @@ def execute_rebalance(
             # ── FIX: Institutional Impact Alignment ──
             if adv_shares is not None and adv_shares[i] > 0:
                 impact_rate = (cfg.IMPACT_COEFF * pv) / (price * adv_shares[i])
-                slip_rate = max(cfg.SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
+                slip_rate = max(cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
             else:
-                slip_rate = cfg.SLIPPAGE_BPS / 20000.0
+                slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
             
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
@@ -569,7 +580,7 @@ def execute_rebalance(
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
-                slip            = n_shares * close_price * (cfg.SLIPPAGE_BPS / 20000.0)
+                slip            = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
                 pv             += n_shares * close_price
                 if trade_log is not None:
@@ -828,7 +839,7 @@ class InstitutionalRiskEngine:
 
         q        = np.zeros(n_vars)
         q[:m]    = -expected_returns - 2.0 * impact * prev_w_arr
-        q[m:2*m] = self.cfg.SLIPPAGE_BPS / 10_000.0
+        q[m:2*m] = self.cfg.ROUND_TRIP_SLIPPAGE_BPS / 10_000.0
         q[-1]    = self.cfg.SLACK_PENALTY
 
         builder = _ConstraintBuilder(n_vars)

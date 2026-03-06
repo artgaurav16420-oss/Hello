@@ -35,6 +35,37 @@ _DOWNLOAD_CHUNK_SIZE = 75
 _SUSPENSION_GAP_DAYS = 30
 
 
+def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with a timezone-naive, monotonic DatetimeIndex."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    return out
+
+
+def _extract_ticker_frame(raw_data: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    """Robustly extract one ticker frame from varying yfinance payload shapes."""
+    if raw_data is None or raw_data.empty:
+        return None
+
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        level0 = set(raw_data.columns.get_level_values(0))
+        level1 = set(raw_data.columns.get_level_values(1))
+
+        if ticker in level0:
+            df = raw_data[ticker].copy()
+        elif ticker in level1:
+            df = raw_data.xs(ticker, level=1, axis=1).copy()
+        else:
+            return None
+        return _normalize_history_index(df)
+
+    # Single ticker payloads often come as flat OHLCV columns
+    return _normalize_history_index(raw_data.copy())
+
+
 def _download_with_timeout(tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
     """
     Attempts to download a chunk of tickers via yfinance with exponential backoff.
@@ -232,7 +263,7 @@ def load_or_fetch(
             tickers_to_download.append(ticker)
         else:
             try:
-                df = pd.read_parquet(parquet_path)
+                df = _normalize_history_index(pd.read_parquet(parquet_path))
                 market_data[ticker] = df
             except Exception as exc:
                 logger.debug("[Cache] Corrupted parquet for %s: %s", ticker, exc)
@@ -252,17 +283,9 @@ def load_or_fetch(
                 logger.warning("[Cache] Received empty response for chunk starting with %s", chunk[0])
                 continue
                 
-            is_multi_index = isinstance(raw_data.columns, pd.MultiIndex)
-            
             for ticker in chunk:
                 try:
-                    if is_multi_index:
-                        # yfinance multi-index slicing
-                        df = raw_data[ticker].copy()
-                    else:
-                        # if the chunk only contained one valid ticker
-                        df = raw_data.copy()
-                        
+                    df = _extract_ticker_frame(raw_data, ticker)
                     if df is None or df.empty:
                         continue
                         
