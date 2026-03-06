@@ -155,6 +155,7 @@ class UltimateConfig:
     HISTORY_GATE:             int   = 90
     HALFLIFE_FAST:            int   = 21
     HALFLIFE_SLOW:            int   = 63
+    SIGNAL_LAG_DAYS:          int   = 21
     RISK_AVERSION:            float = 5.0
     SLACK_PENALTY:            float = 10.0
     DIMENSIONALITY_MULTIPLIER:int   = 3
