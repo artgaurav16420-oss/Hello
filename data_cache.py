@@ -248,9 +248,12 @@ def load_or_fetch(
         for t in tickers
     ))
     
-    # We always pad the required start date back by ~400 days to guarantee
-    # we have enough history for 200-day SMAs and long-term CVaR lookbacks.
-    padded_start = (pd.Timestamp(required_start or "2020-01-01") - timedelta(days=400)).strftime("%Y-%m-%d")
+    # Dynamic padding based on strategy lookback requirements (plus safety margin).
+    cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
+    dynamic_padding_days = max(400, cfg_lookback * 2)
+    padded_start = (
+        pd.Timestamp(required_start or "2020-01-01") - timedelta(days=dynamic_padding_days)
+    ).strftime("%Y-%m-%d")
     
     # Latest valid business day
     latest_bday = (pd.Timestamp.today() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
