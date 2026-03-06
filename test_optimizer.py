@@ -84,6 +84,27 @@ def test_objective_prunes_trial_on_optimization_error(monkeypatch):
         objective(trial)
 
 
+def test_objective_prunes_trial_when_drawdown_exceeds_cap(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 30.0}
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 63,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 5.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+    )
+
+    with pytest.raises(optuna.TrialPruned):
+        objective(trial)
+
+
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
