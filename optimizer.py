@@ -14,7 +14,6 @@ import tempfile
 import sys
 import warnings
 
-import numpy as np
 import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
@@ -97,16 +96,16 @@ class MomentumObjective:
         cagr = metrics.get("cagr", 0.0)
         max_dd = abs(metrics.get("max_dd", 100.0))
 
-        # 5. Objective Calculation (Calmar Ratio)
-        if max_dd == 0:
-            return 0.0
-            
-        calmar = cagr / max_dd
-
         # 6. Hard prune if IS drawdown exceeds the pre-COVID cap.
         # IS window (2018-2019) has no crash, so >25% DD is a real structural fail.
         if max_dd > MAX_DD_CAP:
             raise optuna.TrialPruned()
+
+        # 5. Objective Calculation (Calmar Ratio)
+        if max_dd == 0:
+            return 0.0
+
+        calmar = cagr / max_dd
 
         return calmar
 
@@ -149,7 +148,7 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
-        dir=output_dir or None,
+        dir=output_dir or os.path.dirname(os.path.abspath(filepath)) or ".",
         delete=False,
     ) as tmp_file:
         json.dump(best_params, tmp_file, indent=4)
