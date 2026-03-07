@@ -353,7 +353,16 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
             )
             walk_returns = np.cumprod(1.0 + noise_rets)
             df.loc[missing_idx, "Close"] = anchor_prices.values * walk_returns
-            
+
+            # FIX (Bug-6): Sync Adj Close with the synthetic Close values on suspended days.
+            # _ensure_price_columns() copies Close→Adj Close before this function runs, but
+            # only for the original (non-reindexed) rows. After reindex(), new dates have NaN
+            # for Adj Close. Backtest uses Adj Close for returns calculation, so unsynchronised
+            # NaN values produce silent NaN returns for suspended stocks, corrupting CVaR
+            # estimates and signal generation during any period with SIMULATE_HALTS=True.
+            if "Adj Close" in df.columns:
+                df.loc[missing_idx, "Adj Close"] = df.loc[missing_idx, "Close"]
+
             # Zero out volume for the days it didn't trade
             df["Volume"] = df["Volume"].fillna(0)
             

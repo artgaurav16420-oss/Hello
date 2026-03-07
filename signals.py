@@ -131,25 +131,28 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
     """
     from momentum_engine import UltimateConfig
     from data_cache import load_or_fetch
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from universe_manager import _ADV_MAX_WORKERS
-    
+
     if cfg is None:
         cfg = UltimateConfig()
-        
+
     end_date = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
-    
+
     chunk_size = 75
     chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
-    
+
     filtered_tickers = []
     min_adv_volume = cfg.MIN_ADV_CRORES * 1e7
-    
-    def process_chunk(chunk: List[str]) -> List[str]:
-        valid_in_chunk = []
+
+    logger.info("[Signals] Filtering %d tickers against ₹%dCr ADV minimum...", len(tickers), cfg.MIN_ADV_CRORES)
+
+    # FIX (Bug-5): Replaced ThreadPoolExecutor with a sequential loop.
+    # Parallel yfinance calls on a large universe trigger Yahoo Finance rate-limiting
+    # (HTTP 429 / 401 "Invalid Crumb"), causing entire chunks to return empty, which
+    # incorrectly disqualifies hundreds of valid liquid stocks. Sequential processing
+    # is slower (~30s for 500 tickers) but produces reliable, complete ADV results.
+    for chunk in chunks:
         try:
-            # Load short history for liquidity validation
             data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
             for symbol in chunk:
                 ns_sym = symbol + ".NS"
@@ -157,18 +160,10 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
                     df = data[ns_sym]
                     adv = compute_single_adv(df)
                     if adv >= min_adv_volume:
-                        valid_in_chunk.append(symbol)
+                        filtered_tickers.append(symbol)
         except Exception as exc:
             logger.error("[Signals] Error processing ADV chunk: %s", exc)
-        return valid_in_chunk
 
-    logger.info("[Signals] Filtering %d tickers against ₹%dCr ADV minimum...", len(tickers), cfg.MIN_ADV_CRORES)
-
-    with ThreadPoolExecutor(max_workers=max(1, int(_ADV_MAX_WORKERS))) as pool:
-        futures = {pool.submit(process_chunk, chunk): chunk for chunk in chunks}
-        for future in as_completed(futures):
-            filtered_tickers.extend(future.result())
-            
     return filtered_tickers
 
 

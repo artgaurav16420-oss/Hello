@@ -364,7 +364,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     if missing_tickers:
         logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
         import yfinance as yf
-        
+
         def _fetch_single_sector(sym: str) -> Tuple[str, str]:
             try:
                 ns_sym = sym + ".NS"
@@ -376,9 +376,15 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             except Exception as e:
                 logger.debug("Failed to fetch sector for %s: %s", sym, e)
                 return sym, "Unknown"
-                
-        # Threaded fetch to overcome network latency
-        with ThreadPoolExecutor(max_workers=8) as pool:
+
+        # FIX (Bug-7): Reduced max_workers from 8 to 1 and made it sequential.
+        # Concurrent yfinance.info calls on a large selection trigger Yahoo Finance
+        # rate-limiting (HTTP 429 / 401), causing all workers to return "Unknown"
+        # sector for every ticker. A single worker is slower (~2s per ticker) but
+        # produces correct results. The static STATIC_NSE_SECTORS map already covers
+        # the Nifty 50 blue-chips, so the network call is only reached for mid/small
+        # caps not in that map.
+        with ThreadPoolExecutor(max_workers=1) as pool:
             future_to_sym = {pool.submit(_fetch_single_sector, sym): sym for sym in missing_tickers}
             for future in as_completed(future_to_sym):
                 sym, sector = future.result()

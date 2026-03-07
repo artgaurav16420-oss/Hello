@@ -351,6 +351,11 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
     if not volume.empty:
         idx = volume.index
         if date in idx:
+            # pandas 2.x always returns an int from get_loc on a unique DatetimeIndex.
+            # The isinstance(pos, slice/ndarray) branches below guard against pandas < 2.0
+            # behaviour (where get_loc could return a slice or boolean array on duplicates).
+            # They are dead code in the current environment (pandas 2.3+) but kept for
+            # defensive compatibility should the code be run on an older environment.
             pos = idx.get_loc(date)
             if isinstance(pos, slice):
                 pos = pos.start

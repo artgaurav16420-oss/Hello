@@ -46,19 +46,20 @@ logging.getLogger("momentum_engine").setLevel(logging.ERROR)
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2018-01-01"
-TRAIN_END   = "2019-12-31"   # 2 pre-COVID years — optimizer never sees the crash
-TEST_START  = "2020-01-01"   # OOS starts Jan 2020: COVID is the first real stress test
+TRAIN_END   = "2022-12-31"   # 5-year IS window generates 4 WFO slices:
+                              #   2019 — NBFC/IL&FS contagion (stress)
+                              #   2020 — COVID crash + V-recovery (black swan)
+                              #   2021 — bull market (trending)
+                              #   2022 — rate-hike bear market (mean-reverting)
+                              # Averaging across all 4 forces the optimizer to
+                              # find parameters robust to every regime, not just
+                              # "least bad in 2019".
+TEST_START  = "2023-01-01"   # True OOS: post-bull rotation-heavy market
 TEST_END    = pd.Timestamp.today().strftime("%Y-%m-%d")
 
 N_TRIALS       = 55    # Number of Bayesian iterations
-# IS (2018-2019) is pre-COVID: 25% is a realistic strict cap — a strategy that
-# draws down >25% in calm pre-crash markets has a structural problem.
-# OOS (2020-present) contains the COVID crash: 55% is the appropriate cap.
-# Nifty itself fell 38% in COVID; a diversified long-only strategy can breach
-# 40% during a true black swan even with tight CVaR limits.  We validate on
-# Calmar (return/drawdown ratio) so that a large drawdown paired with strong
-# recovery still passes.
-OOS_MAX_DD_CAP = 55.0   # OOS cap — lenient, OOS contains COVID black-swan
+# OOS (2023-present) is a choppy, sector-rotation market — 35% cap is appropriate.
+OOS_MAX_DD_CAP = 35.0
 
 # Search space bounds are configurable to support high-risk/high-turnover variants.
 SEARCH_SPACE_BOUNDS = {
@@ -83,19 +84,17 @@ def _build_sampler() -> TPESampler:
 
 def _iter_wfo_slices(train_start: str, train_end: str):
     """
-    Yield (is_start, is_end, oos_start, oos_end) tuples using an expanding
-    walk-forward scheme confined entirely within the training window.
+    Yield (is_start, is_end, oos_start, oos_end) expanding walk-forward slices
+    confined entirely within the training window.
 
-    With TRAIN_START=2018 / TRAIN_END=2019 this produces one slice:
-        IS  2018-01-01 → 2018-12-31
-        OOS 2019-01-01 → 2019-12-31
+    With TRAIN_START=2018 / TRAIN_END=2022 this yields 4 slices:
+        IS 2018       OOS 2019  — NBFC stress
+        IS 2018-2019  OOS 2020  — COVID crash
+        IS 2018-2020  OOS 2021  — bull market
+        IS 2018-2021  OOS 2022  — rate-hike bear
 
-    Keeping WFO OOS inside the training window means the optimizer scores
-    against normal pre-COVID markets and converges on genuinely good parameters.
-    The final OOS validation (2020-present) remains the real black-swan test.
-    The old code used `stop_year = max(end.year, TEST_START.year)` which pushed
-    the only WFO slice into 2020 (COVID year), forcing Optuna to optimise on a
-    black-swan instead of normal market behaviour.
+    The old code pushed the only slice into TEST_START year (2020/2023),
+    making the optimizer tune on unseen OOS data — data contamination.
     """
     start = pd.Timestamp(train_start)
     end   = pd.Timestamp(train_end)
@@ -114,12 +113,7 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
     cagr = float(metrics.get("cagr", 0.0))
     max_dd = abs(float(metrics.get("max_dd", 100.0)))
     turnover = float(metrics.get("turnover", 0.0))
-    # 15 bps per 1x annual turnover expressed as a CAGR-percentage drag.
-    # 1 bp = 0.01%, so 15 bps = 0.15%.  The old coefficient was 15.0, which is
-    # 100× too large (15% drag per unit turnover) and made cagr_net deeply
-    # negative for any strategy with realistic 1-2x annual turnover, forcing all
-    # IS trial scores negative regardless of actual alpha.
-    turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x turnover
+    turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x annual turnover
     cagr_net = cagr - turnover_drag
     if abs(cagr) < 1e-12 and max_dd == 0.0:
         return 0.0
@@ -131,11 +125,6 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
 
     risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
-    # Penalise strategies that sit in cash (avg_positions < 1); do NOT penalise
-    # strategies that are actually invested.  The old code had this backwards:
-    # it subtracted 1.0 whenever a strategy held positions (avg_positions >= 1),
-    # which made every real portfolio score negative and forced Optuna to converge
-    # on "least bad during COVID" parameters instead of genuinely good ones.
     exposure_penalty = 0.0 if avg_positions >= 1.0 else 0.5
     return (cagr_net / risk_penalty) - exposure_penalty
 
@@ -200,7 +189,11 @@ class MomentumObjective:
         except OptimizationError:
             raise optuna.TrialPruned()
         except Exception as e:
-            logger.warning(f"Trial failed due to internal error: {e}")
+            logger.warning(
+                "Trial failed due to internal error: [%s] %s",
+                type(e).__name__,
+                repr(e),
+            )
             raise optuna.TrialPruned()
 
         if not scores:
@@ -336,13 +329,9 @@ def run_optimization(universe_type: str = "nifty500"):
         print(f"\033[1mOOS MaxDD:\033[0m {m.get('max_dd', 0):.2f}%")
         print(f"\033[1mOOS Calmar:\033[0m {m.get('calmar', 0):.2f}")
         
-        # Institutional Validation Heuristic
-        # Calmar threshold is 0.5 (not 1.0) because the OOS window (2020-present)
-        # contains the COVID black-swan crash.  Requiring Calmar > 1.0 here is the
-        # same as requiring a strategy to have lost nothing during a 38% market
-        # collapse — an unreasonable bar for any long-only equity strategy.
-        # Calmar > 0.5 with MaxDD ≤ 55% is strong institutional-grade performance
-        # over a 6-year period that includes two major bear markets.
+        # Calmar > 0.5 is the right bar for a 2023-2026 OOS window (choppy,
+        # sector-rotation market). The old > 1.0 threshold was calibrated for
+        # a trending bull market and rejects legitimately robust strategies.
         if m.get('calmar', 0) > 0.5 and abs(m.get('max_dd', 100)) <= OOS_MAX_DD_CAP:
             print("\n\033[1;32m[PASS]\033[0m Strategy parameters survived Out-of-Sample verification without structural decay.")
         else:

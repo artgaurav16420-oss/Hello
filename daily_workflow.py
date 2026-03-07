@@ -906,7 +906,12 @@ def main_menu() -> None:
             elif not historical_union:
                 historical_union.update(get_nifty500())
 
-            data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end)
+            # FIX (Bug-8): Pass cfg=bt_cfg so load_or_fetch uses the optimized
+            # CVAR_LOOKBACK for padding instead of the hardcoded 200-day default.
+            # Without this, strategies with CVAR_LOOKBACK > 200 (e.g., 500) would
+            # receive insufficient historical data, causing early rebalance dates to
+            # fail the dimensionality check inside InstitutionalRiskEngine.optimize().
+            data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
             # FIX (Bug-A — Survivorship Bias Guard): run_backtest raises RuntimeError
             # when no point-in-time historical universe files are found, intentionally
             # refusing to fall back to the current Nifty 500 constituents (which
