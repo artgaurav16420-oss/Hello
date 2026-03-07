@@ -37,6 +37,12 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("\033[90m[%(asctime)s]\033[0m %(message)s", "%H:%M:%S"))
     logger.addHandler(handler)
 
+# --- ADD THESE 3 LINES TO SILENCE THE SPAM ---
+logging.getLogger("universe_manager").setLevel(logging.ERROR)
+logging.getLogger("backtest_engine").setLevel(logging.ERROR)
+logging.getLogger("momentum_engine").setLevel(logging.ERROR)
+# ---------------------------------------------
+
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2018-01-01"
@@ -44,7 +50,7 @@ TRAIN_END   = "2019-12-31"   # 2 pre-COVID years — optimizer never sees the cr
 TEST_START  = "2020-01-01"   # OOS starts Jan 2020: COVID is the first real stress test
 TEST_END    = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-N_TRIALS       = 100    # Number of Bayesian iterations
+N_TRIALS       = 55    # Number of Bayesian iterations
 # IS (2018-2019) is pre-COVID: 25% is a realistic strict cap — a strategy that
 # draws down >25% in calm pre-crash markets has a structural problem.
 # OOS (2020-present) contains the COVID crash: 40% is the appropriate cap
@@ -231,13 +237,16 @@ def run_optimization(universe_type: str = "nifty500"):
     logger.info(f"Optimization universe: {universe_type}")
     market_data = pre_load_data(universe_type)
 
-    # 1. Setup Optuna Study
+    # 1. Setup Optuna Study with SQLite Persistence
+    os.makedirs("data", exist_ok=True) # Ensure the data folder exists
     study = optuna.create_study(
         study_name="Momentum_Risk_Parity",
         direction="maximize",
         sampler=_build_sampler(),
+        storage="sqlite:///data/optuna_study.db",  # Saves progress here
+        load_if_exists=True                        # Resumes if file exists
     )
-    
+     
     objective = MomentumObjective(market_data, universe_type)
 
     # 2. Run In-Sample Optimization
