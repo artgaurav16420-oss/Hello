@@ -168,13 +168,13 @@ class MomentumObjective:
         scores = []
         try:
             for wf_train_start, wf_train_end, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
-                _ = run_backtest(
-                    market_data=self.market_data,
-                    universe_type=self.universe_type,
-                    start_date=wf_train_start,
-                    end_date=wf_train_end,
-                    cfg=cfg
-                )
+                # BUG-2 FIX: The previous code ran a full IS backtest here and
+                # discarded the result (_ = run_backtest(..., wf_train_start,
+                # wf_train_end, ...)).  run_backtest() creates a completely fresh
+                # BacktestEngine and PortfolioState on every call — there is no
+                # shared state between an IS run and the subsequent OOS run.  The
+                # discarded IS run therefore had zero effect on OOS results while
+                # consuming ~50% of total optimizer compute across all trials.
                 oos = run_backtest(
                     market_data=self.market_data,
                     universe_type=self.universe_type,

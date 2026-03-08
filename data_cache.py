@@ -194,8 +194,15 @@ def _download_with_timeout(
     provider: Optional[DataProvider] = None,
 ) -> Optional[pd.DataFrame]:
     """
-    Attempts to download a chunk of tickers via yfinance with exponential backoff.
-    auto_adjust=True guarantees that all historical data handles corporate actions (splits).
+    Attempts to download a chunk of tickers via the given provider (defaulting to
+    YFinanceProvider) with exponential backoff.
+
+    YFinanceProvider uses auto_adjust=False so that both the raw Close and the
+    dividend+split-adjusted Adj Close columns are returned.  The backtest and
+    signal engine use Adj Close for return computation and raw Close for trade
+    execution prices — keeping both is therefore intentional.  (auto_adjust=True
+    would strip Adj Close from the payload, causing _is_valid_dataframe to reject
+    every downloaded frame.)
     """
     max_retries = 3
     for attempt in range(max_retries):
@@ -372,7 +379,17 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "Adj Close" not in out.columns:
+        # Column entirely absent (common for index tickers like ^NSEI).
         out["Adj Close"] = out["Close"]
+    else:
+        # BUG-1 FIX: yfinance sometimes returns an Adj Close column that is
+        # present but all-NaN (e.g. recently-listed stocks, certain indices,
+        # or partial corporate-action data).  _is_valid_dataframe rejects any
+        # frame whose Adj Close is entirely null, so those tickers would be
+        # silently dropped from the cache on every download.  Fill the NaN
+        # cells with the corresponding raw Close so the frame passes validation
+        # while still using the true adjusted price wherever it is available.
+        out["Adj Close"] = out["Adj Close"].fillna(out["Close"])
     return out
 
 
@@ -441,10 +458,24 @@ def load_or_fetch(
         for chunk in chunks:
             raw_data = None
             for provider in providers:
+                # BUG-3 FIX: The previous code caught TypeError to handle a
+                # hypothetical missing 'provider' kwarg — but _download_with_timeout
+                # has always accepted that kwarg, so TypeError was never raised from
+                # the call itself.  Worse, the fallback path re-called the function
+                # WITHOUT provider, silently retrying YFinance instead of advancing
+                # to AlphaVantage.  Any non-TypeError exception (ConnectionError,
+                # Timeout, etc.) also propagated uncaught and crashed the entire
+                # load_or_fetch call for the chunk.
+                # Fix: catch all exceptions from a provider attempt, log them, and
+                # move on to the next provider in the chain.
                 try:
                     raw_data = _download_with_timeout(chunk, padded_start, required_end, provider=provider)
-                except TypeError:
-                    raw_data = _download_with_timeout(chunk, padded_start, required_end)
+                except Exception as exc:
+                    logger.warning(
+                        "[Cache] Provider %s failed for chunk starting with %s: %s",
+                        type(provider).__name__, chunk[0], exc,
+                    )
+                    raw_data = None
                 if raw_data is not None and not raw_data.empty:
                     break
             if raw_data is None or raw_data.empty:

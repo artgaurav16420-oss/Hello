@@ -128,37 +128,120 @@ def build_historical_csv(universe_type: str, output_path: str) -> Path:
     return path
 
 
+def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
+    """
+    Convert a PIT CSV (date, ticker) produced by build_historical_csv into the
+    parquet format expected by universe_manager.get_historical_universe().
+
+    Required parquet schema:
+        Index : DatetimeIndex named "date" — one row per monthly snapshot date.
+        Column: "tickers" — Python list of .NS-suffixed ticker strings.
+
+    This is the canonical way to produce the parquet files.  Never call
+    bootstrap_historical_parquet() to create production parquets; always call
+    this function after build_historical_csv() has run successfully.
+    """
+    csv = Path(csv_path)
+    if not csv.exists():
+        raise FileNotFoundError(
+            f"[HistoricalBuilder] CSV source not found: {csv_path}. "
+            "Run build_historical_csv() first."
+        )
+
+    df = pd.read_csv(csv, parse_dates=["date"])
+    if df.empty or "date" not in df.columns or "ticker" not in df.columns:
+        raise ValueError(
+            f"[HistoricalBuilder] CSV at {csv_path} is empty or missing required columns."
+        )
+
+    # Group by snapshot date → list of tickers (already .NS-suffixed from build_historical_csv)
+    rows = (
+        df.groupby(df["date"].dt.normalize())["ticker"]
+        .apply(list)
+    )
+    out_df = pd.DataFrame({"tickers": rows})
+    out_df.index = pd.DatetimeIndex(out_df.index, name="date")
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_parquet(path)
+    logger.info(
+        "[HistoricalBuilder] Wrote %d monthly PIT snapshots → %s",
+        len(out_df),
+        path,
+    )
+    return path
+
+
 def bootstrap_historical_parquet(
     output_path: str = "data/historical_nifty500.parquet",
     default_tickers: list[str] | None = None,
 ) -> Path:
-    """Create a minimal historical parquet with DatetimeIndex + tickers list column."""
-    tickers = default_tickers or ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
-    if default_tickers is None:
-        logger.warning(
-            "[HistoricalBuilder] Bootstrapping %s with a 3-ticker stub universe only (%s). "
-            "Use build_historical_csv outputs for full PIT backtests.",
-            output_path,
-            ", ".join(tickers),
+    """
+    Last-resort stub parquet.  Attempts to derive content from the sibling CSV
+    (same stem, .csv extension) before falling back to a minimal stub.
+
+    WARNING: The stub path (3 tickers, today's date only) causes every
+    historical backtest lookup to miss because universe_manager checks
+    `available_dates <= rebalance_date` — a single row dated today will
+    never match any historical date.  Always prefer build_parquet_from_csv().
+    """
+    path = Path(output_path)
+
+    # Derive the matching CSV path from the parquet path stem.
+    # e.g. data/historical_nifty500.parquet → data/historical_nifty500.csv
+    sibling_csv = path.with_suffix(".csv")
+    if sibling_csv.exists():
+        logger.info(
+            "[HistoricalBuilder] Found sibling CSV %s — building parquet from it "
+            "instead of creating a stub.",
+            sibling_csv,
         )
+        return build_parquet_from_csv(str(sibling_csv), output_path)
+
+    # True fallback: stub with today's date only.  This is only useful for
+    # smoke-testing imports; it will produce survivorship bias in backtests.
+    tickers = default_tickers or ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
+    logger.warning(
+        "[HistoricalBuilder] Bootstrapping %s with a 3-ticker stub universe only (%s). "
+        "This parquet has a single row dated today and will cause every historical "
+        "universe lookup to miss — run build_historical_csv() then "
+        "build_parquet_from_csv() to produce a proper PIT parquet.",
+        output_path,
+        ", ".join(tickers),
+    )
     idx = pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date")
     df = pd.DataFrame({"tickers": [tickers]}, index=idx)
-
-    path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path)
     return path
 
 
 def main() -> None:
-    outputs = [
-        bootstrap_historical_parquet("data/historical_nifty500.parquet"),
-        bootstrap_historical_parquet("data/historical_nse_total.parquet"),
-        build_historical_csv("nifty500", "data/historical_nifty500.csv"),
-        build_historical_csv("nse_total", "data/historical_nse_total.csv"),
-    ]
-    for path in outputs:
-        print(f"[+] Bootstrap complete: {path}")
+    """
+    Build the full set of PIT universe files needed for survivorship-safe backtests.
+
+    Order matters:
+      1. Build CSVs first  (monthly PIT snapshots, 2018-present)
+      2. Convert CSVs to parquets  (schema required by universe_manager)
+
+    Never call bootstrap_historical_parquet() here — it produces a single-row
+    stub dated today which makes every historical lookup miss.
+    """
+    print("[HistoricalBuilder] Step 1/2 — Building PIT CSV snapshots...")
+    csv_nifty   = build_historical_csv("nifty500",  "data/historical_nifty500.csv")
+    csv_total   = build_historical_csv("nse_total", "data/historical_nse_total.csv")
+    print(f"  [+] {csv_nifty}")
+    print(f"  [+] {csv_total}")
+
+    print("[HistoricalBuilder] Step 2/2 — Converting CSVs to parquet...")
+    pq_nifty  = build_parquet_from_csv("data/historical_nifty500.csv",  "data/historical_nifty500.parquet")
+    pq_total  = build_parquet_from_csv("data/historical_nse_total.csv", "data/historical_nse_total.parquet")
+    print(f"  [+] {pq_nifty}")
+    print(f"  [+] {pq_total}")
+
+    print("\n[HistoricalBuilder] All PIT files ready. Backtests will now use "
+          "correct point-in-time constituents without survivorship bias.")
 
 
 if __name__ == "__main__":

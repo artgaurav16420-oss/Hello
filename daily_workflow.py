@@ -620,7 +620,12 @@ def _run_scan(
 
 
 def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
-    """Activate exposure override immediately after hard risk events."""
+    """Activate exposure override immediately after hard risk events.
+
+    BUG-6 NOTE: An identical copy of this function exists in backtest_engine.py.
+    If the override logic changes here it must be mirrored there manually.
+    Consolidation into momentum_engine.py is the correct long-term fix.
+    """
     state.override_active = True
     state.override_cooldown = max(state.override_cooldown, 4)
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))

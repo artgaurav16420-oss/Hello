@@ -321,7 +321,13 @@ class BacktestEngine:
 
 
 def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
-    """Activate exposure override after hard risk events (breach/exhaustion)."""
+    """Activate exposure override after hard risk events (breach/exhaustion).
+
+    BUG-6 NOTE: An identical copy of this function exists in daily_workflow.py.
+    If the override logic changes here it must be mirrored there manually.
+    Consolidation into momentum_engine.py (as a PortfolioState method or module-level
+    helper) is the correct long-term fix but requires updating imports in both callers.
+    """
     state.override_active = True
     state.override_cooldown = max(state.override_cooldown, 4)
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))

@@ -129,7 +129,7 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
     Helper for Universe Manager.
     Filters a raw list of tickers down to those meeting the minimum ADV liquidity threshold.
     """
-    from momentum_engine import UltimateConfig
+    from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
 
     if cfg is None:
@@ -155,7 +155,11 @@ def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
         try:
             data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
             for symbol in chunk:
-                ns_sym = symbol + ".NS"
+                # BUG-4 FIX: Hard-coded `symbol + ".NS"` produces a double-suffix
+                # ("RELIANCE.NS.NS") if the symbol already carries the .NS tag.
+                # load_or_fetch standardises all keys to .NS internally, so the
+                # lookup key must match.  Use to_ns() which is idempotent.
+                ns_sym = to_ns(symbol)
                 if ns_sym in data:
                     df = data[ns_sym]
                     adv = compute_single_adv(df)
