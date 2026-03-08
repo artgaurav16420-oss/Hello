@@ -11,8 +11,8 @@ import argparse
 import json
 import logging
 import os
-import tempfile
 import sys
+import tempfile
 import warnings
 
 import pandas as pd
@@ -28,6 +28,16 @@ from universe_manager import get_nifty500, fetch_nse_equity_universe
 # Suppress solver/sklearn warnings during the thousands of iterations
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Ensure stdout can handle Unicode characters (₹, etc.) on Windows where the
+# default 'charmap' (cp1252) codec raises UnicodeEncodeError for U+20B9.
+# errors='replace' is a safe fallback for environments that truly cannot
+# represent the character; reconfigure() is a no-op on UTF-8 terminals.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # TTY doesn't support reconfigure (e.g. redirected pipe)
 
 # Configure local logger
 logger = logging.getLogger("Optimizer")
@@ -73,6 +83,23 @@ SEARCH_SPACE_BOUNDS = {
 # Runtime knobs: use all cores by default and allow optional deterministic seed.
 N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "-1"))
 OPTUNA_SEED = os.getenv("OPTUNA_SEED")
+
+# SQLITE CONTENTION FIX: When using SQLite storage (the default), parallel Optuna
+# workers all compete for the same write lock.  SQLite serialises every INSERT, so
+# with n_jobs=-1 workers queue behind the lock holder and produce the periodic
+# ~10-minute freezes visible in the progress bar.  To avoid this:
+#   • If the user explicitly set OPTUNA_N_JOBS we honour it (they know what they want).
+#   • Otherwise, cap at 1 worker when the SQLite backend is active.
+# Use OPTUNA_STORAGE=":memory:" (or any non-file URI) to re-enable parallelism
+# with an in-memory study (no resume capability, but no lock contention).
+OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
+_sqlite_storage = OPTUNA_STORAGE.startswith("sqlite:")
+if "OPTUNA_N_JOBS" not in os.environ and _sqlite_storage:
+    N_JOBS = 1
+    logger.info(
+        "SQLite storage detected — capping n_jobs=1 to prevent write-lock contention. "
+        "Set OPTUNA_STORAGE=:memory: and OPTUNA_N_JOBS=-1 for parallel in-memory runs."
+    )
 
 
 def _build_sampler() -> TPESampler:
@@ -168,13 +195,13 @@ class MomentumObjective:
         scores = []
         try:
             for wf_train_start, wf_train_end, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
-                # BUG-2 FIX: The previous code ran a full IS backtest here and
-                # discarded the result (_ = run_backtest(..., wf_train_start,
-                # wf_train_end, ...)).  run_backtest() creates a completely fresh
-                # BacktestEngine and PortfolioState on every call — there is no
-                # shared state between an IS run and the subsequent OOS run.  The
-                # discarded IS run therefore had zero effect on OOS results while
-                # consuming ~50% of total optimizer compute across all trials.
+                _ = run_backtest(
+                    market_data=self.market_data,
+                    universe_type=self.universe_type,
+                    start_date=wf_train_start,
+                    end_date=wf_train_end,
+                    cfg=cfg
+                )
                 oos = run_backtest(
                     market_data=self.market_data,
                     universe_type=self.universe_type,
@@ -267,8 +294,8 @@ def run_optimization(universe_type: str = "nifty500"):
         study_name="Momentum_Risk_Parity",
         direction="maximize",
         sampler=_build_sampler(),
-        storage="sqlite:///data/optuna_study.db",  # Saves progress here
-        load_if_exists=True                        # Resumes if file exists
+        storage=OPTUNA_STORAGE,         # configurable via OPTUNA_STORAGE env var
+        load_if_exists=True
     )
      
     objective = MomentumObjective(market_data, universe_type)
@@ -324,7 +351,12 @@ def run_optimization(universe_type: str = "nifty500"):
         )
         
         m = oos_results.metrics
-        print(f"\n\033[1mOOS Final Equity:\033[0m \033[32m₹{m.get('final', 0):,.0f}\033[0m")
+        # Encoding-safe currency prefix: cp1252/charmap Windows consoles cannot
+        # render ₹ (U+20B9) and raise UnicodeEncodeError, crashing the entire
+        # OOS validation block even though the backtest succeeded.
+        _enc = getattr(sys.stdout, "encoding", "utf-8") or "utf-8"
+        _rs = "\u20b9" if _enc.lower().replace("-", "") in ("utf8", "utf16", "utf32") else "Rs."
+        print(f"\n\033[1mOOS Final Equity:\033[0m \033[32m{_rs}{m.get('final', 0):,.0f}\033[0m")
         print(f"\033[1mOOS CAGR:\033[0m {m.get('cagr', 0):.2f}%")
         print(f"\033[1mOOS MaxDD:\033[0m {m.get('max_dd', 0):.2f}%")
         print(f"\033[1mOOS Calmar:\033[0m {m.get('calmar', 0):.2f}")
