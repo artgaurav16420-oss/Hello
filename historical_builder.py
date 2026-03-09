@@ -16,6 +16,10 @@ from universe_manager import get_nifty500, fetch_nse_equity_universe
 
 logger = logging.getLogger(__name__)
 
+# All paths in this module are rooted here.  Change DATA_DIR to relocate
+# the entire historical-data directory without touching individual functions.
+DATA_DIR = Path("data")
+
 
 def _monthly_dates(start: str = "2018-01-01", end: str | None = None) -> pd.DatetimeIndex:
     end_ts = pd.Timestamp.today().normalize() if end is None else pd.Timestamp(end)
@@ -40,8 +44,8 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
     - data/raw_{universe_type}_archives.csv
     """
     candidates = [
-        Path("data/raw_nifty_archives.csv"),
-        Path(f"data/raw_{universe_type}_archives.csv"),
+        DATA_DIR / "raw_nifty_archives.csv",
+        DATA_DIR / f"raw_{universe_type}_archives.csv",
     ]
     src = next((p for p in candidates if p.exists()), None)
     if src is None:
@@ -174,7 +178,7 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
 
 
 def bootstrap_historical_parquet(
-    output_path: str = "data/historical_nifty500.parquet",
+    output_path: str = str(DATA_DIR / "historical_nifty500.parquet"),
     default_tickers: list[str] | None = None,
 ) -> Path:
     """
@@ -229,14 +233,18 @@ def main() -> None:
     stub dated today which makes every historical lookup miss.
     """
     print("[HistoricalBuilder] Step 1/2 — Building PIT CSV snapshots...")
-    csv_nifty   = build_historical_csv("nifty500",  "data/historical_nifty500.csv")
-    csv_total   = build_historical_csv("nse_total", "data/historical_nse_total.csv")
+    csv_nifty   = build_historical_csv("nifty500",  str(DATA_DIR / "historical_nifty500.csv"))
+    csv_total   = build_historical_csv("nse_total", str(DATA_DIR / "historical_nse_total.csv"))
     print(f"  [+] {csv_nifty}")
     print(f"  [+] {csv_total}")
 
     print("[HistoricalBuilder] Step 2/2 — Converting CSVs to parquet...")
-    pq_nifty  = build_parquet_from_csv("data/historical_nifty500.csv",  "data/historical_nifty500.parquet")
-    pq_total  = build_parquet_from_csv("data/historical_nse_total.csv", "data/historical_nse_total.parquet")
+    pq_nifty  = build_parquet_from_csv(
+        str(DATA_DIR / "historical_nifty500.csv"),  str(DATA_DIR / "historical_nifty500.parquet")
+    )
+    pq_total  = build_parquet_from_csv(
+        str(DATA_DIR / "historical_nse_total.csv"), str(DATA_DIR / "historical_nse_total.parquet")
+    )
     print(f"  [+] {pq_nifty}")
     print(f"  [+] {pq_total}")
 

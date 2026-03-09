@@ -285,3 +285,58 @@ def test_parse_args_accepts_universe_override():
     args = optimizer._parse_args(["--universe", "nse_total"])
 
     assert args.universe == "nse_total"
+
+
+def test_parse_args_in_memory_flag_defaults_false():
+    args = optimizer._parse_args([])
+    assert args.in_memory is False
+
+
+def test_parse_args_in_memory_flag_sets_true():
+    args = optimizer._parse_args(["--in-memory"])
+    assert args.in_memory is True
+
+
+def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monkeypatch):
+    """
+    --in-memory must route to :memory: storage and not apply the SQLite n_jobs=1 cap,
+    regardless of whether OPTUNA_N_JOBS is set in the environment.
+    """
+    monkeypatch.setattr(optimizer, "N_TRIALS", 1)
+    monkeypatch.setattr(optimizer, "pre_load_data", lambda universe_type: {})
+    monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
+
+    class _Result:
+        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    captured = {}
+
+    class _Study:
+        best_trials = [object()]
+        best_params = {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 63,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 5.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+        best_value = 1.23
+
+        def optimize(self, objective, **kwargs):
+            captured.update(kwargs)
+
+    def _fake_create_study(**kwargs):
+        captured["storage"] = kwargs.get("storage")
+        return _Study()
+
+    monkeypatch.setattr(optimizer.optuna, "create_study", _fake_create_study)
+    # Ensure OPTUNA_N_JOBS is absent so the default -1 path is exercised
+    monkeypatch.delenv("OPTUNA_N_JOBS", raising=False)
+
+    optimizer.run_optimization(in_memory=True)
+
+    assert captured["storage"] == ":memory:", (
+        f"in_memory=True must use ':memory:' storage, got: {captured['storage']!r}"
+    )

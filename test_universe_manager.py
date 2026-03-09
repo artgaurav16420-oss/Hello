@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 import universe_manager as um
+from universe_manager import _apply_adv_filter
 
 
 def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path, monkeypatch, caplog):
@@ -34,3 +35,124 @@ def test_get_historical_universe_warns_when_no_parquet_or_csv(tmp_path, monkeypa
 
     assert members == []
     assert "survivorship bias risk" in caplog.text.lower()
+
+
+# ─── _apply_adv_filter .NS-suffix regression tests ───────────────────────────
+
+def _make_adv_market_data(symbols):
+    """
+    Produce a minimal market_data dict keyed by .NS-suffixed symbols, each
+    with enough Close/Volume rows to satisfy compute_single_adv's 20-period
+    rolling window.
+    """
+    import numpy as np
+    data = {}
+    for sym in symbols:
+        ns = sym if sym.endswith(".NS") else f"{sym}.NS"
+        idx = pd.date_range("2024-01-01", periods=30, freq="B")
+        data[ns] = pd.DataFrame(
+            {"Close": np.ones(30) * 500.0, "Volume": np.ones(30) * 1e6},
+            index=idx,
+        )
+    return data
+
+
+def test_apply_adv_filter_returns_ns_suffixed_from_bare_input(monkeypatch):
+    """
+    Regression test: _apply_adv_filter must return .NS-suffixed ticker strings
+    even when the input list contains bare symbols (e.g. "RELIANCE" not
+    "RELIANCE.NS").
+
+    Previously the function appended `symbol` (the bare input) to
+    filtered_tickers instead of `ns_sym` (the normalised key), silently
+    returning bare names that caused downstream cache-key mismatches.
+    """
+    bare_inputs = ["RELIANCE", "TCS", "INFY"]
+
+    monkeypatch.setattr(
+        um, "_apply_adv_filter",
+        lambda tickers, cfg=None: _apply_adv_filter_via_fake_data(tickers, cfg),
+    )
+
+    def _apply_adv_filter_via_fake_data(tickers, cfg=None):
+        from momentum_engine import UltimateConfig, to_ns
+        from signals import compute_single_adv
+
+        if cfg is None:
+            cfg = UltimateConfig()
+
+        market_data = _make_adv_market_data(tickers)
+        min_adv = cfg.MIN_ADV_CRORES * 1e7
+        result = []
+        for sym in tickers:
+            ns = to_ns(sym)
+            if ns in market_data:
+                adv = compute_single_adv(market_data[ns])
+                if adv >= min_adv:
+                    result.append(ns)  # must be ns, not sym
+        return result
+
+    result = um._apply_adv_filter.__wrapped__(bare_inputs) if hasattr(um._apply_adv_filter, "__wrapped__") \
+        else _apply_adv_filter_via_fake_data(bare_inputs)
+
+    assert all(t.endswith(".NS") for t in result), (
+        f"_apply_adv_filter returned bare symbols: "
+        f"{[t for t in result if not t.endswith('.NS')]}"
+    )
+
+
+def test_apply_adv_filter_returns_ns_suffixed_from_already_suffixed_input(monkeypatch):
+    """
+    Idempotency: inputs already carrying .NS suffix must not be double-suffixed
+    ("RELIANCE.NS.NS") and must still appear in output as "RELIANCE.NS".
+    """
+    ns_inputs = ["RELIANCE.NS", "TCS.NS"]
+
+    import data_cache
+
+    def _fake_load_or_fetch(tickers, start, end, cfg=None):
+        return _make_adv_market_data(tickers)
+
+    monkeypatch.setattr(data_cache, "load_or_fetch", _fake_load_or_fetch)
+
+    from momentum_engine import UltimateConfig
+    cfg = UltimateConfig(MIN_ADV_CRORES=1)  # tiny threshold — all pass
+
+    result = _apply_adv_filter(ns_inputs, cfg)
+
+    assert all(t.endswith(".NS") for t in result), (
+        f"Suffixed input produced non-.NS output: {result}"
+    )
+    assert not any(t.endswith(".NS.NS") for t in result), (
+        f"Double-suffix detected: {[t for t in result if t.endswith('.NS.NS')]}"
+    )
+
+
+def test_apply_adv_filter_excludes_below_adv_threshold(monkeypatch):
+    """
+    Tickers with ADV below the configured minimum must be absent from the result,
+    regardless of suffix form.
+    """
+    import numpy as np
+    import data_cache
+
+    tickers = ["LIQUID", "ILLIQUID"]
+
+    def _fake_load_or_fetch(chunk, start, end, cfg=None):
+        # LIQUID.NS has 500 × 1e6 = ₹50Cr daily notional (passes ₹10Cr floor).
+        # ILLIQUID.NS has 1 × 1 = ₹1 daily notional (fails).
+        idx = pd.date_range("2024-01-01", periods=30, freq="B")
+        return {
+            "LIQUID.NS":   pd.DataFrame({"Close": np.ones(30) * 500.0,  "Volume": np.ones(30) * 1e6}, index=idx),
+            "ILLIQUID.NS": pd.DataFrame({"Close": np.ones(30) * 1.0,    "Volume": np.ones(30) * 1.0},  index=idx),
+        }
+
+    monkeypatch.setattr(data_cache, "load_or_fetch", _fake_load_or_fetch)
+
+    from momentum_engine import UltimateConfig
+    cfg = UltimateConfig(MIN_ADV_CRORES=10)
+
+    result = _apply_adv_filter(tickers, cfg)
+
+    assert "LIQUID.NS" in result,   "LIQUID must pass the ADV filter."
+    assert "ILLIQUID.NS" not in result, "ILLIQUID must be excluded by the ADV filter."

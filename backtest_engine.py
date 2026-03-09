@@ -187,20 +187,43 @@ class BacktestEngine:
         _force_full_cash       = False
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
+        # Two-tier breach architecture (see CVAR_HARD_BREACH_MULTIPLIER in UltimateConfig):
+        #
+        #  HARD breach  (CVaR > limit × CVAR_HARD_BREACH_MULTIPLIER, default 1.5×):
+        #    CVaR is so elevated the QP solver is unlikely to find a feasible
+        #    solution. Skip the optimizer, force full liquidation immediately.
+        #
+        #  SOFT breach  (limit < CVaR ≤ hard threshold):
+        #    Let the optimizer run — its explicit QP CVaR constraint will build
+        #    a de-risked portfolio naturally. The previous code triggered a full
+        #    liquidation for any breach, including marginal ones like 6.507% vs
+        #    6.500%, causing 33 unnecessary liquidations per 6-year backtest.
         if self.state.shares:
-            # Note: We use prices_t here (T+0) as this screens for current stress limits against 
-            # execution constraints immediately prior to order submission.
+            # Use prices_t (T+0): screens current stress before order submission.
             book_cvar = compute_book_cvar(self.state, prices_t, symbols, hist_log_rets, cfg)
-            if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+            hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+            hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
+
+            if book_cvar > hard_breach_threshold:
+                # HARD breach: liquidate immediately.
                 logger.warning(
-                    "[Backtest] Book CVaR %.4f%% exceeds limit %.4f%% on %s — "
+                    "[Backtest] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) on %s — "
                     "skipping optimization, forcing immediate liquidation.",
-                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, date,
+                    book_cvar * 100, hard_breach_threshold * 100, hard_multiplier, date,
                 )
                 self.state.consecutive_failures += 1
                 apply_decay      = True
                 _force_full_cash = True
                 _activate_override_on_stress(self.state, cfg)
+
+            elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+                # SOFT breach: elevated but manageable. Let the QP handle it.
+                logger.info(
+                    "[Backtest] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) on %s — "
+                    "running optimizer with CVaR constraint active.",
+                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100, date,
+                )
+                # Do NOT set _force_full_cash — fall through to signal generation.
 
         # ── Signal generation + optimization ─────────────────────────────────
         if not _force_full_cash:

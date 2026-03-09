@@ -140,16 +140,32 @@ class UltimateConfig:
     SIGNAL_ANNUAL_FACTOR:     int   = 252
 
     # CVaR
-    CVAR_DAILY_LIMIT:         float = 0.040
-    CVAR_ALPHA:               float = 0.95
-    CVAR_LOOKBACK:            int   = 200
-    CVAR_SENTINEL_MULTIPLIER: float = 2.5
-    CVAR_MIN_HISTORY:         int   = 20
+    CVAR_DAILY_LIMIT:            float = 0.055
+    CVAR_ALPHA:                  float = 0.95
+    CVAR_LOOKBACK:               int   = 90
+    # 90-day lookback forgets a crash in ~4 months instead of 10.
+    # The 200-day default kept COVID-crash tail losses in the CVaR window
+    # throughout the entire 2020 recovery, causing persistent soft breaches.
+    CVAR_SENTINEL_MULTIPLIER:    float = 2.5
+    CVAR_MIN_HISTORY:            int   = 20
+    # Two-tier breach architecture (implemented in backtest_engine.py):
+    #   SOFT breach (limit < CVaR ≤ limit × multiplier): run optimizer normally,
+    #     its QP CVaR constraint will build a de-risked portfolio naturally.
+    #   HARD breach (CVaR > limit × multiplier): skip optimizer, liquidate.
+    # At 1.5× (9.75% when limit=6.5%), only genuine tail events trigger HARD.
+    CVAR_HARD_BREACH_MULTIPLIER: float = 1.5
+
+    # Drift tolerance: minimum weight change (as a fraction of portfolio value)
+    # required before a trade is actually executed. Prevents micro-adjustments
+    # from the soft-breach optimizer accumulating as slippage and turnover.
+    # Example: 0.02 means a position must change by ≥ 2% of portfolio to trade.
+    # This is applied per-symbol at execution time in execute_rebalance().
+    DRIFT_TOLERANCE:             float = 0.02
 
     # Exposure management
-    DELEVERAGING_LIMIT:       float = 0.10
-    MIN_EXPOSURE_FLOOR:       float = 0.40
-    CAPITAL_ELASTICITY:       float = 0.15
+    DELEVERAGING_LIMIT:          float = 0.10
+    MIN_EXPOSURE_FLOOR:          float = 0.40
+    CAPITAL_ELASTICITY:          float = 0.15
 
     # Signal / optimizer
     HISTORY_GATE:             int   = 90
@@ -551,14 +567,33 @@ def execute_rebalance(
 
         if s > 0 or old_s > 0:
             delta = s - old_s
-            
+
+            # Drift tolerance gate: skip micro-adjustments smaller than
+            # DRIFT_TOLERANCE × portfolio value. This prevents the soft-breach
+            # optimizer from accumulating slippage on tiny weekly weight tweaks
+            # (e.g. 1-2 shares) during periods of persistently elevated CVaR.
+            # Full exits (s == 0, old_s > 0) always execute regardless of tolerance.
+            # New entries (old_s == 0, s > 0) always execute.
+            if delta != 0 and old_s > 0 and s > 0:
+                drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
+                weight_change = abs(delta * price) / max(pv, 1.0)
+                if weight_change < drift_threshold:
+                    # Hold existing position, absorb new target weight silently.
+                    s = old_s
+                    delta = 0
+                    new_weights[sym] = old_s * price / max(pv, 1.0)
+                    new_shares[sym]  = old_s
+                    new_entry_prices[sym] = state.entry_prices.get(sym, price)
+                    actual_notional += old_s * price
+                    continue
+
             # ── FIX: Institutional Impact Alignment ──
             if adv_shares is not None and adv_shares[i] > 0:
                 impact_rate = (cfg.IMPACT_COEFF * pv) / (price * adv_shares[i])
                 slip_rate = max(cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
             else:
                 slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
-            
+
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
             actual_notional += s * price

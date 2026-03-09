@@ -12,11 +12,11 @@ from __future__ import annotations
 import io
 import json
 import logging
-import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -25,8 +25,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR            = "data/cache"
-UNIVERSE_CACHE_FILE  = os.path.join(CACHE_DIR, "_universe_cache.json")
+DATA_DIR             = Path("data")
+CACHE_DIR            = DATA_DIR / "cache"
+UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
 _ADV_MAX_WORKERS     = 1
@@ -106,8 +107,8 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 
 
 def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
-    csv_path = f"data/historical_{universe_type}.csv"
-    if not os.path.exists(csv_path):
+    csv_path = DATA_DIR / f"historical_{universe_type}.csv"
+    if not csv_path.exists():
         return []
     try:
         df = pd.read_csv(csv_path)
@@ -144,11 +145,11 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     If neither source has a valid record, returns an empty list and issues
     a survivorship-bias warning.
     """
-    hist_file = f"data/historical_{universe_type}.parquet"
+    hist_file = DATA_DIR / f"historical_{universe_type}.parquet"
 
     # Warn once per missing parquet file (not once per date) to keep optimizer
     # output readable. The warning is still ERROR level so it's never silent.
-    if not os.path.exists(hist_file):
+    if not hist_file.exists():
         if not _MISSING_PARQUET_WARNED.get(universe_type):
             logger.error(
                 "HISTORICAL PARQUET MISSING: %s — attempting point-in-time CSV fallback "
@@ -215,33 +216,105 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 # ─── Cache Management ─────────────────────────────────────────────────────────
 
 def _load_universe_cache() -> dict:
-    if not os.path.exists(UNIVERSE_CACHE_FILE):
+    if not UNIVERSE_CACHE_FILE.exists():
         return {}
     try:
-        with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as file:
+        with UNIVERSE_CACHE_FILE.open("r", encoding="utf-8") as file:
             return json.load(file)
     except Exception as exc:
         logger.warning("[Universe] Cache load failed, starting fresh: %s", exc)
         return {}
 
 def _save_universe_cache(data: dict) -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    temp_file = UNIVERSE_CACHE_FILE + ".tmp"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = UNIVERSE_CACHE_FILE.with_name(UNIVERSE_CACHE_FILE.name + ".tmp")
     try:
-        with open(temp_file, "w", encoding="utf-8") as file:
+        with temp_file.open("w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
-        os.replace(temp_file, UNIVERSE_CACHE_FILE)
+        temp_file.replace(UNIVERSE_CACHE_FILE)
     except Exception as exc:
         logger.error("[Universe] Failed to save cache: %s", exc)
 
 def invalidate_universe_cache() -> None:
     """Force clears the local universe JSON cache."""
-    if os.path.exists(UNIVERSE_CACHE_FILE):
+    if UNIVERSE_CACHE_FILE.exists():
         try:
-            os.remove(UNIVERSE_CACHE_FILE)
+            UNIVERSE_CACHE_FILE.unlink()
             logger.info("[Universe] Cache invalidated.")
         except OSError as e:
             logger.error("[Universe] Failed to invalidate cache: %s", e)
+
+# ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
+
+def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
+    """
+    Filter a raw list of tickers down to those meeting the minimum ADV
+    liquidity threshold defined in cfg.MIN_ADV_CRORES.
+
+    Moved here from signals.py — this is a universe curation concern, not a
+    signal computation concern.  Keeping it alongside the other universe
+    management utilities avoids a conceptual mismatch and removes the
+    asymmetric import (signals → universe_manager was already the wrong
+    direction; the correct dependency edge is universe_manager → signals for
+    compute_single_adv).
+
+    BUG FIX (bare-symbol return):
+    The previous implementation looked up market data with to_ns(symbol) —
+    correctly obtaining a ".NS"-suffixed key — but then appended the original
+    bare symbol to filtered_tickers.  Callers expecting ".NS"-suffixed tickers
+    back (e.g. the cache's manifest-keyed entries) received bare names like
+    "RELIANCE" instead of "RELIANCE.NS", causing silent lookup misses
+    downstream.  This version always appends the normalised ns_sym.
+    """
+    from momentum_engine import UltimateConfig, to_ns
+    from data_cache import load_or_fetch
+    from signals import compute_single_adv
+
+    if cfg is None:
+        cfg = UltimateConfig()
+
+    end_date   = datetime.today().strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
+
+    chunk_size  = 75
+    chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+
+    filtered_tickers: List[str] = []
+    min_adv_volume = cfg.MIN_ADV_CRORES * 1e7
+
+    logger.info(
+        "[Universe] Filtering %d tickers against ₹%dCr ADV minimum...",
+        len(tickers), cfg.MIN_ADV_CRORES,
+    )
+
+    # Sequential loop intentionally retained — parallel yfinance calls on a
+    # large universe trigger Yahoo Finance rate-limiting (HTTP 429 / 401
+    # "Invalid Crumb"), causing entire chunks to return empty and incorrectly
+    # disqualifying hundreds of valid liquid stocks.  Sequential processing
+    # (~30s for 500 tickers) produces reliable, complete ADV results.
+    for chunk in chunks:
+        try:
+            data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
+            for symbol in chunk:
+                # to_ns() is idempotent — handles both "RELIANCE" and
+                # "RELIANCE.NS" inputs without producing a double-suffix.
+                ns_sym = to_ns(symbol)
+                if ns_sym in data:
+                    adv = compute_single_adv(data[ns_sym])
+                    if adv >= min_adv_volume:
+                        # FIX: append ns_sym (the normalised ".NS" key), NOT
+                        # the original bare symbol.  The previous code appended
+                        # `symbol` here, which silently returned bare ticker
+                        # strings to callers that expected ".NS"-suffixed names,
+                        # causing downstream cache-key mismatches.
+                        filtered_tickers.append(ns_sym)
+        except Exception as exc:
+            logger.error("[Universe] Error processing ADV chunk: %s", exc)
+
+    return filtered_tickers
+
+
+
 
 # ─── Network Fetchers ─────────────────────────────────────────────────────────
 
@@ -275,8 +348,7 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         equity_df = df[df["SERIES"] == "EQ"]
         tickers = equity_df["SYMBOL"].unique().tolist()
         
-        # Apply strict ADV liquidity filter
-        from signals import _apply_adv_filter
+        # Apply strict ADV liquidity filter — defined in this module.
         logger.info("[Universe] Applying liquidity filters to %d symbols...", len(tickers))
         liquid_tickers = _apply_adv_filter(tickers, cfg)
         

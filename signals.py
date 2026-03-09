@@ -1,5 +1,5 @@
 """
-signals.py — Deterministic Regime & Momentum Kernel v11.46
+signals.py — Deterministic Regime & Momentum Kernel v11.48
 =========================================================
 Generates momentum Z-scores, handles liquidity filtering, calculates
 macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.
@@ -8,7 +8,6 @@ macro regime penalties, and implements the Dispersion-Normalized Continuity Bonu
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -34,14 +33,17 @@ def compute_regime_score(
     High score -> Risk-on (upward trend, low volatility)
     Low score -> Risk-off (downward trend, high volatility)
     """
-    if idx_hist is None or len(idx_hist) < 253:
+    if idx_hist is None or len(idx_hist) < (
+        int(getattr(cfg, "TRADING_DAYS_PER_YEAR", 253)) if cfg else 253
+    ):
         logger.debug("[Signals] Insufficient index history for regime. Defaulting to 0.5")
         return 0.5
         
     close_series = idx_hist["Close"]
     
     # 1. Trend component (Distance from 200-day SMA)
-    sma200 = float(close_series.rolling(window=200).mean().iloc[-1])
+    sma_window = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
+    sma200 = float(close_series.rolling(window=sma_window).mean().iloc[-1])
     last_price = float(close_series.iloc[-1])
     
     if sma200 <= 0 or not np.isfinite(sma200):
@@ -75,8 +77,9 @@ def compute_regime_score(
         vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
 
     breadth_component = 0.5
-    if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= 200:
-        sma200 = universe_close_hist.rolling(200).mean().iloc[-1]
+    _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
+    if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= _sma_win:
+        sma200 = universe_close_hist.rolling(_sma_win).mean().iloc[-1]
         last = universe_close_hist.iloc[-1]
         valid = (sma200 > 0) & sma200.notna() & last.notna()
         if valid.any():
@@ -109,67 +112,53 @@ def compute_single_adv(df: pd.DataFrame) -> float:
 
 
 def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
-    """Vectorized application of compute_single_adv across active universe."""
+    """
+    Compute Average Daily Notional Volume for every symbol in a single
+    vectorized pass.
+
+    Builds a (T × N) notional DataFrame (Close × Volume) for all symbols
+    simultaneously, applies one rolling(20).mean() across all columns at
+    once, and extracts the last row.  This replaces the previous per-symbol
+    loop — which allocated a new Pandas Series per ticker — with a single
+    2-D matrix operation that is significantly faster inside the backtest
+    inner loop and during Bayesian optimisation trials.
+
+    Symbols absent from market_data receive a value of 0.0.
+    """
     from momentum_engine import to_ns
-    
-    adv_list = []
+
+    notional_cols: Dict[str, pd.Series] = {}
     for symbol in active_symbols:
         ns_sym = to_ns(symbol)
-        if ns_sym in market_data:
-            adv_val = compute_single_adv(market_data[ns_sym])
-            adv_list.append(adv_val)
-        else:
-            adv_list.append(0.0)
-            
-    return np.array(adv_list, dtype=float)
+        df = market_data.get(ns_sym)
+        if df is not None and "Close" in df.columns and "Volume" in df.columns:
+            notional_cols[symbol] = (df["Close"] * df["Volume"]).replace(0, np.nan)
+
+    if not notional_cols:
+        return np.zeros(len(active_symbols), dtype=float)
+
+    # Single rolling mean across the entire matrix — O(T·N) instead of N × O(T).
+    notional_df = pd.DataFrame(notional_cols).ffill().fillna(0.0)
+    adv_last_row = notional_df.rolling(20, min_periods=1).mean().iloc[-1]
+
+    def _safe_adv(sym: str) -> float:
+        # Inline helper keeps `x` strictly scoped to this call frame.
+        # Replaces the `v :=` walrus expression that previously leaked `v`
+        # into the enclosing function scope after the list comprehension ran
+        # (PEP 572 — assignment expressions in comprehensions deliberately
+        # leak into the nearest enclosing non-comprehension scope, creating a
+        # latent state-pollution footgun for any future edit that references
+        # `v` after the return statement).
+        x = adv_last_row.get(sym, 0.0)
+        return float(x) if np.isfinite(x) else 0.0
+
+    return np.array([_safe_adv(sym) for sym in active_symbols], dtype=float)
 
 
-def _apply_adv_filter(tickers: List[str], cfg) -> List[str]:
-    """
-    Helper for Universe Manager.
-    Filters a raw list of tickers down to those meeting the minimum ADV liquidity threshold.
-    """
-    from momentum_engine import UltimateConfig, to_ns
-    from data_cache import load_or_fetch
-
-    if cfg is None:
-        cfg = UltimateConfig()
-
-    end_date = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
-
-    chunk_size = 75
-    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
-
-    filtered_tickers = []
-    min_adv_volume = cfg.MIN_ADV_CRORES * 1e7
-
-    logger.info("[Signals] Filtering %d tickers against ₹%dCr ADV minimum...", len(tickers), cfg.MIN_ADV_CRORES)
-
-    # FIX (Bug-5): Replaced ThreadPoolExecutor with a sequential loop.
-    # Parallel yfinance calls on a large universe trigger Yahoo Finance rate-limiting
-    # (HTTP 429 / 401 "Invalid Crumb"), causing entire chunks to return empty, which
-    # incorrectly disqualifies hundreds of valid liquid stocks. Sequential processing
-    # is slower (~30s for 500 tickers) but produces reliable, complete ADV results.
-    for chunk in chunks:
-        try:
-            data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
-            for symbol in chunk:
-                # BUG-4 FIX: Hard-coded `symbol + ".NS"` produces a double-suffix
-                # ("RELIANCE.NS.NS") if the symbol already carries the .NS tag.
-                # load_or_fetch standardises all keys to .NS internally, so the
-                # lookup key must match.  Use to_ns() which is idempotent.
-                ns_sym = to_ns(symbol)
-                if ns_sym in data:
-                    df = data[ns_sym]
-                    adv = compute_single_adv(df)
-                    if adv >= min_adv_volume:
-                        filtered_tickers.append(symbol)
-        except Exception as exc:
-            logger.error("[Signals] Error processing ADV chunk: %s", exc)
-
-    return filtered_tickers
-
+# _apply_adv_filter has been moved to universe_manager.py.
+# It is a universe curation function, not a signal computation function,
+# and belongs alongside the other universe management utilities.
+# Import it from there: from universe_manager import _apply_adv_filter
 
 def generate_signals(
     log_rets:     pd.DataFrame,
@@ -235,7 +224,14 @@ def generate_signals(
     valid_mask = np.isfinite(adj_scores)
     
     if prev_weights and valid_mask.any():
-        current_dispersion = max(np.nanstd(adj_scores[valid_mask]), cfg.CONTINUITY_DISPERSION_FLOOR)
+        # Guard: nanstd on a single-element array returns NaN (0/0 in ddof=1 mode),
+        # which would poison base_bonus.  Default strictly to the floor when fewer
+        # than 2 finite scores are available (e.g. extreme crash states where all but
+        # one asset is gated out).
+        if valid_mask.sum() >= 2:
+            current_dispersion = max(np.nanstd(adj_scores[valid_mask]), cfg.CONTINUITY_DISPERSION_FLOOR)
+        else:
+            current_dispersion = cfg.CONTINUITY_DISPERSION_FLOOR
         cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
         base_bonus = min(cfg.CONTINUITY_BONUS, cap) * current_dispersion
 

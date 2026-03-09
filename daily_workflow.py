@@ -120,6 +120,13 @@ def _scrape_screener(base_url: str) -> List[str]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
+    # CONNECT_TIMEOUT: 5s — fail fast if Screener.in is unreachable.
+    # READ_TIMEOUT:   30s — allow enough time for a slow first-byte response
+    #                       without hanging the CLI indefinitely (requests has
+    #                       no default timeout; omitting it risks an infinite
+    #                       stall at the socket level on a stalled connection).
+    _TIMEOUT = (5, 30)
+
     symbols = set()
     page = 1
     max_pages = 50
@@ -129,40 +136,42 @@ def _scrape_screener(base_url: str) -> List[str]:
     qs.pop('page', None)
     clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
-    while page <= max_pages:
-        sep = "&" if "?" in clean_url else "?"
-        url = f"{clean_url}{sep}page={page}"
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-        except requests.RequestException as e:
-            logger.error("[Screener] Network error while reaching Screener.in: %s", e)
-            break
+    # Session reuses the underlying TCP/TLS connection across paginated requests,
+    # eliminating per-page handshake overhead and automatically propagating any
+    # session cookies that Screener.in sets on the first request.
+    with requests.Session() as session:
+        session.headers.update(headers)
+        while page <= max_pages:
+            sep = "&" if "?" in clean_url else "?"
+            url = f"{clean_url}{sep}page={page}"
+            try:
+                resp = session.get(url, timeout=_TIMEOUT)
+            except requests.RequestException as e:
+                logger.error("[Screener] Network error while reaching Screener.in: %s", e)
+                break
 
-        if resp.status_code in (401, 403):
-            print(f"\n  {C.RED}[!] Screener.in denied access (HTTP {resp.status_code}).{C.RST}")
-            print(f"  {C.GRY}Verify the screen is marked Public at:{C.RST}")
-            print(f"  {C.GRY}screener.in → Your Screen → Edit → Visibility: Public{C.RST}\n")
-            break
-        elif resp.status_code != 200:
-            break
+            if resp.status_code in (401, 403):
+                print(f"\n  {C.RED}[!] Screener.in denied access (HTTP {resp.status_code}).{C.RST}")
+                print(f"  {C.GRY}Verify the screen is marked Public at:{C.RST}")
+                print(f"  {C.GRY}screener.in → Your Screen → Edit → Visibility: Public{C.RST}\n")
+                break
+            elif resp.status_code != 200:
+                break
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
 
-        page_symbols = 0
-        before_count = len(symbols)
-        for link in links:
-            match = re.search(r'/company/([^/]+)/', link['href'])
-            if match:
-                sym = match.group(1).upper()
-                symbols.add(sym)
-                page_symbols += 1
+            before_count = len(symbols)
+            for link in links:
+                match = re.search(r'/company/([^/]+)/', link['href'])
+                if match:
+                    symbols.add(match.group(1).upper())
 
-        if page_symbols == 0 or len(symbols) == before_count:
-            break
+            if len(symbols) == before_count:
+                break
 
-        page += 1
-        time.sleep(1)
+            page += 1
+            time.sleep(1)
 
     if page > max_pages:
         logger.warning("[Screener] Reached pagination safety limit (%d pages).", max_pages)
@@ -375,7 +384,9 @@ def _run_scan(
     engine = InstitutionalRiskEngine(cfg)
     state.equity_hist_cap = cfg.EQUITY_HIST_CAP
 
-    end_date   = datetime.today().strftime("%Y-%m-%d")
+    # Pass tomorrow as end_date so load_or_fetch's required_end covers today.
+    # yfinance end= is exclusive, so +1 day ensures today's close is fetched.
+    end_date   = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
     # FIX (Bug-D — Delisting Crash / PV Gap): Always include currently-held symbols
@@ -813,6 +824,13 @@ def main_menu() -> None:
             continue
 
         if c == "1":
+            print(
+                f"\n  {C.RED}[!] NSE Total Scan is DISABLED.{C.RST}\n"
+                f"  {C.GRY}The nse_total universe uses a static constituent list with no point-in-time{C.RST}\n"
+                f"  {C.GRY}history. Running live scans against it will select from today\'s membership{C.RST}\n"
+                f"  {C.GRY}only. Use Nifty 500 Scan until a proper PIT archive is available.{C.RST}\n"
+            )
+            continue
             _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
             cfg = load_optimized_config()
             try:
@@ -892,7 +910,15 @@ def main_menu() -> None:
                 continue
 
             if bt_c == "1":
-                universe_identifier = "nse_total"
+                print(
+                    f"\n  {C.RED}[!] NSE Total backtesting is DISABLED.{C.RST}\n"
+                    f"  {C.GRY}The historical_nse_total.parquet uses a static constituent list{C.RST}\n"
+                    f"  {C.GRY}(identical tickers from 2018-01 to today). This causes severe{C.RST}\n"
+                    f"  {C.GRY}survivorship bias — post-2020 listings appear in 2018 portfolios,{C.RST}\n"
+                    f"  {C.GRY}inflating returns and suppressing drawdowns artificially.{C.RST}\n"
+                    f"  {C.GRY}Use Nifty 500 for all backtesting until a real PIT archive is available.{C.RST}\n"
+                )
+                continue
             elif bt_c == "3":
                 universe_identifier = "custom"
             else:

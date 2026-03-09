@@ -587,8 +587,9 @@ def test_static_sector_map_covers_nifty50_top10():
 
 def test_data_cache_staleness_logic(tmp_path, monkeypatch):
     from data_cache import load_or_fetch
-    monkeypatch.setattr("data_cache.CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr("data_cache.MANIFEST_FILE", str(tmp_path / "_manifest.json"))
+    # CACHE_DIR and MANIFEST_FILE are now pathlib.Path objects — patch with Path values.
+    monkeypatch.setattr("data_cache.CACHE_DIR",     tmp_path)
+    monkeypatch.setattr("data_cache.MANIFEST_FILE", tmp_path / "_manifest.json")
 
     manifest = {
         "schema_version": 1,
