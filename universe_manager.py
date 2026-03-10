@@ -316,7 +316,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                 # "RELIANCE.NS" inputs without producing a double-suffix.
                 ns_sym = to_ns(symbol)
                 if ns_sym in data:
-                    adv = compute_single_adv(data[ns_sym])
+                    adv = compute_single_adv(data[ns_sym], cfg=cfg)
                     if adv >= min_adv_volume:
                         # FIX: append ns_sym (the normalised ".NS" key), NOT
                         # the original bare symbol.  The previous code appended

@@ -98,10 +98,10 @@ def compute_regime_score(
     return round(float(np.clip(composite, 0.0, 1.0)), 10)
 
 
-def compute_single_adv(df: pd.DataFrame) -> float:
+def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None) -> float:
     """
     Robust calculation of Average Daily Notional Volume (ADV) for a single asset.
-    Handles NaN padding and computes 20-day MA of (Close * Volume) 
+    Handles NaN padding and computes configurable MA of (Close * Volume)
     Fixes the I-10 asymmetric floor bug and unit incoherence.
     """
     try:
@@ -112,7 +112,7 @@ def compute_single_adv(df: pd.DataFrame) -> float:
         if notional.empty:
             return 0.0
             
-        adv_lookback = 20
+        adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
         # Take configurable moving average to ensure unit coherence against limit bounds.
         adv_val = float(notional.rolling(adv_lookback, min_periods=1).mean().iloc[-1])
         return adv_val if np.isfinite(adv_val) else 0.0

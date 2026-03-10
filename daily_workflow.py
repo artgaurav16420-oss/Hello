@@ -305,7 +305,23 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
         split_ratio = 0.0
         if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
-            split_ratio = float(row["Stock Splits"].iloc[-1] or 0.0)
+            split_series = row["Stock Splits"].fillna(0.0)
+            last_scan_date = None
+            if state.last_rebalance_date:
+                try:
+                    last_scan_date = pd.Timestamp(state.last_rebalance_date)
+                except Exception:
+                    last_scan_date = None
+
+            if last_scan_date is not None:
+                window = split_series.loc[(split_series.index > last_scan_date) & (split_series.index <= split_series.index.max())]
+            else:
+                window = split_series.tail(1)
+
+            if not window.empty:
+                positive = window[window > 0]
+                if not positive.empty:
+                    split_ratio = float(np.prod(positive.values))
         if not np.isfinite(split_ratio) or split_ratio <= 0:
             state.last_known_prices[sym] = current_price
             continue
@@ -612,7 +628,7 @@ def _run_scan(
         else:
             weights = compute_decay_targets(state, sel_idx, active, cfg)
 
-    if rebalance_allowed and (optimization_succeeded or apply_decay):
+    if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
         _scenario_losses = -(
             log_rets.iloc[-_T_cvar:]

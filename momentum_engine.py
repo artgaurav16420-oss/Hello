@@ -227,6 +227,7 @@ class UltimateConfig:
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
+    REGIME_SMA_WINDOW:       int   = 200
 
     # Ghost risk synthesis
     GHOST_VOL_LOOKBACK:       int   = 20
@@ -661,7 +662,7 @@ def execute_rebalance(
             actual_notional += s * price
 
             if s > 0:
-                new_weights[sym] = w
+                new_weights[sym] = (s * price) / max(pv, 1.0)
                 new_shares[sym]  = s
                 if delta > 0:
                     if old_s == 0:

@@ -197,6 +197,41 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
     assert out_state.absent_periods["MISSING"] == 3
 
 
+def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "ABC.NS": pd.DataFrame({"Close": [100] * 6, "Dividends": [0] * 6}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: UltimateConfig().CVAR_DAILY_LIMIT * 2.0)
+
+    called = {"n": 0}
+
+    def _track(*args, **kwargs):
+        called["n"] += 1
+        return execute_rebalance(*args, **kwargs)
+
+    monkeypatch.setattr(dw, "execute_rebalance", _track)
+
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 100.0},
+        last_rebalance_date=datetime.today().strftime("%Y-%m-%d"),
+    )
+    cfg = UltimateConfig(REBALANCE_FREQ="W-FRI")
+
+    out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
+
+    assert called["n"] == 1
+    assert out_state.shares == {}
+
+
 def test_execute_rebalance_initializes_dividend_marker_on_new_position():
     cfg = UltimateConfig()
     state = PortfolioState(cash=10_000.0)
