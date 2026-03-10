@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
 import daily_workflow as dw
-from momentum_engine import PortfolioState, UltimateConfig
+from momentum_engine import PortfolioState, UltimateConfig, execute_rebalance
 
 
 def test_prompt_menu_choice_retries_until_valid(monkeypatch):
@@ -83,3 +84,97 @@ def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, 
 
     with pytest.raises(RuntimeError, match="all discovered state files are corrupted"):
         dw.load_portfolio_state("main")
+
+
+def test_detect_and_apply_splits_runs_on_raw_prices_even_when_auto_adjust_flag_true():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True, SPLIT_TOLERANCE=0.01)
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 1000.0},
+        last_known_prices={"ABC": 1000.0},
+        cash=0.0,
+    )
+    idx = pd.date_range("2024-01-01", periods=2)
+    market_data = {
+        "ABC.NS": pd.DataFrame({"Close": [1000.0, 100.0], "Dividends": [0.0, 0.0]}, index=idx)
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == ["ABC"]
+    assert state.shares["ABC"] == 100
+    assert state.entry_prices["ABC"] == 100.0
+
+
+def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "ABC.NS": pd.DataFrame({"Close": [100, 101, 102, 103, 104, 105], "Dividends": [0, 0, 0, 0, 0, 0]}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+
+    called = {"n": 0}
+
+    def _boom(*_args, **_kwargs):
+        called["n"] += 1
+        raise AssertionError("execute_rebalance should not be called when cadence gate blocks")
+
+    monkeypatch.setattr(dw, "execute_rebalance", _boom)
+
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 100.0},
+        last_rebalance_date=datetime.today().strftime("%Y-%m-%d"),
+    )
+    cfg = UltimateConfig(REBALANCE_FREQ="W-FRI")
+
+    out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
+
+    assert called["n"] == 0
+    assert out_state.absent_periods == {}
+
+
+def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+
+    state = PortfolioState(
+        shares={"MISSING": 5},
+        last_known_prices={"MISSING": 10.0},
+        absent_periods={"MISSING": 2},
+        last_rebalance_date=datetime.today().strftime("%Y-%m-%d"),
+    )
+    cfg = UltimateConfig(REBALANCE_FREQ="W-FRI", MAX_ABSENT_PERIODS=10)
+
+    out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
+
+    assert out_state.absent_periods["MISSING"] == 3
+
+
+def test_execute_rebalance_initializes_dividend_marker_on_new_position():
+    cfg = UltimateConfig()
+    state = PortfolioState(cash=10_000.0)
+    execute_rebalance(
+        state=state,
+        target_weights=pd.Series([1.0]).values,
+        prices=pd.Series([100.0]).values,
+        active_symbols=["ABC"],
+        cfg=cfg,
+        date_context=pd.Timestamp("2025-01-15"),
+    )
+
+    assert state.shares.get("ABC", 0) > 0
+    assert state.dividend_ledger["ABC"].startswith("2025-01-15:")

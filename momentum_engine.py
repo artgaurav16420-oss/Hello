@@ -276,6 +276,7 @@ class PortfolioState:
     last_known_volatility:Dict[str, float] = field(default_factory=dict)
     decay_rounds:         int              = 0
     dividend_ledger:      Dict[str, str]   = field(default_factory=dict)
+    last_rebalance_date:  str              = ""
 
     def update_exposure(
         self,
@@ -384,6 +385,7 @@ class PortfolioState:
             "last_known_volatility":_r(self.last_known_volatility),
             "decay_rounds":         self.decay_rounds,
             "dividend_ledger":      dict(sorted(self.dividend_ledger.items())),
+            "last_rebalance_date":  self.last_rebalance_date,
         }
 
     @classmethod
@@ -430,6 +432,7 @@ class PortfolioState:
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
         ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
+        ps.last_rebalance_date  = _get("last_rebalance_date",  str,                                             "")
 
         if errors:
             logger.error(
@@ -650,6 +653,11 @@ def execute_rebalance(
                 if delta > 0:
                     if old_s == 0:
                         new_entry_prices[sym] = price * (1.0 + slip_rate)
+                        marker_date = (
+                            pd.Timestamp(date_context).strftime("%Y-%m-%d")
+                            if date_context is not None else pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+                        )
+                        state.dividend_ledger[sym] = f"{marker_date}:0.00000000"
                     else:
                         old_basis = new_entry_prices.get(sym, price)
                         new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + slip_rate) * delta) / s

@@ -685,15 +685,15 @@ def test_detect_and_apply_splits_fractional_cash():
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
     assert state.cash == 100.0, "Fractional value must be safely routed to Cash."
 
-def test_detect_and_apply_splits_skips_when_auto_adjust_enabled():
+def test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled():
     state = PortfolioState(cash=0.0)
     state.shares = {"A": 100}
     state.last_known_prices = {"A": 100.0}
-    market_data = {"A": pd.DataFrame({"Close": [50.0]})}
+    market_data = {"A": pd.DataFrame({"Close": [50.0], "Dividends": [0.0]})}
 
     detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=True))
 
-    assert state.shares["A"] == 100
+    assert state.shares["A"] == 200
 
 
 def test_detect_and_apply_splits_dividend_sweep_idempotent():
