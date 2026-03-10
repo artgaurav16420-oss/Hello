@@ -29,6 +29,7 @@ from momentum_engine import (
     compute_decay_targets,
     Trade,
     activate_override_on_stress,
+    absent_symbol_effective_price,
 )
 from signals import (
     generate_signals,
@@ -77,6 +78,7 @@ class BacktestEngine:
         high_px:         Optional[pd.DataFrame] = None,
         low_px:          Optional[pd.DataFrame] = None,
         dividends:       Optional[pd.DataFrame] = None,
+        splits:          Optional[pd.DataFrame] = None,
         universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
     ) -> pd.DataFrame:
         start_dt = pd.Timestamp(start_date)
@@ -92,6 +94,26 @@ class BacktestEngine:
 
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
+
+            if splits is not None and date in splits.index:
+                split_row = splits.loc[date]
+                for sym, old_shares in list(self.state.shares.items()):
+                    if old_shares <= 0 or sym not in split_row.index:
+                        continue
+                    split_ratio = float(split_row[sym]) if pd.notna(split_row[sym]) else 0.0
+                    if split_ratio <= 0:
+                        continue
+
+                    theoretical_new = old_shares * split_ratio
+                    new_shares = int(np.floor(theoretical_new + 1e-12))
+                    fractional_shares = max(0.0, theoretical_new - new_shares)
+                    price_now = float(close_t[sym]) if sym in close_t.index and pd.notna(close_t[sym]) else 0.0
+                    if price_now > 0 and fractional_shares > 0:
+                        self.state.cash = round(self.state.cash + fractional_shares * price_now, 10)
+
+                    self.state.shares[sym] = new_shares
+                    old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
+                    self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
 
             if dividends is not None and date in dividends.index and self.engine.cfg.DIVIDEND_SWEEP:
                 div_row = dividends.loc[date]
@@ -169,7 +191,7 @@ class BacktestEngine:
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
                 if (sym in close.columns and pd.notna(valuation_close[sym]))
-                else _ffill_price(self.state, sym)
+                else _ffill_price(self.state, sym, cfg)
             )
             for sym in self.state.shares
         )
@@ -188,7 +210,7 @@ class BacktestEngine:
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
                 if pd.notna(valuation_close[sym])
-                else _ffill_price(self.state, sym)
+                else _ffill_price(self.state, sym, cfg)
             )
             for sym in self.state.shares
             if sym in symbols
@@ -410,7 +432,7 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
             try:
                 c_series = close.loc[:signal_date, sym]
                 v_series = volume.loc[:signal_date, sym]
-                notional = (c_series * v_series).replace(0, np.nan).ffill().dropna()
+                notional = (c_series * v_series).dropna()
                 lookback = notional.tail(20)
                 if lookback.empty:
                     adv.append(0.0)
@@ -433,9 +455,12 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
 
 
 
-def _ffill_price(state: PortfolioState, sym: str) -> float:
+def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:
     px = state.last_known_prices.get(sym)
-    return float(px) if px is not None and np.isfinite(px) else 0.0
+    if px is None or not np.isfinite(px):
+        return 0.0
+    absent_n = int(state.absent_periods.get(sym, 0))
+    return float(absent_symbol_effective_price(float(px), absent_n, cfg.MAX_ABSENT_PERIODS))
 
 
 def _execution_prices(
@@ -538,7 +563,7 @@ def run_backtest(
                 "verify universe snapshots or date range."
             )
 
-    close_d, close_adj_d, open_d, high_d, low_d, div_d, volume_d = {}, {}, {}, {}, {}, {}, {}
+    close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
     for sym in union_universe:
         if not sym:
             continue
@@ -554,6 +579,7 @@ def run_backtest(
         high_d[sym] = row.get("High", row["Close"]).ffill()
         low_d[sym] = row.get("Low", row["Close"]).ffill()
         div_d[sym] = row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
+        split_d[sym] = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
         volume_d[sym] = row["Volume"]
 
     if not close_d:
@@ -565,6 +591,7 @@ def run_backtest(
     high_px = pd.DataFrame(high_d).sort_index()
     low_px = pd.DataFrame(low_d).sort_index()
     dividends = pd.DataFrame(div_d).sort_index().fillna(0.0)
+    splits = pd.DataFrame(split_d).sort_index().fillna(0.0)
     volume  = pd.DataFrame(volume_d).sort_index()
     returns = close_adj.pct_change(fill_method=None).clip(lower=-0.99)
 
@@ -590,7 +617,7 @@ def run_backtest(
 
     engine = InstitutionalRiskEngine(cfg)
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
-    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends, universe_by_rebalance_date=universe_by_rebalance_date)
+    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends, splits=splits, universe_by_rebalance_date=universe_by_rebalance_date)
 
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
@@ -720,6 +747,9 @@ def _compute_metrics(
         avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
         if avg_equity > 0:
             turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
+            years = n_periods / float(periods_per_year)
+            if years > 0:
+                turnover = turnover / years
 
     return {
         "cagr":    round(cagr,    2),

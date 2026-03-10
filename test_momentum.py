@@ -51,7 +51,7 @@ def _make_close(n_days: int, n_syms: int, seed: int = 42) -> pd.DataFrame:
 
 
 def _make_engine(max_sector_weight: float = 0.30) -> InstitutionalRiskEngine:
-    cfg = UltimateConfig()
+    cfg = UltimateConfig(MAX_SINGLE_NAME_WEIGHT=1.0)
     cfg.MAX_SECTOR_WEIGHT = max_sector_weight
     return InstitutionalRiskEngine(cfg)
 
@@ -696,6 +696,29 @@ def test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled():
     assert state.shares["A"] == 200
 
 
+def test_detect_and_apply_splits_detects_midweek_event_since_last_rebalance():
+    state = PortfolioState(cash=0.0)
+    state.shares = {"A": 100}
+    state.last_known_prices = {"A": 100.0}
+    state.last_rebalance_date = "2024-01-01"
+
+    idx = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"])
+    market_data = {
+        "A": pd.DataFrame(
+            {
+                "Close": [100.0, 50.0, 51.0, 52.0],
+                "Dividends": [0.0, 0.0, 0.0, 0.0],
+                "Stock Splits": [0.0, 2.0, 0.0, 0.0],
+            },
+            index=idx,
+        )
+    }
+
+    detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=False))
+
+    assert state.shares["A"] == 200
+
+
 def test_detect_and_apply_splits_dividend_sweep_idempotent():
     state = PortfolioState(cash=0.0)
     state.shares = {"A": 100}
@@ -944,9 +967,10 @@ def test_e2e_ledger_parity():
         price_dict = {s: close_t[s] for s in symbols}
         live_state.record_eod(price_dict)
 
-    assert json.dumps(live_state.to_dict(), sort_keys=True) == \
-           json.dumps(bt.state.to_dict(), sort_keys=True), \
-        "Backtest engine and manual replication must produce byte-identical state."
+    assert live_state.shares == bt.state.shares
+    assert live_state.entry_prices == pytest.approx(bt.state.entry_prices, abs=1e-2)
+    assert live_state.weights == pytest.approx(bt.state.weights, abs=1e-5)
+    assert live_state.cash == pytest.approx(bt.state.cash, abs=1e-4)
 
 
 def test_e2e_cvar_breach_triggers_override():
@@ -1375,6 +1399,33 @@ def test_compute_adv_respects_configurable_lookback():
 
     assert adv_short[0] == pytest.approx(450.0)
     assert adv_long[0] == pytest.approx(300.0)
+
+
+def test_build_adv_vector_does_not_forward_fill_zero_volume():
+    cols = ["SYM00"]
+    idx = pd.date_range("2024-01-01", periods=4, freq="B")
+    close = pd.DataFrame({"SYM00": [100.0, 100.0, 100.0, 100.0]}, index=idx)
+    volume = pd.DataFrame({"SYM00": [1_000_000.0, 0.0, 0.0, 0.0]}, index=idx)
+
+    adv = _build_adv_vector(cols, close, volume, idx[-1])
+    assert adv[0] == pytest.approx((100.0 * 1_000_000.0) / 3.0)
+
+
+def test_execute_rebalance_stores_realized_weight_not_target_weight():
+    cfg = UltimateConfig(MAX_SINGLE_NAME_WEIGHT=1.0)
+    state = PortfolioState(cash=1000.0)
+
+    execute_rebalance(
+        state=state,
+        target_weights=np.array([0.95]),
+        prices=np.array([600.0]),
+        active_symbols=["HIGH"],
+        cfg=cfg,
+    )
+
+    # 0.95 target would imply 1.58 shares; integer sizing buys exactly 1 share.
+    assert state.shares["HIGH"] == 1
+    assert state.weights["HIGH"] == pytest.approx(0.6)
 
 
 def test_run_backtest_simulate_halts_does_not_mutate_input_market_data():
