@@ -143,14 +143,13 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
         ns_sym = to_ns(symbol)
         df = market_data.get(ns_sym)
         if df is not None and "Close" in df.columns and "Volume" in df.columns:
-            notional_cols[symbol] = (df["Close"] * df["Volume"]).replace(0, np.nan)
+            notional_cols[symbol] = df["Close"] * df["Volume"]
 
     if not notional_cols:
         return np.zeros(len(active_symbols), dtype=float)
 
     # Single rolling mean across the entire matrix — O(T·N) instead of N × O(T).
     notional_df = pd.DataFrame(notional_cols)
-    notional_df.ffill(inplace=True)
     notional_df.fillna(0.0, inplace=True)
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
     adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).mean().iloc[-1]
