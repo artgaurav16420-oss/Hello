@@ -239,6 +239,27 @@ def test_regime_score_bear_market():
     assert compute_regime_score(idx) < 0.5
 
 
+def test_regime_breadth_requires_sufficient_history_per_symbol():
+    idx = pd.DataFrame(
+        {"Close": np.linspace(100.0, 120.0, 300)},
+        index=pd.date_range("2020-01-01", periods=300),
+    )
+
+    universe_close = pd.DataFrame(
+        {
+            "OLD": np.linspace(100.0, 120.0, 300),
+            # Recent IPO-like series: only 20 observations inside a 200-day window.
+            "IPO": [np.nan] * 280 + list(np.linspace(100.0, 150.0, 20)),
+        },
+        index=idx.index,
+    )
+
+    score_with_ipo = compute_regime_score(idx, universe_close_hist=universe_close)
+    score_without_ipo = compute_regime_score(idx, universe_close_hist=universe_close[["OLD"]])
+
+    assert score_with_ipo == pytest.approx(score_without_ipo, abs=1e-12)
+
+
 # ─── momentum_engine.py ───────────────────────────────────────────────────────
 
 def test_optimizer_sector_cap_enforced():

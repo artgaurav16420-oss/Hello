@@ -147,10 +147,9 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        # Use execution-date prices for portfolio valuation inputs so manual/live
-        # walk-forward replication (which rebalances on this same bar) remains
-        # byte-identical to the backtest engine state transitions.
-        valuation_close = close.loc[date]
+        # Value the pre-trade portfolio using last fully-observed prices (T-1 close).
+        # This avoids lookahead when we size orders that execute on the current bar.
+        valuation_close = close.loc[signal_date]
         
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (

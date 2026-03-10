@@ -129,9 +129,23 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
 
 # Module-level flags so each warning fires at most once per process,
 # preventing thousands of identical lines from flooding optimizer output.
+
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
 _SECTOR_MAP_CACHE_LOCK = threading.Lock()
+_HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
+
+
+def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
+    """Load historical universe parquet with mtime-based in-memory caching."""
+    mtime = hist_file.stat().st_mtime
+    cached = _HISTORICAL_UNIVERSE_DF_CACHE.get(hist_file)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    df = pd.read_parquet(hist_file)
+    _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
+    return df
 
 
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
@@ -159,7 +173,7 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
             _MISSING_PARQUET_WARNED[universe_type] = True
     else:
         try:
-            df = pd.read_parquet(hist_file)
+            df = _load_historical_universe_df(hist_file)
             
             # Find the closest available manifest date preceding the requested date
             available_dates = df.index.unique()
