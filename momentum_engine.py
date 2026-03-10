@@ -221,6 +221,7 @@ class UltimateConfig:
     # New institutional flags
     DIVIDEND_SWEEP:           bool  = True
     SPLIT_TOLERANCE:          float = 0.005 # Tightened for institutional accuracy
+    AUTO_ADJUST_PRICES:       bool  = True
 
     @property
     def SLIPPAGE_BPS(self) -> float:
@@ -436,12 +437,13 @@ def execute_rebalance(
     prices:         np.ndarray,
     active_symbols: List[str],
     cfg:            UltimateConfig,
-    adv_shares:     Optional[np.ndarray] = None, # NOW REQUIRED for impact parity
+    adv_shares:     Optional[np.ndarray] = None, # ADV notional (₹/day)
     date_context=None,
     trade_log:      Optional[List[Trade]] = None,
     apply_decay:    bool = False,
     scenario_losses: Optional[np.ndarray] = None,
     conviction_scores: Optional[np.ndarray] = None,
+    force_rebalance_trades: bool = False,
 ) -> float:
     """Execute a portfolio rebalance, updating state in-place."""
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
@@ -578,7 +580,7 @@ def execute_rebalance(
             # (e.g. 1-2 shares) during periods of persistently elevated CVaR.
             # Full exits (s == 0, old_s > 0) always execute regardless of tolerance.
             # New entries (old_s == 0, s > 0) always execute.
-            if delta != 0 and old_s > 0 and s > 0:
+            if delta != 0 and old_s > 0 and s > 0 and not force_rebalance_trades:
                 drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
                 weight_change = abs(delta * price) / max(pv, 1.0)
                 if weight_change < drift_threshold:
@@ -593,7 +595,9 @@ def execute_rebalance(
 
             # ── FIX: Institutional Impact Alignment ──
             if adv_shares is not None and adv_shares[i] > 0:
-                impact_rate = (cfg.IMPACT_COEFF * pv) / (price * adv_shares[i])
+                # ADV is passed in notional units (₹/day), so impact denominator
+                # must not multiply by price again (which would create ₹^2 units).
+                impact_rate = (cfg.IMPACT_COEFF * pv) / adv_shares[i]
                 slip_rate = max(cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
             else:
                 slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
@@ -808,7 +812,14 @@ class InstitutionalRiskEngine:
                 "portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA
             )
 
-        clean_rets = historical_returns.replace([np.inf, -np.inf], np.nan).ffill().dropna()
+        # Avoid matrix collapse from DataFrame-wide dropna(): with broad universes,
+        # a single symbol NaN can otherwise delete the entire row for all symbols.
+        clean_rets = historical_returns.replace([np.inf, -np.inf], np.nan).ffill()
+        if clean_rets.empty:
+            raise OptimizationError("historical_returns is empty after sanitisation.", OptimizationErrorType.DATA)
+        # Preserve all rows and impute residual leading NaNs conservatively to 0.
+        # This keeps the sample horizon stable and avoids pathological shrinkage.
+        clean_rets = clean_rets.fillna(0.0)
         T          = len(clean_rets)
         min_rows   = self.cfg.DIMENSIONALITY_MULTIPLIER * m
         if T < min_rows:
@@ -872,9 +883,9 @@ class InstitutionalRiskEngine:
             gamma *= 0.5
             gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma)
 
-        adv_limit = np.clip(
-            (adv_shares * prices * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40
-        )
+        # adv_shares carries ADV notional (₹/day), so max tradable weight is
+        # ADV-notional budget divided by portfolio value.
+        adv_limit = np.clip((adv_shares * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40)
         adv_limit = np.minimum(adv_limit, self.cfg.MAX_SINGLE_NAME_WEIGHT)
         l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
         u_gamma = min(1.0, gamma * (1.0 + self.cfg.CAPITAL_ELASTICITY))
@@ -900,7 +911,7 @@ class InstitutionalRiskEngine:
 
         impact     = np.clip(
             self.cfg.IMPACT_COEFF * portfolio_value
-            / (np.maximum(prices, 1.0) * np.maximum(adv_shares, 1.0)),
+            / np.maximum(adv_shares, 1.0),
             0.0, 1e4,
         )
         T_cvar     = min(T, self.cfg.CVAR_LOOKBACK)
@@ -914,7 +925,8 @@ class InstitutionalRiskEngine:
 
         q        = np.zeros(n_vars)
         q[:m]    = -expected_returns - 2.0 * impact * prev_w_arr
-        q[m:2*m] = self.cfg.ROUND_TRIP_SLIPPAGE_BPS / 10_000.0
+        # |w-w_prev| is one-way turnover, so use one-way cost (round-trip / 2).
+        q[m:2*m] = self.cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
         q[-1]    = self.cfg.SLACK_PENALTY
 
         builder = _ConstraintBuilder(n_vars)

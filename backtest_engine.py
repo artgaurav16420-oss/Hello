@@ -186,6 +186,7 @@ class BacktestEngine:
         optimization_succeeded = False
         sel_idx: List[int]     = []
         _force_full_cash       = False
+        soft_cvar_breach       = False
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
         # Two-tier breach architecture (see CVAR_HARD_BREACH_MULTIPLIER in UltimateConfig):
@@ -219,6 +220,7 @@ class BacktestEngine:
 
             elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 # SOFT breach: elevated but manageable. Let the QP handle it.
+                soft_cvar_breach = True
                 logger.info(
                     "[Backtest] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) on %s — "
                     "running optimizer with CVaR constraint active.",
@@ -328,6 +330,7 @@ class BacktestEngine:
                 trade_log      = self.trades,
                 apply_decay    = apply_decay and not _exhaust_decay,
                 scenario_losses = None if _exhaust_decay else _L,
+                force_rebalance_trades = soft_cvar_breach,
             )
             if _exhaust_decay:
                 self.state.decay_rounds = 0
