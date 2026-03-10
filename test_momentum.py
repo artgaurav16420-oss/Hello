@@ -381,7 +381,7 @@ def test_optimizer_cvar_sentinel_deleverages():
         engine.optimize(
             np.ones(m) * 0.01,
             log_rets,
-            np.ones(m) * 1e6,
+            np.ones(m) * 1e8,
             np.ones(m) * 100,
             1e6,
             exposure_multiplier=1.0,

@@ -5,9 +5,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import numpy as np
+import pandas as pd
 
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
+from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
@@ -420,6 +423,78 @@ def test_stdout_supports_rupee_false_when_stdout_missing(monkeypatch):
     assert optimizer._stdout_supports_rupee() is False
 
 
+def test_optimizer_excludes_insufficient_history_symbols_without_overweight():
+    cfg = UltimateConfig()
+    cfg.HISTORY_GATE = 60
+    cfg.DIMENSIONALITY_MULTIPLIER = 1
+
+    engine = InstitutionalRiskEngine(cfg)
+
+    idx = pd.date_range("2023-01-02", periods=80, freq="B")
+    rng = np.random.default_rng(123)
+
+    mature_a = rng.normal(0.0010, 0.01, len(idx))
+    mature_b = rng.normal(0.0008, 0.01, len(idx))
+    ipo_sparse = np.full(len(idx), np.nan)
+    ipo_sparse[-12:] = rng.normal(0.0015, 0.01, 12)
+
+    historical_returns = pd.DataFrame(
+        {"MATURE_A": mature_a, "IPO_NEW": ipo_sparse, "MATURE_B": mature_b},
+        index=idx,
+    )
+
+    expected_returns = np.array([0.010, 0.030, 0.011])
+    prices = np.array([100.0, 150.0, 120.0])
+    adv_shares = np.array([2e8, 2e8, 2e8])
+    prev_w = np.array([0.20, 0.10, 0.20])
+    sector_labels = np.array([0, 1, 0])
+
+    weights = engine.optimize(
+        expected_returns=expected_returns,
+        historical_returns=historical_returns,
+        adv_shares=adv_shares,
+        prices=prices,
+        portfolio_value=1_000_000.0,
+        prev_w=prev_w,
+        exposure_multiplier=1.0,
+        sector_labels=sector_labels,
+    )
+
+    assert weights.shape == (3,)
+    assert weights[1] == pytest.approx(0.0, abs=1e-12)
+    assert np.isfinite(weights).all()
+    assert float(np.sum(weights)) > 0.0
+
+
+def test_optimizer_logs_insufficient_history_exclusions(caplog):
+    cfg = UltimateConfig()
+    cfg.HISTORY_GATE = 40
+    cfg.DIMENSIONALITY_MULTIPLIER = 1
+
+    engine = InstitutionalRiskEngine(cfg)
+
+    idx = pd.date_range("2023-01-02", periods=50, freq="B")
+    stable = np.linspace(-0.01, 0.01, len(idx))
+    sparse = np.full(len(idx), np.nan)
+    sparse[-5:] = np.linspace(-0.005, 0.005, 5)
+
+    historical_returns = pd.DataFrame(
+        {"STABLE": stable, "SPARSE": sparse},
+        index=idx,
+    )
+
+    with caplog.at_level("INFO", logger="momentum_engine"):
+        weights = engine.optimize(
+            expected_returns=np.array([0.01, 0.02]),
+            historical_returns=historical_returns,
+            adv_shares=np.array([1e8, 1e8]),
+            prices=np.array([100.0, 100.0]),
+            portfolio_value=1_000_000.0,
+        )
+
+    assert weights.shape == (2,)
+    assert weights[1] == pytest.approx(0.0, abs=1e-12)
+    assert "reason=insufficient_history" in caplog.text
 def test_optimizer_uses_higher_turnover_penalty_for_illiquid_name(monkeypatch):
     cfg = UltimateConfig()
     engine = InstitutionalRiskEngine(cfg)
