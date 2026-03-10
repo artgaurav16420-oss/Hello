@@ -20,13 +20,16 @@ def test_load_or_fetch_uses_dynamic_padding_from_cfg(monkeypatch):
     monkeypatch.setattr(data_cache, "_download_with_timeout", _fake_download_with_timeout)
 
     cfg = UltimateConfig(CVAR_LOOKBACK=500)
-    data_cache.load_or_fetch(
-        tickers=["ABC"],
-        required_start="2024-01-01",
-        required_end="2024-12-31",
-        force_refresh=True,
-        cfg=cfg,
-    )
+    try:
+        data_cache.load_or_fetch(
+            tickers=["ABC"],
+            required_start="2024-01-01",
+            required_end="2024-12-31",
+            force_refresh=True,
+            cfg=cfg,
+        )
+    except data_cache.DataFetchError:
+        pass
 
     assert captured["start"] == "2021-04-06"
     assert captured["end"] == "2025-01-01"
@@ -68,3 +71,36 @@ def test_secondary_provider_returns_none_without_api_key(monkeypatch):
     sp = data_cache.SecondaryProvider()
     out = sp.download(["ABC.NS"], "2024-01-01", "2024-01-31")
     assert out is None
+
+
+def test_load_or_fetch_raises_on_chunk_failure(monkeypatch):
+    monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
+    monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)
+    monkeypatch.setattr(data_cache, "_download_with_timeout", lambda *args, **kwargs: pd.DataFrame())
+
+    try:
+        data_cache.load_or_fetch(
+            tickers=["ABC"],
+            required_start="2024-01-01",
+            required_end="2024-01-31",
+            force_refresh=True,
+        )
+    except data_cache.DataFetchError:
+        return
+
+    raise AssertionError("Expected DataFetchError for an empty chunk response")
+
+
+def test_extract_ticker_frame_fills_adj_close_for_multiindex_payload():
+    idx = pd.date_range("2024-01-01", periods=6, freq="D")
+    raw = pd.DataFrame(
+        {
+            ("ABC.NS", "Close"): [100, 101, 102, 103, 104, 105],
+            ("ABC.NS", "Adj Close"): [None, None, None, None, None, None],
+            ("ABC.NS", "Volume"): [1, 1, 1, 1, 1, 1],
+        },
+        index=idx,
+    )
+    out = data_cache._extract_ticker_frame(raw, "ABC.NS")
+    assert out is not None
+    assert out["Adj Close"].equals(out["Close"])

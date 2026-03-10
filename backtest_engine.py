@@ -11,6 +11,7 @@ to eliminate Survivorship Bias. Fixes Look-Ahead PV/ADV computation biases.
 from __future__ import annotations
 
 import logging
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -38,6 +39,7 @@ from universe_manager import get_historical_universe
 
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
+_SUSPENSION_GAP_DAYS = 30
 
 # ─── Results container ────────────────────────────────────────────────────────
 
@@ -442,6 +444,51 @@ def _execution_prices(
         return np.where(np.isfinite(vwap) & (vwap > 0), vwap, close_prices)
     return close_prices
 
+
+def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """In-memory suspension simulation used only during backtest runtime."""
+    if len(df) < 2:
+        return df
+
+    gap_days = df.index.to_series().diff().dt.days
+    max_gap = int(gap_days.max()) if not gap_days.empty else 0
+    if max_gap <= _SUSPENSION_GAP_DAYS:
+        return df
+
+    out = df.copy()
+    logger.warning(
+        "[Backtest] %s: Prolonged trading gap of %d days detected. Applying in-memory synthetic halt simulation.",
+        ticker,
+        max_gap,
+    )
+    bday_idx = pd.bdate_range(out.index[0], out.index[-1])
+
+    first_gap_positions = np.where(gap_days.values > _SUSPENSION_GAP_DAYS)[0]
+    pre_gap_close = out["Close"].iloc[: first_gap_positions[0]] if len(first_gap_positions) > 0 else out["Close"]
+    pre_gap_rets = pre_gap_close.pct_change().dropna()
+    hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
+
+    out = out.reindex(bday_idx)
+    missing_mask = out["Close"].isna()
+    if not missing_mask.any():
+        return out
+
+    n_missing = int(missing_mask.sum())
+    seed = int(hashlib.sha256(ticker.encode()).hexdigest()[:8], 16) % (2**31)
+    rng = np.random.RandomState(seed)
+    noise_rets = rng.normal(0, hist_vol, n_missing)
+
+    out["Close"] = out["Close"].ffill()
+    missing_idx = out.index[missing_mask]
+    anchor_prices = out["Close"].shift(1).reindex(missing_idx).ffill().fillna(out["Close"].dropna().iloc[0])
+    walk_returns = np.cumprod(1.0 + noise_rets)
+    out.loc[missing_idx, "Close"] = anchor_prices.values * walk_returns
+    if "Adj Close" in out.columns:
+        out.loc[missing_idx, "Adj Close"] = out.loc[missing_idx, "Close"]
+    if "Volume" in out.columns:
+        out["Volume"] = out["Volume"].fillna(0)
+    return out
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def run_backtest(
@@ -481,6 +528,8 @@ def run_backtest(
         if key not in market_data:
             continue
         row = market_data[key]
+        if cfg.SIMULATE_HALTS:
+            row = _repair_suspension_gaps(row, key)
         close_d[sym]  = row["Close"].ffill()
         close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
         open_d[sym] = row.get("Open", row["Close"]).ffill()
