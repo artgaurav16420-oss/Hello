@@ -350,13 +350,19 @@ class PortfolioState:
         for sym, n_shares in self.shares.items():
             px = prices.get(sym)
             if px is not None:
-                self.last_known_prices[sym] = float(px)
+                px = float(px)
+                self.last_known_prices[sym] = px
             else:
-                px = self.last_known_prices.get(sym)
-                if px is None:
+                last_px = self.last_known_prices.get(sym)
+                if last_px is None:
                     logger.warning(
                         "record_eod: no price for %s and no last known price; treating as ₹0.", sym
                     )
+                    px = 0.0
+                else:
+                    absent_n = int(self.absent_periods.get(sym, 0))
+                    px = absent_symbol_effective_price(last_px, absent_n, 12)
+                    self.absent_periods[sym] = absent_n + 1
             pv += n_shares * float(px or 0.0)
 
         pv_rounded = round(float(pv), 10)
@@ -954,7 +960,7 @@ class InstitutionalRiskEngine:
         # FIX (Bug-C — Zero-Vol Crash, Part 2): Guarantee a non-zero ridge even
         # when trace(Sigma) ≈ 0.  Use the larger of the proportional value and a
         # dimension-scaled absolute floor so regularisation is always meaningful.
-        ridge     = max(1e-8 * float(np.trace(Sigma)), 1e-8 * m)
+        ridge     = max(1e-6 * float(np.trace(Sigma)), 1e-6 * m)
         Sigma_reg = Sigma + ridge * np.eye(m)
 
         gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))

@@ -64,8 +64,14 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
         first_col_is_date = first_col_date_like
 
         if first_col_is_date or not other_cols_are_dates:
-            melted = df.melt(id_vars=[first_col], value_name="ticker").drop(columns=["variable"])
-            out = melted.rename(columns={first_col: "date"})
+            melted = df.melt(id_vars=[first_col], var_name="ticker", value_name="is_member")
+            is_member_str = melted["is_member"].astype(str).str.strip().str.lower()
+            valid_member = (
+                melted["is_member"].notna()
+                & is_member_str.ne("")
+                & ~is_member_str.isin({"0", "false", "no", "n", "nan"})
+            )
+            out = melted.loc[valid_member, [first_col, "ticker"]].rename(columns={first_col: "date"})
         else:
             melted = df.melt(id_vars=[first_col], var_name="date", value_name="member")
             member_raw = melted["member"].astype(str).str.strip()

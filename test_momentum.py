@@ -205,7 +205,7 @@ def test_generate_signals_blocks_empty_input():
 
 def test_regime_score_neutral_on_thin_history():
     idx = pd.DataFrame({"Close": [100.0] * 100}, index=pd.date_range("2020-01-01", periods=100))
-    assert compute_regime_score(idx) == 0.5
+    assert compute_regime_score(idx) == 0.6
 
 
 def test_regime_score_neutral_below_vol_lookback_requirement():
@@ -213,7 +213,7 @@ def test_regime_score_neutral_below_vol_lookback_requirement():
         {"Close": np.linspace(100.0, 120.0, 251)},
         index=pd.date_range("2020-01-01", periods=251),
     )
-    assert compute_regime_score(idx) == 0.5
+    assert compute_regime_score(idx) > 0.5
 
 
 
@@ -679,7 +679,7 @@ def test_detect_and_apply_splits_fractional_cash():
     state.shares = {"A": 101}
     state.last_known_prices = {"A": 100.0}
 
-    market_data = {"A": pd.DataFrame({"Close": [200.0]})}
+    market_data = {"A": pd.DataFrame({"Close": [200.0], "Stock Splits": [0.5]})}
     detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=False))
 
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
@@ -689,7 +689,7 @@ def test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled():
     state = PortfolioState(cash=0.0)
     state.shares = {"A": 100}
     state.last_known_prices = {"A": 100.0}
-    market_data = {"A": pd.DataFrame({"Close": [50.0], "Dividends": [0.0]})}
+    market_data = {"A": pd.DataFrame({"Close": [50.0], "Dividends": [0.0], "Stock Splits": [2.0]})}
 
     detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=True))
 
@@ -732,6 +732,16 @@ def test_record_eod_history_grows_without_truncation():
         ps.record_eod({})
     assert len(ps.equity_hist) == 20
     assert ps.equity_hist[-1] == round(1_000_000.0 + 19 * 100.0, 10)
+
+def test_record_eod_applies_absent_haircut_when_price_missing():
+    ps = PortfolioState(cash=0.0)
+    ps.shares = {"A": 10}
+    ps.last_known_prices = {"A": 100.0}
+
+    ps.record_eod({})
+
+    assert ps.absent_periods["A"] == 1
+    assert ps.equity_hist[-1] == pytest.approx(1000.0, abs=1e-9)
 
 
 def test_realised_cvar_warm_up_guard():

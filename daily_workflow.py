@@ -302,40 +302,33 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
             continue
-            
-        last_price = state.last_known_prices.get(sym)
-        if last_price is None or last_price <= 0:
+
+        split_ratio = 0.0
+        if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
+            split_ratio = float(row["Stock Splits"].iloc[-1] or 0.0)
+        if not np.isfinite(split_ratio) or split_ratio <= 0:
+            state.last_known_prices[sym] = current_price
             continue
 
-        # data_cache uses auto_adjust=False, so split detection must always run
-        # against raw closes to avoid false crash marks on split dates.
-        ratio = last_price / current_price
+        old_shares = state.shares[sym]
+        theoretical_new_shares = old_shares * split_ratio
+        new_shares = int(np.floor(theoretical_new_shares + 1e-12))
+        old_entry = state.entry_prices.get(sym, current_price * split_ratio)
+        new_entry = old_entry / split_ratio
 
-        # Broader institutional ratio list with a tighter tolerance
-        split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
-        for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
-            if abs(ratio - r) / r <= split_tolerance:
-                old_shares     = state.shares[sym]
-                theoretical_new_shares = old_shares * r
-                new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
-                old_entry      = state.entry_prices.get(sym, current_price * r)
-                new_entry      = old_entry / r
+        # Safely sweep fractional shares
+        fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
+        fractional_value = fractional_new_shares * current_price
+        state.cash = round(state.cash + fractional_value, 10)
 
-                # Safely sweep fractional shares
-                fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
-                fractional_value = fractional_new_shares * current_price
-                state.cash = round(state.cash + fractional_value, 10)
-
-                logger.warning(
-                    "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
-                    "shares %d→%d entry_price ₹%.2f→₹%.2f",
-                    sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
-                )
-                state.shares[sym]       = new_shares
-                state.entry_prices[sym] = round(new_entry, 4)
-                state.last_known_prices[sym] = current_price
-                adjusted.append(sym)
-                break
+        logger.warning(
+            "SPLIT DETECTED: %s stock_splits=%.6f shares %d→%d entry_price ₹%.2f→₹%.2f",
+            sym, split_ratio, old_shares, new_shares, old_entry, new_entry,
+        )
+        state.shares[sym] = new_shares
+        state.entry_prices[sym] = round(new_entry, 4)
+        state.last_known_prices[sym] = current_price
+        adjusted.append(sym)
 
     return adjusted
 

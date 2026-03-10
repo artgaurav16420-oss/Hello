@@ -86,8 +86,8 @@ def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, 
         dw.load_portfolio_state("main")
 
 
-def test_detect_and_apply_splits_runs_on_raw_prices_even_when_auto_adjust_flag_true():
-    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True, SPLIT_TOLERANCE=0.01)
+def test_detect_and_apply_splits_requires_explicit_stock_splits_signal():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
     state = PortfolioState(
         shares={"ABC": 10},
         entry_prices={"ABC": 1000.0},
@@ -96,14 +96,47 @@ def test_detect_and_apply_splits_runs_on_raw_prices_even_when_auto_adjust_flag_t
     )
     idx = pd.date_range("2024-01-01", periods=2)
     market_data = {
-        "ABC.NS": pd.DataFrame({"Close": [1000.0, 100.0], "Dividends": [0.0, 0.0]}, index=idx)
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [1000.0, 100.0],
+                "Dividends": [0.0, 0.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=idx,
+        )
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == []
+    assert state.shares["ABC"] == 10
+
+
+def test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 1000.0},
+        last_known_prices={"ABC": 1000.0},
+        cash=0.0,
+    )
+    idx = pd.date_range("2024-01-01", periods=2)
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [1000.0, 500.0],
+                "Dividends": [0.0, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            index=idx,
+        )
     }
 
     adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
 
     assert adjusted == ["ABC"]
-    assert state.shares["ABC"] == 100
-    assert state.entry_prices["ABC"] == 100.0
+    assert state.shares["ABC"] == 20
+    assert state.entry_prices["ABC"] == 500.0
 
 
 def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
