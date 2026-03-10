@@ -35,6 +35,7 @@ from momentum_engine import (
     to_ns,
     to_bare,
     Trade,
+    activate_override_on_stress,
 )
 from universe_manager import (
     fetch_nse_equity_universe,
@@ -411,7 +412,6 @@ def _run_scan(
         idx_df = market_data.get("^NSEI")
 
     idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
-    regime_score = compute_regime_score(idx_slice, cfg=cfg)
 
     # Detect splits and sweep dividends BEFORE marking MTM values
     split_syms = detect_and_apply_splits(state, market_data, cfg)
@@ -461,6 +461,7 @@ def _run_scan(
     initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
 
     close_hist    = close.iloc[:-1]
+    regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
     log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
     adv_arr       = compute_adv(market_data, active)
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
@@ -484,16 +485,25 @@ def _run_scan(
     # ── Book CVaR screen ──────────────────────────────────────────────────────
     if state.shares:
         book_cvar = compute_book_cvar(state, prices, active, log_rets, cfg)
-        if book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+        hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+        hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
+
+        if book_cvar > hard_breach_threshold:
             logger.warning(
-                "[Scan] Book CVaR %.4f%% exceeds limit %.4f%% — "
+                "[Scan] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) — "
                 "skipping optimization, forcing immediate liquidation.",
-                book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100,
+                book_cvar * 100, hard_breach_threshold * 100, hard_multiplier,
             )
             state.consecutive_failures += 1
             apply_decay      = True
             _force_full_cash = True
-            _activate_override_on_stress(state, cfg)
+            activate_override_on_stress(state, cfg)
+        elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+            logger.info(
+                "[Scan] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) — "
+                "running optimizer with CVaR constraint active.",
+                book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100,
+            )
 
     if not _force_full_cash:
         try:
@@ -629,17 +639,6 @@ def _run_scan(
 
     return state, market_data
 
-
-def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
-    """Activate exposure override immediately after hard risk events.
-
-    BUG-6 NOTE: An identical copy of this function exists in backtest_engine.py.
-    If the override logic changes here it must be mirrored there manually.
-    Consolidation into momentum_engine.py is the correct long-term fix.
-    """
-    state.override_active = True
-    state.override_cooldown = max(state.override_cooldown, 4)
-    state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 # ─── Status display ───────────────────────────────────────────────────────────
 
@@ -831,24 +830,6 @@ def main_menu() -> None:
                 f"  {C.GRY}only. Use Nifty 500 Scan until a proper PIT archive is available.{C.RST}\n"
             )
             continue
-            _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
-            cfg = load_optimized_config()
-            try:
-                _universe = fetch_nse_equity_universe(cfg=cfg)
-            except UniverseFetchError as e:
-                _universe = _prompt_survival_mode(e, "NSE Total Equity")
-                if _universe is None:
-                    continue
-            preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL MKT SCAN", cfg)
-            mkt_cache["nse_total"] = mkt
-            _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
-            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
-                states["nse_total"] = preview
-                save_portfolio_state(preview, "nse_total")
-                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
-            else:
-                print(f"  {C.GRY}[-] Discarded.{C.RST}")
 
         elif c == "2":
             _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")

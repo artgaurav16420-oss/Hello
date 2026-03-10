@@ -34,7 +34,7 @@ def compute_regime_score(
     Low score -> Risk-off (downward trend, high volatility)
     """
     if idx_hist is None or len(idx_hist) < (
-        int(getattr(cfg, "TRADING_DAYS_PER_YEAR", 253)) if cfg else 253
+        int(getattr(cfg, "SIGNAL_ANNUAL_FACTOR", 252)) if cfg else 252
     ):
         logger.debug("[Signals] Insufficient index history for regime. Defaulting to 0.5")
         return 0.5

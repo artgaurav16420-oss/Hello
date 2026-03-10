@@ -428,8 +428,6 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
     for k, v in best_params.items():
         print(f"  {k}: \033[33m{v}\033[0m")
 
-    save_optimal_config(best_params)
-
     # 3. Out-of-Sample Validation (The true test of robustness)
     print(f"\n\033[1;36m=== INITIATING OUT-OF-SAMPLE (OOS) VALIDATION ===\033[0m")
     
@@ -469,6 +467,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
         # (not trivially easy — drawdowns still occur). MaxDD cap at 35%
         # is appropriate since we're outside a known bear period.
         if m.get('calmar', 0) > 0.5 and abs(m.get('max_dd', 100)) <= OOS_MAX_DD_CAP:
+            save_optimal_config(best_params)
             print("\n\033[1;32m[PASS]\033[0m Strategy parameters survived Out-of-Sample verification without structural decay.")
         else:
             raise RuntimeError(

@@ -27,6 +27,7 @@ from momentum_engine import (
     compute_book_cvar,
     compute_decay_targets,
     Trade,
+    activate_override_on_stress,
 )
 from signals import (
     generate_signals,
@@ -161,7 +162,7 @@ class BacktestEngine:
 
         _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
         idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
-        regime_score = compute_regime_score(idx_slice, cfg=cfg)
+        regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date])
 
         if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
             realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
@@ -214,7 +215,7 @@ class BacktestEngine:
                 self.state.consecutive_failures += 1
                 apply_decay      = True
                 _force_full_cash = True
-                _activate_override_on_stress(self.state, cfg)
+                activate_override_on_stress(self.state, cfg)
 
             elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 # SOFT breach: elevated but manageable. Let the QP handle it.
@@ -299,7 +300,7 @@ class BacktestEngine:
                     date,
                 )
                 _exhaust_decay = True
-                _activate_override_on_stress(self.state, cfg)
+                activate_override_on_stress(self.state, cfg)
             else:
                 target_weights = compute_decay_targets(self.state, sel_idx, symbols, cfg)
                 sel_idx_set = set(sel_idx)
@@ -341,19 +342,6 @@ class BacktestEngine:
                 "n_positions":        len(self.state.shares),
                 "apply_decay":        apply_decay,
             })
-
-
-def _activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
-    """Activate exposure override after hard risk events (breach/exhaustion).
-
-    BUG-6 NOTE: An identical copy of this function exists in daily_workflow.py.
-    If the override logic changes here it must be mirrored there manually.
-    Consolidation into momentum_engine.py (as a PortfolioState method or module-level
-    helper) is the correct long-term fix but requires updating imports in both callers.
-    """
-    state.override_active = True
-    state.override_cooldown = max(state.override_cooldown, 4)
-    state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -668,7 +656,7 @@ def _compute_metrics(
         "max_dd":  round(max_dd,  2),
         "final":   round(final,   2),
         "sharpe":  round(sharpe,  2),
-        "sortino": sortino if not np.isfinite(sortino) else round(sortino, 2),
+        "sortino": round(sortino, 2) if np.isfinite(sortino) else sortino,
         "calmar":  round(calmar,  2),
         "hit_rate": round(hit_rate, 2),
         "turnover": round(turnover, 4),

@@ -215,6 +215,7 @@ class UltimateConfig:
     GHOST_VOL_LOOKBACK:       int   = 20
     GHOST_RET_DRIFT:          float = -0.02
     GHOST_VOL_FALLBACK:       float = 0.04
+    SIMULATE_HALTS:           bool  = False
 
     # New institutional flags
     DIVIDEND_SWEEP:           bool  = True
@@ -417,6 +418,13 @@ class PortfolioState:
                 "PortfolioState.from_dict: %d field(s) reset to defaults: %s", len(errors), errors
             )
         return ps
+
+
+def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
+    """Activate exposure override immediately after hard risk events."""
+    state.override_active = True
+    state.override_cooldown = max(state.override_cooldown, 4)
+    state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────

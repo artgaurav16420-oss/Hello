@@ -12,7 +12,7 @@ def test_load_or_fetch_uses_dynamic_padding_from_cfg(monkeypatch):
     monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
     monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)
 
-    def _fake_download_with_timeout(tickers, start, end):
+    def _fake_download_with_timeout(tickers, start, end, **kwargs):
         captured["start"] = start
         captured["end"] = end
         return pd.DataFrame()
@@ -29,7 +29,7 @@ def test_load_or_fetch_uses_dynamic_padding_from_cfg(monkeypatch):
     )
 
     assert captured["start"] == "2021-04-06"
-    assert captured["end"] == "2024-12-31"
+    assert captured["end"] == "2025-01-01"
 
 
 def test_secondary_provider_parses_alpha_vantage_payload(monkeypatch):

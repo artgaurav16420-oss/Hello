@@ -156,8 +156,8 @@ def test_regime_score_neutral_on_thin_history():
 
 def test_regime_score_neutral_below_vol_lookback_requirement():
     idx = pd.DataFrame(
-        {"Close": np.linspace(100.0, 120.0, 252)},
-        index=pd.date_range("2020-01-01", periods=252),
+        {"Close": np.linspace(100.0, 120.0, 251)},
+        index=pd.date_range("2020-01-01", periods=251),
     )
     assert compute_regime_score(idx) == 0.5
 
@@ -1096,7 +1096,7 @@ def test_book_cvar_screen_with_ghost_resets_failures():
 
     import unittest.mock as mock
 
-    with mock.patch("backtest_engine.compute_book_cvar", return_value=cfg.CVAR_DAILY_LIMIT + 0.01):
+    with mock.patch("backtest_engine.compute_book_cvar", return_value=cfg.CVAR_DAILY_LIMIT * cfg.CVAR_HARD_BREACH_MULTIPLIER + 0.01):
         rebal_dates = close.index[60:61]
         bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
 
