@@ -124,6 +124,54 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
     assert small_bonus == pytest.approx(base_bonus * 0.25, abs=1e-9)
     assert large_bonus == pytest.approx(base_bonus * 1.0, abs=1e-9)
 
+
+
+def test_generate_signals_continuity_bonus_blocked_for_flatlined_symbol():
+    """Flatlined names must not receive continuity bonus even with prior weight."""
+    n_days = 120
+    live = np.linspace(-0.01, 0.01, n_days)
+    flat = np.zeros(n_days)
+    log_rets = pd.DataFrame({"LIVE": live, "FLAT": flat})
+    adv = np.array([1e6, 1e6], dtype=float)
+    cfg = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=2, CONTINUITY_STALE_SESSIONS=10)
+
+    _, scores_with_hold, _ = generate_signals(
+        log_rets,
+        adv,
+        cfg,
+        prev_weights={"FLAT": 0.10, "LIVE": 0.0},
+    )
+    _, scores_no_hold, _ = generate_signals(log_rets, adv, cfg)
+
+    assert scores_with_hold[1] == pytest.approx(scores_no_hold[1], abs=1e-12)
+    assert scores_with_hold[0] > scores_with_hold[1], "Flatlined held name must not outrank active name via continuity."
+
+
+def test_generate_signals_continuity_denial_logging_counts(caplog):
+    """Continuity denial logging should report stale and liquidity counter totals."""
+    n_days = 60
+    live = np.linspace(-0.01, 0.01, n_days)
+    stale = np.zeros(n_days)
+    illiquid = np.concatenate([np.zeros(n_days - 5), np.array([0.01, -0.01, 0.01, -0.01, 0.01])])
+    log_rets = pd.DataFrame({"LIVE": live, "STALE": stale, "ILLIQ": illiquid})
+    adv = np.array([1e6, 1e6, 1e3], dtype=float)
+    cfg = UltimateConfig(
+        HISTORY_GATE=10,
+        MAX_POSITIONS=3,
+        CONTINUITY_STALE_SESSIONS=10,
+        CONTINUITY_MIN_ADV_NOTIONAL=1e5,
+    )
+
+    with caplog.at_level("DEBUG"):
+        generate_signals(
+            log_rets,
+            adv,
+            cfg,
+            prev_weights={"STALE": 0.10, "ILLIQ": 0.10, "LIVE": 0.0},
+        )
+
+    assert "Continuity denied for 1 stale and 1 illiquid symbols." in caplog.text
+
 def test_continuity_bonus_respects_max_scalar_cap():
     """When CONTINUITY_BONUS exceeds CONTINUITY_MAX_SCALAR the cap clamps the bonus."""
     base_col = np.linspace(-0.01, 0.01, 120)
