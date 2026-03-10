@@ -80,9 +80,11 @@ def compute_regime_score(
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= _sma_win:
         recent = universe_close_hist.iloc[-_sma_win:]
+        min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
+        obs_count = recent.notna().sum()
         sma200 = recent.mean()
         last = universe_close_hist.iloc[-1]
-        valid = (sma200 > 0) & sma200.notna() & last.notna()
+        valid = (obs_count >= min_obs) & (sma200 > 0) & sma200.notna() & last.notna()
         if valid.any():
             breadth_component = float((last[valid] > sma200[valid]).mean())
 

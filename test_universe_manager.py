@@ -10,9 +10,11 @@ from universe_manager import _apply_adv_filter
 def reset_universe_warning_state():
     um._MISSING_PARQUET_WARNED.clear()
     um._NO_RECORD_WARNED.clear()
+    um._HISTORICAL_UNIVERSE_DF_CACHE.clear()
     yield
     um._MISSING_PARQUET_WARNED.clear()
     um._NO_RECORD_WARNED.clear()
+    um._HISTORICAL_UNIVERSE_DF_CACHE.clear()
 
 
 def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path, monkeypatch, caplog):
@@ -40,6 +42,35 @@ def test_get_historical_universe_warns_when_no_parquet_or_csv(tmp_path, monkeypa
 
     assert members == []
     assert "survivorship bias risk" in caplog.text.lower()
+
+
+def test_get_historical_universe_parquet_cache_reuses_dataframe(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    df = pd.DataFrame(
+        {"tickers": [["AAA.NS", "BBB.NS"]]},
+        index=pd.DatetimeIndex([pd.Timestamp("2020-01-01")]),
+    )
+    hist_file = data_dir / "historical_nifty500.parquet"
+    df.to_parquet(hist_file)
+
+    read_calls = {"n": 0}
+    original = um.pd.read_parquet
+
+    def _spy_read_parquet(path, *args, **kwargs):
+        read_calls["n"] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(um.pd, "read_parquet", _spy_read_parquet)
+
+    first = um.get_historical_universe("nifty500", pd.Timestamp("2020-01-15"))
+    second = um.get_historical_universe("nifty500", pd.Timestamp("2020-01-20"))
+
+    assert first == ["AAA.NS", "BBB.NS"]
+    assert second == ["AAA.NS", "BBB.NS"]
+    assert read_calls["n"] == 1
 
 
 # ─── _apply_adv_filter .NS-suffix regression tests ───────────────────────────
