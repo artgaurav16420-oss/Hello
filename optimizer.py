@@ -241,9 +241,14 @@ class MomentumObjective:
         # dragging crash returns forward for months after the event has passed.
         cvar_lb_bounds = self.search_space.get("CVAR_LOOKBACK", (60, 150, 10))
         cvar_lb_min, cvar_lb_max, cvar_lb_step = cvar_lb_bounds
-        cfg.CVAR_LOOKBACK = trial.suggest_int(
-            "CVAR_LOOKBACK", cvar_lb_min, cvar_lb_max, step=cvar_lb_step
-        )
+        if isinstance(trial, optuna.trial.FixedTrial) and "CVAR_LOOKBACK" not in trial.params:
+            # Backward-compatible fallback for manually constructed FixedTrial
+            # objects that predate the CVAR_LOOKBACK search dimension.
+            cfg.CVAR_LOOKBACK = UltimateConfig().CVAR_LOOKBACK
+        else:
+            cfg.CVAR_LOOKBACK = trial.suggest_int(
+                "CVAR_LOOKBACK", cvar_lb_min, cvar_lb_max, step=cvar_lb_step
+            )
         # Prune if lookback is shorter than LedoitWolf minimum row requirement.
         if cfg.CVAR_LOOKBACK < cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS:
             raise optuna.TrialPruned()

@@ -179,6 +179,37 @@ def test_build_sampler_returns_tpe_sampler(monkeypatch):
     assert isinstance(sampler_seeded, optimizer.TPESampler)
 
 
+
+
+def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}
+        rebal_log = None
+
+    class _DummyTrial:
+        params = {}
+
+        def __init__(self):
+            self.suggested = []
+
+        def suggest_int(self, name, low, high, step=1):
+            self.suggested.append(name)
+            return low
+
+        def suggest_float(self, name, low, high, step=None):
+            self.suggested.append(name)
+            return low
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = _DummyTrial()
+
+    objective(trial)
+
+    assert "CVAR_LOOKBACK" in trial.suggested
+
+
 def test_objective_uses_configurable_search_space(monkeypatch):
     class _Result:
         metrics = {"cagr": 10.0, "max_dd": 5.0, "turnover": 0.0}
