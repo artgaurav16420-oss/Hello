@@ -105,6 +105,21 @@ def _print_stage_status(label: str, progress: float, detail: str) -> None:
     print(_render_meter(label, progress))
     print(f"  {C.GRY}{detail}{C.RST}")
 
+
+def _next_rebalance_due(last_rebalance_date: str, rebalance_freq: str) -> Optional[pd.Timestamp]:
+    if not last_rebalance_date:
+        return None
+    try:
+        anchor = pd.Timestamp(last_rebalance_date).normalize()
+        return anchor + pd.tseries.frequencies.to_offset(rebalance_freq)
+    except Exception:
+        logger.warning(
+            "[Scan] Invalid last_rebalance_date='%s' or REBALANCE_FREQ='%s'; disabling cadence gate this run.",
+            last_rebalance_date,
+            rebalance_freq,
+        )
+        return None
+
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
 def _scrape_screener(base_url: str) -> List[str]:
@@ -292,34 +307,35 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if last_price is None or last_price <= 0:
             continue
 
-        if not getattr(cfg, "AUTO_ADJUST_PRICES", True):
-            ratio = last_price / current_price
+        # data_cache uses auto_adjust=False, so split detection must always run
+        # against raw closes to avoid false crash marks on split dates.
+        ratio = last_price / current_price
 
-            # Broader institutional ratio list with a tighter tolerance
-            split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
-            for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
-                if abs(ratio - r) / r <= split_tolerance:
-                    old_shares     = state.shares[sym]
-                    theoretical_new_shares = old_shares * r
-                    new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
-                    old_entry      = state.entry_prices.get(sym, current_price * r)
-                    new_entry      = old_entry / r
+        # Broader institutional ratio list with a tighter tolerance
+        split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
+        for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
+            if abs(ratio - r) / r <= split_tolerance:
+                old_shares     = state.shares[sym]
+                theoretical_new_shares = old_shares * r
+                new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
+                old_entry      = state.entry_prices.get(sym, current_price * r)
+                new_entry      = old_entry / r
 
-                    # Safely sweep fractional shares
-                    fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
-                    fractional_value = fractional_new_shares * current_price
-                    state.cash = round(state.cash + fractional_value, 10)
+                # Safely sweep fractional shares
+                fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
+                fractional_value = fractional_new_shares * current_price
+                state.cash = round(state.cash + fractional_value, 10)
 
-                    logger.warning(
-                        "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
-                        "shares %d→%d entry_price ₹%.2f→₹%.2f",
-                        sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
-                    )
-                    state.shares[sym]       = new_shares
-                    state.entry_prices[sym] = round(new_entry, 4)
-                    state.last_known_prices[sym] = current_price
-                    adjusted.append(sym)
-                    break
+                logger.warning(
+                    "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
+                    "shares %d→%d entry_price ₹%.2f→₹%.2f",
+                    sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
+                )
+                state.shares[sym]       = new_shares
+                state.entry_prices[sym] = round(new_entry, 4)
+                state.last_known_prices[sym] = current_price
+                adjusted.append(sym)
+                break
 
     return adjusted
 
@@ -397,6 +413,17 @@ def _run_scan(
     engine = InstitutionalRiskEngine(cfg)
     state.equity_hist_cap = cfg.EQUITY_HIST_CAP
 
+    today = pd.Timestamp(datetime.today().date())
+    next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
+    rebalance_allowed = next_due is None or today >= next_due
+    if not rebalance_allowed:
+        logger.info(
+            "[Scan] Cadence gate active: last rebalance %s, next due %s (%s). Scan will mark-to-market only.",
+            state.last_rebalance_date,
+            next_due.strftime("%Y-%m-%d"),
+            cfg.REBALANCE_FREQ,
+        )
+
     # Pass tomorrow as end_date so load_or_fetch's required_end covers today.
     # yfinance end= is exclusive, so +1 day ensures today's close is fetched.
     end_date   = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -438,6 +465,9 @@ def _run_scan(
 
     if not close_d:
         logger.warning("[Scan] No data available for any universe symbol.")
+        for held_sym in list(state.shares.keys()):
+            if held_sym not in close_d:
+                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
         return state, market_data
 
     _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
@@ -500,6 +530,7 @@ def _run_scan(
     sel_idx: List[int]   = []
     _force_full_cash     = False
     _soft_cvar_breach    = False
+    rebalanced_this_scan = False
 
     # ── Book CVaR screen ──────────────────────────────────────────────────────
     if state.shares:
@@ -525,7 +556,7 @@ def _run_scan(
                 book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100,
             )
 
-    if not _force_full_cash:
+    if rebalance_allowed and not _force_full_cash:
         try:
             raw_daily, adj_scores, sel_idx = generate_signals(
                 log_rets, adv_arr, cfg, prev_weights=state.weights
@@ -587,7 +618,7 @@ def _run_scan(
         else:
             weights = compute_decay_targets(state, sel_idx, active, cfg)
 
-    if optimization_succeeded or apply_decay:
+    if rebalance_allowed and (optimization_succeeded or apply_decay):
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
         _scenario_losses = -(
             log_rets.iloc[-_T_cvar:]
@@ -597,11 +628,13 @@ def _run_scan(
         total_slippage = execute_rebalance(
             state, weights, prices, active, cfg,
             adv_shares=adv_arr,
-            date_context=pd.Timestamp(end_date), trade_log=trade_log,
+            date_context=today, trade_log=trade_log,
             apply_decay    = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _scenario_losses,
             force_rebalance_trades = _soft_cvar_breach,
         )
+        state.last_rebalance_date = today.strftime("%Y-%m-%d")
+        rebalanced_this_scan = True
         if _exhaust_decay:
             state.decay_rounds = 0
             state.consecutive_failures = 0
@@ -610,6 +643,14 @@ def _run_scan(
 
     price_dict = {sym: prices[active_idx[sym]] for sym in active}
     state.record_eod(price_dict)
+
+    if not rebalanced_this_scan:
+        for held_sym in list(state.shares.keys()):
+            if held_sym not in active_idx:
+                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+            else:
+                state.absent_periods.pop(held_sym, None)
+
     final_pv = state.equity_hist[-1] if state.equity_hist else pv
 
     logger.info(
