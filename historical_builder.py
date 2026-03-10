@@ -6,16 +6,66 @@ Generate point-in-time (PIT) universe snapshots for survivorship-safe backtests.
 
 from __future__ import annotations
 
+import io
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
 # All paths in this module are rooted here.  Change DATA_DIR to relocate
 # the entire historical-data directory without touching individual functions.
+
 DATA_DIR = Path("data")
+
+REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
+    "nifty500": [
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/raw_nifty_archives.csv",
+    ],
+    "nse_total": [
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/raw_nse_total_archives.csv",
+    ],
+}
+
+
+def _candidate_remote_archive_urls(universe_type: str) -> list[str]:
+    env_key = f"HIST_BUILDER_{universe_type.upper()}_ARCHIVE_URL"
+    env_override = os.getenv(env_key, "").strip()
+    urls: list[str] = []
+    if env_override:
+        urls.append(env_override)
+    urls.extend(REMOTE_ARCHIVE_URLS.get(universe_type, []))
+    return [u for u in urls if u]
+
+
+def _download_master_archive(universe_type: str, output_path: Path) -> Path | None:
+    """Attempt to download a raw archive CSV for universe_type."""
+    urls = _candidate_remote_archive_urls(universe_type)
+    if not urls:
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "text/csv,application/csv,text/plain,*/*",
+    }
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            preview = pd.read_csv(io.StringIO(resp.text), nrows=5)
+            if preview.empty and len(preview.columns) < 2:
+                raise ValueError("downloaded archive does not look like a valid CSV")
+            output_path.write_text(resp.text, encoding="utf-8")
+            logger.info("[HistoricalBuilder] Downloaded %s archive from %s", universe_type, url)
+            return output_path
+        except Exception as exc:
+            logger.warning("[HistoricalBuilder] Download failed for %s from %s: %s", universe_type, url, exc)
+
+    return None
 
 
 def _ns_ticker(sym: str) -> str:
@@ -41,7 +91,12 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
     ]
     src = next((p for p in candidates if p.exists()), None)
     if src is None:
-        return pd.DataFrame(columns=["date", "ticker"])
+        download_target = DATA_DIR / f"raw_{universe_type}_archives.csv"
+        downloaded = _download_master_archive(universe_type, download_target)
+        if downloaded is not None and downloaded.exists():
+            src = downloaded
+        else:
+            return pd.DataFrame(columns=["date", "ticker"])
 
     df = pd.read_csv(src)
     cols = {c.lower().strip(): c for c in df.columns}
@@ -236,24 +291,29 @@ def main() -> None:
     Never call bootstrap_historical_parquet() here — it produces a single-row
     stub dated today which makes every historical lookup miss.
     """
+    jobs = [
+        ("nifty500", DATA_DIR / "historical_nifty500.csv", DATA_DIR / "historical_nifty500.parquet"),
+        ("nse_total", DATA_DIR / "historical_nse_total.csv", DATA_DIR / "historical_nse_total.parquet"),
+    ]
+
     print("[HistoricalBuilder] Step 1/2 — Building PIT CSV snapshots...")
-    csv_nifty   = build_historical_csv("nifty500",  str(DATA_DIR / "historical_nifty500.csv"))
-    csv_total   = build_historical_csv("nse_total", str(DATA_DIR / "historical_nse_total.csv"))
-    print(f"  [+] {csv_nifty}")
-    print(f"  [+] {csv_total}")
+    built_csvs: list[Path] = []
+    for universe_type, csv_path, _ in jobs:
+        built = build_historical_csv(universe_type, str(csv_path))
+        built_csvs.append(built)
+        print(f"  [+] {built}")
 
     print("[HistoricalBuilder] Step 2/2 — Converting CSVs to parquet...")
-    pq_nifty  = build_parquet_from_csv(
-        str(DATA_DIR / "historical_nifty500.csv"),  str(DATA_DIR / "historical_nifty500.parquet")
-    )
-    pq_total  = build_parquet_from_csv(
-        str(DATA_DIR / "historical_nse_total.csv"), str(DATA_DIR / "historical_nse_total.parquet")
-    )
-    print(f"  [+] {pq_nifty}")
-    print(f"  [+] {pq_total}")
+    built_parquets: list[Path] = []
+    for _, csv_path, parquet_path in jobs:
+        built = build_parquet_from_csv(str(csv_path), str(parquet_path))
+        built_parquets.append(built)
+        print(f"  [+] {built}")
 
-    print("\n[HistoricalBuilder] All PIT files ready. Backtests will now use "
-          "correct point-in-time constituents without survivorship bias.")
+    print(
+        "\n[HistoricalBuilder] Completed. "
+        f"CSV files: {len(built_csvs)} | parquet files: {len(built_parquets)}."
+    )
 
 
 if __name__ == "__main__":

@@ -78,3 +78,37 @@ def test_load_master_archive_supports_wide_date_rows_truthy_filter(tmp_path, mon
     assert set(out["date"]) == {"2020-01-31", "2020-02-28"}
     jan = out[out["date"] == "2020-01-31"]["ticker"].tolist()
     assert jan == ["RELIANCE.NS"]
+
+
+def test_main_downloads_archives_when_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    sample_by_universe = {
+        "nifty500": "date,ticker\n2020-01-31,RELIANCE\n2020-01-31,TCS\n",
+        "nse_total": "date,ticker\n2020-01-31,INFY\n2020-01-31,SBIN\n",
+    }
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, headers=None, timeout=20):
+        if "nifty" in url:
+            return _Resp(sample_by_universe["nifty500"])
+        return _Resp(sample_by_universe["nse_total"])
+
+    monkeypatch.setattr(hb, "REMOTE_ARCHIVE_URLS", {
+        "nifty500": ["https://example.com/nifty500.csv"],
+        "nse_total": ["https://example.com/nse_total.csv"],
+    })
+    monkeypatch.setattr(hb.requests, "get", _fake_get)
+
+    hb.main()
+
+    assert (tmp_path / "data" / "raw_nifty500_archives.csv").exists()
+    assert (tmp_path / "data" / "raw_nse_total_archives.csv").exists()
+    assert (tmp_path / "data" / "historical_nifty500.parquet").exists()
+    assert (tmp_path / "data" / "historical_nse_total.parquet").exists()
