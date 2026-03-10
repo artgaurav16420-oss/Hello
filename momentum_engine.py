@@ -50,6 +50,17 @@ def to_bare(sym: str) -> str:
     return sym[:-3] if sym.endswith(".NS") else sym
 
 
+def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
+    """Mark absent symbols with a linear haircut that reaches zero at the absence threshold."""
+    px = float(last_known_price)
+    if not np.isfinite(px) or px <= 0:
+        return 0.0
+    n_absent = max(0, int(absent_periods))
+    max_absent = max(1, int(max_absent_periods))
+    haircut = max(0.0, 1.0 - (n_absent / max_absent))
+    return px * haircut
+
+
 # ─── Enumerations & exceptions ────────────────────────────────────────────────
 
 class OptimizationErrorType(Enum):
@@ -184,6 +195,11 @@ class UltimateConfig:
     CONTINUITY_DISPERSION_FLOOR: float = 0.1
     CONTINUITY_MAX_SCALAR:    float = 0.20
     CONTINUITY_MAX_HOLD_WEIGHT: float = 0.10
+    CONTINUITY_ACTIVITY_WINDOW: int = 5
+    CONTINUITY_MIN_NONZERO_DAYS: int = 1
+    CONTINUITY_STALE_SESSIONS: int = 10
+    CONTINUITY_FLAT_RET_EPS: float = 1e-12
+    CONTINUITY_MIN_ADV_NOTIONAL: float = 0.0
     KNIFE_WINDOW:             int   = 20
     KNIFE_THRESHOLD:          float = -0.15
 
@@ -429,6 +445,22 @@ def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> N
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 
+def compute_one_way_slip_rate(
+    cfg: UltimateConfig,
+    portfolio_value: float,
+    adv_notional: Optional[float],
+) -> float:
+    """Compute per-name one-way slippage rate with execution-aligned floor/cap semantics."""
+    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
+        return base_rate
+
+    # ADV is notional (₹/day); retain execution semantics exactly:
+    # impact = coeff * PV / ADV, then clamp [base_rate, 5%].
+    impact_rate = (cfg.IMPACT_COEFF * portfolio_value) / float(adv_notional)
+    return max(base_rate, min(0.05, impact_rate))
+
+
 # ─── Execution ────────────────────────────────────────────────────────────────
 
 def execute_rebalance(
@@ -473,9 +505,13 @@ def execute_rebalance(
             else:
                 logger.info(
                     "execute_rebalance: %s absent from data feed (period %d/%d); "
-                    "carrying position at last known price ₹%.2f.",
+                    "carrying position at effective marked price ₹%.2f.",
                     sym, count, cfg.MAX_ABSENT_PERIODS,
-                    state.last_known_prices.get(sym, 0.0),
+                    absent_symbol_effective_price(
+                        state.last_known_prices.get(sym, 0.0),
+                        count,
+                        cfg.MAX_ABSENT_PERIODS,
+                    ),
                 )
 
     pv = state.cash
@@ -483,7 +519,11 @@ def execute_rebalance(
         if sym in active_idx:
             pv += n_shares * float(local_prices[active_idx[sym]])
         elif sym not in symbols_to_force_close:
-            pv += n_shares * state.last_known_prices.get(sym, 0.0)
+            pv += n_shares * absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                state.absent_periods.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
 
     if apply_decay:
         state.decay_rounds += 1
@@ -594,13 +634,11 @@ def execute_rebalance(
                     continue
 
             # ── FIX: Institutional Impact Alignment ──
-            if adv_shares is not None and adv_shares[i] > 0:
-                # ADV is passed in notional units (₹/day), so impact denominator
-                # must not multiply by price again (which would create ₹^2 units).
-                impact_rate = (cfg.IMPACT_COEFF * pv) / adv_shares[i]
-                slip_rate = max(cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
-            else:
-                slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
+            slip_rate = compute_one_way_slip_rate(
+                cfg=cfg,
+                portfolio_value=pv,
+                adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+            )
 
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
@@ -627,10 +665,18 @@ def execute_rebalance(
             new_shares[sym]       = state.shares[sym]
             new_weights[sym]      = state.weights.get(sym, 0.0)
             new_entry_prices[sym] = state.entry_prices.get(sym, 0.0)
-            actual_notional      += new_shares[sym] * state.last_known_prices.get(sym, 0.0)
+            actual_notional      += new_shares[sym] * absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                state.absent_periods.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
 
     for sym in symbols_to_force_close:
-        close_price = state.last_known_prices.get(sym, 0.0)
+        close_price = absent_symbol_effective_price(
+            state.last_known_prices.get(sym, 0.0),
+            max(0, state.absent_periods.get(sym, 0) - 1),
+            cfg.MAX_ABSENT_PERIODS,
+        )
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
@@ -968,10 +1014,17 @@ class InstitutionalRiskEngine:
         P_aux = sp.eye(n_vars - m, format="csc") * 1e-6
         P     = sp.block_diag([sp.csc_matrix(P_w), P_aux], format="csc")
 
+        turnover_costs = np.array(
+            [
+                compute_one_way_slip_rate(self.cfg, portfolio_value, float(adv))
+                for adv in adv_shares
+            ],
+            dtype=float,
+        )
+
         q        = np.zeros(n_vars)
         q[:m]    = -expected_returns - 2.0 * impact * prev_w_arr
-        # |w-w_prev| is one-way turnover, so use one-way cost (round-trip / 2).
-        q[m:2*m] = self.cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+        q[m:2*m] = turnover_costs
         q[-1]    = self.cfg.SLACK_PENALTY
 
         builder = _ConstraintBuilder(n_vars)

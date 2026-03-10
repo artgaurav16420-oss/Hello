@@ -32,6 +32,7 @@ from momentum_engine import (
     execute_rebalance,
     compute_book_cvar,
     compute_decay_targets,
+    absent_symbol_effective_price,
     to_ns,
     to_bare,
     Trade,
@@ -460,15 +461,18 @@ def _run_scan(
             _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
             if _fallback_px > 0:
                 _absent_n = int(state.absent_periods.get(_absent_sym, 0))
-                _haircut = max(0.0, 1.0 - (_absent_n / max(cfg.MAX_ABSENT_PERIODS, 1)))
-                _mtm_px = _fallback_px * _haircut
+                _mtm_px = absent_symbol_effective_price(_fallback_px, _absent_n, cfg.MAX_ABSENT_PERIODS)
                 mtm_notional += state.shares[_absent_sym] * _mtm_px
                 logger.warning(
                     "[Scan] Held symbol '%s' absent from current market data "
                     "(possibly delisted/suspended). Applying absence haircut %.1f%% "
                     "to last-known price ₹%.2f for PV calculation (mark ₹%.2f). "
                     "Position will be force-closed after %d consecutive absent periods.",
-                    _absent_sym, (1.0 - _haircut) * 100.0, _fallback_px, _mtm_px, cfg.MAX_ABSENT_PERIODS,
+                    _absent_sym,
+                    (1.0 - (_mtm_px / _fallback_px if _fallback_px > 0 else 0.0)) * 100.0,
+                    _fallback_px,
+                    _mtm_px,
+                    cfg.MAX_ABSENT_PERIODS,
                 )
     pv = mtm_notional + state.cash
     initial_cash = state.cash

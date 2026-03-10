@@ -161,3 +161,33 @@ def test_apply_adv_filter_excludes_below_adv_threshold(monkeypatch):
 
     assert "LIQUID.NS" in result,   "LIQUID must pass the ADV filter."
     assert "ILLIQUID.NS" not in result, "ILLIQUID must be excluded by the ADV filter."
+
+
+def test_apply_adv_filter_raises_on_any_chunk_failure(monkeypatch):
+    """
+    If any chunk fetch fails, _apply_adv_filter must raise UniverseFetchError
+    rather than silently returning a partial filtered list.
+    """
+    import data_cache
+    import numpy as np
+    from momentum_engine import UltimateConfig
+
+    tickers = [f"SYM{i:03d}" for i in range(76)]
+
+    def _fake_load_or_fetch(chunk, start, end, cfg=None):
+        if "SYM075" in chunk:
+            raise RuntimeError("chunk boom")
+
+        idx = pd.date_range("2024-01-01", periods=30, freq="B")
+        return {
+            f"{sym}.NS": pd.DataFrame(
+                {"Close": np.ones(30) * 500.0, "Volume": np.ones(30) * 1e6},
+                index=idx,
+            )
+            for sym in chunk
+        }
+
+    monkeypatch.setattr(data_cache, "load_or_fetch", _fake_load_or_fetch)
+
+    with pytest.raises(um.UniverseFetchError, match="ADV filter failed for 1 chunk"):
+        _apply_adv_filter(tickers, UltimateConfig(MIN_ADV_CRORES=1))
