@@ -79,7 +79,8 @@ def compute_regime_score(
     breadth_component = 0.5
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= _sma_win:
-        sma200 = universe_close_hist.rolling(_sma_win).mean().iloc[-1]
+        recent = universe_close_hist.iloc[-_sma_win:]
+        sma200 = recent.mean()
         last = universe_close_hist.iloc[-1]
         valid = (sma200 > 0) & sma200.notna() & last.notna()
         if valid.any():
@@ -103,15 +104,16 @@ def compute_single_adv(df: pd.DataFrame) -> float:
         if notional.empty:
             return 0.0
             
-        # Take 20-day moving average strictly to ensure unit coherence against limit bounds
-        adv_val = float(notional.rolling(20, min_periods=1).mean().iloc[-1])
+        adv_lookback = 20
+        # Take configurable moving average to ensure unit coherence against limit bounds.
+        adv_val = float(notional.rolling(adv_lookback, min_periods=1).mean().iloc[-1])
         return adv_val if np.isfinite(adv_val) else 0.0
     except Exception as exc:
         logger.debug("[Signals] ADV calculation failed: %s", exc)
         return 0.0
 
 
-def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
+def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['UltimateConfig'] = None) -> np.ndarray:
     """
     Compute Average Daily Notional Volume for every symbol in a single
     vectorized pass.
@@ -124,6 +126,7 @@ def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
     inner loop and during Bayesian optimisation trials.
 
     Symbols absent from market_data receive a value of 0.0.
+    Lookback defaults to 20 days when cfg is not supplied.
     """
     from momentum_engine import to_ns
 
@@ -138,8 +141,11 @@ def compute_adv(market_data: dict, active_symbols: List[str]) -> np.ndarray:
         return np.zeros(len(active_symbols), dtype=float)
 
     # Single rolling mean across the entire matrix — O(T·N) instead of N × O(T).
-    notional_df = pd.DataFrame(notional_cols).ffill().fillna(0.0)
-    adv_last_row = notional_df.rolling(20, min_periods=1).mean().iloc[-1]
+    notional_df = pd.DataFrame(notional_cols)
+    notional_df.ffill(inplace=True)
+    notional_df.fillna(0.0, inplace=True)
+    adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
+    adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).mean().iloc[-1]
 
     def _safe_adv(sym: str) -> float:
         # Inline helper keeps `x` strictly scoped to this call frame.

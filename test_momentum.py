@@ -1156,3 +1156,19 @@ def test_volume_first_day_adv_is_zero_no_lookahead():
     adv_day0 = _build_adv_vector(cols, close, volume, idx[0])
 
     assert np.allclose(adv_day0, 0.0)
+
+
+def test_compute_adv_respects_configurable_lookback():
+    idx = pd.date_range("2024-01-01", periods=5, freq="B")
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {"Close": [100.0] * 5, "Volume": [1, 2, 3, 4, 5]},
+            index=idx,
+        )
+    }
+
+    adv_short = compute_adv(market_data, ["ABC"], cfg=UltimateConfig(ADV_LOOKBACK=2))
+    adv_long = compute_adv(market_data, ["ABC"], cfg=UltimateConfig(ADV_LOOKBACK=5))
+
+    assert adv_short[0] == pytest.approx(450.0)
+    assert adv_long[0] == pytest.approx(300.0)

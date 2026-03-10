@@ -466,12 +466,12 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         if use_cache:
             with _SECTOR_MAP_CACHE_LOCK:
                 cache = _load_universe_cache()
-                existing_sector_cache = cache.get("sector_map", {}).get("sectors", {})
+                existing_sector_cache = dict(cache.get("sector_map", {}).get("sectors", {}))
                 existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
 
                 cache["sector_map"] = {
                     "fetched_at": datetime.now().isoformat(),
-                    "sectors": existing_sector_cache
+                    "sectors": existing_sector_cache,
                 }
                 _save_universe_cache(cache)
             

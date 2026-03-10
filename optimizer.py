@@ -218,7 +218,7 @@ class MomentumObjective:
         cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max)
         
         # Logical Constraint: Fast must be strictly faster than slow
-        if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
+        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
             raise optuna.TrialPruned()
             
         continuity_min, continuity_max, continuity_step = self.search_space["CONTINUITY_BONUS"]
