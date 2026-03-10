@@ -24,9 +24,16 @@ DATA_DIR = Path("data")
 REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
     "nifty500": [
         "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/raw_nifty_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/raw_nifty500_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/master/raw_nifty_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/master/raw_nifty500_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/data/raw_nifty_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/data/raw_nifty500_archives.csv",
     ],
     "nse_total": [
         "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/raw_nse_total_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/master/raw_nse_total_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/data/raw_nse_total_archives.csv",
     ],
 }
 
