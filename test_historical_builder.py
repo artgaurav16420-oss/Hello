@@ -21,20 +21,35 @@ def test_build_historical_csv_from_local_master(tmp_path, monkeypatch):
 
     assert set(out.columns) == {"date", "ticker"}
     assert out["date"].min() == "2018-01-01"
+    assert out["date"].nunique() == 2
     assert out["ticker"].str.endswith(".NS").all()
 
 
-def test_build_historical_csv_uses_fallback_when_master_missing(tmp_path, monkeypatch):
+def test_build_historical_csv_raises_when_master_missing(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(hb, "get_nifty500", lambda: ["RELIANCE", "TCS"])
-    monkeypatch.setattr(hb, "fetch_nse_equity_universe", lambda: ["SBIN", "INFY"])
 
-    out_path = hb.build_historical_csv("nifty500", "data/historical_nifty500.csv")
-    out = pd.read_csv(out_path)
+    try:
+        hb.build_historical_csv("nifty500", "data/historical_nifty500.csv")
+        assert False, "Expected FileNotFoundError when raw archive is absent"
+    except FileNotFoundError as exc:
+        assert "Raw archive missing" in str(exc)
 
-    assert not out.empty
-    assert out["date"].nunique() > 12
-    assert out["ticker"].str.endswith(".NS").all()
+
+def test_load_master_archive_supports_wide_ticker_rows(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw = data_dir / "raw_nifty_archives.csv"
+    raw.write_text(
+        "ticker,2020-01-31,2020-02-28\nRELIANCE,1,1\nTCS,0,1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    out = hb._load_master_archive("nifty500")
+
+    assert set(out.columns) == {"date", "ticker"}
+    assert set(out["date"]) == {"2020-01-31", "2020-02-28"}
+    assert set(out["ticker"]) == {"RELIANCE.NS", "TCS.NS"}
 
 
 def test_bootstrap_historical_parquet_warns_stub_content(tmp_path, monkeypatch, caplog):
