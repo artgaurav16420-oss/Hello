@@ -1344,3 +1344,31 @@ def test_compute_adv_respects_configurable_lookback():
 
     assert adv_short[0] == pytest.approx(450.0)
     assert adv_long[0] == pytest.approx(300.0)
+
+
+def test_run_backtest_simulate_halts_does_not_mutate_input_market_data():
+    cfg = UltimateConfig(HISTORY_GATE=5, INITIAL_CAPITAL=1_000_000, SIMULATE_HALTS=True)
+    dates = pd.to_datetime(["2020-01-01", "2020-01-02", "2020-03-20", "2020-03-23", "2020-03-24", "2020-03-25"])
+    raw = pd.DataFrame(
+        {
+            "Close": [100, 101, 102, 103, 104, 105],
+            "Adj Close": [100, 101, 102, 103, 104, 105],
+            "Volume": [1000, 1000, 1000, 1000, 1000, 1000],
+        },
+        index=dates,
+    )
+    market_data = {
+        "AAA.NS": raw.copy(),
+        "^NSEI": pd.DataFrame({"Close": np.linspace(10000, 11000, len(dates))}, index=dates),
+    }
+
+    _ = run_backtest(
+        market_data=market_data,
+        universe=["AAA"],
+        start_date="2020-01-01",
+        end_date="2020-03-25",
+        cfg=cfg,
+    )
+
+    assert market_data["AAA.NS"].index.equals(raw.index)
+    assert market_data["AAA.NS"]["Close"].equals(raw["Close"])

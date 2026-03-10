@@ -6,9 +6,7 @@ Robustly manages downloading, parsing, and persisting yfinance data.
 Features:
 - Atomic JSON manifest updates
 - Network retry logic and chunking
-- Fully DETERMINISTIC synthetic noise injection for long trading 
-  suspensions (ASM/GSM) to prevent the optimizer from misidentifying 
-  frozen assets as zero-volatility safe havens.
+- Persistent storage of raw provider data only (no synthetic mutation at cache layer)
 """
 
 from __future__ import annotations
@@ -18,14 +16,12 @@ import logging
 import os
 import random
 import time
-import hashlib
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import requests
 from datetime import datetime, time as dt_time, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -36,7 +32,9 @@ logger = logging.getLogger(__name__)
 CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
-_SUSPENSION_GAP_DAYS = 30
+
+class DataFetchError(RuntimeError):
+    """Raised when one or more requested ticker chunks cannot be fetched."""
 
 
 class DataProvider(ABC):
@@ -86,7 +84,7 @@ class SecondaryProvider(DataProvider):
                 time.sleep(self.min_interval - elapsed)
 
             try:
-                frame = self._download_single(av_symbol, self.api_key)
+                frame = self._download_single(av_symbol, self.api_key, start=start, end=end)
                 last_call_ts = time.time()
             except Exception as exc:
                 logger.warning("[Cache][Fallback] %s fetch failed: %s", ticker, exc)
@@ -95,10 +93,7 @@ class SecondaryProvider(DataProvider):
             if frame is None:
                 continue
 
-            filtered = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
-            if filtered.empty:
-                continue
-            ticker_frames[ticker] = filtered
+            ticker_frames[ticker] = frame
 
         if not ticker_frames:
             return None
@@ -110,7 +105,7 @@ class SecondaryProvider(DataProvider):
         combined = pd.concat(ticker_frames, axis=1)
         return _normalize_history_index(combined)
 
-    def _download_single(self, symbol: str, api_key: str) -> Optional[pd.DataFrame]:
+    def _download_single(self, symbol: str, api_key: str, start: str, end: str) -> Optional[pd.DataFrame]:
         params = {
             "function": "TIME_SERIES_DAILY_ADJUSTED",
             "symbol": symbol,
@@ -133,11 +128,16 @@ class SecondaryProvider(DataProvider):
             logger.warning("[Cache][Fallback] Invalid payload for %s: %s", symbol, err)
             return None
 
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
         rows = []
         for d, item in series.items():
+            date = pd.Timestamp(d)
+            if date < start_ts or date > end_ts:
+                continue
             rows.append(
                 {
-                    "Date": pd.Timestamp(d),
+                    "Date": date,
                     "Open": float(item.get("1. open", np.nan)),
                     "High": float(item.get("2. high", np.nan)),
                     "Low": float(item.get("3. low", np.nan)),
@@ -147,8 +147,11 @@ class SecondaryProvider(DataProvider):
                 }
             )
 
+        if not rows:
+            return None
+
         df = pd.DataFrame(rows).set_index("Date").sort_index()
-        return _normalize_history_index(df)
+        return _ensure_price_columns(_normalize_history_index(df))
 
     @staticmethod
     def _map_symbol(ticker: str) -> str:
@@ -184,10 +187,10 @@ def _extract_ticker_frame(raw_data: pd.DataFrame, ticker: str) -> Optional[pd.Da
             df = raw_data.xs(ticker, level=1, axis=1).copy()
         else:
             return None
-        return _normalize_history_index(df)
+        return _ensure_price_columns(_normalize_history_index(df))
 
     # Single ticker payloads often come as flat OHLCV columns
-    return _normalize_history_index(raw_data.copy())
+    return _ensure_price_columns(_normalize_history_index(raw_data.copy()))
 
 
 def _download_with_timeout(
@@ -293,93 +296,6 @@ def _is_valid_dataframe(df: pd.DataFrame) -> bool:
     if "Volume" not in df.columns or df["Volume"].isnull().all():
         return False
     return True
-
-
-def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> Tuple[pd.DataFrame, bool, int]:
-    """
-    Detects long gaps (e.g. from ASM/GSM regulatory suspensions) and injects 
-    DETERMINISTIC synthetic noise instead of a flat forward-fill.
-    
-    A flat line has 0.0% variance. The risk engine (CVaR optimizer) will see 
-    this suspended stock as the "safest asset in the world" and over-allocate 
-    to it. This fix prevents that critical institutional flaw.
-    """
-    if len(df) < 2:
-        return df, False, 0
-        
-    # Calculate days between adjacent dates in the index
-    gap_days = df.index.to_series().diff().dt.days
-    max_gap = int(gap_days.max()) if not gap_days.empty else 0
-    is_suspended = max_gap > _SUSPENSION_GAP_DAYS
-    
-    if is_suspended:
-        logger.warning(
-            "[Cache] %s: Prolonged trading gap of %d days detected. "
-            "Injecting deterministic synthetic noise to prevent risk-engine suppression.", 
-            ticker, max_gap
-        )
-        
-        # Create a complete business day timeline covering the entire range
-        bday_idx = pd.bdate_range(df.index[0], df.index[-1])
-        
-        # FIX (Bug-B — Lookahead Bias): Compute volatility STRICTLY from price data
-        # that existed BEFORE the first detected gap.  Using the full series would
-        # leak future volatility regimes into the imputed past prices — e.g.,
-        # computing vol from 2019-2024 data to fill a 2018 suspension gap inflates
-        # apparent risk during backtests and pollutes CVaR estimates.
-        _gap_days_tmp = df.index.to_series().diff().dt.days
-        _first_gap_positions = np.where(_gap_days_tmp.values > _SUSPENSION_GAP_DAYS)[0]
-        if len(_first_gap_positions) > 0:
-            _pre_gap_close = df["Close"].iloc[: _first_gap_positions[0]]
-        else:
-            _pre_gap_close = df["Close"]
-
-        _pre_gap_rets = _pre_gap_close.pct_change().dropna()
-        if len(_pre_gap_rets) > 10:
-            hist_vol = float(_pre_gap_rets.std())
-        else:
-            hist_vol = 0.02  # fallback 2 % daily vol when insufficient pre-gap history
-            
-        # Reindex to fill the gap with NaNs
-        df = df.reindex(bday_idx)
-        missing_mask = df["Close"].isna()
-        
-        if missing_mask.any():
-            n_missing = missing_mask.sum()
-            
-            # FIX (I-07): Use a hash derived RandomState seed unique to the ticker.
-            # sha256 is used instead of md5 — not for cryptographic strength (the
-            # output is truncated to 8 hex chars and used only as an RNG seed), but
-            # to eliminate the Bandit B324 false-positive that md5 triggers in
-            # automated security scanners (SonarQube, GitHub Advanced Security, etc.).
-            seed = int(hashlib.sha256(ticker.encode()).hexdigest()[:8], 16) % (2**31)
-            rng = np.random.RandomState(seed)
-            noise_rets = rng.normal(0, hist_vol, n_missing)
-            
-            # Forward fill as a baseline
-            df["Close"] = df["Close"].ffill()
-            
-            # Build a deterministic random walk for suspended periods so variance compounds over time.
-            missing_idx = df.index[missing_mask]
-            anchor_prices = (
-                df["Close"].shift(1).reindex(missing_idx).ffill().fillna(df["Close"].dropna().iloc[0])
-            )
-            walk_returns = np.cumprod(1.0 + noise_rets)
-            df.loc[missing_idx, "Close"] = anchor_prices.values * walk_returns
-
-            # FIX (Bug-6): Sync Adj Close with the synthetic Close values on suspended days.
-            # _ensure_price_columns() copies Close→Adj Close before this function runs, but
-            # only for the original (non-reindexed) rows. After reindex(), new dates have NaN
-            # for Adj Close. Backtest uses Adj Close for returns calculation, so unsynchronised
-            # NaN values produce silent NaN returns for suspended stocks, corrupting CVaR
-            # estimates and signal generation during any period with SIMULATE_HALTS=True.
-            if "Adj Close" in df.columns:
-                df.loc[missing_idx, "Adj Close"] = df.loc[missing_idx, "Close"]
-
-            # Zero out volume for the days it didn't trade
-            df["Volume"] = df["Volume"].fillna(0)
-            
-    return df, is_suspended, max_gap
 
 
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -500,8 +416,9 @@ def load_or_fetch(
                 if raw_data is not None and not raw_data.empty:
                     break
             if raw_data is None or raw_data.empty:
-                logger.warning("[Cache] Received empty response for chunk starting with %s", chunk[0])
-                continue
+                raise DataFetchError(
+                    f"Failed to fetch data for chunk starting with {chunk[0]} after all providers."
+                )
                 
             for ticker in chunk:
                 try:
@@ -512,8 +429,6 @@ def load_or_fetch(
                     df.dropna(how='all', inplace=True)
                     if df.empty:
                         continue
-                    df = _ensure_price_columns(df)
-
                     # Structural validation before anything touches disk.
                     # Catches non-unique/non-monotonic indexes and all-NaN Close
                     # columns that dropna(how='all') cannot detect.
@@ -525,14 +440,6 @@ def load_or_fetch(
                         )
                         continue
 
-                    simulate_halts = bool(getattr(cfg, "SIMULATE_HALTS", False))
-                    if simulate_halts:
-                        df, suspended, max_gap = _repair_suspension_gaps(df, ticker)
-                        if suspended:
-                            logger.warning("[Cache] Synthetic halt simulation applied to %s", ticker)
-                    else:
-                        suspended, max_gap = False, 0
-                    
                     parquet_path = CACHE_DIR / f"{ticker}.parquet"
                     df.to_parquet(parquet_path)
                     
@@ -540,8 +447,8 @@ def load_or_fetch(
                         "fetched_at": datetime.now().isoformat(),
                         "rows": len(df),
                         "last_date": df.index[-1].strftime("%Y-%m-%d"),
-                        "suspended": suspended,
-                        "max_gap_days": max_gap
+                        "suspended": False,
+                        "max_gap_days": 0,
                     }
                     market_data[ticker] = df
                     
