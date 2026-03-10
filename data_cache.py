@@ -417,6 +417,31 @@ def load_or_fetch(
                 if raw_data is not None and not raw_data.empty:
                     break
             if raw_data is None or raw_data.empty:
+                recovered = 0
+                for ticker in chunk:
+                    parquet_path = CACHE_DIR / f"{ticker}.parquet"
+                    if not parquet_path.exists():
+                        continue
+                    try:
+                        fallback_df = _normalize_history_index(pd.read_parquet(parquet_path))
+                        if fallback_df is None or fallback_df.empty:
+                            continue
+                        market_data[ticker] = fallback_df
+                        recovered += 1
+                        logger.warning(
+                            "[Cache] Using stale cached parquet for %s after provider failures.",
+                            ticker,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Cache] Failed loading stale parquet fallback for %s: %s",
+                            ticker,
+                            exc,
+                        )
+
+                if recovered == len(chunk):
+                    continue
+
                 raise DataFetchError(
                     f"Failed to fetch data for chunk starting with {chunk[0]} after all providers."
                 )

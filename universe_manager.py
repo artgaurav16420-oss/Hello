@@ -217,14 +217,12 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     if csv_members:
         return csv_members
 
-    # Warn once only when both parquet and CSV are unavailable for the date.
-    if not _NO_RECORD_WARNED.get(universe_type):
-        logger.warning(
-            "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
-            "Returning empty universe (survivorship bias risk if caller falls back).",
-            universe_type,
-        )
-        _NO_RECORD_WARNED[universe_type] = True
+    logger.error(
+        "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
+        "Returning empty universe (survivorship bias risk if caller falls back).",
+        universe_type,
+    )
+    _NO_RECORD_WARNED[universe_type] = True
     return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────
