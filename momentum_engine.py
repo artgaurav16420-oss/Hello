@@ -184,6 +184,11 @@ class UltimateConfig:
     CONTINUITY_DISPERSION_FLOOR: float = 0.1
     CONTINUITY_MAX_SCALAR:    float = 0.20
     CONTINUITY_MAX_HOLD_WEIGHT: float = 0.10
+    CONTINUITY_ACTIVITY_WINDOW: int = 5
+    CONTINUITY_MIN_NONZERO_DAYS: int = 1
+    CONTINUITY_STALE_SESSIONS: int = 10
+    CONTINUITY_FLAT_RET_EPS: float = 1e-12
+    CONTINUITY_MIN_ADV_NOTIONAL: float = 0.0
     KNIFE_WINDOW:             int   = 20
     KNIFE_THRESHOLD:          float = -0.15
 

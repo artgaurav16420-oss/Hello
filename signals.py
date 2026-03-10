@@ -241,11 +241,48 @@ def generate_signals(
         cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
         base_bonus = min(cfg.CONTINUITY_BONUS, cap) * current_dispersion
 
+        activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
+        stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)
+        min_nonzero_days = max(int(getattr(cfg, "CONTINUITY_MIN_NONZERO_DAYS", 1)), 1)
+        flat_ret_eps = float(getattr(cfg, "CONTINUITY_FLAT_RET_EPS", 1e-12))
+        continuity_min_adv = float(getattr(cfg, "CONTINUITY_MIN_ADV_NOTIONAL", 0.0))
+
+        stale_denied = 0
+        liquidity_denied = 0
+
         for i, sym in enumerate(active_symbols):
             prev_w = float(prev_weights.get(sym, 0.0))
             if valid_mask[i] and prev_w > 0.001:
+                recent_rets = log_rets[sym].tail(activity_window)
+                nonzero_days = int((recent_rets.abs() > flat_ret_eps).sum()) if len(recent_rets) else 0
+                has_recent_activity = nonzero_days >= min_nonzero_days
+
+                stale_rets = log_rets[sym].tail(stale_sessions)
+                is_stale = (
+                    len(stale_rets) == stale_sessions
+                    and stale_rets.notna().all()
+                    and bool((stale_rets.abs() <= flat_ret_eps).all())
+                )
+
+                passes_continuity_liquidity = np.isfinite(adv_arr[i]) and adv_arr[i] >= continuity_min_adv
+                continuity_eligible = has_recent_activity or passes_continuity_liquidity
+
+                if is_stale:
+                    stale_denied += 1
+                if not passes_continuity_liquidity:
+                    liquidity_denied += 1
+                if is_stale or not passes_continuity_liquidity or not continuity_eligible:
+                    continue
+
                 decay = float(np.clip(prev_w / max(getattr(cfg, "CONTINUITY_MAX_HOLD_WEIGHT", 0.10), 1e-6), 0.25, 1.0))
                 adj_scores[i] += base_bonus * decay
+
+        if stale_denied or liquidity_denied:
+            logger.debug(
+                "[Signals] Continuity denied for %d stale and %d illiquid symbols.",
+                stale_denied,
+                liquidity_denied,
+            )
 
     # 4. Final Selection
     # Sort and pick the top N elements (ignoring those assigned -inf)
