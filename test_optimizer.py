@@ -1,17 +1,14 @@
 import importlib
 import json
+import numbers
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-import numpy as np
-import pandas as pd
 
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
-from momentum_engine import InstitutionalRiskEngine, UltimateConfig
-
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 
@@ -135,19 +132,35 @@ def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch
         }
     )
 
-    assert isinstance(objective(trial), float)
+    assert isinstance(objective(trial), numbers.Real)
 
 
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
 
-    optimizer.save_optimal_config({"HALFLIFE_FAST": 34}, str(output_path))
+    captured = {}
+    original_replace = optimizer.os.replace
+
+    def _capturing_replace(src, dst):
+        captured["src"] = src
+        captured["dst"] = dst
+        captured["src_exists_before_replace"] = Path(src).exists()
+        return original_replace(src, dst)
+
+    optimizer.os.replace = _capturing_replace
+    try:
+        optimizer.save_optimal_config({"HALFLIFE_FAST": 34}, str(output_path))
+    finally:
+        optimizer.os.replace = original_replace
 
     with output_path.open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
 
     assert payload == {"HALFLIFE_FAST": 34}
+    assert captured["dst"] == str(output_path)
+    assert captured["src"] != str(output_path)
+    assert captured["src_exists_before_replace"] is True
 
 
 def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch):
@@ -495,6 +508,8 @@ def test_optimizer_logs_insufficient_history_exclusions(caplog):
     assert weights.shape == (2,)
     assert weights[1] == pytest.approx(0.0, abs=1e-12)
     assert "reason=insufficient_history" in caplog.text
+
+
 def test_optimizer_uses_higher_turnover_penalty_for_illiquid_name(monkeypatch):
     cfg = UltimateConfig()
     engine = InstitutionalRiskEngine(cfg)
