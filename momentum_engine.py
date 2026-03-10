@@ -769,8 +769,8 @@ class InstitutionalRiskEngine:
         sector_labels:       Optional[np.ndarray] = None,
         execution_date:      Optional[pd.Timestamp] = None,
     ) -> np.ndarray:
-        m = len(expected_returns)
-        if m == 0:
+        original_m = len(expected_returns)
+        if original_m == 0:
             return np.array([])
 
         if execution_date is not None and not historical_returns.empty:
@@ -780,17 +780,17 @@ class InstitutionalRiskEngine:
                     OptimizationErrorType.DATA,
                 )
 
-        if len(prices) != m or len(adv_shares) != m:
+        if len(prices) != original_m or len(adv_shares) != original_m:
             raise OptimizationError(
                 "Input length mismatch across expected_returns/prices/adv_shares.",
                 OptimizationErrorType.DATA,
             )
-        if prev_w is not None and len(prev_w) != m:
+        if prev_w is not None and len(prev_w) != original_m:
             raise OptimizationError(
                 "prev_w length must match expected_returns length.",
                 OptimizationErrorType.DATA,
             )
-        if sector_labels is not None and len(sector_labels) != m:
+        if sector_labels is not None and len(sector_labels) != original_m:
             raise OptimizationError(
                 "Sector mapping array length does not match expected_returns length.",
                 OptimizationErrorType.DATA,
@@ -814,12 +814,57 @@ class InstitutionalRiskEngine:
 
         # Avoid matrix collapse from DataFrame-wide dropna(): with broad universes,
         # a single symbol NaN can otherwise delete the entire row for all symbols.
-        clean_rets = historical_returns.replace([np.inf, -np.inf], np.nan).ffill()
-        if clean_rets.empty:
+        raw_rets = historical_returns.replace([np.inf, -np.inf], np.nan)
+        if raw_rets.empty:
             raise OptimizationError("historical_returns is empty after sanitisation.", OptimizationErrorType.DATA)
-        # Preserve all rows and impute residual leading NaNs conservatively to 0.
-        # This keeps the sample horizon stable and avoids pathological shrinkage.
+
+        if raw_rets.shape[1] != original_m:
+            raise OptimizationError(
+                "historical_returns columns must align with expected_returns length.",
+                OptimizationErrorType.DATA,
+            )
+
+        lookback = min(max(int(self.cfg.HISTORY_GATE), 1), len(raw_rets))
+        min_valid_ratio = 0.70
+        required_count = max(1, int(np.ceil(lookback * min_valid_ratio)))
+        valid_counts = raw_rets.tail(lookback).notna().sum()
+        keep_mask = valid_counts >= required_count
+        kept_indices = np.flatnonzero(keep_mask.to_numpy())
+        excluded_symbols = valid_counts.index[~keep_mask].tolist()
+
+        if excluded_symbols:
+            logger.info(
+                "[OptimizerGuard] excluded_symbols=%d reason=insufficient_history "
+                "lookback=%d required_non_nan=%d symbols=%s",
+                len(excluded_symbols),
+                lookback,
+                required_count,
+                excluded_symbols,
+            )
+
+        if len(kept_indices) == 0:
+            raise OptimizationError(
+                "No symbols passed optimizer minimum-history gate.",
+                OptimizationErrorType.DATA,
+            )
+
+        expected_returns = expected_returns[kept_indices]
+        prices = prices[kept_indices]
+        adv_shares = adv_shares[kept_indices]
+        if prev_w is not None:
+            prev_w = prev_w[kept_indices]
+        if sector_labels is not None:
+            sector_labels = np.asarray(sector_labels)[kept_indices]
+
+        clean_rets = raw_rets.iloc[:, kept_indices].ffill()
+        # Avoid synthetic zero-padding for sparse/IPO-like series. Fill residual
+        # gaps first with cross-sectional date means, then per-symbol means.
+        row_means = clean_rets.mean(axis=1)
+        clean_rets = clean_rets.T.fillna(row_means).T
+        clean_rets = clean_rets.fillna(clean_rets.mean(axis=0))
         clean_rets = clean_rets.fillna(0.0)
+
+        m = len(kept_indices)
         T          = len(clean_rets)
         min_rows   = self.cfg.DIMENSIONALITY_MULTIPLIER * m
         if T < min_rows:
@@ -1029,4 +1074,6 @@ class InstitutionalRiskEngine:
                 OptimizationErrorType.NUMERICAL,
             )
 
-        return np.round(w_opt, 10)
+        full_w_opt = np.zeros(original_m)
+        full_w_opt[kept_indices] = np.round(w_opt, 10)
+        return full_w_opt
