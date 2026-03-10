@@ -314,6 +314,15 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                     last_scan_date = None
 
             if last_scan_date is not None:
+                split_index_tz = getattr(split_series.index, "tz", None)
+                if split_index_tz is not None:
+                    if last_scan_date.tzinfo is None:
+                        last_scan_date = last_scan_date.tz_localize(split_index_tz)
+                    else:
+                        last_scan_date = last_scan_date.tz_convert(split_index_tz)
+                elif last_scan_date.tzinfo is not None:
+                    last_scan_date = last_scan_date.tz_localize(None)
+
                 window = split_series.loc[(split_series.index > last_scan_date) & (split_series.index <= split_series.index.max())]
             else:
                 window = split_series.tail(1)

@@ -48,3 +48,34 @@ def test_rebalance_values_portfolio_from_previous_close(monkeypatch):
 
     # cash (100) + shares (10) * previous close (10)
     assert captured["pv"] == 200.0
+
+
+def test_run_skips_corporate_actions_when_auto_adjust_prices_enabled(monkeypatch):
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True, DIVIDEND_SWEEP=True, CVAR_MIN_HISTORY=9999)
+    engine = InstitutionalRiskEngine(cfg)
+    bt = be.BacktestEngine(engine, initial_cash=0.0)
+    bt.state.shares["AAA"] = 10
+    bt.state.entry_prices["AAA"] = 100.0
+
+    dates = pd.DatetimeIndex([pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
+    close = pd.DataFrame({"AAA": [100.0, 50.0]}, index=dates)
+    volume = pd.DataFrame({"AAA": [1_000_000, 1_000_000]}, index=dates)
+    returns = close.pct_change(fill_method=None).fillna(0.0)
+
+    dividends = pd.DataFrame({"AAA": [0.0, 5.0]}, index=dates)
+    splits = pd.DataFrame({"AAA": [0.0, 2.0]}, index=dates)
+
+    monkeypatch.setattr(bt, "_run_rebalance", lambda *args, **kwargs: None)
+
+    bt.run(
+        close=close,
+        volume=volume,
+        returns=returns,
+        rebalance_dates=pd.DatetimeIndex([]),
+        start_date="2020-01-01",
+        dividends=dividends,
+        splits=splits,
+    )
+
+    assert bt.state.shares["AAA"] == 10
+    assert bt.state.cash == 0.0

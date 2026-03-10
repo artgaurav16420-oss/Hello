@@ -246,3 +246,30 @@ def test_execute_rebalance_initializes_dividend_marker_on_new_position():
 
     assert state.shares.get("ABC", 0) > 0
     assert state.dividend_ledger["ABC"].startswith("2025-01-15:")
+
+
+def test_detect_and_apply_splits_handles_tz_aware_split_index():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=False)
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 1000.0},
+        last_known_prices={"ABC": 1000.0},
+        cash=0.0,
+        last_rebalance_date="2024-01-01",
+    )
+    idx = pd.date_range("2024-01-01", periods=3, tz="Asia/Kolkata")
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [1000.0, 500.0, 505.0],
+                "Dividends": [0.0, 0.0, 0.0],
+                "Stock Splits": [0.0, 2.0, 0.0],
+            },
+            index=idx,
+        )
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == ["ABC"]
+    assert state.shares["ABC"] == 20

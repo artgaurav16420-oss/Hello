@@ -150,7 +150,6 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
 
     # Single rolling mean across the entire matrix — O(T·N) instead of N × O(T).
     notional_df = pd.DataFrame(notional_cols)
-    notional_df.fillna(0.0, inplace=True)
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
     adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).mean().iloc[-1]
 

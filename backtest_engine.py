@@ -95,7 +95,7 @@ class BacktestEngine:
             close_t  = close.loc[date]
             prices_t = close_t.values.astype(float)
 
-            if splits is not None and date in splits.index:
+            if splits is not None and date in splits.index and not self.engine.cfg.AUTO_ADJUST_PRICES:
                 split_row = splits.loc[date]
                 for sym, old_shares in list(self.state.shares.items()):
                     if old_shares <= 0 or sym not in split_row.index:
@@ -115,7 +115,12 @@ class BacktestEngine:
                     old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
                     self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
 
-            if dividends is not None and date in dividends.index and self.engine.cfg.DIVIDEND_SWEEP:
+            if (
+                dividends is not None
+                and date in dividends.index
+                and self.engine.cfg.DIVIDEND_SWEEP
+                and not self.engine.cfg.AUTO_ADJUST_PRICES
+            ):
                 div_row = dividends.loc[date]
                 for sym, shares in self.state.shares.items():
                     if shares <= 0 or sym not in div_row.index:
@@ -181,7 +186,7 @@ class BacktestEngine:
             .replace([np.inf, -np.inf], np.nan)
         )
 
-        adv_vector = _build_adv_vector(active_symbols, close, volume, date)
+        adv_vector = _build_adv_vector(active_symbols, close, volume, date, cfg=cfg)
 
         # Value the pre-trade portfolio using last fully-observed prices (T-1 close).
         # This avoids lookahead when we size orders that execute on the current bar.
@@ -401,7 +406,13 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
     return result
 
 
-def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFrame, date: pd.Timestamp) -> np.ndarray:
+def _build_adv_vector(
+    symbols: List[str],
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    date: pd.Timestamp,
+    cfg: Optional[UltimateConfig] = None,
+) -> np.ndarray:
     adv = []
     signal_date: Optional[pd.Timestamp] = None
 
@@ -433,7 +444,8 @@ def _build_adv_vector(symbols: List[str], close: pd.DataFrame, volume: pd.DataFr
                 c_series = close.loc[:signal_date, sym]
                 v_series = volume.loc[:signal_date, sym]
                 notional = (c_series * v_series).dropna()
-                lookback = notional.tail(20)
+                adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
+                lookback = notional.tail(adv_lookback)
                 if lookback.empty:
                     adv.append(0.0)
                 else:
