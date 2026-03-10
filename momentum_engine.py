@@ -143,6 +143,7 @@ class UltimateConfig:
     CVAR_DAILY_LIMIT:            float = 0.055
     CVAR_ALPHA:                  float = 0.95
     CVAR_LOOKBACK:               int   = 90
+    ADV_LOOKBACK:                int   = 90
     # 90-day lookback forgets a crash in ~4 months instead of 10.
     # The 200-day default kept COVID-crash tail losses in the CVaR window
     # throughout the entire 2020 recovery, causing persistent soft breaches.

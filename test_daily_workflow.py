@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import daily_workflow as dw
 from momentum_engine import PortfolioState, UltimateConfig
@@ -69,3 +70,16 @@ def test_run_scan_returns_early_when_universe_has_no_data(monkeypatch):
     assert returned_state is state
     assert "^NSEI" in market_data
     assert captured["cfg"] is cfg
+
+
+def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    base = data_dir / "portfolio_state_main.json"
+    base.write_text("{not json", encoding="utf-8")
+    (data_dir / "portfolio_state_main.json.bak.0").write_text("{also bad", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="all discovered state files are corrupted"):
+        dw.load_portfolio_state("main")

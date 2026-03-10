@@ -361,6 +361,8 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 def load_portfolio_state(name: str) -> PortfolioState:
     state_file = f"data/portfolio_state_{name}.json"
     backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
+    corrupted_paths = []
+
     for path in backups:
         if os.path.exists(path):
             try:
@@ -368,6 +370,14 @@ def load_portfolio_state(name: str) -> PortfolioState:
                     return PortfolioState.from_dict(json.load(f))
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
+                corrupted_paths.append(path)
+
+    if corrupted_paths:
+        raise RuntimeError(
+            "Portfolio state recovery failed: all discovered state files are corrupted "
+            f"for '{name}' ({', '.join(corrupted_paths)})."
+        )
+
     return PortfolioState()
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
@@ -463,7 +473,7 @@ def _run_scan(
     close_hist    = close.iloc[:-1]
     regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
     log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
-    adv_arr       = compute_adv(market_data, active)
+    adv_arr       = compute_adv(market_data, active, cfg=cfg)
     prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
     _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
 

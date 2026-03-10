@@ -371,3 +371,24 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
     assert captured["storage"] == ":memory:", (
         f"in_memory=True must use ':memory:' storage, got: {captured['storage']!r}"
     )
+
+
+def test_objective_allows_equal_halflife_values(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 5.0, "turnover": 0.0}
+        rebal_log = None
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 21,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 5.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+    )
+
+    assert objective(trial) != 0.0
