@@ -65,7 +65,7 @@ def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
     assert objective(trial) == 0.0
 
 
-def test_objective_prunes_trial_on_optimization_error(monkeypatch):
+def test_objective_propagates_optimization_error(monkeypatch):
     monkeypatch.setattr(
         optimizer,
         "run_backtest",
@@ -85,11 +85,11 @@ def test_objective_prunes_trial_on_optimization_error(monkeypatch):
         }
     )
 
-    with pytest.raises(optuna.TrialPruned):
+    with pytest.raises(optimizer.OptimizationError, match="Solver failed"):
         objective(trial)
 
 
-def test_objective_logs_unexpected_errors_as_warning_and_prunes(monkeypatch, caplog):
+def test_objective_propagates_unexpected_errors(monkeypatch):
     monkeypatch.setattr(
         optimizer,
         "run_backtest",
@@ -107,11 +107,8 @@ def test_objective_logs_unexpected_errors_as_warning_and_prunes(monkeypatch, cap
         }
     )
 
-    with caplog.at_level("WARNING", logger="Optimizer"):
-        with pytest.raises(optuna.TrialPruned):
-            objective(trial)
-
-    assert "Trial failed due to internal error" in caplog.text
+    with pytest.raises(TypeError, match="bad type"):
+        objective(trial)
 
 
 def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch):
@@ -260,7 +257,7 @@ def test_objective_uses_configurable_search_space(monkeypatch):
     assert round(objective(trial), 6) == round((10.0 / 6.0) - 0.5, 6)
 
 
-def test_run_optimization_passes_parallel_jobs_to_optuna(monkeypatch):
+def test_run_optimization_forces_single_job(monkeypatch):
     monkeypatch.setattr(optimizer, "N_TRIALS", 1)
     monkeypatch.setattr(optimizer, "N_JOBS", 3)
     monkeypatch.setattr(optimizer, "pre_load_data", lambda universe_type: {})
@@ -291,7 +288,7 @@ def test_run_optimization_passes_parallel_jobs_to_optuna(monkeypatch):
 
     optimizer.run_optimization()
 
-    assert captured["n_jobs"] == 3
+    assert captured["n_jobs"] == 1
 
 
 def test_run_optimization_uses_selected_universe(monkeypatch):
@@ -608,3 +605,82 @@ def test_optimizer_turnover_penalty_respects_execution_floor_and_cap(monkeypatch
     base_one_way = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     assert turnover_q[0] == pytest.approx(base_one_way)
     assert turnover_q[1] == pytest.approx(0.05)
+
+
+def test_objective_cvar_lookback_min_scales_with_dimensionality(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}
+        rebal_log = None
+
+    class _DummyCfg:
+        HALFLIFE_FAST = 21
+        HALFLIFE_SLOW = 63
+        CONTINUITY_BONUS = 0.15
+        RISK_AVERSION = 5.0
+        CVAR_DAILY_LIMIT = 0.04
+        CVAR_LOOKBACK = 60
+        DIMENSIONALITY_MULTIPLIER = 3
+        MAX_POSITIONS = 30
+
+    class _RecordingTrial:
+        params = {}
+
+        def __init__(self):
+            self.bounds = {}
+
+        def suggest_int(self, name, low, high, step=1):
+            self.bounds[name] = (low, high, step)
+            return low
+
+        def suggest_float(self, name, low, high, step=None):
+            return low
+
+    monkeypatch.setattr(optimizer, "UltimateConfig", _DummyCfg)
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = _RecordingTrial()
+
+    objective(trial)
+
+    assert trial.bounds["CVAR_LOOKBACK"][0] == 90
+
+
+def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch):
+    class _DummyCfg:
+        HALFLIFE_FAST = 21
+        HALFLIFE_SLOW = 63
+        CONTINUITY_BONUS = 0.15
+        RISK_AVERSION = 5.0
+        CVAR_DAILY_LIMIT = 0.04
+        CVAR_LOOKBACK = 60
+        DIMENSIONALITY_MULTIPLIER = 3
+        MAX_POSITIONS = 60
+
+    monkeypatch.setattr(optimizer, "UltimateConfig", _DummyCfg)
+
+    objective = optimizer.MomentumObjective(
+        market_data={},
+        universe_type="nifty500",
+        search_space={
+            "HALFLIFE_FAST": (10, 40),
+            "HALFLIFE_SLOW": (50, 120),
+            "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
+            "RISK_AVERSION": (5.0, 15.0, 0.5),
+            "CVAR_DAILY_LIMIT": (0.04, 0.09, 0.005),
+            "CVAR_LOOKBACK": (60, 150, 10),
+        },
+    )
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 63,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 5.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+            "CVAR_LOOKBACK": 150,
+        }
+    )
+
+    with pytest.raises(optuna.TrialPruned):
+        objective(trial)

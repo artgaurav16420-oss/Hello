@@ -1,8 +1,9 @@
 """
-optimizer.py — Institutional Bayesian Walk-Forward Optimizer v11.46
-===================================================================
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.46
+====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
-Implements strict Out-of-Sample (OOS) validation to prevent curve-fitting.
+Uses expanding-window time-series cross-validation for parameter selection,
+followed by a true holdout Out-of-Sample (OOS) validation period.
 
 Requires: pip install optuna
 """
@@ -103,26 +104,14 @@ SEARCH_SPACE_BOUNDS = {
     "CVAR_LOOKBACK":    (60, 150, 10),
 }
 
-# Runtime knobs: use all cores by default and allow optional deterministic seed.
-N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "-1"))
+# Runtime knobs: optimization runs in-process (`n_jobs=1`) by default because
+# Optuna's threaded `n_jobs>1` does not scale CPU-bound backtests under the GIL.
+# For parallel speedup, run multiple python processes against shared storage.
+N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED = os.getenv("OPTUNA_SEED")
 
-# SQLITE CONTENTION FIX: When using SQLite storage (the default), parallel Optuna
-# workers all compete for the same write lock.  SQLite serialises every INSERT, so
-# with n_jobs=-1 workers queue behind the lock holder and produce the periodic
-# ~10-minute freezes visible in the progress bar.  To avoid this:
-#   • If the user explicitly set OPTUNA_N_JOBS we honour it (they know what they want).
-#   • Otherwise, cap at 1 worker when the SQLite backend is active.
-# Use OPTUNA_STORAGE=":memory:" (or any non-file URI) to re-enable parallelism
-# with an in-memory study (no resume capability, but no lock contention).
+# Storage backend for Optuna study persistence (SQLite by default).
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
-_sqlite_storage = OPTUNA_STORAGE.startswith("sqlite:")
-if "OPTUNA_N_JOBS" not in os.environ and _sqlite_storage:
-    N_JOBS = 1
-    logger.info(
-        "SQLite storage detected — capping n_jobs=1 to prevent write-lock contention. "
-        "Set OPTUNA_STORAGE=:memory: and OPTUNA_N_JOBS=-1 for parallel in-memory runs."
-    )
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
@@ -148,7 +137,7 @@ def _build_sampler() -> TPESampler:
 
 def _iter_wfo_slices(train_start: str, train_end: str):
     """
-    Yield (is_start, is_end, oos_start, oos_end) expanding walk-forward slices
+    Yield (is_start, is_end, oos_start, oos_end) expanding time-series CV slices
     confined entirely within the training window.
 
     With TRAIN_START=2018 / TRAIN_END=2022 this yields 4 slices:
@@ -255,60 +244,48 @@ class MomentumObjective:
         # dragging crash returns forward for months after the event has passed.
         cvar_lb_bounds = self.search_space.get("CVAR_LOOKBACK", (60, 150, 10))
         cvar_lb_min, cvar_lb_max, cvar_lb_step = cvar_lb_bounds
+        min_required_lookback = cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS
+        effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
+
+        # No feasible CVAR_LOOKBACK exists inside the configured bounds.
+        if effective_cvar_lb_min > int(cvar_lb_max):
+            raise optuna.TrialPruned()
+
         if isinstance(trial, optuna.trial.FixedTrial) and "CVAR_LOOKBACK" not in trial.params:
             # Backward-compatible fallback for manually constructed FixedTrial
             # objects that predate the CVAR_LOOKBACK search dimension.
-            cfg.CVAR_LOOKBACK = UltimateConfig().CVAR_LOOKBACK
+            cfg.CVAR_LOOKBACK = max(UltimateConfig().CVAR_LOOKBACK, effective_cvar_lb_min)
         else:
             cfg.CVAR_LOOKBACK = trial.suggest_int(
-                "CVAR_LOOKBACK", cvar_lb_min, cvar_lb_max, step=cvar_lb_step
+                "CVAR_LOOKBACK", effective_cvar_lb_min, cvar_lb_max, step=cvar_lb_step
             )
-        # Prune if lookback is shorter than LedoitWolf minimum row requirement.
-        if cfg.CVAR_LOOKBACK < cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS:
-            raise optuna.TrialPruned()
 
-        # 5. Walk-forward evaluation on expanding windows
-        # NOTE: IS runs are NOT executed here. Each OOS backtest starts from
-        # cash=INITIAL_CAPITAL (no state transfer). The IS run was previously
-        # assigning to `_` and discarding the result — pure compute waste.
-        # Parameters that crash during IS would throw an exception caught below
-        # as TrialPruned, so the validation is equivalent.
+        # 5. Expanding-window time-series CV evaluation
         scores = []
-        try:
-            for wf_train_start, wf_train_end, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
-                oos_year = pd.Timestamp(wf_oos_start).year
+        for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
+            oos_year = pd.Timestamp(wf_oos_start).year
 
-                # EXCLUDE 2019 from scoring (see _iter_wfo_slices docstring).
-                # Still run the OOS backtest so exceptions propagate (parameters
-                # that produce NaN signals in 2019 should be pruned), but do not
-                # append its score to the aggregate.
-                exclude_from_score = (oos_year == 2019)
+            # EXCLUDE 2019 from scoring (see _iter_wfo_slices docstring).
+            # Still run the OOS backtest so exceptions propagate (parameters
+            # that produce NaN signals in 2019 should be pruned), but do not
+            # append its score to the aggregate.
+            exclude_from_score = (oos_year == 2019)
 
-                oos = run_backtest(
-                    market_data=self.market_data,
-                    universe_type=self.universe_type,
-                    start_date=wf_oos_start,
-                    end_date=wf_oos_end,
-                    cfg=cfg
-                )
-                m = oos.metrics
-                score = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
-
-                if not pd.notna(score):
-                    raise optuna.TrialPruned()
-
-                if not exclude_from_score:
-                    scores.append(float(score))
-
-        except OptimizationError:
-            raise optuna.TrialPruned()
-        except Exception as e:
-            logger.warning(
-                "Trial failed due to internal error: [%s] %s",
-                type(e).__name__,
-                repr(e),
+            oos = run_backtest(
+                market_data=self.market_data,
+                universe_type=self.universe_type,
+                start_date=wf_oos_start,
+                end_date=wf_oos_end,
+                cfg=cfg
             )
-            raise optuna.TrialPruned()
+            m = oos.metrics
+            score = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
+
+            if not pd.notna(score):
+                raise optuna.TrialPruned()
+
+            if not exclude_from_score:
+                scores.append(float(score))
 
         if not scores:
             raise optuna.TrialPruned()
@@ -371,8 +348,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
     # Priority: explicit in_memory flag > OPTUNA_STORAGE env var > SQLite default.
     if in_memory:
         effective_storage = ":memory:"
-        # Remove the SQLite cap: in-memory storage has no write-lock contention.
-        effective_n_jobs  = int(os.getenv("OPTUNA_N_JOBS", "-1"))
+        effective_n_jobs = 1
         logger.info(
             "In-memory mode: storage=:memory:, n_jobs=%d. "
             "Note — trial history will not be persisted; interrupted runs cannot be resumed.",
@@ -380,24 +356,16 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
         )
     else:
         effective_storage = OPTUNA_STORAGE
-        effective_n_jobs  = N_JOBS   # already capped to 1 for SQLite (see module-level logic)
+        effective_n_jobs = N_JOBS
 
-    # TPE is a sequential acquisition model.  With n_jobs > 1, multiple trials
-    # are *sampled* simultaneously before any complete, so all share the same
-    # (incomplete) observation history.  This weakens TPE toward random search
-    # for the first ~(4 × n_jobs) trials.  With N_TRIALS=55 and n_jobs=8 you
-    # get only ~7 true sequential TPE rounds — borderline for a 5-D search
-    # space.  Warn so the operator can tune N_TRIALS accordingly.
-    if effective_n_jobs != 1 and abs(effective_n_jobs) > 1:
-        tpe_rounds = N_TRIALS // max(abs(effective_n_jobs), 1)
-        if tpe_rounds < 10:
-            logger.warning(
-                "n_jobs=%d with N_TRIALS=%d yields only ~%d sequential TPE rounds — "
-                "consider increasing N_TRIALS to at least %d for reliable convergence.",
-                effective_n_jobs, N_TRIALS, tpe_rounds, abs(effective_n_jobs) * 10,
-            )
+    if effective_n_jobs != 1:
+        logger.warning(
+            "Forcing n_jobs=1 because backtests are CPU-bound and Optuna uses threads. "
+            "Use multiple optimizer processes with shared storage for real parallelism."
+        )
+        effective_n_jobs = 1
 
-    print(f"\n\033[1;36m=== INSTITUTIONAL WALK-FORWARD OPTIMIZER ===\033[0m")
+    print(f"\n\033[1;36m=== INSTITUTIONAL TIME-SERIES CV OPTIMIZER ===\033[0m")
     print(f"\033[90mIn-Sample (Train) : {TRAIN_START} to {TRAIN_END}\033[0m")
     print(f"\033[90mOut-of-Sample     : {TEST_START} to {TEST_END}\033[0m")
     print(f"\033[90mTrials            : {N_TRIALS}\033[0m\n")
@@ -419,13 +387,17 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
 
     # 2. Run In-Sample Optimization
     logger.info(f"Starting {N_TRIALS} Bayesian Trials (This may take a while)...")
-    study.optimize(
-        objective, 
-        n_trials=N_TRIALS, 
-        show_progress_bar=True,
-        n_jobs=effective_n_jobs,
-        catch=(Exception,)
-    )
+    try:
+        study.optimize(
+            objective,
+            n_trials=N_TRIALS,
+            show_progress_bar=True,
+            n_jobs=effective_n_jobs,
+            catch=(OptimizationError,),
+        )
+    except Exception:
+        logger.exception("Optimization aborted due to unexpected internal error.")
+        raise
 
     if not study.best_trials:
         raise RuntimeError(
@@ -503,9 +475,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help=(
             "Use Optuna in-memory storage instead of the default SQLite backend. "
-            "Eliminates write-lock contention so all CPU cores can run trials in parallel. "
+            "Eliminates write-lock contention for local runs. "
             "Trade-off: interrupted runs cannot be resumed (no on-disk checkpoint). "
-            "Equivalent to: OPTUNA_STORAGE=':memory:' OPTUNA_N_JOBS=-1"
+            "Uses in-process execution (n_jobs=1)"
         ),
     )
     return parser.parse_args(argv)
