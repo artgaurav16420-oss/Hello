@@ -37,6 +37,27 @@ REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
     ],
 }
 
+GITHUB_TREE_API_URLS: dict[str, list[str]] = {
+    "nifty500": [
+        "https://api.github.com/repos/india-investing/historical-index-constituents/git/trees/main?recursive=1",
+        "https://api.github.com/repos/india-investing/historical-index-constituents/git/trees/master?recursive=1",
+    ],
+    "nse_total": [
+        "https://api.github.com/repos/india-investing/historical-index-constituents/git/trees/main?recursive=1",
+        "https://api.github.com/repos/india-investing/historical-index-constituents/git/trees/master?recursive=1",
+    ],
+}
+
+ARCHIVE_FILE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "nifty500": (
+        "raw_nifty500_archives.csv",
+        "raw_nifty_archives.csv",
+    ),
+    "nse_total": (
+        "raw_nse_total_archives.csv",
+    ),
+}
+
 
 def _candidate_remote_archive_urls(universe_type: str) -> list[str]:
     env_key = f"HIST_BUILDER_{universe_type.upper()}_ARCHIVE_URL"
@@ -72,7 +93,69 @@ def _download_master_archive(universe_type: str, output_path: Path) -> Path | No
         except Exception as exc:
             logger.warning("[HistoricalBuilder] Download failed for %s from %s: %s", universe_type, url, exc)
 
+    discovered = _discover_archive_urls_from_github(universe_type, headers=headers)
+    for url in discovered:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            preview = pd.read_csv(io.StringIO(resp.text), nrows=5)
+            if preview.empty and len(preview.columns) < 2:
+                raise ValueError("downloaded archive does not look like a valid CSV")
+            output_path.write_text(resp.text, encoding="utf-8")
+            logger.info("[HistoricalBuilder] Downloaded %s archive via discovered URL %s", universe_type, url)
+            return output_path
+        except Exception as exc:
+            logger.warning(
+                "[HistoricalBuilder] Download failed for %s from discovered URL %s: %s",
+                universe_type,
+                url,
+                exc,
+            )
+
     return None
+
+
+def _discover_archive_urls_from_github(universe_type: str, headers: dict[str, str] | None = None) -> list[str]:
+    patterns = ARCHIVE_FILE_PATTERNS.get(universe_type, ())
+    if not patterns:
+        return []
+
+    matches: list[str] = []
+    seen: set[str] = set()
+    for api_url in GITHUB_TREE_API_URLS.get(universe_type, []):
+        try:
+            resp = requests.get(api_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            tree = payload.get("tree", [])
+            for node in tree:
+                path = str(node.get("path", ""))
+                if not any(path.endswith(name) for name in patterns):
+                    continue
+                if node.get("type") != "blob":
+                    continue
+                raw_url = _github_api_to_raw_url(api_url, path)
+                if raw_url and raw_url not in seen:
+                    seen.add(raw_url)
+                    matches.append(raw_url)
+        except Exception as exc:
+            logger.warning("[HistoricalBuilder] GitHub tree discovery failed for %s: %s", api_url, exc)
+
+    return matches
+
+
+def _github_api_to_raw_url(api_url: str, path: str) -> str:
+    marker = "repos/"
+    if marker not in api_url:
+        return ""
+    repo_part = api_url.split(marker, 1)[1]
+    if "/git/trees/" not in repo_part:
+        return ""
+    owner_repo, branch_part = repo_part.split("/git/trees/", 1)
+    branch = branch_part.split("?", 1)[0].strip()
+    if not owner_repo or not branch or not path:
+        return ""
+    return f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{path}"
 
 
 def _ns_ticker(sym: str) -> str:
