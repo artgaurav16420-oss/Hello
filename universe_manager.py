@@ -14,7 +14,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -484,30 +484,35 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
         import yfinance as yf
 
-        def _fetch_single_sector(sym: str) -> Tuple[str, str]:
-            try:
-                ns_sym = sym + ".NS"
-                ticker_obj = yf.Ticker(ns_sym)
-                info = ticker_obj.info
-                # Some assets are ETFs or missing standard equity fields
-                sector = info.get("sector", "Unknown")
-                return sym, sector
-            except Exception as e:
-                logger.debug("Failed to fetch sector for %s: %s", sym, e)
-                return sym, "Unknown"
+        try:
+            batch = yf.Tickers(" ".join(f"{sym}.NS" for sym in missing_tickers))
+            ticker_objs = getattr(batch, "tickers", {}) or {}
+            for bare_sym in missing_tickers:
+                ns_sym = f"{bare_sym}.NS"
+                ticker_obj = ticker_objs.get(ns_sym)
+                if ticker_obj is None:
+                    ticker_obj = yf.Ticker(ns_sym)
+                sector = "Unknown"
+                try:
+                    info = getattr(ticker_obj, "info", {}) or {}
+                    sector = str(info.get("sector", "Unknown") or "Unknown")
+                except Exception as e:
+                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e)
+                resolved_map[bare_sym] = sector
+        except Exception as exc:
+            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc)
 
-        # FIX (Bug-7): Reduced max_workers from 8 to 1 and made it sequential.
-        # Concurrent yfinance.info calls on a large selection trigger Yahoo Finance
-        # rate-limiting (HTTP 429 / 401), causing all workers to return "Unknown"
-        # sector for every ticker. A single worker is slower (~2s per ticker) but
-        # produces correct results. The static STATIC_NSE_SECTORS map already covers
-        # the Nifty 50 blue-chips, so the network call is only reached for mid/small
-        # caps not in that map.
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future_to_sym = {pool.submit(_fetch_single_sector, sym): sym for sym in missing_tickers}
-            for future in as_completed(future_to_sym):
-                sym, sector = future.result()
-                resolved_map[sym] = sector
+            def _fetch_single_sector(sym: str) -> Tuple[str, str]:
+                try:
+                    info = (yf.Ticker(sym + ".NS").info) or {}
+                    return sym, str(info.get("sector", "Unknown") or "Unknown")
+                except Exception as e:
+                    logger.debug("Failed to fetch sector for %s: %s", sym, e)
+                    return sym, "Unknown"
+
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
+                for sym, sector in pool.map(_fetch_single_sector, missing_tickers):
+                    resolved_map[sym] = sector
                 
         # Update cache with newly found sectors
         if use_cache:

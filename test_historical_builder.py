@@ -60,3 +60,21 @@ def test_bootstrap_historical_parquet_warns_stub_content(tmp_path, monkeypatch, 
 
     assert out.exists()
     assert "3-ticker stub universe" in caplog.text
+
+
+def test_load_master_archive_supports_wide_date_rows_truthy_filter(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    raw = data_dir / "raw_nifty_archives.csv"
+    raw.write_text(
+        "date,RELIANCE,TCS\n2020-01-31,1,0\n2020-02-28,1,1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    out = hb._load_master_archive("nifty500")
+
+    assert set(out.columns) == {"date", "ticker"}
+    assert set(out["date"]) == {"2020-01-31", "2020-02-28"}
+    jan = out[out["date"] == "2020-01-31"]["ticker"].tolist()
+    assert jan == ["RELIANCE.NS"]

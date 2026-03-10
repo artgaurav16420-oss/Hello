@@ -33,17 +33,18 @@ def compute_regime_score(
     High score -> Risk-on (upward trend, low volatility)
     Low score -> Risk-off (downward trend, high volatility)
     """
-    if idx_hist is None or len(idx_hist) < (
-        int(getattr(cfg, "SIGNAL_ANNUAL_FACTOR", 252)) if cfg else 252
-    ):
-        logger.debug("[Signals] Insufficient index history for regime. Defaulting to 0.5")
+    if idx_hist is None or idx_hist.empty:
+        logger.debug("[Signals] Missing index history for regime. Defaulting to 0.5")
         return 0.5
         
     close_series = idx_hist["Close"]
     
     # 1. Trend component (Distance from 200-day SMA)
     sma_window = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
-    sma200 = float(close_series.rolling(window=sma_window).mean().iloc[-1])
+    if len(close_series) >= sma_window:
+        sma200 = float(close_series.rolling(window=sma_window).mean().iloc[-1])
+    else:
+        sma200 = float(close_series.expanding(min_periods=20).mean().iloc[-1])
     last_price = float(close_series.iloc[-1])
     
     if sma200 <= 0 or not np.isfinite(sma200):
@@ -78,15 +79,20 @@ def compute_regime_score(
 
     breadth_component = 0.5
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
-    if universe_close_hist is not None and not universe_close_hist.empty and len(universe_close_hist) >= _sma_win:
-        recent = universe_close_hist.iloc[-_sma_win:]
-        min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
-        obs_count = recent.notna().sum()
-        sma200 = recent.mean()
+    if universe_close_hist is not None and not universe_close_hist.empty:
+        if len(universe_close_hist) >= _sma_win:
+            recent = universe_close_hist.iloc[-_sma_win:]
+            min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
+            obs_count = recent.notna().sum()
+            sma_vals = recent.mean()
+        else:
+            min_obs = 20
+            obs_count = universe_close_hist.notna().sum()
+            sma_vals = universe_close_hist.expanding(min_periods=min_obs).mean().iloc[-1]
         last = universe_close_hist.iloc[-1]
-        valid = (obs_count >= min_obs) & (sma200 > 0) & sma200.notna() & last.notna()
+        valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
         if valid.any():
-            breadth_component = float((last[valid] > sma200[valid]).mean())
+            breadth_component = float((last[valid] > sma_vals[valid]).mean())
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     return round(float(np.clip(composite, 0.0, 1.0)), 10)
@@ -102,7 +108,7 @@ def compute_single_adv(df: pd.DataFrame) -> float:
         if "Close" not in df.columns or "Volume" not in df.columns:
             return 0.0
             
-        notional = (df["Close"] * df["Volume"]).replace(0, np.nan).ffill().fillna(0)
+        notional = df["Close"] * df["Volume"]
         if notional.empty:
             return 0.0
             

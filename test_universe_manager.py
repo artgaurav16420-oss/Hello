@@ -222,3 +222,33 @@ def test_apply_adv_filter_raises_on_any_chunk_failure(monkeypatch):
 
     with pytest.raises(um.UniverseFetchError, match="ADV filter failed for 1 chunk"):
         _apply_adv_filter(tickers, UltimateConfig(MIN_ADV_CRORES=1))
+
+
+def test_get_sector_map_prefers_batched_yfinance_tickers(monkeypatch):
+    calls = {"tickers": 0, "ticker": 0}
+
+    class _Obj:
+        def __init__(self, sector):
+            self.info = {"sector": sector}
+
+    class _Batch:
+        def __init__(self):
+            self.tickers = {"FOO.NS": _Obj("Energy"), "BAR.NS": _Obj("IT")}
+
+    class _YF:
+        @staticmethod
+        def Tickers(_symbols):
+            calls["tickers"] += 1
+            return _Batch()
+
+        @staticmethod
+        def Ticker(_symbol):
+            calls["ticker"] += 1
+            return _Obj("Unknown")
+
+    monkeypatch.setitem(__import__('sys').modules, 'yfinance', _YF)
+
+    out = um.get_sector_map(["FOO.NS", "BAR.NS"], use_cache=False)
+
+    assert out == {"FOO.NS": "Energy", "BAR.NS": "IT"}
+    assert calls["tickers"] == 1
