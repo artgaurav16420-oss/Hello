@@ -392,3 +392,25 @@ def test_objective_allows_equal_halflife_values(monkeypatch):
     )
 
     assert objective(trial) != 0.0
+
+
+def test_stdout_supports_rupee_with_utf8_stream():
+    class _Stream:
+        encoding = "utf-8"
+        errors = "strict"
+
+    assert optimizer._stdout_supports_rupee(_Stream()) is True
+
+
+def test_stdout_supports_rupee_falls_back_for_cp1252_stream():
+    class _Stream:
+        encoding = "cp1252"
+        errors = "strict"
+
+    assert optimizer._stdout_supports_rupee(_Stream()) is False
+
+
+def test_stdout_supports_rupee_false_when_stdout_missing(monkeypatch):
+    monkeypatch.setattr(optimizer.sys, "stdout", None)
+
+    assert optimizer._stdout_supports_rupee() is False
