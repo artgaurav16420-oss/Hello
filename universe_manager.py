@@ -292,7 +292,9 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     # "Invalid Crumb"), causing entire chunks to return empty and incorrectly
     # disqualifying hundreds of valid liquid stocks.  Sequential processing
     # (~30s for 500 tickers) produces reliable, complete ADV results.
-    for chunk in chunks:
+    chunk_failures: List[Dict[str, object]] = []
+
+    for chunk_idx, chunk in enumerate(chunks):
         try:
             data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
             for symbol in chunk:
@@ -309,7 +311,30 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                         # causing downstream cache-key mismatches.
                         filtered_tickers.append(ns_sym)
         except Exception as exc:
-            logger.error("[Universe] Error processing ADV chunk: %s", exc)
+            failure = {
+                "chunk_index": chunk_idx,
+                "symbols": list(chunk),
+                "error": str(exc),
+            }
+            chunk_failures.append(failure)
+            logger.error(
+                "[Universe] Error processing ADV chunk %d (size=%d): %s",
+                chunk_idx,
+                len(chunk),
+                exc,
+            )
+
+    if chunk_failures:
+        failed_symbol_preview = [
+            symbol
+            for failure in chunk_failures
+            for symbol in failure["symbols"][:3]
+        ][:6]
+        preview_txt = ", ".join(failed_symbol_preview) if failed_symbol_preview else "n/a"
+        raise UniverseFetchError(
+            "ADV filter failed for "
+            f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
+        )
 
     return filtered_tickers
 
@@ -359,6 +384,14 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         _save_universe_cache(cache)
         return liquid_tickers
         
+    except UniverseFetchError as exc:
+        logger.error("[Universe] NSE master fetch failed during ADV filtering: %s", exc)
+        if entry:
+            logger.warning("[Universe] Using stale cache for NSE Total Equity.")
+            return entry["tickers"]
+
+        exc.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
+        raise
     except Exception as exc:
         logger.error("[Universe] NSE master fetch failed: %s", exc)
         if entry:
