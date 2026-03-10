@@ -255,7 +255,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
     Detects splits and sweeps dividends to ensure cash ledger accuracy.
     """
     adjusted: List[str] = []
-    
+
     for sym in list(state.shares.keys()):
         ns = to_ns(sym)
         row = market_data.get(ns)
@@ -291,33 +291,34 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if last_price is None or last_price <= 0:
             continue
 
-        ratio = last_price / current_price
+        if not getattr(cfg, "AUTO_ADJUST_PRICES", True):
+            ratio = last_price / current_price
 
-        # Broader institutional ratio list with a tighter tolerance
-        split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
-        for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
-            if abs(ratio - r) / r <= split_tolerance:
-                old_shares     = state.shares[sym]
-                theoretical_new_shares = old_shares * r
-                new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
-                old_entry      = state.entry_prices.get(sym, current_price * r)
-                new_entry      = old_entry / r
+            # Broader institutional ratio list with a tighter tolerance
+            split_tolerance = getattr(cfg, "SPLIT_TOLERANCE", 0.005)
+            for r in [2, 5, 10, 3, 4, 20, 1.5, 1.25, 0.666, 0.5, 0.2]:
+                if abs(ratio - r) / r <= split_tolerance:
+                    old_shares     = state.shares[sym]
+                    theoretical_new_shares = old_shares * r
+                    new_shares     = int(np.floor(theoretical_new_shares + 1e-12))
+                    old_entry      = state.entry_prices.get(sym, current_price * r)
+                    new_entry      = old_entry / r
 
-                # Safely sweep fractional shares
-                fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
-                fractional_value = fractional_new_shares * current_price
-                state.cash = round(state.cash + fractional_value, 10)
+                    # Safely sweep fractional shares
+                    fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
+                    fractional_value = fractional_new_shares * current_price
+                    state.cash = round(state.cash + fractional_value, 10)
 
-                logger.warning(
-                    "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
-                    "shares %d→%d entry_price ₹%.2f→₹%.2f",
-                    sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
-                )
-                state.shares[sym]       = new_shares
-                state.entry_prices[sym] = round(new_entry, 4)
-                state.last_known_prices[sym] = current_price
-                adjusted.append(sym)
-                break
+                    logger.warning(
+                        "SPLIT DETECTED: %s ratio=%.3f (≈%gx) "
+                        "shares %d→%d entry_price ₹%.2f→₹%.2f",
+                        sym, ratio, r, old_shares, new_shares, old_entry, new_entry,
+                    )
+                    state.shares[sym]       = new_shares
+                    state.entry_prices[sym] = round(new_entry, 4)
+                    state.last_known_prices[sym] = current_price
+                    adjusted.append(sym)
+                    break
 
     return adjusted
 
@@ -458,13 +459,16 @@ def _run_scan(
         if _absent_sym not in active_idx:
             _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
             if _fallback_px > 0:
-                mtm_notional += state.shares[_absent_sym] * _fallback_px
+                _absent_n = int(state.absent_periods.get(_absent_sym, 0))
+                _haircut = max(0.0, 1.0 - (_absent_n / max(cfg.MAX_ABSENT_PERIODS, 1)))
+                _mtm_px = _fallback_px * _haircut
+                mtm_notional += state.shares[_absent_sym] * _mtm_px
                 logger.warning(
                     "[Scan] Held symbol '%s' absent from current market data "
-                    "(possibly delisted/suspended). Using last-known price ₹%.2f "
-                    "for PV calculation. Position will be force-closed after "
-                    "%d consecutive absent periods.",
-                    _absent_sym, _fallback_px, cfg.MAX_ABSENT_PERIODS,
+                    "(possibly delisted/suspended). Applying absence haircut %.1f%% "
+                    "to last-known price ₹%.2f for PV calculation (mark ₹%.2f). "
+                    "Position will be force-closed after %d consecutive absent periods.",
+                    _absent_sym, (1.0 - _haircut) * 100.0, _fallback_px, _mtm_px, cfg.MAX_ABSENT_PERIODS,
                 )
     pv = mtm_notional + state.cash
     initial_cash = state.cash
@@ -491,6 +495,7 @@ def _run_scan(
     trade_log: List[Trade] = []
     sel_idx: List[int]   = []
     _force_full_cash     = False
+    _soft_cvar_breach    = False
 
     # ── Book CVaR screen ──────────────────────────────────────────────────────
     if state.shares:
@@ -509,6 +514,7 @@ def _run_scan(
             _force_full_cash = True
             activate_override_on_stress(state, cfg)
         elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+            _soft_cvar_breach = True
             logger.info(
                 "[Scan] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) — "
                 "running optimizer with CVaR constraint active.",
@@ -590,6 +596,7 @@ def _run_scan(
             date_context=pd.Timestamp(end_date), trade_log=trade_log,
             apply_decay    = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _scenario_losses,
+            force_rebalance_trades = _soft_cvar_breach,
         )
         if _exhaust_decay:
             state.decay_rounds = 0

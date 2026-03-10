@@ -232,6 +232,27 @@ def test_optimizer_raises_data_error_on_thin_history():
     assert exc_info.value.error_type == OptimizationErrorType.DATA
 
 
+def test_optimizer_handles_sparse_nans_without_matrix_collapse():
+    n, m = 30, 3
+    log_rets = _make_log_rets(n, m)
+    # Stagger leading NaNs so at least one column is NaN on many rows.
+    log_rets.iloc[:15, 0] = np.nan
+    log_rets.iloc[:12, 1] = np.nan
+    log_rets.iloc[:9, 2] = np.nan
+
+    engine = _make_engine()
+    w = engine.optimize(
+        np.array([0.001, 0.0012, 0.0008]),
+        log_rets,
+        np.ones(m) * 2e8,
+        np.array([100.0, 500.0, 1000.0]),
+        1_000_000.0,
+        exposure_multiplier=1.0,
+    )
+    assert np.isfinite(w).all()
+    assert len(w) == m
+
+
 def test_optimizer_rejects_non_finite_inputs():
     log_rets = _make_log_rets(120, 4)
     engine   = _make_engine()
@@ -509,6 +530,69 @@ def test_execute_rebalance_pv_includes_stale_positions():
     assert "STALE" not in state.shares, "With MAX_ABSENT_PERIODS=1, one absence closes position."
 
 
+def test_execute_rebalance_uses_notional_adv_for_impact_parity():
+    cfg = UltimateConfig(IMPACT_COEFF=100.0, ROUND_TRIP_SLIPPAGE_BPS=20.0)
+
+    state_low = PortfolioState(cash=1_000_000.0)
+    slip_low = execute_rebalance(
+        state_low,
+        target_weights=np.array([1.0]),
+        prices=np.array([100.0]),
+        active_symbols=["LOW"],
+        cfg=cfg,
+        adv_shares=np.array([1e8]),
+    )
+
+    state_high = PortfolioState(cash=1_000_000.0)
+    slip_high = execute_rebalance(
+        state_high,
+        target_weights=np.array([1.0]),
+        prices=np.array([1000.0]),
+        active_symbols=["HIGH"],
+        cfg=cfg,
+        adv_shares=np.array([1e8]),
+    )
+
+    assert slip_low == pytest.approx(slip_high, rel=1e-6)
+
+
+def test_execute_rebalance_force_rebalance_trades_bypasses_drift_tolerance():
+    cfg = UltimateConfig(DRIFT_TOLERANCE=0.05, MAX_SINGLE_NAME_WEIGHT=1.0)
+
+    no_force = PortfolioState(cash=0.0)
+    no_force.shares = {"A": 100, "B": 100}
+    no_force.weights = {"A": 0.50, "B": 0.50}
+    no_force.entry_prices = {"A": 100.0, "B": 100.0}
+    no_force.last_known_prices = {"A": 100.0, "B": 100.0}
+
+    execute_rebalance(
+        no_force,
+        target_weights=np.array([0.51, 0.49]),
+        prices=np.array([100.0, 100.0]),
+        active_symbols=["A", "B"],
+        cfg=cfg,
+        force_rebalance_trades=False,
+    )
+
+    force = PortfolioState(cash=0.0)
+    force.shares = {"A": 100, "B": 100}
+    force.weights = {"A": 0.50, "B": 0.50}
+    force.entry_prices = {"A": 100.0, "B": 100.0}
+    force.last_known_prices = {"A": 100.0, "B": 100.0}
+
+    execute_rebalance(
+        force,
+        target_weights=np.array([0.51, 0.49]),
+        prices=np.array([100.0, 100.0]),
+        active_symbols=["A", "B"],
+        cfg=cfg,
+        force_rebalance_trades=True,
+    )
+
+    assert no_force.shares["A"] == 100
+    assert force.shares["A"] == 102
+
+
 def test_execute_rebalance_cash_conservation():
     cfg   = UltimateConfig()
     state = PortfolioState(cash=1_000_000.0)
@@ -526,10 +610,21 @@ def test_detect_and_apply_splits_fractional_cash():
     state.last_known_prices = {"A": 100.0}
 
     market_data = {"A": pd.DataFrame({"Close": [200.0]})}
-    detect_and_apply_splits(state, market_data, UltimateConfig())
+    detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=False))
 
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
     assert state.cash == 100.0, "Fractional value must be safely routed to Cash."
+
+def test_detect_and_apply_splits_skips_when_auto_adjust_enabled():
+    state = PortfolioState(cash=0.0)
+    state.shares = {"A": 100}
+    state.last_known_prices = {"A": 100.0}
+    market_data = {"A": pd.DataFrame({"Close": [50.0]})}
+
+    detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=True))
+
+    assert state.shares["A"] == 100
+
 
 def test_detect_and_apply_splits_dividend_sweep_idempotent():
     state = PortfolioState(cash=0.0)
@@ -538,7 +633,7 @@ def test_detect_and_apply_splits_dividend_sweep_idempotent():
     idx = pd.to_datetime(["2024-01-01", "2024-01-02"])
     market_data = {"A.NS": pd.DataFrame({"Close": [100.0, 102.0], "Dividends": [0.0, 2.0]}, index=idx)}
 
-    cfg = UltimateConfig(DIVIDEND_SWEEP=True)
+    cfg = UltimateConfig(DIVIDEND_SWEEP=True, AUTO_ADJUST_PRICES=False)
     detect_and_apply_splits(state, market_data, cfg)
     detect_and_apply_splits(state, market_data, cfg)
 
