@@ -50,6 +50,17 @@ def to_bare(sym: str) -> str:
     return sym[:-3] if sym.endswith(".NS") else sym
 
 
+def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
+    """Mark absent symbols with a linear haircut that reaches zero at the absence threshold."""
+    px = float(last_known_price)
+    if not np.isfinite(px) or px <= 0:
+        return 0.0
+    n_absent = max(0, int(absent_periods))
+    max_absent = max(1, int(max_absent_periods))
+    haircut = max(0.0, 1.0 - (n_absent / max_absent))
+    return px * haircut
+
+
 # ─── Enumerations & exceptions ────────────────────────────────────────────────
 
 class OptimizationErrorType(Enum):
@@ -478,9 +489,13 @@ def execute_rebalance(
             else:
                 logger.info(
                     "execute_rebalance: %s absent from data feed (period %d/%d); "
-                    "carrying position at last known price ₹%.2f.",
+                    "carrying position at effective marked price ₹%.2f.",
                     sym, count, cfg.MAX_ABSENT_PERIODS,
-                    state.last_known_prices.get(sym, 0.0),
+                    absent_symbol_effective_price(
+                        state.last_known_prices.get(sym, 0.0),
+                        count,
+                        cfg.MAX_ABSENT_PERIODS,
+                    ),
                 )
 
     pv = state.cash
@@ -488,7 +503,11 @@ def execute_rebalance(
         if sym in active_idx:
             pv += n_shares * float(local_prices[active_idx[sym]])
         elif sym not in symbols_to_force_close:
-            pv += n_shares * state.last_known_prices.get(sym, 0.0)
+            pv += n_shares * absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                state.absent_periods.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
 
     if apply_decay:
         state.decay_rounds += 1
@@ -632,10 +651,18 @@ def execute_rebalance(
             new_shares[sym]       = state.shares[sym]
             new_weights[sym]      = state.weights.get(sym, 0.0)
             new_entry_prices[sym] = state.entry_prices.get(sym, 0.0)
-            actual_notional      += new_shares[sym] * state.last_known_prices.get(sym, 0.0)
+            actual_notional      += new_shares[sym] * absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                state.absent_periods.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
 
     for sym in symbols_to_force_close:
-        close_price = state.last_known_prices.get(sym, 0.0)
+        close_price = absent_symbol_effective_price(
+            state.last_known_prices.get(sym, 0.0),
+            max(0, state.absent_periods.get(sym, 0) - 1),
+            cfg.MAX_ABSENT_PERIODS,
+        )
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
