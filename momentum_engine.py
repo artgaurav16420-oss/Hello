@@ -554,16 +554,11 @@ def execute_rebalance(
     residual_cash = max(0.0, pv - base_notional)
     if valid_targets:
         ranked = sorted(valid_targets, key=lambda x: x[3], reverse=True)
-        cheapest = min(x[2] for x in ranked)
-        while residual_cash >= cheapest:
-            bought_any = False
-            for _, sym, price, _ in ranked:
-                if residual_cash >= price:
-                    desired_shares[sym] += 1
-                    residual_cash -= price
-                    bought_any = True
-            if not bought_any:
-                break
+        for _, sym, price, _ in ranked:
+            if residual_cash >= price:
+                extra = int(residual_cash // price)
+                desired_shares[sym] += extra
+                residual_cash -= extra * price
 
     for i, sym in enumerate(active_symbols):
         w = round(float(target_weights[i]), 10)

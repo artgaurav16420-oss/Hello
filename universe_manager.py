@@ -1,5 +1,5 @@
 """
-universe_manager.py — Universe Fetching & Caching v11.48
+universe_manager.py — Universe Fetching & Caching v11.46
 ========================================================
 Robust fetching of NSE/Nifty 500 universes, sector mappings, and
 point-in-time historical constituents to eliminate backtest survivorship bias.
