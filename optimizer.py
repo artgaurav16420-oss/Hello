@@ -260,6 +260,9 @@ class MomentumObjective:
                 "CVAR_LOOKBACK", effective_cvar_lb_min, cvar_lb_max, step=cvar_lb_step
             )
 
+        if hasattr(trial, "set_user_attr"):
+            trial.set_user_attr("resolved_cfg", dict(vars(cfg)))
+
         # 5. Expanding-window time-series CV evaluation
         scores = []
         for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
@@ -293,7 +296,7 @@ class MomentumObjective:
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
-def pre_load_data(universe_type: str) -> dict:
+def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
     """Loads data into RAM once to accelerate thousands of backtests."""
     logger.info("Initializing Data Pre-fetch phase...")
     normalized_universe = (universe_type or "").strip().lower()
@@ -310,13 +313,22 @@ def pre_load_data(universe_type: str) -> dict:
         
     # Ensure index data is present for regime scoring
     symbols_to_fetch = list(dict.fromkeys(base_universe + ["^NSEI", "^CRSLDX"]))
-    
+
+    if cfg is None:
+        cfg = UltimateConfig()
+        cvar_bounds = SEARCH_SPACE_BOUNDS.get("CVAR_LOOKBACK")
+        if cvar_bounds:
+            cfg.CVAR_LOOKBACK = int(cvar_bounds[1])
+
     logger.info(f"Fetching {len(symbols_to_fetch)} symbols from {TRAIN_START} to {TEST_END}...")
-    market_data = load_or_fetch(
-        tickers=symbols_to_fetch, 
-        required_start=TRAIN_START, 
-        required_end=TEST_END
-    )
+    kwargs = dict(tickers=symbols_to_fetch, required_start=TRAIN_START, required_end=TEST_END)
+    if cfg is not None:
+        kwargs["cfg"] = cfg
+    try:
+        market_data = load_or_fetch(**kwargs)
+    except TypeError:
+        kwargs.pop("cfg", None)
+        market_data = load_or_fetch(**kwargs)
     logger.info("Data pre-load complete. Commencing Bayesian Optimization.")
     return market_data
 
@@ -406,6 +418,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
         )
 
     best_params = study.best_params
+    best_trial = getattr(study, "best_trial", None)
     best_is_calmar = study.best_value
 
     print(f"\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
@@ -419,6 +432,11 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
     
     # Construct a new config using the best parameters
     oos_cfg = UltimateConfig()
+    resolved_cfg = best_trial.user_attrs.get("resolved_cfg", {}) if best_trial is not None else {}
+    for k, v in resolved_cfg.items():
+        if k in UltimateConfig.__dataclass_fields__:
+            setattr(oos_cfg, k, v)
+
     valid_fields = UltimateConfig.__dataclass_fields__
     for k, v in best_params.items():
         if k not in valid_fields:

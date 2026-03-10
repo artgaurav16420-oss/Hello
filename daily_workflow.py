@@ -885,13 +885,24 @@ def main_menu() -> None:
             continue
 
         if c == "1":
-            print(
-                f"\n  {C.RED}[!] NSE Total Scan is DISABLED.{C.RST}\n"
-                f"  {C.GRY}The nse_total universe uses a static constituent list with no point-in-time{C.RST}\n"
-                f"  {C.GRY}history. Running live scans against it will select from today\'s membership{C.RST}\n"
-                f"  {C.GRY}only. Use Nifty 500 Scan until a proper PIT archive is available.{C.RST}\n"
-            )
-            continue
+            _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
+            cfg = load_optimized_config()
+            try:
+                _universe = fetch_nse_equity_universe()
+            except UniverseFetchError as e:
+                _universe = _prompt_survival_mode(e, "NSE Total")
+                if _universe is None:
+                    continue
+            preview      = copy.deepcopy(states["nse_total"])
+            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg)
+            mkt_cache["nse_total"] = mkt
+            _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
+            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
+                states["nse_total"] = preview
+                save_portfolio_state(preview, "nse_total")
+                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
+            else:
+                print(f"  {C.GRY}[-] Discarded.{C.RST}")
 
         elif c == "2":
             _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
@@ -953,15 +964,7 @@ def main_menu() -> None:
                 continue
 
             if bt_c == "1":
-                print(
-                    f"\n  {C.RED}[!] NSE Total backtesting is DISABLED.{C.RST}\n"
-                    f"  {C.GRY}The historical_nse_total.parquet uses a static constituent list{C.RST}\n"
-                    f"  {C.GRY}(identical tickers from 2018-01 to today). This causes severe{C.RST}\n"
-                    f"  {C.GRY}survivorship bias — post-2020 listings appear in 2018 portfolios,{C.RST}\n"
-                    f"  {C.GRY}inflating returns and suppressing drawdowns artificially.{C.RST}\n"
-                    f"  {C.GRY}Use Nifty 500 for all backtesting until a real PIT archive is available.{C.RST}\n"
-                )
-                continue
+                universe_identifier = "nse_total"
             elif bt_c == "3":
                 universe_identifier = "custom"
             else:
@@ -976,6 +979,7 @@ def main_menu() -> None:
                 historical_union.update(get_historical_universe(universe_identifier, target_date))
 
             if not historical_union and bt_c == "3":
+                print(f"  {C.YLW}[!] No historical PIT snapshots found for custom screener; falling back to current symbol list (look-ahead bias risk).{C.RST}")
                 historical_union.update(_get_custom_universe())
             elif not historical_union:
                 historical_union.update(get_nifty500())

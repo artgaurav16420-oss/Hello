@@ -76,6 +76,7 @@ class BacktestEngine:
         high_px:         Optional[pd.DataFrame] = None,
         low_px:          Optional[pd.DataFrame] = None,
         dividends:       Optional[pd.DataFrame] = None,
+        universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
     ) -> pd.DataFrame:
         start_dt = pd.Timestamp(start_date)
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
@@ -104,6 +105,7 @@ class BacktestEngine:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
                     idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
+                    member_universe=(universe_by_rebalance_date or {}).get(pd.Timestamp(date)),
                 )
 
             price_dict = {
@@ -132,8 +134,19 @@ class BacktestEngine:
         open_px:    Optional[pd.DataFrame] = None,
         high_px:    Optional[pd.DataFrame] = None,
         low_px:     Optional[pd.DataFrame] = None,
+        member_universe: Optional[set[str]] = None,
     ) -> None:
         cfg = self.engine.cfg
+
+        active_symbols = symbols
+        active_prices = prices_t
+        if member_universe is not None:
+            member_set = {str(sym) for sym in member_universe}
+            active_symbols = [sym for sym in symbols if sym in member_set]
+            if not active_symbols:
+                return
+            active_positions = [symbols.index(sym) for sym in active_symbols]
+            active_prices = prices_t[active_positions]
 
         prev_idx = close.index.get_loc(date) - 1
         if prev_idx < 0:
@@ -141,11 +154,11 @@ class BacktestEngine:
         signal_date = close.index[prev_idx]
 
         hist_log_rets = (
-            np.log1p(returns.loc[:signal_date])
+            np.log1p(returns.loc[:signal_date, active_symbols])
             .replace([np.inf, -np.inf], np.nan)
         )
 
-        adv_vector = _build_adv_vector(symbols, close, volume, date)
+        adv_vector = _build_adv_vector(active_symbols, close, volume, date)
 
         # Value the pre-trade portfolio using last fully-observed prices (T-1 close).
         # This avoids lookahead when we size orders that execute on the current bar.
@@ -159,7 +172,7 @@ class BacktestEngine:
             )
             for sym in self.state.shares
         )
-        prev_w_dict = _build_prev_weights(self.state, symbols, pv)
+        prev_w_dict = _build_prev_weights(self.state, active_symbols, pv)
 
         _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
         idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
@@ -182,7 +195,7 @@ class BacktestEngine:
 
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
 
-        target_weights         = np.zeros(len(symbols))
+        target_weights         = np.zeros(len(active_symbols))
         apply_decay            = False
         optimization_succeeded = False
         sel_idx: List[int]     = []
@@ -203,7 +216,7 @@ class BacktestEngine:
         #    6.500%, causing 33 unnecessary liquidations per 6-year backtest.
         if self.state.shares:
             # Use prices_t (T+0): screens current stress before order submission.
-            book_cvar = compute_book_cvar(self.state, prices_t, symbols, hist_log_rets, cfg)
+            book_cvar = compute_book_cvar(self.state, active_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
 
@@ -249,17 +262,17 @@ class BacktestEngine:
                 return
 
             if sel_idx:
-                sel_syms      = [symbols[i] for i in sel_idx]
+                sel_syms      = [active_symbols[i] for i in sel_idx]
                 sector_labels = _build_sector_labels(sel_syms, sector_map)
-                prev_weights  = np.array([prev_w_dict.get(sym, 0.0) for sym in symbols])
+                prev_weights  = np.array([prev_w_dict.get(sym, 0.0) for sym in active_symbols])
 
                 try:
                     weights_sel = self.engine.optimize(
                         expected_returns    = raw_daily[sel_idx],
-                        historical_returns  = hist_log_rets[[symbols[i] for i in sel_idx]],
+                        historical_returns  = hist_log_rets[[active_symbols[i] for i in sel_idx]],
                         execution_date      = date,
                         adv_shares          = adv_vector[sel_idx],
-                        prices              = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)[sel_idx],
+                        prices              = active_prices[sel_idx],
                         portfolio_value     = pv,
                         prev_w              = prev_weights[sel_idx],
                         exposure_multiplier = self.state.exposure_multiplier,
@@ -295,7 +308,7 @@ class BacktestEngine:
         _exhaust_decay = False
         if apply_decay and not optimization_succeeded:
             if _force_full_cash or self.state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
-                target_weights = np.zeros(len(symbols), dtype=float)
+                target_weights = np.zeros(len(active_symbols), dtype=float)
                 logger.warning(
                     "[Backtest] %s on %s — forcing full liquidation to cash.",
                     "Book CVaR breach" if _force_full_cash else
@@ -305,9 +318,9 @@ class BacktestEngine:
                 _exhaust_decay = True
                 activate_override_on_stress(self.state, cfg)
             else:
-                target_weights = compute_decay_targets(self.state, sel_idx, symbols, cfg)
+                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg)
                 sel_idx_set = set(sel_idx)
-                sym_to_pos  = {s: i for i, s in enumerate(symbols)}
+                sym_to_pos  = {s: i for i, s in enumerate(active_symbols)}
                 n_gated = sum(
                     1 for s in self.state.shares
                     if s in sym_to_pos and sym_to_pos[s] not in sel_idx_set
@@ -321,11 +334,11 @@ class BacktestEngine:
 
         if optimization_succeeded or apply_decay:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
-            _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
+            _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
             
-            exec_prices = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)
+            exec_prices = _execution_prices(active_symbols, date, active_prices, open_px, high_px, low_px)
             execute_rebalance(
-                self.state, target_weights, exec_prices, symbols, cfg,
+                self.state, target_weights, exec_prices, active_symbols, cfg,
                 adv_shares     = adv_vector,
                 date_context   = date, 
                 trade_log      = self.trades,
@@ -505,13 +518,18 @@ def run_backtest(
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
 
     union_universe = set(universe or [])
-    if not union_universe:
-        selected_universe_type = universe_type or "nse_total"
+    universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
+    selected_universe_type = universe_type or "nse_total"
 
+    if union_universe:
+        for d in all_target_dates:
+            universe_by_rebalance_date[pd.Timestamp(d)] = set(union_universe)
+    else:
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
-            if historical_members:
-                union_universe.update(historical_members)
+            member_set = set(historical_members or [])
+            universe_by_rebalance_date[pd.Timestamp(d)] = member_set
+            union_universe.update(member_set)
 
         if not union_universe:
             raise RuntimeError(
@@ -571,7 +589,7 @@ def run_backtest(
 
     engine = InstitutionalRiskEngine(cfg)
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
-    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends)
+    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends, universe_by_rebalance_date=universe_by_rebalance_date)
 
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
