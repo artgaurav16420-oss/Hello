@@ -252,3 +252,19 @@ def test_get_sector_map_prefers_batched_yfinance_tickers(monkeypatch):
 
     assert out == {"FOO.NS": "Energy", "BAR.NS": "IT"}
     assert calls["tickers"] == 1
+
+
+def test_apply_adv_filter_deduplicates_ns_equivalents(monkeypatch):
+    import data_cache
+    from momentum_engine import UltimateConfig
+
+    inputs = ["RELIANCE", "RELIANCE.NS", "TCS"]
+
+    def _fake_load_or_fetch(tickers, start, end, cfg=None):
+        return _make_adv_market_data(tickers)
+
+    monkeypatch.setattr(data_cache, "load_or_fetch", _fake_load_or_fetch)
+
+    out = _apply_adv_filter(inputs, UltimateConfig(MIN_ADV_CRORES=1))
+
+    assert out.count("RELIANCE.NS") == 1

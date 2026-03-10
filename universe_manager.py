@@ -350,7 +350,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
         )
 
-    return filtered_tickers
+    return list(dict.fromkeys(filtered_tickers))
 
 
 

@@ -271,6 +271,7 @@ class PortfolioState:
     override_cooldown:    int              = 0
     consecutive_failures: int              = 0
     equity_hist_cap:      int              = 250
+    max_absent_periods:   int              = 12
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
     last_known_volatility:Dict[str, float] = field(default_factory=dict)
@@ -361,8 +362,7 @@ class PortfolioState:
                     px = 0.0
                 else:
                     absent_n = int(self.absent_periods.get(sym, 0))
-                    px = absent_symbol_effective_price(last_px, absent_n, 12)
-                    self.absent_periods[sym] = absent_n + 1
+                    px = absent_symbol_effective_price(last_px, absent_n, self.max_absent_periods)
             pv += n_shares * float(px or 0.0)
 
         pv_rounded = round(float(pv), 10)
@@ -386,6 +386,7 @@ class PortfolioState:
             "override_cooldown":    self.override_cooldown,
             "consecutive_failures": self.consecutive_failures,
             "equity_hist_cap":      self.equity_hist_cap,
+            "max_absent_periods":   self.max_absent_periods,
             "absent_periods":       dict(sorted(self.absent_periods.items())),
             "last_known_prices":    _r(self.last_known_prices),
             "last_known_volatility":_r(self.last_known_volatility),
@@ -433,6 +434,7 @@ class PortfolioState:
         ps.override_cooldown    = _get("override_cooldown",    int,                                             0)
         ps.consecutive_failures = _get("consecutive_failures", int,                                             0)
         ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             250)
+        ps.max_absent_periods   = _get("max_absent_periods",   int,                                             12)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
@@ -609,6 +611,11 @@ def execute_rebalance(
         for _, sym, price, _ in ranked:
             if residual_cash >= price:
                 extra = int(residual_cash // price)
+                max_extra_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv - desired_shares[sym] * price
+                max_extra_shares = max(0, int(max_extra_notional // price))
+                extra = min(extra, max_extra_shares)
+                if extra <= 0:
+                    continue
                 desired_shares[sym] += extra
                 residual_cash -= extra * price
 

@@ -57,6 +57,7 @@ class BacktestEngine:
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
         self.state.equity_hist_cap = engine.cfg.EQUITY_HIST_CAP
+        self.state.max_absent_periods = engine.cfg.MAX_ABSENT_PERIODS
         self.trades:  List[Trade]  = []
         self._eq_dates: list       = []
         self._eq_vals:  list       = []

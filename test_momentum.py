@@ -740,7 +740,7 @@ def test_record_eod_applies_absent_haircut_when_price_missing():
 
     ps.record_eod({})
 
-    assert ps.absent_periods["A"] == 1
+    assert ps.absent_periods == {}
     assert ps.equity_hist[-1] == pytest.approx(1000.0, abs=1e-9)
 
 
@@ -1403,3 +1403,32 @@ def test_run_backtest_simulate_halts_does_not_mutate_input_market_data():
 
     assert market_data["AAA.NS"].index.equals(raw.index)
     assert market_data["AAA.NS"]["Close"].equals(raw["Close"])
+
+
+def test_record_eod_uses_state_max_absent_periods_for_haircut():
+    ps = PortfolioState(cash=0.0, max_absent_periods=20)
+    ps.shares = {"A": 10}
+    ps.last_known_prices = {"A": 100.0}
+    ps.absent_periods = {"A": 12}
+
+    ps.record_eod({})
+
+    expected = 10 * absent_symbol_effective_price(100.0, 12, 20)
+    assert ps.equity_hist[-1] == pytest.approx(expected, abs=1e-9)
+
+
+def test_execute_rebalance_residual_cash_respects_single_name_cap():
+    cfg = UltimateConfig(MAX_SINGLE_NAME_WEIGHT=0.25, ROUND_TRIP_SLIPPAGE_BPS=0.0)
+    state = PortfolioState(cash=1_000.0)
+
+    execute_rebalance(
+        state=state,
+        target_weights=np.array([0.25, 0.25], dtype=float),
+        prices=np.array([10.0, 10.0], dtype=float),
+        active_symbols=["A", "B"],
+        cfg=cfg,
+        conviction_scores=np.array([1.0, 0.1], dtype=float),
+    )
+
+    a_notional = state.shares.get("A", 0) * 10.0
+    assert a_notional <= cfg.MAX_SINGLE_NAME_WEIGHT * 1_000.0 + 1e-9
