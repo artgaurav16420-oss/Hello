@@ -932,11 +932,13 @@ def test_e2e_ledger_parity():
                 np.log1p(returns.loc[:date].iloc[:-1])
                 .replace([np.inf, -np.inf], np.nan)
             )
-            adv_vector = _build_adv_vector(symbols, close, volume, date)
+            adv_vector = _build_adv_vector(symbols, close, volume, date, cfg=cfg)
             if live_state.shares:
                 compute_book_cvar(live_state, prices_t, symbols, hist_log_rets, cfg)
+            prev_idx = close.index.get_loc(date) - 1
+            valuation_close = close.loc[close.index[prev_idx]] if prev_idx >= 0 else close_t
             pv         = live_state.cash + sum(
-                live_state.shares.get(s, 0) * close_t[s] for s in symbols
+                live_state.shares.get(s, 0) * valuation_close[s] for s in symbols
             )
             prev_w_dict = {
                 sym: (live_state.shares.get(sym, 0) * live_state.last_known_prices.get(sym, 0.0)) / pv
@@ -1483,3 +1485,31 @@ def test_execute_rebalance_residual_cash_respects_single_name_cap():
 
     a_notional = state.shares.get("A", 0) * 10.0
     assert a_notional <= cfg.MAX_SINGLE_NAME_WEIGHT * 1_000.0 + 1e-9
+
+
+def test_compute_adv_does_not_penalize_pre_ipo_nan_history():
+    idx = pd.date_range("2024-01-01", periods=5, freq="B")
+    market_data = {
+        "IPO.NS": pd.DataFrame(
+            {
+                "Close": [np.nan, np.nan, np.nan, 100.0, 100.0],
+                "Volume": [np.nan, np.nan, np.nan, 1_000_000.0, 1_000_000.0],
+            },
+            index=idx,
+        )
+    }
+
+    adv = compute_adv(market_data, ["IPO"], cfg=UltimateConfig(ADV_LOOKBACK=5))
+    assert adv[0] == pytest.approx(100_000_000.0)
+
+
+def test_build_adv_vector_respects_configurable_lookback():
+    cols = ["SYM00"]
+    idx = pd.date_range("2024-01-01", periods=6, freq="B")
+    close = pd.DataFrame({"SYM00": [100.0] * 6}, index=idx)
+    volume = pd.DataFrame({"SYM00": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}, index=idx)
+
+    adv = _build_adv_vector(cols, close, volume, idx[-1], cfg=UltimateConfig(ADV_LOOKBACK=4))
+
+    # T-1 volumes are [1,2,3,4,5] => last 4 mean = (2+3+4+5)/4 = 3.5; close=100
+    assert adv[0] == pytest.approx(350.0)
