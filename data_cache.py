@@ -267,7 +267,7 @@ def invalidate_cache() -> None:
             logger.error("[Cache] Failed to invalidate cache: %s", e)
 
 
-def _is_valid_dataframe(df: pd.DataFrame) -> bool:
+def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None) -> bool:
     """
     Strict structural validation gate applied before any data is written to disk.
 
@@ -293,7 +293,8 @@ def _is_valid_dataframe(df: pd.DataFrame) -> bool:
         return False
     if "Adj Close" not in df.columns or df["Adj Close"].isnull().all():
         return False
-    if "Volume" not in df.columns or df["Volume"].isnull().all():
+    is_index_ticker = bool(ticker) and str(ticker).startswith("^")
+    if (not is_index_ticker) and ("Volume" not in df.columns or df["Volume"].isnull().all()):
         return False
     return True
 
@@ -432,7 +433,7 @@ def load_or_fetch(
                     # Structural validation before anything touches disk.
                     # Catches non-unique/non-monotonic indexes and all-NaN Close
                     # columns that dropna(how='all') cannot detect.
-                    if not _is_valid_dataframe(df):
+                    if not _is_valid_dataframe(df, ticker=ticker):
                         logger.warning(
                             "[Cache] Structural validation failed for %s "
                             "(non-monotonic index, duplicate dates, or null Close). Skipping.",

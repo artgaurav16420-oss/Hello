@@ -104,3 +104,31 @@ def test_extract_ticker_frame_fills_adj_close_for_multiindex_payload():
     out = data_cache._extract_ticker_frame(raw, "ABC.NS")
     assert out is not None
     assert out["Adj Close"].equals(out["Close"])
+
+
+def test_is_valid_dataframe_allows_index_ticker_with_nan_volume():
+    idx = pd.date_range("2024-01-01", periods=6, freq="D")
+    df = pd.DataFrame(
+        {
+            "Close": [100, 101, 102, 103, 104, 105],
+            "Adj Close": [100, 101, 102, 103, 104, 105],
+            "Volume": [None, None, None, None, None, None],
+        },
+        index=idx,
+    )
+
+    assert data_cache._is_valid_dataframe(df, ticker="^NSEI")
+
+
+def test_is_valid_dataframe_rejects_non_index_ticker_with_nan_volume():
+    idx = pd.date_range("2024-01-01", periods=6, freq="D")
+    df = pd.DataFrame(
+        {
+            "Close": [100, 101, 102, 103, 104, 105],
+            "Adj Close": [100, 101, 102, 103, 104, 105],
+            "Volume": [None, None, None, None, None, None],
+        },
+        index=idx,
+    )
+
+    assert not data_cache._is_valid_dataframe(df, ticker="ABC.NS")

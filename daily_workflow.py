@@ -405,6 +405,7 @@ def _run_scan(
     cfg    = cfg_override if cfg_override else load_optimized_config()
     engine = InstitutionalRiskEngine(cfg)
     state.equity_hist_cap = cfg.EQUITY_HIST_CAP
+    state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
     today = pd.Timestamp(datetime.today().date())
     next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
@@ -417,9 +418,9 @@ def _run_scan(
             cfg.REBALANCE_FREQ,
         )
 
-    # Pass tomorrow as end_date so load_or_fetch's required_end covers today.
-    # yfinance end= is exclusive, so +1 day ensures today's close is fetched.
-    end_date   = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    # Pass the actual desired terminal date; load_or_fetch applies the
+    # yfinance exclusive-end +1 day correction internally.
+    end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
     # FIX (Bug-D — Delisting Crash / PV Gap): Always include currently-held symbols
