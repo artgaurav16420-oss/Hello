@@ -24,6 +24,7 @@ from momentum_engine import (
     execute_rebalance,
     compute_book_cvar,
     compute_decay_targets,
+    absent_symbol_effective_price,
     _ConstraintBuilder,
 )
 from backtest_engine import BacktestEngine, run_backtest, _compute_metrics, _build_adv_vector
@@ -982,6 +983,33 @@ def test_ghost_position_single_day_absence_is_preserved():
     assert state.absent_periods.get("GHOST", 0) == 1, "Absent counter must increment."
 
 
+
+
+def test_force_close_uses_prior_marked_value_without_pv_spike():
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=4, ROUND_TRIP_SLIPPAGE_BPS=0.0)
+    state = PortfolioState(cash=0.0)
+    state.shares = {"GHOST": 10}
+    state.entry_prices = {"GHOST": 100.0}
+    state.last_known_prices = {"GHOST": 100.0}
+    state.weights = {"GHOST": 1.0}
+
+    target_empty = np.array([], dtype=float)
+
+    for _ in range(cfg.MAX_ABSENT_PERIODS - 1):
+        execute_rebalance(state, target_empty, np.array([]), [], cfg)
+        absent_n = state.absent_periods.get("GHOST", 0)
+        expected_mtm = 10 * absent_symbol_effective_price(100.0, absent_n, cfg.MAX_ABSENT_PERIODS)
+        current_mtm = state.shares.get("GHOST", 0) * absent_symbol_effective_price(
+            state.last_known_prices.get("GHOST", 0.0), absent_n, cfg.MAX_ABSENT_PERIODS
+        )
+        assert state.cash + current_mtm == pytest.approx(expected_mtm)
+
+    marked_before_close = 10 * absent_symbol_effective_price(100.0, cfg.MAX_ABSENT_PERIODS - 1, cfg.MAX_ABSENT_PERIODS)
+    execute_rebalance(state, target_empty, np.array([]), [], cfg)
+
+    assert "GHOST" not in state.shares
+    assert state.cash == pytest.approx(marked_before_close)
+
 def test_ghost_position_delists_after_max_absent_periods():
     cfg   = UltimateConfig(MAX_ABSENT_PERIODS=12)
     state = PortfolioState(cash=500_000.0)
@@ -1003,8 +1031,9 @@ def test_ghost_position_delists_after_max_absent_periods():
     assert "DELISTED" not in state.shares, "Position must be closed after MAX_ABSENT_PERIODS."
     sell_trades = [t for t in trade_log if t.symbol == "DELISTED" and t.direction == "SELL"]
     assert sell_trades, "A SELL trade must be logged for the delisted position."
-    assert sell_trades[-1].exec_price == pytest.approx(900.0, rel=1e-4), \
-        "Delisted position must be closed at last known price, not ₹0."
+    expected_close = absent_symbol_effective_price(900.0, cfg.MAX_ABSENT_PERIODS - 1, cfg.MAX_ABSENT_PERIODS)
+    assert sell_trades[-1].exec_price == pytest.approx(expected_close, rel=1e-4), \
+        "Delisted position must be closed at the same prior marked value used for PV."
 
 
 def test_decay_rounds_increment_and_counter_reset():
