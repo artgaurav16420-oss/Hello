@@ -145,15 +145,13 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(symbols, close, volume, date)
 
-        # Use execution-date prices for portfolio valuation inputs so manual/live
-        # walk-forward replication (which rebalances on this same bar) remains
-        # byte-identical to the backtest engine state transitions.
-        valuation_close = close.loc[date]
+        exec_prices = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)
+        exec_price_map = {sym: float(exec_prices[i]) for i, sym in enumerate(symbols)}
         
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
-                float(valuation_close[sym])
-                if (sym in close.columns and pd.notna(valuation_close[sym]))
+                exec_price_map[sym]
+                if (sym in exec_price_map and np.isfinite(exec_price_map[sym]) and exec_price_map[sym] > 0)
                 else _ffill_price(self.state, sym)
             )
             for sym in self.state.shares
@@ -171,8 +169,8 @@ class BacktestEngine:
 
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
-                float(valuation_close[sym])
-                if pd.notna(valuation_close[sym])
+                exec_price_map[sym]
+                if (sym in exec_price_map and np.isfinite(exec_price_map[sym]) and exec_price_map[sym] > 0)
                 else _ffill_price(self.state, sym)
             )
             for sym in self.state.shares
@@ -322,7 +320,6 @@ class BacktestEngine:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=symbols, fill_value=0.0).values)
             
-            exec_prices = _execution_prices(symbols, date, prices_t, open_px, high_px, low_px)
             execute_rebalance(
                 self.state, target_weights, exec_prices, symbols, cfg,
                 adv_shares     = adv_vector,

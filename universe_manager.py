@@ -132,6 +132,24 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
 _SECTOR_MAP_CACHE_LOCK = threading.Lock()
+_HIST_UNIVERSE_CACHE_LOCK = threading.Lock()
+_HIST_UNIVERSE_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
+
+
+def _read_historical_universe_parquet(hist_file: Path) -> pd.DataFrame:
+    """Read historical constituents parquet with mtime-aware in-memory cache."""
+    mtime = hist_file.stat().st_mtime
+    with _HIST_UNIVERSE_CACHE_LOCK:
+        cached = _HIST_UNIVERSE_CACHE.get(hist_file)
+        if cached is not None:
+            cached_mtime, cached_df = cached
+            if cached_mtime == mtime:
+                return cached_df
+
+    df = pd.read_parquet(hist_file)
+    with _HIST_UNIVERSE_CACHE_LOCK:
+        _HIST_UNIVERSE_CACHE[hist_file] = (mtime, df)
+    return df
 
 
 def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]:
@@ -159,7 +177,7 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
             _MISSING_PARQUET_WARNED[universe_type] = True
     else:
         try:
-            df = pd.read_parquet(hist_file)
+            df = _read_historical_universe_parquet(hist_file)
             
             # Find the closest available manifest date preceding the requested date
             available_dates = df.index.unique()

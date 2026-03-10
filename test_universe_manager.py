@@ -191,3 +191,33 @@ def test_apply_adv_filter_raises_on_any_chunk_failure(monkeypatch):
 
     with pytest.raises(um.UniverseFetchError, match="ADV filter failed for 1 chunk"):
         _apply_adv_filter(tickers, UltimateConfig(MIN_ADV_CRORES=1))
+
+
+def test_historical_universe_parquet_cache_reuses_dataframe(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "historical_nifty500.parquet").write_text("stub", encoding="utf-8")
+
+    hist_df = pd.DataFrame(
+        {"tickers": [["AAA.NS", "BBB.NS"]]},
+        index=pd.DatetimeIndex([pd.Timestamp("2020-01-01")]),
+    )
+
+    monkeypatch.setattr(um, "_HIST_UNIVERSE_CACHE", {})
+
+    read_calls = {"count": 0}
+
+    def _fake_read_parquet(path):
+        read_calls["count"] += 1
+        return hist_df
+
+    monkeypatch.setattr(pd, "read_parquet", _fake_read_parquet)
+
+    target = pd.Timestamp("2020-02-01")
+    first = um.get_historical_universe("nifty500", target)
+    second = um.get_historical_universe("nifty500", target)
+
+    assert first == ["AAA.NS", "BBB.NS"]
+    assert second == first
+    assert read_calls["count"] == 1

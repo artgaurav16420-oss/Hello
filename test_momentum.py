@@ -1344,3 +1344,63 @@ def test_compute_adv_respects_configurable_lookback():
 
     assert adv_short[0] == pytest.approx(450.0)
     assert adv_long[0] == pytest.approx(300.0)
+
+def test_regime_breadth_requires_min_history_for_sma_window():
+    idx = pd.DataFrame(
+        {"Close": np.linspace(100.0, 130.0, 260)},
+        index=pd.date_range("2020-01-01", periods=260),
+    )
+    cols = ["OLD", "IPO"]
+    universe = pd.DataFrame(index=idx.index, columns=cols, dtype=float)
+    universe["OLD"] = np.linspace(100.0, 120.0, len(idx))
+    universe["IPO"] = np.nan
+    universe.loc[idx.index[-15:], "IPO"] = np.linspace(50.0, 80.0, 15)
+
+    cfg = UltimateConfig()
+    cfg.REGIME_SMA_WINDOW = 200
+    score_with_ipo = compute_regime_score(idx, cfg=cfg, universe_close_hist=universe)
+
+    universe_without_ipo = universe[["OLD"]]
+    score_without_ipo = compute_regime_score(idx, cfg=cfg, universe_close_hist=universe_without_ipo)
+
+    assert score_with_ipo == pytest.approx(score_without_ipo, abs=1e-12)
+
+
+def test_rebalance_portfolio_value_uses_execution_prices_not_close(monkeypatch):
+    cfg = UltimateConfig(HISTORY_GATE=5)
+    engine = InstitutionalRiskEngine(cfg)
+    bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+
+    dates = pd.date_range("2021-01-01", periods=30, freq="B")
+    close = pd.DataFrame({"SYM00": np.linspace(100.0, 200.0, len(dates))}, index=dates)
+    open_px = pd.DataFrame({"SYM00": np.linspace(100.0, 105.0, len(dates))}, index=dates)
+    volume = pd.DataFrame({"SYM00": np.ones(len(dates)) * 1e6}, index=dates)
+    returns = close.pct_change(fill_method=None).fillna(0.0)
+
+    rebalance_day = dates[-1]
+    bt.state.shares = {"SYM00": 10}
+    bt.state.last_known_prices = {"SYM00": 150.0}
+
+    captured = {}
+
+    def _fake_generate_signals(*args, **kwargs):
+        return np.array([0.001]), np.array([1.0]), [0]
+
+    def _fake_optimize(*args, **kwargs):
+        captured["portfolio_value"] = kwargs.get("portfolio_value")
+        return np.array([0.0])
+
+    monkeypatch.setattr("backtest_engine.generate_signals", _fake_generate_signals)
+    monkeypatch.setattr(bt.engine, "optimize", _fake_optimize)
+
+    bt.run(
+        close,
+        volume,
+        returns,
+        pd.DatetimeIndex([rebalance_day]),
+        dates[0].strftime("%Y-%m-%d"),
+        open_px=open_px,
+    )
+
+    expected_pv = cfg.INITIAL_CAPITAL + 10 * float(open_px.loc[rebalance_day, "SYM00"])
+    assert captured["portfolio_value"] == pytest.approx(expected_pv)
