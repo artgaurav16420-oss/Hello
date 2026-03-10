@@ -2,10 +2,14 @@ import importlib
 import json
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
+
+from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 
 def test_save_optimal_config_allows_plain_filename(tmp_path: Path):
@@ -414,3 +418,103 @@ def test_stdout_supports_rupee_false_when_stdout_missing(monkeypatch):
     monkeypatch.setattr(optimizer.sys, "stdout", None)
 
     assert optimizer._stdout_supports_rupee() is False
+
+
+def test_optimizer_uses_higher_turnover_penalty_for_illiquid_name(monkeypatch):
+    cfg = UltimateConfig()
+    engine = InstitutionalRiskEngine(cfg)
+
+    captured = {}
+
+    class _FakeResInfo:
+        status = "solved"
+
+    class _FakeRes:
+        def __init__(self, n_vars):
+            self.info = _FakeResInfo()
+            self.x = np.zeros(n_vars, dtype=float)
+
+    class _FakeOSQP:
+        def setup(self, P, q, A, l, u, **kwargs):
+            captured["q"] = np.array(q, dtype=float)
+            captured["n_vars"] = len(q)
+
+        def solve(self):
+            return _FakeRes(captured["n_vars"])
+
+    monkeypatch.setattr("momentum_engine.osqp.OSQP", _FakeOSQP)
+
+    expected_returns = np.array([0.01, 0.01], dtype=float)
+    prices = np.array([100.0, 100.0], dtype=float)
+    adv_shares = np.array([1e9, 1e5], dtype=float)
+    hist = pd.DataFrame(
+        np.array([
+            [0.0010, 0.0015],
+            [0.0005, -0.0002],
+            [-0.0003, 0.0001],
+            [0.0008, -0.0004],
+            [0.0001, 0.0002],
+            [0.0004, -0.0001],
+            [0.0006, 0.0003],
+            [-0.0002, 0.0005],
+            [0.0003, -0.0002],
+            [0.0007, 0.0004],
+        ]),
+        columns=["LIQUID", "ILLIQUID"],
+    )
+
+    engine.optimize(
+        expected_returns=expected_returns,
+        historical_returns=hist,
+        adv_shares=adv_shares,
+        prices=prices,
+        portfolio_value=1_000_000.0,
+        prev_w=np.array([0.0, 0.0], dtype=float),
+    )
+
+    turnover_q = captured["q"][2:4]
+    assert turnover_q[1] > turnover_q[0]
+
+
+def test_optimizer_turnover_penalty_respects_execution_floor_and_cap(monkeypatch):
+    cfg = UltimateConfig(IMPACT_COEFF=1.0, ROUND_TRIP_SLIPPAGE_BPS=20.0)
+    engine = InstitutionalRiskEngine(cfg)
+
+    captured = {}
+
+    class _FakeResInfo:
+        status = "solved"
+
+    class _FakeRes:
+        def __init__(self, n_vars):
+            self.info = _FakeResInfo()
+            self.x = np.zeros(n_vars, dtype=float)
+
+    class _FakeOSQP:
+        def setup(self, P, q, A, l, u, **kwargs):
+            captured["q"] = np.array(q, dtype=float)
+            captured["n_vars"] = len(q)
+
+        def solve(self):
+            return _FakeRes(captured["n_vars"])
+
+    monkeypatch.setattr("momentum_engine.osqp.OSQP", _FakeOSQP)
+
+    expected_returns = np.array([0.01, 0.01], dtype=float)
+    prices = np.array([100.0, 100.0], dtype=float)
+    adv_shares = np.array([1e12, 1.0], dtype=float)
+    hist = pd.DataFrame(np.tile([0.001, -0.001], (10, 1)), columns=["A", "B"])
+
+    engine.optimize(
+        expected_returns=expected_returns,
+        historical_returns=hist,
+        adv_shares=adv_shares,
+        prices=prices,
+        portfolio_value=1_000_000.0,
+        prev_w=np.array([0.0, 0.0], dtype=float),
+    )
+
+    turnover_q = captured["q"][2:4]
+    base_one_way = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    assert turnover_q[0] == pytest.approx(base_one_way)
+    assert turnover_q[1] == pytest.approx(0.05)

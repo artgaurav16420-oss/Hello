@@ -429,6 +429,22 @@ def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> N
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
 
 
+def compute_one_way_slip_rate(
+    cfg: UltimateConfig,
+    portfolio_value: float,
+    adv_notional: Optional[float],
+) -> float:
+    """Compute per-name one-way slippage rate with execution-aligned floor/cap semantics."""
+    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
+        return base_rate
+
+    # ADV is notional (₹/day); retain execution semantics exactly:
+    # impact = coeff * PV / ADV, then clamp [base_rate, 5%].
+    impact_rate = (cfg.IMPACT_COEFF * portfolio_value) / float(adv_notional)
+    return max(base_rate, min(0.05, impact_rate))
+
+
 # ─── Execution ────────────────────────────────────────────────────────────────
 
 def execute_rebalance(
@@ -594,13 +610,11 @@ def execute_rebalance(
                     continue
 
             # ── FIX: Institutional Impact Alignment ──
-            if adv_shares is not None and adv_shares[i] > 0:
-                # ADV is passed in notional units (₹/day), so impact denominator
-                # must not multiply by price again (which would create ₹^2 units).
-                impact_rate = (cfg.IMPACT_COEFF * pv) / adv_shares[i]
-                slip_rate = max(cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0, min(0.05, impact_rate))
-            else:
-                slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
+            slip_rate = compute_one_way_slip_rate(
+                cfg=cfg,
+                portfolio_value=pv,
+                adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+            )
 
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
@@ -923,10 +937,17 @@ class InstitutionalRiskEngine:
         P_aux = sp.eye(n_vars - m, format="csc") * 1e-6
         P     = sp.block_diag([sp.csc_matrix(P_w), P_aux], format="csc")
 
+        turnover_costs = np.array(
+            [
+                compute_one_way_slip_rate(self.cfg, portfolio_value, float(adv))
+                for adv in adv_shares
+            ],
+            dtype=float,
+        )
+
         q        = np.zeros(n_vars)
         q[:m]    = -expected_returns - 2.0 * impact * prev_w_arr
-        # |w-w_prev| is one-way turnover, so use one-way cost (round-trip / 2).
-        q[m:2*m] = self.cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+        q[m:2*m] = turnover_costs
         q[-1]    = self.cfg.SLACK_PENALTY
 
         builder = _ConstraintBuilder(n_vars)
