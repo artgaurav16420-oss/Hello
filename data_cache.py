@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -436,7 +436,7 @@ def load_or_fetch(
     _now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
     _market_closed_today = (
         _now_ist.weekday() < 5  # Mon–Fri
-        and _now_ist.time() >= __import__("datetime").time(15, 45)
+        and _now_ist.time() >= dt_time(15, 45)
     )
     if _market_closed_today:
         latest_bday = _now_ist.strftime("%Y-%m-%d")
