@@ -116,8 +116,13 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
     small_bonus = float(scores[0] - scores[2])
     large_bonus = float(scores[1] - scores[2])
 
-    assert small_bonus == pytest.approx(0.00375, abs=1e-6)
-    assert large_bonus == pytest.approx(0.015, abs=1e-6)
+    raw_scores, _, _ = generate_signals(log_rets, adv, cfg)
+    finite = raw_scores[np.isfinite(raw_scores)]
+    dispersion = max(np.nanstd(finite), cfg.CONTINUITY_DISPERSION_FLOOR)
+    base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR) * dispersion
+
+    assert small_bonus == pytest.approx(base_bonus * 0.25, abs=1e-9)
+    assert large_bonus == pytest.approx(base_bonus * 1.0, abs=1e-9)
 
 def test_continuity_bonus_respects_max_scalar_cap():
     """When CONTINUITY_BONUS exceeds CONTINUITY_MAX_SCALAR the cap clamps the bonus."""
