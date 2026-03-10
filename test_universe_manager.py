@@ -1,7 +1,18 @@
 import logging
+
 import pandas as pd
+import pytest
 import universe_manager as um
 from universe_manager import _apply_adv_filter
+
+
+@pytest.fixture(autouse=True)
+def reset_universe_warning_state():
+    um._MISSING_PARQUET_WARNED.clear()
+    um._NO_RECORD_WARNED.clear()
+    yield
+    um._MISSING_PARQUET_WARNED.clear()
+    um._NO_RECORD_WARNED.clear()
 
 
 def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path, monkeypatch, caplog):
@@ -13,9 +24,6 @@ def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path,
         encoding="utf-8",
     )
 
-    um._MISSING_PARQUET_WARNED.clear()
-    um._NO_RECORD_WARNED.clear()
-
     caplog.set_level(logging.WARNING)
     members = um.get_historical_universe("nifty500", pd.Timestamp("2020-02-01"))
 
@@ -26,9 +34,6 @@ def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path,
 def test_get_historical_universe_warns_when_no_parquet_or_csv(tmp_path, monkeypatch, caplog):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "data").mkdir()
-
-    um._MISSING_PARQUET_WARNED.clear()
-    um._NO_RECORD_WARNED.clear()
 
     caplog.set_level(logging.WARNING)
     members = um.get_historical_universe("nifty500", pd.Timestamp("2020-02-01"))
