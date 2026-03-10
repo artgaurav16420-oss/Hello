@@ -112,3 +112,64 @@ def test_main_downloads_archives_when_missing(tmp_path, monkeypatch):
     assert (tmp_path / "data" / "raw_nse_total_archives.csv").exists()
     assert (tmp_path / "data" / "historical_nifty500.parquet").exists()
     assert (tmp_path / "data" / "historical_nse_total.parquet").exists()
+
+
+def test_discover_archive_urls_from_github_tree(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "tree": [
+                    {"path": "data/raw_nifty500_archives.csv", "type": "blob"},
+                    {"path": "README.md", "type": "blob"},
+                ]
+            }
+
+    monkeypatch.setattr(hb.requests, "get", lambda *args, **kwargs: _Resp())
+
+    urls = hb._discover_archive_urls_from_github("nifty500", headers={})
+
+    assert set(urls) == {
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/main/data/raw_nifty500_archives.csv",
+        "https://raw.githubusercontent.com/india-investing/historical-index-constituents/master/data/raw_nifty500_archives.csv",
+    }
+
+
+def test_download_master_archive_uses_github_tree_fallback(tmp_path, monkeypatch):
+    out = tmp_path / "data" / "raw_nifty500_archives.csv"
+
+    class _TextResp:
+        def __init__(self, text: str):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class _TreeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"tree": [{"path": "data/raw_nifty500_archives.csv", "type": "blob"}]}
+
+    def _fake_get(url, headers=None, timeout=20):
+        if "git/trees" in url:
+            return _TreeResp()
+        if "raw.githubusercontent.com" in url and "data/raw_nifty500_archives.csv" in url:
+            return _TextResp("date,ticker\n2020-01-31,RELIANCE\n")
+        raise Exception("404")
+
+    monkeypatch.setattr(hb, "REMOTE_ARCHIVE_URLS", {"nifty500": ["https://example.com/missing.csv"]})
+    monkeypatch.setattr(hb, "GITHUB_TREE_API_URLS", {
+        "nifty500": [
+            "https://api.github.com/repos/india-investing/historical-index-constituents/git/trees/main?recursive=1"
+        ]
+    })
+    monkeypatch.setattr(hb.requests, "get", _fake_get)
+
+    downloaded = hb._download_master_archive("nifty500", out)
+
+    assert downloaded == out
+    assert out.exists()
