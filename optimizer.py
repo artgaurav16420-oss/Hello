@@ -125,6 +125,20 @@ if "OPTUNA_N_JOBS" not in os.environ and _sqlite_storage:
     )
 
 
+def _stdout_supports_rupee(stdout=None) -> bool:
+    stream = stdout if stdout is not None else getattr(sys, "stdout", None)
+    if stream is None:
+        return False
+
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    errors = getattr(stream, "errors", None) or "strict"
+    try:
+        "\u20b9".encode(encoding, errors=errors)
+    except (LookupError, TypeError, UnicodeEncodeError):
+        return False
+    return True
+
+
 def _build_sampler() -> TPESampler:
     if OPTUNA_SEED in (None, ""):
         return TPESampler()
@@ -452,11 +466,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
         )
         
         m = oos_results.metrics
-        # Encoding-safe currency prefix: cp1252/charmap Windows consoles cannot
-        # render ₹ (U+20B9) and raise UnicodeEncodeError, crashing the entire
-        # OOS validation block even though the backtest succeeded.
-        _enc = getattr(sys.stdout, "encoding", "utf-8") or "utf-8"
-        _rs = "\u20b9" if _enc.lower().replace("-", "") in ("utf8", "utf16", "utf32") else "Rs."
+        _rs = "\u20b9" if _stdout_supports_rupee() else "Rs."
         print(f"\n\033[1mOOS Final Equity:\033[0m \033[32m{_rs}{m.get('final', 0):,.0f}\033[0m")
         print(f"\033[1mOOS CAGR:\033[0m {m.get('cagr', 0):.2f}%")
         print(f"\033[1mOOS MaxDD:\033[0m {m.get('max_dd', 0):.2f}%")
