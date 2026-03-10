@@ -68,13 +68,18 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
             out = melted.rename(columns={first_col: "date"})
         else:
             melted = df.melt(id_vars=[first_col], var_name="date", value_name="member")
-            member = melted["member"].astype(str).str.strip().str.lower()
-            valid_member = (
-                melted["member"].notna()
-                & member.ne("")
-                & ~member.isin({"0", "false", "no", "n", "nan"})
-            )
-            out = melted.loc[valid_member, ["date", first_col]].rename(columns={first_col: "ticker"})
+            member_raw = melted["member"].astype(str).str.strip()
+            member = member_raw.str.lower()
+            member_looks_ticker = member_raw.str.contains(r"[A-Za-z]", na=False)
+            if member_looks_ticker.mean() >= 0.7:
+                out = melted.loc[member_raw.ne(""), ["date", "member"]].rename(columns={"member": "ticker"})
+            else:
+                valid_member = (
+                    melted["member"].notna()
+                    & member.ne("")
+                    & ~member.isin({"0", "false", "no", "n", "nan"})
+                )
+                out = melted.loc[valid_member, ["date", first_col]].rename(columns={first_col: "ticker"})
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     out["ticker"] = out["ticker"].map(_ns_ticker)
