@@ -225,7 +225,11 @@ def generate_signals(
     # Gate C: Falling Knife Protection
     if len(log_rets) >= cfg.KNIFE_WINDOW:
         recent_simple = np.expm1(log_rets.iloc[-cfg.KNIFE_WINDOW:])
-        recent_cumulative_returns = ((1.0 + recent_simple).prod(min_count=1) - 1.0).values
+        recent_cumulative_returns = (
+            (1.0 + recent_simple)
+            .prod(skipna=False, min_count=cfg.KNIFE_WINDOW)
+            - 1.0
+        ).values
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
             if np.isfinite(cumulative_ret) and cumulative_ret < cfg.KNIFE_THRESHOLD:
                 adj_scores[i] = -np.inf

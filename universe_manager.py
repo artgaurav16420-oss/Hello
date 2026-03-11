@@ -286,7 +286,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
         cfg = UltimateConfig()
 
     end_date   = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=40)).strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=max(150, int(cfg.ADV_LOOKBACK) * 2))).strftime("%Y-%m-%d")
 
     chunk_size  = 75
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]

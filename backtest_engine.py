@@ -166,6 +166,8 @@ class BacktestEngine:
     ) -> None:
         cfg = self.engine.cfg
 
+        sym_to_global_idx = {sym: i for i, sym in enumerate(symbols)}
+
         active_symbols = symbols
         active_prices = prices_t
         if member_universe is not None:
@@ -173,7 +175,7 @@ class BacktestEngine:
             active_symbols = [sym for sym in symbols if sym in member_set]
             if not active_symbols:
                 return
-            active_positions = [symbols.index(sym) for sym in active_symbols]
+            active_positions = [sym_to_global_idx[sym] for sym in active_symbols]
             active_prices = prices_t[active_positions]
 
         prev_idx = close.index.get_loc(date) - 1
@@ -214,11 +216,10 @@ class BacktestEngine:
         gross_exposure = sum(
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
-                if pd.notna(valuation_close[sym])
+                if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
                 else _ffill_price(self.state, sym, cfg)
             )
             for sym in self.state.shares
-            if sym in symbols
         ) / max(pv, 1e-6)
 
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
@@ -585,7 +586,8 @@ def run_backtest(
         row = market_data[key]
         if cfg.SIMULATE_HALTS:
             row = _repair_suspension_gaps(row, key)
-        close_d[sym]  = row["Close"].ffill()
+        valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        close_d[sym]  = valuation_series.ffill()
         close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
         open_d[sym] = row.get("Open", row["Close"]).ffill()
         high_d[sym] = row.get("High", row["Close"]).ffill()
