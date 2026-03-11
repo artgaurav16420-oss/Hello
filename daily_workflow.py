@@ -1,5 +1,5 @@
 """
-daily_workflow.py — Ultimate Momentum v11.46
+daily_workflow.py — Ultimate Momentum v11.48
 ============================================
 Interactive CLI for live scanning, status display, and backtesting.
 Features robust capital management, direct Screener.in web scraping,
@@ -281,8 +281,13 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
             
-        # Dividend sweep is universally safe as long as we haven't already swept it this period
-        if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns:
+        # MB-09 FIX: Skip dividend sweep when AUTO_ADJUST_PRICES=True.
+        # With auto-adjusted prices, Adj Close already embeds dividend distributions
+        # (the price falls on ex-date to reflect the payout).  Crediting cash on top
+        # of an already-adjusted price double-counts the dividend, overstating NAV by
+        # 2× the dividend amount per share.  The backtest engine applies the same
+        # guard in BacktestEngine.run(); this aligns the live-scan path with it.
+        if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns and not getattr(cfg, "AUTO_ADJUST_PRICES", True):
             dividends = row["Dividends"][row["Dividends"] > 0]
             if not dividends.empty:
                 shares_held = state.shares.get(sym, 0)
@@ -594,16 +599,35 @@ def _run_scan(
 
     if rebalance_allowed and not _force_full_cash:
         try:
-            raw_daily, adj_scores, sel_idx = generate_signals(
+            raw_daily, adj_scores, sel_idx, gate_counts = generate_signals(
                 log_rets, adv_arr, cfg, prev_weights=state.weights
+            )
+            # MB-18 FIX: Log the per-gate rejection funnel at INFO level so the
+            # portfolio manager can distinguish a volatility spike (knife gate) from
+            # a data-provider outage (history gate) when the eligible universe shrinks.
+            logger.info(
+                "[Scan] Universe funnel: %d total → %d history-gated → %d ADV-gated "
+                "→ %d knife-gated → %d selected.",
+                gate_counts["total"],
+                gate_counts["history_gated"],
+                gate_counts["adv_gated"],
+                gate_counts["knife_gated"],
+                gate_counts["selected"],
             )
             if not sel_idx:
                 raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
             sel_syms      = [active[i] for i in sel_idx]
             sector_map    = get_sector_map(sel_syms, cfg=cfg)
-            unique_sectors = sorted(set(sector_map.values()))
-            sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
-            sector_labels  = np.array([sec_idx[sector_map[sym]] for sym in sel_syms], dtype=int)
+            # FIX (Sector-Cap Strangulation): exclude "Unknown" from the integer
+            # label space by assigning it the reserved sentinel -1.  The optimizer's
+            # constraint builder skips sec_id == -1, so unknown-sector assets are
+            # governed only by the global budget constraint instead of being grouped
+            # into a synthetic super-sector that strangulates their combined weight.
+            known_sectors  = sorted(s for s in set(sector_map.values()) if s != "Unknown")
+            sec_idx        = {s: i for i, s in enumerate(known_sectors)}
+            sector_labels  = np.array(
+                [sec_idx.get(sector_map[sym], -1) for sym in sel_syms], dtype=int
+            )
 
             weights_sel = engine.optimize(
                 expected_returns    = raw_daily[sel_idx],
@@ -628,7 +652,19 @@ def _run_scan(
             if not is_data_error:
                 state.consecutive_failures += 1
                 logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
-                if state.consecutive_failures >= 3:
+                # FIX (Risk-Breach Paralysis): if a soft CVaR breach is already
+                # active and the optimizer fails (KKT infeasibility or post-check
+                # rejection), the portfolio is in a mathematically unsafe state.
+                # Waiting for 3 consecutive failures before triggering decay leaves
+                # the live portfolio over-risk for potentially weeks.  Bypass the
+                # counter and force decay on this exact bar.
+                if _soft_cvar_breach:
+                    logger.warning(
+                        "Solver failure during active soft CVaR breach — "
+                        "bypassing 3-failure wait, triggering immediate decay."
+                    )
+                    apply_decay = True
+                elif state.consecutive_failures >= 3:
                     logger.warning(
                         "3 consecutive solver failures — triggering gate-filtered "
                         "pro-rata liquidation (%.0f%% of gate-passing positions).",
@@ -903,6 +939,23 @@ def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Option
     print(f"  {C.GRY}Cancelled. Returning to main menu.{C.RST}")
     return None
 
+def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> None:
+    """Copy stress-tracking risk fields from *source* into *target* in-place.
+
+    Called when the user discards trade-level changes after a scan.  The
+    holdings (shares, cash, weights, entry_prices) revert to their pre-scan
+    values, but the risk engine must retain any stress signals that were
+    detected during the scan (consecutive_failures, override state, decay
+    progress).  Without this, a portfolio that detected three solver failures
+    or an override trigger during a scan silently forgets the stress event
+    the moment the user presses 'n'.
+    """
+    target.consecutive_failures = source.consecutive_failures
+    target.override_cooldown    = source.override_cooldown
+    target.override_active      = source.override_active
+    target.decay_rounds         = source.decay_rounds
+
+
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main_menu() -> None:
@@ -938,7 +991,14 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "nse_total")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
-                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+                # FIX (State Desync Amnesia): discard trade-level changes but
+                # preserve any risk metadata updated during the scan.  Stress
+                # signals (consecutive_failures, override state, decay_rounds)
+                # must survive a user rejection so the risk engine remembers
+                # that the portfolio was under stress during this bar.
+                _preserve_risk_metadata(source=preview, target=states["nse_total"])
+                save_portfolio_state(states["nse_total"], "nse_total")
+                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "2":
             _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
@@ -958,7 +1018,9 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "nifty")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
-                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+                _preserve_risk_metadata(source=preview, target=states["nifty"])
+                save_portfolio_state(states["nifty"], "nifty")
+                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "3":
             universe = _get_custom_universe()
@@ -983,7 +1045,9 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "custom")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
-                print(f"  {C.GRY}[-] Discarded.{C.RST}")
+                _preserve_risk_metadata(source=preview, target=states["custom"])
+                save_portfolio_state(states["custom"], "custom")
+                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "4":
             print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
@@ -1126,8 +1190,30 @@ def main_menu() -> None:
                     p = f"data/portfolio_state_{n}.json"
                     for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
                         target = p + suffix
-                        if os.path.exists(target):
-                            os.remove(target)
+                        if not os.path.exists(target):
+                            continue
+                        # FIX (Transactional File Wipe): on Windows, antivirus and
+                        # filesystem indexers briefly lock state files, causing a raw
+                        # os.remove() to raise PermissionError and crash the loop
+                        # mid-wipe.  The remaining files are left on disk in an
+                        # inconsistent state.  We retry up to 3 times with a short
+                        # back-off; if all retries fail we log a warning and continue
+                        # to the next file rather than aborting the entire wipe.
+                        _removed = False
+                        for _attempt in range(3):
+                            try:
+                                os.remove(target)
+                                _removed = True
+                                break
+                            except OSError:
+                                if _attempt < 2:
+                                    time.sleep(0.1)
+                        if not _removed:
+                            logger.warning(
+                                "[Clear] Could not delete '%s' after 3 attempts "
+                                "(file may be locked). Skipping.",
+                                target,
+                            )
                 states    = {"nse_total": PortfolioState(), "nifty": PortfolioState(), "custom": PortfolioState()}
                 mkt_cache = {"nse_total": {}, "nifty": {}, "custom": {}}
                 print(f"  {C.GRN}[+] Portfolio holdings cleared. Cache and config untouched.{C.RST}")

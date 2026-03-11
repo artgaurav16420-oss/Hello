@@ -1,5 +1,5 @@
 """
-backtest_engine.py — Deterministic Walk-Forward Engine v11.46
+backtest_engine.py — Deterministic Walk-Forward Engine v11.48
 =============================================================
 Weekly rebalance cadence with full equity ledger, CVaR risk management,
 and sector-diversified portfolio construction.
@@ -283,7 +283,7 @@ class BacktestEngine:
         # ── Signal generation + optimization ─────────────────────────────────
         if not _force_full_cash:
             try:
-                raw_daily, adj_scores, sel_idx = generate_signals(
+                raw_daily, adj_scores, sel_idx, _gate_counts = generate_signals(
                     hist_log_rets,
                     adv_vector,
                     cfg,
@@ -330,7 +330,22 @@ class BacktestEngine:
                             "[Backtest] Solver failure #%d on %s: %s",
                             self.state.consecutive_failures, date, oe,
                         )
-                        if self.state.consecutive_failures >= 3:
+                        # FIX (Risk-Breach Paralysis): if a soft CVaR breach is
+                        # already active and the optimizer fails (KKT infeasibility
+                        # or post-check rejection), the portfolio is in a
+                        # mathematically unsafe state RIGHT NOW.  Waiting for 3
+                        # consecutive failures before triggering decay means the
+                        # position could remain over-risk for up to 3 rebalance
+                        # periods.  Bypass the counter and force decay immediately.
+                        if soft_cvar_breach:
+                            logger.warning(
+                                "[Backtest] Solver failure during active soft CVaR "
+                                "breach on %s — bypassing 3-failure wait, "
+                                "triggering immediate decay.",
+                                date,
+                            )
+                            apply_decay = True
+                        elif self.state.consecutive_failures >= 3:
                             logger.debug(
                                 "[Backtest] 3 consecutive solver failures on %s — "
                                 "triggering gate-filtered pro-rata liquidation.",
@@ -473,10 +488,23 @@ def _build_adv_vector(
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
     if not sector_map:
         return None
-    unique_sectors = sorted(set(sector_map.get(s, "Unknown") for s in sel_syms))
-    sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
-    return np.array([sec_idx[sector_map.get(sym, "Unknown")] for sym in sel_syms], dtype=int)
-
+    # FIX (Sector-Cap Strangulation): symbols whose sector could not be fetched
+    # from universe_manager default to the string "Unknown".  If we assign them a
+    # regular integer label, the OSQP constraint builder groups ALL unknown-sector
+    # assets into one synthetic super-sector and applies MAX_SECTOR_WEIGHT to their
+    # combined allocation.  When many mid-cap names have missing sector data this
+    # creates an invisible allocation cap that strangulates the optimizer.
+    #
+    # Sentinel -1 is used for "Unknown" so that the constraint builder loop can
+    # detect and skip it, allowing the global budget constraint alone to govern
+    # those assets.  Known sectors receive non-negative sequential IDs as before.
+    known_sectors = sorted(s for s in set(sector_map.get(sym, "Unknown") for sym in sel_syms)
+                           if s != "Unknown")
+    sec_idx = {s: i for i, s in enumerate(known_sectors)}
+    return np.array(
+        [sec_idx.get(sector_map.get(sym, "Unknown"), -1) for sym in sel_syms],
+        dtype=int,
+    )
 
 def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:
     px = state.last_known_prices.get(sym)
@@ -509,12 +537,16 @@ def _execution_prices(
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """In-memory suspension simulation used only during backtest runtime."""
     if len(df) < 2:
-        return df
+        # MB-11 FIX: Always return a copy so subsequent operations on the returned
+        # frame never mutate the shared market_data dict.  The no-repair early-return
+        # previously returned `df` directly (the market_data value), making the
+        # function's ownership contract ambiguous and creating latent mutation risk.
+        return df.copy()
 
     gap_days = df.index.to_series().diff().dt.days
     max_gap = int(gap_days.max()) if not gap_days.empty else 0
     if max_gap <= _SUSPENSION_GAP_DAYS:
-        return df
+        return df.copy()  # MB-11 FIX: copy on no-repair path too
 
     out = df.copy()
     logger.warning(
@@ -550,7 +582,20 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         out["Volume"] = out["Volume"].fillna(0)
     return out
 
-# ─── Public API ───────────────────────────────────────────────────────────────
+def apply_halt_simulation(market_data: dict) -> dict:
+    """
+    Pre-apply _repair_suspension_gaps to every ticker once, returning a new dict
+    of repaired frames.  Called by pre_load_data so the per-trial objective can
+    share a single repaired copy without any per-trial allocation.
+
+    MB-03 FIX (memory): The v11.48 fix passed {k: v.copy()} on every run_backtest
+    call — 500 tickers × 300 trials × 4 WFO slices = 600,000 DataFrame allocations
+    per optimizer run.  Pre-computing the repair once and passing a read-only
+    reference eliminates this O(N×trials) allocation cascade.  _repair_suspension_gaps
+    is deterministic (seeded from ticker hash), so computing it once is equivalent
+    to computing it on every trial.
+    """
+    return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
 def run_backtest(
     market_data:   dict,
@@ -577,8 +622,48 @@ def run_backtest(
     # so the union_universe branch below handles it correctly without needing
     # special-casing here.
     if union_universe:
-        for d in all_target_dates:
-            universe_by_rebalance_date[pd.Timestamp(d)] = set(union_universe)
+        # MB-04 FIX: Custom universes previously received NO historical narrowing —
+        # every target date was assigned the full current-day screener list, silently
+        # trading 2022-IPO stocks in 2018.  Bayesian optimization on this survivor-biased
+        # universe learned parameters that exploit look-ahead; the resulting
+        # optimal_cfg.json was lethal in live trading.
+        #
+        # Fix: use cumulative-volume existence gates from market_data (already loaded)
+        # to narrow each rebalance date's universe to assets that had verifiable trading
+        # activity prior to that date (>= HISTORY_GATE cumulative trading days).
+        # This mirrors the PIT logic in build_historical_fallback.build_parquet.
+        history_gate = int(getattr(cfg, "HISTORY_GATE", 20))
+        vol_dict: Dict[str, pd.Series] = {}
+        for sym in list(union_universe):
+            key = sym if sym.endswith(".NS") else sym + ".NS"
+            row = market_data.get(key) or market_data.get(sym)
+            if row is not None and not row.empty and "Volume" in row.columns:
+                import numpy as _np
+                vol_dict[sym] = row["Volume"].replace(0, _np.nan).notna().cumsum()
+
+        if vol_dict:
+            cum_vol_df = pd.DataFrame(vol_dict).sort_index()
+            for d in all_target_dates:
+                ts = pd.Timestamp(d)
+                past = cum_vol_df[cum_vol_df.index <= ts]
+                if past.empty:
+                    universe_by_rebalance_date[ts] = set()
+                    continue
+                eligible = past.iloc[-1]
+                pit_syms = set(eligible[eligible >= history_gate].index.tolist())
+                universe_by_rebalance_date[ts] = pit_syms & union_universe
+                logger.debug(
+                    "[Backtest][MB-04] %s: %d/%d custom universe symbols pass PIT volume gate.",
+                    ts.date(), len(universe_by_rebalance_date[ts]), len(union_universe),
+                )
+        else:
+            # No volume data available — fall back to full union with warning
+            logger.warning(
+                "[Backtest][MB-04] No volume data found for custom universe; "
+                "survivorship bias is NOT corrected for this backtest."
+            )
+            for d in all_target_dates:
+                universe_by_rebalance_date[pd.Timestamp(d)] = set(union_universe)
     else:
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
@@ -600,8 +685,11 @@ def run_backtest(
         if key not in market_data:
             continue
         row = market_data[key]
-        if cfg.SIMULATE_HALTS:
-            row = _repair_suspension_gaps(row, key)
+        # MB-03 FIX: Gap repair is now pre-computed once in pre_load_data via
+        # apply_halt_simulation().  The SIMULATE_HALTS branch here is intentionally
+        # removed: market_data already contains repaired frames when called from
+        # the optimizer.  For direct run_backtest calls without pre-loading (e.g.
+        # the final OOS validation), repair is applied at call site if needed.
         valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
         close_d[sym]  = valuation_series.ffill()
         close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
@@ -823,7 +911,15 @@ def _compute_metrics(
         avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
         if avg_equity > 0:
             turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
-            years = n_periods / float(periods_per_year)
+            # MB-16 FIX: Use the actual date span to annualize turnover instead of
+            # n_periods/252.  When eq is a weekly-frequency rebalance-date slice,
+            # n_periods/252 gives ~0.21 years for a year of weekly bars, overstating
+            # annual turnover by ~5x and causing Optuna to over-penalize low-turnover
+            # parameters.  Use calendar days when a DatetimeIndex is available.
+            if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
+                years = (eq.index[-1] - eq.index[0]).days / 365.25
+            else:
+                years = n_periods / float(periods_per_year)
             if years > 0:
                 turnover = turnover / years
 

@@ -1,5 +1,5 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.46
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.48
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses expanding-window time-series cross-validation for parameter selection,
@@ -20,9 +20,9 @@ import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
 
-# Local imports from your v11.46 architecture
+# Local imports from your v11.48 architecture
 from momentum_engine import UltimateConfig, OptimizationError
-from backtest_engine import run_backtest
+from backtest_engine import run_backtest, apply_halt_simulation
 from data_cache import load_or_fetch
 from universe_manager import get_nifty500, fetch_nse_equity_universe
 
@@ -200,10 +200,11 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
     if abs(cagr) < 1e-12 and max_dd == 0.0:
         return max(-exposure_penalty, -2.0)
 
-    # Hard MaxDD gate: 55% catches genuinely broken configurations (extreme
-    # concentration + no CVaR protection). Set at 55% not 40% because the 2020
-    # COVID OOS slice can produce 40-50% drawdowns for any equity momentum strategy.
-    if max_dd > 55.0:
+    # MB-12 FIX: Align IS soft-gate with OOS hard gate (OOS_MAX_DD_CAP).
+    # The previous threshold (55%) was 15 percentage points above OOS rejection
+    # (40%), causing IS-winners with 40-55% MaxDD to waste OOS validation runs.
+    # Using OOS_MAX_DD_CAP here ensures IS and OOS apply the same drawdown bar.
+    if max_dd > OOS_MAX_DD_CAP:
         # Return a gradient signal so TPE steers away, not a uniform floor.
         raw = -(max_dd / 10.0)
     else:
@@ -296,6 +297,10 @@ class MomentumObjective:
             exclude_from_score = (oos_year == first_oos_year)
 
             oos = run_backtest(
+                # MB-03 FIX (v11.48): market_data is pre-repaired by apply_halt_simulation()
+                # in pre_load_data — no per-trial copy needed.  Frames are never written
+                # back to in the post-repair path (close_d etc. are new Series derived from
+                # .ffill() on the frame values, not in-place mutations of the frames).
                 market_data=self.market_data,
                 universe_type=self.universe_type,
                 start_date=wf_oos_start,
@@ -338,8 +343,18 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     if cfg is None:
         cfg = UltimateConfig()
         cvar_bounds = SEARCH_SPACE_BOUNDS.get("CVAR_LOOKBACK")
+        halflife_bounds = SEARCH_SPACE_BOUNDS.get("HALFLIFE_SLOW")
         if cvar_bounds:
             cfg.CVAR_LOOKBACK = int(cvar_bounds[1])
+        # MB-17 FIX: Also account for HALFLIFE_SLOW upper bound when computing
+        # the pre-fetch padding.  EWMA needs ~4x halflife to converge; previously
+        # only CVAR_LOOKBACK was considered, leaving slow-halflife trials with
+        # unconverged signals at the start of the first OOS slice.
+        if halflife_bounds:
+            halflife_slow_max = int(halflife_bounds[1])
+            halflife_calendar_days = halflife_slow_max * 4 * 365 // 252
+            current_cvar_padding = max(400, cfg.CVAR_LOOKBACK * 2)
+            cfg._pre_load_padding_days = max(current_cvar_padding, halflife_calendar_days)
 
     logger.info(f"Fetching {len(symbols_to_fetch)} symbols from {TRAIN_START} to {TEST_END}...")
     kwargs = dict(tickers=symbols_to_fetch, required_start=TRAIN_START, required_end=TEST_END)
@@ -350,6 +365,14 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     except TypeError:
         kwargs.pop("cfg", None)
         market_data = load_or_fetch(**kwargs)
+
+    # MB-03 FIX: Pre-apply gap repair once here so the per-trial objective
+    # receives already-repaired frames and needs zero per-trial allocation.
+    # _repair_suspension_gaps is deterministic (ticker-hash seed), so pre-computing
+    # is equivalent to re-computing on every trial while eliminating
+    # 500 tickers × 300 trials × 4 slices = 600,000 DataFrame allocations per run.
+    market_data = apply_halt_simulation(market_data)
+
     logger.info("Data pre-load complete. Commencing Bayesian Optimization.")
     return market_data
 

@@ -201,7 +201,6 @@ def fetch_via_nsepy(universe_type: str) -> List[str]:
 # ─── Point-in-Time Parquet builder ────────────────────────────────────────────
 
 def build_parquet(
-    symbols: List[str],
     universe_type: str,
     valid_trading_days: pd.DataFrame,
     history_gate: int,
@@ -209,10 +208,19 @@ def build_parquet(
     snap_freq: str = "QS",
 ) -> Path:
     """
-    Create a PIT parquet from a list of symbols by backfilling quarterly
+    Create a PIT parquet from valid_trading_days by backfilling quarterly
     snapshots from start_date to today, STRICTLY EXCLUDING assets that had
     not yet listed / lacked trading volume prior to the snapshot date.
+
+    MB-15 FIX: The `symbols` parameter was dead code — the actual output
+    symbols come exclusively from valid_trading_days.columns (which are
+    correctly .NS-suffixed from load_or_fetch).  Passing `symbols` created
+    false impression that callers could control which tickers appear in output.
+    The function now derives the universe solely from valid_trading_days.columns.
     """
+    assert all(
+        s.endswith(".NS") or s.startswith("^") for s in valid_trading_days.columns
+    ), "MB-15: all columns in valid_trading_days must be .NS-suffixed or index tickers"
     output_path = DATA_DIR / f"historical_{universe_type}.parquet"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -244,14 +252,16 @@ def build_parquet(
 
 
 def build_csv_from_symbols(
-    symbols: List[str],
     universe_type: str,
     valid_trading_days: pd.DataFrame,
     history_gate: int,
     start_date: str = "2018-01-01",
     snap_freq: str = "QS",
 ) -> Path:
-    """Write the companion CSV incorporating strict volume existence gates."""
+    """Write the companion CSV incorporating strict volume existence gates.
+
+    MB-15 FIX: The `symbols` parameter was unused dead code (see build_parquet).
+    """
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
     
@@ -340,10 +350,10 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
         # 5. Build parquet and CSV using the Point-In-Time gates
         logger.info("Building parquet with %d symbols from %s...", len(symbols), start_date)
         parquet_path = build_parquet(
-            symbols, universe_type, valid_trading_days, history_gate, start_date
+            universe_type, valid_trading_days, history_gate, start_date
         )
         csv_path = build_csv_from_symbols(
-            symbols, universe_type, valid_trading_days, history_gate, start_date
+            universe_type, valid_trading_days, history_gate, start_date
         )
 
         # 6. Quick sanity check: load back and verify

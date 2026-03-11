@@ -135,11 +135,17 @@ class SecondaryProvider(DataProvider):
             return None
 
         start_ts = pd.Timestamp(start)
+        # MB-08 FIX: Use strictly-less-than for end_ts so partial bars on
+        # required_end (e.g. mid-session prices from AlphaVantage's full-history
+        # download) cannot slip through.  AlphaVantage returns the entire history
+        # client-side with no server-side date filter; using `date > end_ts` allowed
+        # the required_end date itself to pass, which may contain incomplete OHLCV
+        # when the server clock is ahead of IST close.
         end_ts = pd.Timestamp(end)
         rows = []
         for d, item in series.items():
             date = pd.Timestamp(d)
-            if date < start_ts or date > end_ts:
+            if date < start_ts or date >= end_ts:
                 continue
             rows.append(
                 {
@@ -238,16 +244,21 @@ def _download_with_timeout(
     every downloaded frame.)
     """
     max_retries = 3
+    errors: list = []
     for attempt in range(max_retries):
         try:
             active_provider = provider or YFinanceProvider()
             df = active_provider.download(tickers, start, end)
             return df
         except Exception as exc:
+            errors.append(exc)
             logger.debug("[Cache] yfinance download attempt %d failed: %s", attempt + 1, exc)
             if attempt == max_retries - 1:
                 logger.error("[Cache] yfinance failed after %d retries.", max_retries)
-                raise exc
+                # MB-14 FIX: Chain exceptions so callers see full retry history.
+                # Previously only the final exception was raised, masking earlier
+                # (often more informative) network errors with e.g. a JSON parse error.
+                raise errors[-1] from errors[0]
             time.sleep((2 ** attempt) + random.random())
             
     return None
@@ -294,7 +305,7 @@ def invalidate_cache() -> None:
             logger.error("[Cache] Failed to invalidate cache: %s", e)
 
 
-def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None) -> bool:
+def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
     """
     Strict structural validation gate applied before any data is written to disk.
 
@@ -302,12 +313,15 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None) -> bool:
     silently into the cache and corrupt downstream CVaR and signal calculations.
 
     Checks:
-    - Minimum row count (5) to exclude stub responses.
+    - Minimum row count (MB-20 FIX: max(30, HISTORY_GATE) to match strategy warm-up
+      requirements; a 5-row frame passes validation but is immediately gated out by
+      HISTORY_GATE and cached as "valid", wasting disk space).
     - Unique, monotonically increasing DatetimeIndex — yfinance occasionally
       returns duplicate or out-of-order dates on partial trading sessions.
     - 'Open', 'High', 'Low', 'Close' columns present and not entirely NaN.
     """
-    if df is None or df.empty or len(df) < 5:
+    min_rows = max(30, int(getattr(cfg, "HISTORY_GATE", 30))) if cfg is not None else 30
+    if df is None or df.empty or len(df) < min_rows:
         return False
     if not isinstance(df.index, pd.DatetimeIndex):
         return False
@@ -516,7 +530,7 @@ def load_or_fetch(
                     # Structural validation before anything touches disk.
                     # Catches non-unique/non-monotonic indexes and all-NaN Close
                     # columns that dropna(how='all') cannot detect.
-                    if not _is_valid_dataframe(df, ticker=ticker):
+                    if not _is_valid_dataframe(df, ticker=ticker, cfg=cfg):
                         logger.warning(
                             "[Cache] Structural validation failed for %s "
                             "(non-monotonic index, duplicate dates, or null OHLC). Skipping.",
@@ -564,8 +578,19 @@ def load_or_fetch(
     #
     # We still trim at required_end to prevent future-data leakage.
     # CRITICAL: Do NOT trim back to required_start — that was the original bug.
+    #
+    # MB-01 FIX: For cache-hit tickers, the stored parquet may START EARLIER than the
+    # current call's padded_start (e.g. previously cached with a larger CVAR_LOOKBACK).
+    # Trimming with the new (shorter) padded_start silently discards valid warm-up history
+    # that was already fetched.  Fix: use the stored frame's actual first date so we
+    # never trim back beyond what is already on disk.  For freshly-downloaded tickers
+    # the parquet start equals padded_start anyway, so the min() is a no-op.
+    padded_start_ts = pd.Timestamp(padded_start)
     for t, df in market_data.items():
-        market_data[t] = df.loc[padded_start:required_end]
+        if df.empty:
+            continue
+        effective_start = min(df.index[0], padded_start_ts)
+        market_data[t] = df.loc[effective_start:required_end]
 
     return market_data
 
