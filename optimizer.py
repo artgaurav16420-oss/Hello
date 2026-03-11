@@ -81,7 +81,7 @@ TEST_START  = "2023-01-01"   # True OOS: 2023-present is fully unseen data.
                               # bear-market discipline without poisoning scoring.
 TEST_END    = pd.Timestamp.today().strftime("%Y-%m-%d")
 
-N_TRIALS       = 100   # 100 trials: TPE needs ~20+ warm-up then ~80 exploitation
+N_TRIALS       = 300   # 100 trials: TPE needs ~20+ warm-up then ~80 exploitation
                         # rounds across 6 dimensions to converge reliably.
 # OOS window is 2023-2026 (bull market): 35% DD cap appropriate.
 # A well-tuned momentum strategy should not exceed -35% in a bull regime.

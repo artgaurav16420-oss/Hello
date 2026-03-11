@@ -1070,12 +1070,14 @@ def main_menu() -> None:
                 print(f"  {C.RED}Invalid choice.{C.RST}")
 
         elif c == "7":
-            print(f"\n  {C.B_RED}WARNING: This will permanently erase ALL portfolio states and caches.{C.RST}")
+            print(f"\n  {C.B_RED}WARNING: This will reset your holdings to zero (cash only).{C.RST}")
+            print(f"  {C.GRY}Market data cache and optimal_cfg.json are NOT affected.{C.RST}")
+            print(f"  {C.GRY}Use this when you want to start a fresh portfolio with new capital.{C.RST}")
             confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
             if confirm.upper() == "YES":
-                invalidate_cache()
-                from universe_manager import invalidate_universe_cache
-                invalidate_universe_cache()
+                # Only delete portfolio state files — never touch the data cache
+                # or optimal_cfg.json. Wiping those forces a full re-download and
+                # loses optimized parameters, neither of which is wanted here.
                 for n in ["nse_total", "nifty", "custom"]:
                     p = f"data/portfolio_state_{n}.json"
                     for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
@@ -1084,7 +1086,7 @@ def main_menu() -> None:
                             os.remove(target)
                 states    = {"nse_total": PortfolioState(), "nifty": PortfolioState(), "custom": PortfolioState()}
                 mkt_cache = {"nse_total": {}, "nifty": {}, "custom": {}}
-                print(f"  {C.GRN}[+] All states and caches cleared.{C.RST}")
+                print(f"  {C.GRN}[+] Portfolio holdings cleared. Cache and config untouched.{C.RST}")
             else:
                 print(f"  {C.GRY}Cancelled.{C.RST}")
 
