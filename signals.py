@@ -204,9 +204,22 @@ def generate_signals(
     if np.all(np.isnan(raw_daily_momentum)):
         return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), []
 
-    # Cross-sectional Z-score standardization
-    mu_cross = np.nanmean(raw_daily_momentum)
-    std_cross = max(np.nanstd(raw_daily_momentum), 1e-8)
+    # FIX D3: Compute cross-sectional normalization statistics ONLY over stocks that
+    # pass the history and liquidity gates. Stocks with thin history have extreme EWMA
+    # values (short-sample bias) that inflate or deflate mu_cross and std_cross before
+    # gating removes them, distorting the Z-scores of every other stock in the universe.
+    # Pre-compute gate masks here; the same masks are applied as hard gates below.
+    history_pass = np.zeros(len(active_symbols), dtype=bool)
+    liquidity_pass = np.zeros(len(active_symbols), dtype=bool)
+    for i, sym in enumerate(active_symbols):
+        history_pass[i]   = int(log_rets[sym].notna().sum()) >= cfg.HISTORY_GATE
+        liquidity_pass[i] = bool(np.isfinite(adv_arr[i]) and adv_arr[i] > 0)
+    gate_pass_mask = history_pass & liquidity_pass
+
+    # Normalise over gate-passing stocks; fall back to all stocks only if none pass.
+    norm_src = raw_daily_momentum[gate_pass_mask] if gate_pass_mask.any() else raw_daily_momentum
+    mu_cross  = np.nanmean(norm_src)
+    std_cross = max(np.nanstd(norm_src), 1e-8)
 
     adj_scores = np.clip(
         (raw_daily_momentum - mu_cross) / std_cross,
@@ -214,27 +227,44 @@ def generate_signals(
         cfg.Z_SCORE_CLIP
     )
 
-    # 2. Hard Gates (Disqualification)
-    for i, sym in enumerate(active_symbols):
-        # Gate A: Minimum History Requirement
-        valid_history_days = int(log_rets[sym].notna().sum())
-        if valid_history_days < cfg.HISTORY_GATE:
+    # 2. Hard Gates (Disqualification) — using pre-computed masks
+    for i in range(len(active_symbols)):
+        if not history_pass[i]:
+            adj_scores[i] = -np.inf
+        if not liquidity_pass[i]:
             adj_scores[i] = -np.inf
             
-        # Gate B: Liquidity / ADV Requirement
-        if not np.isfinite(adv_arr[i]) or adv_arr[i] <= 0:
-            adj_scores[i] = -np.inf
-            
-    # Gate C: Falling Knife Protection
+    # Gate C: Volatility-adjusted Falling Knife Protection
+    # FIX B4: Changed skipna=False → skipna=True so stocks with data gaps are still
+    # checked against the threshold. Under skipna=False, a single NaN in the window
+    # propagated through .prod() → NaN → np.isfinite() returned False → gate bypassed.
+    # A stock down 40% over 18 of 20 trading days with 2 gaps previously passed undetected.
+    #
+    # FIX G2: Threshold is now volatility-adjusted. A fixed -15% threshold treats a
+    # high-beta small-cap and a low-beta utility identically, which is incorrect.
+    # Each stock's threshold is scaled by its full-lookback daily vol relative to a
+    # 1% daily baseline (~16% annualised). Scalar is bounded [0.5×, 2.0×]:
+    #   - Low-vol stock (σ=0.5%): threshold tightens to -7.5% — catches mild slides.
+    #   - High-vol stock (σ=2.0%): threshold widens to -30% — tolerates normal swings.
     if len(log_rets) >= cfg.KNIFE_WINDOW:
         recent_simple = np.expm1(log_rets.iloc[-cfg.KNIFE_WINDOW:])
         recent_cumulative_returns = (
             (1.0 + recent_simple)
-            .prod(skipna=False, min_count=cfg.KNIFE_WINDOW)
+            .prod(skipna=True, min_count=1)   # FIX B4: skipna=True, gap stocks still checked
             - 1.0
         ).values
+
+        _baseline_daily_vol = 0.01  # ~1% daily ≈ 16% annualised; reference for Nifty 500 large-caps
+        _full_daily_vols = log_rets.std().values  # full-lookback std per asset (stable estimate)
+
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
-            if np.isfinite(cumulative_ret) and cumulative_ret < cfg.KNIFE_THRESHOLD:
+            if not np.isfinite(cumulative_ret):
+                continue  # genuine data gap on all days — can't evaluate; skip safely
+            # FIX G2: vol-scaled threshold
+            asset_vol = float(_full_daily_vols[i]) if np.isfinite(_full_daily_vols[i]) and _full_daily_vols[i] > 0 else _baseline_daily_vol
+            vol_scalar = float(np.clip(asset_vol / _baseline_daily_vol, 0.5, 2.0))
+            vol_adj_threshold = cfg.KNIFE_THRESHOLD * vol_scalar
+            if cumulative_ret < vol_adj_threshold:
                 adj_scores[i] = -np.inf
 
     # 3. FIX: Dispersion-Normalized Continuity Bonus

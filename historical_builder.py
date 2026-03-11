@@ -85,8 +85,15 @@ def _download_master_archive(universe_type: str, output_path: Path) -> Path | No
             resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             preview = pd.read_csv(io.StringIO(resp.text), nrows=5)
-            if preview.empty and len(preview.columns) < 2:
-                raise ValueError("downloaded archive does not look like a valid CSV")
+            # FIX HB1: Was `and` — a single-column malformed file (e.g. a server error
+            # page parsed as one column) has empty=False, so the AND never fired and the
+            # corrupt content was written to disk. OR is correct: reject if EITHER the
+            # file has no rows OR it has fewer than 2 columns (date + ticker minimum).
+            if preview.empty or len(preview.columns) < 2:
+                raise ValueError(
+                    f"downloaded archive looks malformed: {len(preview)} rows, "
+                    f"{len(preview.columns)} columns"
+                )
             output_path.write_text(resp.text, encoding="utf-8")
             logger.info("[HistoricalBuilder] Downloaded %s archive from %s", universe_type, url)
             return output_path
@@ -99,8 +106,12 @@ def _download_master_archive(universe_type: str, output_path: Path) -> Path | No
             resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             preview = pd.read_csv(io.StringIO(resp.text), nrows=5)
-            if preview.empty and len(preview.columns) < 2:
-                raise ValueError("downloaded archive does not look like a valid CSV")
+            # FIX HB1: Same AND→OR fix as primary download path above.
+            if preview.empty or len(preview.columns) < 2:
+                raise ValueError(
+                    f"discovered archive looks malformed: {len(preview)} rows, "
+                    f"{len(preview.columns)} columns"
+                )
             output_path.write_text(resp.text, encoding="utf-8")
             logger.info("[HistoricalBuilder] Downloaded %s archive via discovered URL %s", universe_type, url)
             return output_path

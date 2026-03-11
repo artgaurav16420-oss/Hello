@@ -137,23 +137,27 @@ def _build_sampler() -> TPESampler:
 
 def _iter_wfo_slices(train_start: str, train_end: str):
     """
-    Yield (is_start, is_end, oos_start, oos_end) expanding time-series CV slices
-    confined entirely within the training window.
+    Yield (is_start, is_end, oos_start, oos_end) tuples for each calendar year
+    within the training window. The IS window bounds are yielded for documentation
+    purposes and logging; the actual backtest in MomentumObjective.__call__ always
+    uses start_date=oos_start so that each evaluation covers one OOS year only.
+    Signal warm-up history (all pre-OOS data in market_data) is available to the
+    backtest engine via BacktestEngine._run_rebalance's hist_log_rets slice.
 
     With TRAIN_START=2018 / TRAIN_END=2022 this yields 4 slices:
-        IS 2018       OOS 2019  — NBFC stress  (skipped — see NOTE below)
-        IS 2018-2019  OOS 2020  — COVID crash
-        IS 2018-2020  OOS 2021  — bull market
-        IS 2018-2021  OOS 2022  — Ukraine/rate-hike bear
+        IS window    OOS window   Regime
+        2018         2019         NBFC/IL&FS stress  (score excluded — see NOTE)
+        2018-2019    2020         COVID crash + V-recovery
+        2018-2020    2021         bull market
+        2018-2021    2022         Ukraine/rate-hike bear
 
-    NOTE: The first slice (OOS 2019) is intentionally EXCLUDED from scoring.
-    The NBFC/IL&FS contagion made 2019 a structural bear for long-only momentum
-    strategies (-50 to -80% for mid/small cap momentum). Including this slice as
-    a scored signal causes it to dominate the aggregate by 40× (score ≈ -7 vs
-    the other slices' ≈ ±2), turning TPE into random search.
+    NOTE: The first slice (OOS 2019) is intentionally EXCLUDED from the fitness
+    aggregate. The NBFC/IL&FS contagion made 2019 a structural bear for long-only
+    momentum strategies. Including it caused it to dominate the aggregate by 40×
+    (score ≈ -7 vs the other slices' ≈ ±2), turning TPE into random search.
 
-    The 2019 IS run IS still executed (to validate the parameters don't crash
-    during that regime) but its OOS score is excluded from the fitness aggregate.
+    The 2019 OOS backtest IS still run so exceptions propagate — parameters that
+    crash during that regime are pruned — but its score is not appended to `scores`.
     """
     start = pd.Timestamp(train_start)
     end   = pd.Timestamp(train_end)
@@ -174,8 +178,6 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
     turnover = float(metrics.get("turnover", 0.0))
     turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x annual turnover
     cagr_net = cagr - turnover_drag
-    if abs(cagr) < 1e-12 and max_dd == 0.0:
-        return 0.0
 
     avg_cvar = 0.0
     avg_positions = 0.0
@@ -185,6 +187,18 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
 
     risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
     exposure_penalty = 0.0 if avg_positions >= 1.0 else 0.5
+
+    # FIX O1: The previous early return `if abs(cagr) < 1e-12 and max_dd == 0.0: return 0.0`
+    # bypassed exposure_penalty before it was computed. A trial that produced zero trades —
+    # equity flat in cash, CAGR=0, MaxDD=0 — returned 0.0 while any losing trial returned
+    # a negative score. TPE ranked 0.0 above negative scores and converged on all-cash
+    # parameter sets (tight CVaR limit during COVID → no signals pass → zero trades → 0.0 score).
+    #
+    # Fix: compute exposure_penalty first (avg_positions=0 → penalty=0.5), then apply it.
+    # Zero-trade trials now score max(-0.5, -2.0) = -0.5, correctly below any trial that
+    # made trades and scored -0.27 or better. The floor is preserved.
+    if abs(cagr) < 1e-12 and max_dd == 0.0:
+        return max(-exposure_penalty, -2.0)
 
     # Hard MaxDD gate: 55% catches genuinely broken configurations (extreme
     # concentration + no CVaR protection). Set at 55% not 40% because the 2020
@@ -220,8 +234,14 @@ class MomentumObjective:
         cfg.HALFLIFE_FAST = trial.suggest_int("HALFLIFE_FAST", halflife_fast_min, halflife_fast_max)
         cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max)
         
-        # Logical Constraint: Fast must be strictly faster than slow
-        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
+        # Logical Constraint: Fast must be strictly faster than slow.
+        # FIX O4: With current bounds (FAST max=40, SLOW min=50) this branch is
+        # unreachable — max(FAST)=40 can never exceed min(SLOW)=50. It is kept as
+        # a safety net: if HALFLIFE_FAST bounds are ever widened past 50 (e.g. to
+        # test longer fast windows), the constraint will automatically activate and
+        # prune nonsensical FAST > SLOW combinations without needing a separate edit.
+        # Do NOT remove this check when widening search bounds.
+        if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
             raise optuna.TrialPruned()
             
         continuity_min, continuity_max, continuity_step = self.search_space["CONTINUITY_BONUS"]
@@ -341,6 +361,9 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
         os.makedirs(output_dir, exist_ok=True)
 
     # Write atomically to avoid partial/truncated JSON if the process is interrupted.
+    # FIX O2: Wrap os.replace in try/finally so the temp file is deleted on failure.
+    # Without this, a failed os.replace (e.g. Windows file-lock on the target) leaves
+    # a NamedTemporaryFile(delete=False) orphan in the data/ directory indefinitely.
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -352,7 +375,14 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
         os.fsync(tmp_file.fileno())
         temp_path = tmp_file.name
 
-    os.replace(temp_path, filepath)
+    try:
+        os.replace(temp_path, filepath)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
     logger.info(f"Saved optimal parameters to {filepath}")
 
 
@@ -372,9 +402,18 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
         effective_n_jobs = N_JOBS
 
     if effective_n_jobs != 1:
+        # FIX O5: OPTUNA_N_JOBS is always forced to 1 here. CPU-bound backtests under
+        # the GIL do not benefit from Optuna's thread-based n_jobs > 1.
+        # For real parallelism: launch N separate `python optimizer.py` processes that
+        # all point to the same SQLite or RDB storage. Optuna's study coordination
+        # handles concurrent trial allocation automatically. The N_JOBS env var is
+        # intentionally preserved for forward-compatibility if this path is later
+        # migrated to a process-pool backend.
         logger.warning(
-            "Forcing n_jobs=1 because backtests are CPU-bound and Optuna uses threads. "
-            "Use multiple optimizer processes with shared storage for real parallelism."
+            "OPTUNA_N_JOBS=%d is not supported in this execution path (GIL bottleneck). "
+            "Forcing n_jobs=1. For parallelism, run multiple optimizer processes with "
+            "shared SQLite/RDB storage.",
+            effective_n_jobs,
         )
         effective_n_jobs = 1
 
@@ -420,10 +459,13 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
 
     best_params = study.best_params
     best_trial = getattr(study, "best_trial", None)
-    best_is_calmar = study.best_value
+    best_is_fitness = study.best_value  # composite fitness score, NOT a Calmar ratio
 
     print(f"\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
-    print(f"\033[1mBest In-Sample Calmar Ratio:\033[0m {best_is_calmar:.2f}")
+    # FIX O3: Previous label "Best In-Sample Calmar Ratio" was wrong.
+    # study.best_value is the output of _fitness_from_metrics() — a composite of
+    # (cagr_net / risk_penalty) - exposure_penalty — not CAGR / |MaxDD|.
+    print(f"\033[1mBest Fitness Score (IS):\033[0m {best_is_fitness:.4f}")
     print("\033[1mWinning Parameters:\033[0m")
     for k, v in best_params.items():
         print(f"  {k}: \033[33m{v}\033[0m")

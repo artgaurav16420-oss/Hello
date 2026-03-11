@@ -475,10 +475,15 @@ def execute_rebalance(
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     local_prices = np.array(prices, dtype=float, copy=True)
 
+    # FIX B1: Snapshot T-1 prices BEFORE the loop overwrites last_known_prices with T+0
+    # execution prices. Without this snapshot, pv_t1 reads the just-written T+0 prices,
+    # making it identical to pv_exec and breaking the T-1 sizing intent entirely.
+    t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
+
     for sym, i in active_idx.items():
         px = float(local_prices[i])
         if np.isfinite(px) and px > 0:
-            state.last_known_prices[sym] = px
+            state.last_known_prices[sym] = px   # T+0 execution price stored here
         else:
             px = float(state.last_known_prices.get(sym, 0.0))
         local_prices[i] = px
@@ -497,16 +502,20 @@ def execute_rebalance(
                 )
                 symbols_to_force_close.append(sym)
 
-    # 3. POSITION SIZING LOGIC: strictly evaluate baseline PV using T-1 prices 
+    # 3. POSITION SIZING LOGIC: strictly evaluate baseline PV using T-1 prices
     # to avoid intraday/T+0 lookahead sizing leaks.
+    # pv_t1 uses t1_price_snapshot (captured before the T+0 overwrite above).
+    # pv_exec uses local_prices which now contain the T+0 execution prices.
     pv_t1 = state.cash
     pv_exec = state.cash
-    
+
     for sym, n_shares in state.shares.items():
         if sym in active_idx:
             px_exec = float(local_prices[active_idx[sym]])
-            # Fallback to current execution if last_known absent (rare, e.g. IPO day)
-            px_t1 = float(state.last_known_prices.get(sym, px_exec))
+            # FIX B1: Use the pre-loop snapshot for T-1 prices.
+            # state.last_known_prices now holds T+0 prices (overwritten above),
+            # so reading from it here would silently make pv_t1 == pv_exec.
+            px_t1 = float(t1_price_snapshot.get(sym, px_exec))
             pv_exec += n_shares * px_exec
             pv_t1 += n_shares * px_t1
         elif sym not in symbols_to_force_close:
@@ -775,9 +784,22 @@ def compute_book_cvar(
     if ghost_mask.any():
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
         for sym in ghost_cols:
-            # Hold ghost assets constant to neutralize their risk contribution, 
-            # avoiding deterministic synthetic volatility or hardcoded random seeds.
-            rets.loc[:, sym] = 0.0
+            # FIX D2: Zeroing ghost returns suppresses their variance entirely, causing
+            # the portfolio CVaR to be materially understated when large ghost positions
+            # persist (e.g. a 30%-NAV position contributes 30% weight but 0% risk).
+            # Instead, synthesise returns using the last known volatility so the ghost
+            # position contributes realistic tail risk to the CVaR calculation.
+            # Daily drift is annualised GHOST_RET_DRIFT / 252 (negative → decaying value).
+            # Seed is SHA-256 of the symbol name for full reproducibility across runs.
+            import hashlib as _hashlib
+            vol = float(state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK))
+            vol = max(vol, cfg.GHOST_VOL_FALLBACK)
+            daily_vol   = vol / np.sqrt(252)
+            daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
+            seed = int(_hashlib.sha256(sym.encode()).hexdigest()[:8], 16) % (2 ** 31)
+            rng  = np.random.RandomState(seed)
+            synth_rets = rng.normal(daily_drift, daily_vol, len(rets))
+            rets.loc[:, sym] = synth_rets
 
     if len(rets) < 5:
         return 0.0
@@ -1092,6 +1114,20 @@ class InstitutionalRiskEngine:
         if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
             raise OptimizationError(
                 f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL
+            )
+
+        # FIX G1: 'solved inaccurate' means the solver did not verify strict KKT conditions.
+        # Sector caps, budget bounds, and ADV limits may be violated at the margin.
+        # Log a warning so the diag log captures the occurrence frequency, then let the
+        # downstream physical CVaR check serve as the hard safety gate. If the weights
+        # survive that check they are deployed; if not, OptimizationError is raised below.
+        if res.info.status in ("solved inaccurate", "solved_inaccurate"):
+            logger.warning(
+                "[Optimizer] OSQP returned '%s' — KKT conditions not strictly satisfied. "
+                "Proceeding to physical CVaR verification; weights rejected if they "
+                "exceed the hard limit. Consider tightening eps_abs/eps_rel or increasing "
+                "max_iter if this warning appears frequently.",
+                res.info.status,
             )
 
         w_opt = np.maximum(res.x[:m], 0.0)

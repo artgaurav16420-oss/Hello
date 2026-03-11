@@ -298,7 +298,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=max(150, int(cfg.ADV_LOOKBACK) * 2))).strftime("%Y-%m-%d")
 
-    chunk_size  = 75
+    chunk_size  = _ADV_CHUNK_SIZE   # FIX M2: use module constant; hardcoded duplicate ignored it
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
 
     filtered_tickers: List[str] = []

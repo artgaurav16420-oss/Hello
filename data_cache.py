@@ -523,13 +523,25 @@ def load_or_fetch(
                     
             # Checkpoint the manifest after every chunk
             _save_manifest(manifest)
-            
-    # STABILITY ISSUE 1 FIX: Trim Padding
-    # Ensure all returns exactly match the required window, avoiding data leakage 
-    # across mixed historical/fresh symbols
+
+    # FIX D1: Trim to padded_start (not required_start) so callers receive the
+    # full warm-up window for EWMA and CVaR initialisation.
+    #
+    # The original "STABILITY ISSUE 1 FIX" trimmed to required_start:required_end,
+    # silently discarding the padding that was just fetched. For WFO IS slices that
+    # begin at TRAIN_START (e.g. 2018-01-01), this left the first ~90 trading days
+    # with no historical signal warm-up, causing HISTORY_GATE to gate out nearly
+    # every stock in Q1 2018 and producing zero-trade early slices.
+    #
+    # The backtest engine already constrains *trading activity* to [start_date, end_date]
+    # via BacktestEngine.run()'s per-bar `if date < start_dt: continue` guard, so the
+    # pre-required_start rows are never executed against — they only serve as look-back
+    # history for signal computation on the first live bar, which is the correct design.
+    #
+    # We still trim at required_end to prevent future-data leakage.
     for t, df in market_data.items():
-        market_data[t] = df.loc[required_start:required_end]
-            
+        market_data[t] = df.loc[padded_start:required_end]
+
     return market_data
 
 

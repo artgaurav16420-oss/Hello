@@ -22,6 +22,16 @@ This script now strictly enforces Point-in-Time trading volume gates. Even thoug
 we use the surviving constituents, an asset is strictly excluded from a historical
 snapshot if it did not have verifiable trading volume prior to that snapshot date.
 
+DATA CACHE INTERACTION NOTE (data_cache.py D1 fix):
+load_or_fetch now returns data from padded_start (~2 years before required_start)
+rather than trimming to required_start. This means the vol_matrix used to build
+valid_trading_days starts from ~2016 rather than 2018. As a result, early
+quarterly snapshots (2018-Q1, 2018-Q2) now correctly see pre-2018 cumulative
+volume counts for stocks that listed in 2016/2017, producing non-empty first
+snapshots. Previously, all stocks showed 0 cumulative days at the 2018-Q1
+snapshot, causing the first 1-2 quarterly snapshots to be empty. This is a
+silent improvement; no code change needed here.
+
 USAGE
 -----
   python build_historical_fallback.py

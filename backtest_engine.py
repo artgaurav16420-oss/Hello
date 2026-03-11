@@ -626,6 +626,30 @@ def run_backtest(
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
+    # FIX B3: universe_by_rebalance_date was keyed by *target* calendar dates
+    # (e.g. 2021-01-01 — New Year) but BacktestEngine.run() looks up by the
+    # *snapped* trading date (e.g. 2020-12-31). The key mismatch caused the
+    # constituent filter to silently return None on every market holiday, falling
+    # back to the full union universe and injecting survivorship bias.
+    # Now that trading_index is available we remap the dict to snapped keys so
+    # every lookup in _run_rebalance hits the correct member set.
+    if universe_by_rebalance_date:
+        snapped_universe: Dict[pd.Timestamp, set] = {}
+        for target_d, members in universe_by_rebalance_date.items():
+            lower = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
+            eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
+            if len(eligible) > 0:
+                snapped_key = eligible[-1]
+                # If two target dates snap to the same trading day (back-to-back holidays),
+                # take the union of their member sets — conservative, avoids silent exclusions.
+                if snapped_key in snapped_universe:
+                    snapped_universe[snapped_key] = snapped_universe[snapped_key] | set(members)
+                else:
+                    snapped_universe[snapped_key] = set(members)
+            # If no eligible trading day exists for this target, the rebalance was already
+            # skipped in the snapping loop above — no entry needed.
+        universe_by_rebalance_date = snapped_universe
+
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
         idx_df = market_data.get("^NSEI")

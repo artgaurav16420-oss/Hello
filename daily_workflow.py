@@ -305,11 +305,20 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if not np.isfinite(current_price) or current_price <= 0:
             continue
 
-        # PHASE 9 FIX: If prices are auto-adjusted, the historical matrix has ALREADY 
-        # been modified. Do NOT apply manual share multiplication or you will double-count.
+        # FIX B2: The previous PHASE 9 implementation used an unconditional `continue`
+        # here when AUTO_ADJUST_PRICES=True, skipping the entire split-detection block.
+        # This is incorrect. AUTO_ADJUST_PRICES controls whether *prices* in the
+        # valuation matrix use Adj Close (split-adjusted). It does NOT mean the share
+        # ledger is automatically updated — that is this function's responsibility.
+        # If we hold 10 shares and a 2:1 split occurs, we must update to 20 shares
+        # regardless of price-adjustment mode, otherwise portfolio NAV halves on the
+        # ex-date (10 shares × new price of ₹50 = ₹500 vs correct 20 × ₹50 = ₹1000).
+        # Two committed tests (test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event
+        # and test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled) confirm
+        # this requirement. We still update last_known_prices here before falling through.
         if getattr(cfg, "AUTO_ADJUST_PRICES", True):
             state.last_known_prices[sym] = current_price
-            continue
+            # ↓ Fall through to split detection below — do NOT continue.
 
         split_ratio = 0.0
         if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
