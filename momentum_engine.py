@@ -696,7 +696,7 @@ def execute_rebalance(
     for sym in symbols_to_force_close:
         close_price = absent_symbol_effective_price(
             state.last_known_prices.get(sym, 0.0),
-            max(0, state.absent_periods.get(sym, 0) - 1),
+            state.absent_periods.get(sym, 0),
             cfg.MAX_ABSENT_PERIODS,
         )
         n_shares    = state.shares.get(sym, 0)
@@ -771,14 +771,24 @@ def compute_book_cvar(
             .dropna()
         )
         for sym, vol in rolling_vol.items():
-            state.last_known_volatility[str(sym)] = float(max(vol, 1e-4))
+            vol_value = float(max(vol, 1e-4))
+            key = str(sym)
+            state.last_known_volatility[key] = vol_value
+            state.last_known_volatility[to_bare(key)] = vol_value
+            state.last_known_volatility[to_ns(key)] = vol_value
 
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
         rng = np.random.RandomState(42)
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
         for sym in ghost_cols:
-            ghost_vol = state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK)
+            ghost_vol = state.last_known_volatility.get(
+                sym,
+                state.last_known_volatility.get(
+                    to_bare(sym),
+                    state.last_known_volatility.get(to_ns(sym), cfg.GHOST_VOL_FALLBACK),
+                ),
+            )
             ghost_vol = float(max(1e-4, ghost_vol))
             rets.loc[:, sym] = rng.normal(cfg.GHOST_RET_DRIFT, ghost_vol, size=len(rets))
 

@@ -358,7 +358,7 @@ def load_or_fetch(
     if _market_closed_today:
         latest_bday = _now_ist.strftime("%Y-%m-%d")
     else:
-        latest_bday = (pd.Timestamp.today() - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+        latest_bday = (_now_ist - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
     
     tickers_to_download = []
     market_data: Dict[str, pd.DataFrame] = {}

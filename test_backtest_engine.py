@@ -79,3 +79,43 @@ def test_run_skips_corporate_actions_when_auto_adjust_prices_enabled(monkeypatch
 
     assert bt.state.shares["AAA"] == 10
     assert bt.state.cash == 0.0
+
+
+def test_run_backtest_uses_adjusted_close_for_valuation_when_auto_adjust_enabled(monkeypatch):
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True, REBALANCE_FREQ="W-FRI")
+
+    dates = pd.DatetimeIndex([pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
+    market_data = {
+        "AAA.NS": pd.DataFrame(
+            {
+                "Close": [100.0, 50.0],
+                "Adj Close": [100.0, 100.0],
+                "Open": [100.0, 50.0],
+                "High": [100.0, 50.0],
+                "Low": [100.0, 50.0],
+                "Volume": [1_000_000, 1_000_000],
+                "Dividends": [0.0, 0.0],
+                "Stock Splits": [0.0, 2.0],
+            },
+            index=dates,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [1.0, 1.0]}, index=dates),
+    }
+
+    captured = {}
+
+    def _fake_run(self, close, *_args, **_kwargs):
+        captured["close"] = close.copy()
+        return pd.DataFrame({"equity": pd.Series(dtype=float)})
+
+    monkeypatch.setattr(be.BacktestEngine, "run", _fake_run)
+
+    be.run_backtest(
+        market_data=market_data,
+        start_date="2020-01-01",
+        end_date="2020-01-02",
+        cfg=cfg,
+        universe=["AAA"],
+    )
+
+    assert list(captured["close"]["AAA"]) == [100.0, 100.0]

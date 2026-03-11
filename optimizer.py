@@ -272,7 +272,8 @@ class MomentumObjective:
             # Still run the OOS backtest so exceptions propagate (parameters
             # that produce NaN signals in 2019 should be pruned), but do not
             # append its score to the aggregate.
-            exclude_from_score = (oos_year == 2019)
+            first_oos_year = pd.Timestamp(TRAIN_START).year + 1
+            exclude_from_score = (oos_year == first_oos_year)
 
             oos = run_backtest(
                 market_data=self.market_data,
