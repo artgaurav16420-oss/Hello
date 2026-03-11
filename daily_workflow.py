@@ -269,6 +269,7 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
 def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: UltimateConfig) -> List[str]:
     """
     Detects splits and sweeps dividends to ensure cash ledger accuracy.
+    PHASE 9 FIX: Strictly prevents double-counting splits when AUTO_ADJUST_PRICES=True.
     """
     adjusted: List[str] = []
 
@@ -280,6 +281,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
             
+        # Dividend sweep is universally safe as long as we haven't already swept it this period
         if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns:
             dividends = row["Dividends"][row["Dividends"] > 0]
             if not dividends.empty:
@@ -301,6 +303,12 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
+            continue
+
+        # PHASE 9 FIX: If prices are auto-adjusted, the historical matrix has ALREADY 
+        # been modified. Do NOT apply manual share multiplication or you will double-count.
+        if getattr(cfg, "AUTO_ADJUST_PRICES", True):
+            state.last_known_prices[sym] = current_price
             continue
 
         split_ratio = 0.0
@@ -995,33 +1003,25 @@ def main_menu() -> None:
             all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
             historical_union = set()
             for target_date in all_target_dates:
-                historical_union.update(get_historical_universe(universe_identifier, target_date))
+                try:
+                    historical_union.update(get_historical_universe(universe_identifier, target_date))
+                except ValueError as ve:
+                    print(f"\n  {C.B_RED}[!] BACKTEST BLOCKED — Survivorship Bias Guard{C.RST}")
+                    print(f"  {C.RED}{ve}{C.RST}")
+                    print(f"  {C.YLW}Please select 'Nifty 500' or 'NSE Total' for safe historical backtesting.{C.RST}\n")
+                    historical_union = set()
+                    break
 
-            if not historical_union and bt_c == "3":
-                print(f"  {C.YLW}[!] No historical PIT snapshots found for custom screener; falling back to current symbol list (look-ahead bias risk).{C.RST}")
-                historical_union.update(_get_custom_universe())
-            elif not historical_union:
-                historical_union.update(get_nifty500())
+            if not historical_union:
+                continue
 
-            # FIX (Bug-8): Pass cfg=bt_cfg so load_or_fetch uses the optimized
-            # CVAR_LOOKBACK for padding instead of the hardcoded 200-day default.
-            # Without this, strategies with CVAR_LOOKBACK > 200 (e.g., 500) would
-            # receive insufficient historical data, causing early rebalance dates to
-            # fail the dimensionality check inside InstitutionalRiskEngine.optimize().
             data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
-            # FIX (Bug-A — Survivorship Bias Guard): run_backtest raises RuntimeError
-            # when no point-in-time historical universe files are found, intentionally
-            # refusing to fall back to the current Nifty 500 constituents (which
-            # would silently inflate CAGR by 3-5% p.a. via survivorship bias).
-            # Catch that error here so the CLI loop stays alive and guide the user.
+
             try:
                 print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
             except RuntimeError as exc:
                 print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
                 print(f"  {C.RED}{exc}{C.RST}")
-                print(f"\n  {C.YLW}This safeguard prevents silently survivorship-biased backtests.{C.RST}")
-                print(f"  {C.YLW}Backtesting with today's index members over-states CAGR by ~3-5%{C.RST}")
-                print(f"  {C.YLW}p.a. because it excludes companies that were delisted or demoted.{C.RST}")
                 print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
                 print(f"  {C.BLD}    python historical_builder.py{C.RST}")
                 print(f"  {C.GRY}Required files:{C.RST}")

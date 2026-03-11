@@ -42,7 +42,7 @@ def compute_regime_score(
     # 1. Trend component (Distance from 200-day SMA)
     sma_window = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if len(close_series) >= sma_window:
-        sma200 = float(close_series.rolling(window=sma_window).mean().iloc[-1])
+        sma200 = float(close_series.rolling(window=sma_window, min_periods=20).mean().iloc[-1])
     else:
         sma200 = float(close_series.expanding(min_periods=20).mean().iloc[-1])
     last_price = float(close_series.iloc[-1])
@@ -114,7 +114,7 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
             
         adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
         # Take configurable moving average to ensure unit coherence against limit bounds.
-        adv_val = float(notional.rolling(adv_lookback, min_periods=1).mean().iloc[-1])
+        adv_val = float(notional.rolling(adv_lookback, min_periods=1).median().iloc[-1])
         return adv_val if np.isfinite(adv_val) else 0.0
     except Exception as exc:
         logger.debug("[Signals] ADV calculation failed: %s", exc)
@@ -127,7 +127,7 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
     vectorized pass.
 
     Builds a (T × N) notional DataFrame (Close × Volume) for all symbols
-    simultaneously, applies one rolling(20).mean() across all columns at
+    simultaneously, applies one rolling(20).median() across all columns at
     once, and extracts the last row.  This replaces the previous per-symbol
     loop — which allocated a new Pandas Series per ticker — with a single
     2-D matrix operation that is significantly faster inside the backtest
@@ -148,10 +148,10 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
     if not notional_cols:
         return np.zeros(len(active_symbols), dtype=float)
 
-    # Single rolling mean across the entire matrix — O(T·N) instead of N × O(T).
+    # Single rolling median across the entire matrix — O(T·N) instead of N × O(T).
     notional_df = pd.DataFrame(notional_cols)
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
-    adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).mean().iloc[-1]
+    adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).median().iloc[-1]
 
     def _safe_adv(sym: str) -> float:
         # Inline helper keeps `x` strictly scoped to this call frame.
@@ -200,6 +200,9 @@ def generate_signals(
     slow_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_SLOW).mean().iloc[-1].values
 
     raw_daily_momentum = 0.5 * fast_ema + 0.5 * slow_ema
+
+    if np.all(np.isnan(raw_daily_momentum)):
+        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), []
 
     # Cross-sectional Z-score standardization
     mu_cross = np.nanmean(raw_daily_momentum)

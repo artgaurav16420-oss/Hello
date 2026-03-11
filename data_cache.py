@@ -7,6 +7,9 @@ Features:
 - Atomic JSON manifest updates
 - Network retry logic and chunking
 - Persistent storage of raw provider data only (no synthetic mutation at cache layer)
+- PHASE 4 FIX: Strict timezone stripping and index normalization to prevent misalignment.
+- PHASE 9 FIX: Explicit `actions=True` to fetch Corporate Actions (Dividends/Splits).
+- STABILITY: Strict OHLC validation, padding trimming, and robust ticker sanitization.
 """
 
 from __future__ import annotations
@@ -54,6 +57,7 @@ class YFinanceProvider(DataProvider):
             group_by="ticker",
             progress=False,
             auto_adjust=False,
+            actions=True,  # PHASE 9 FIX: Ensure Corporate Actions (Dividends/Splits) are downloaded
         )
 
 
@@ -66,7 +70,7 @@ class SecondaryProvider(DataProvider):
         # Read configuration once at construction time.  Environment variable
         # lookups are system calls; calling them on every download() invocation
         # is wasteful and makes state unpredictable if the env changes mid-run.
-        self.api_key     = os.getenv("FALLBACK_API_KEY", "").strip()
+        self.api_key      = os.getenv("FALLBACK_API_KEY", "").strip()
         self.min_interval = float(os.getenv("FALLBACK_MIN_INTERVAL_SEC", "12"))
 
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
@@ -163,12 +167,33 @@ class SecondaryProvider(DataProvider):
 
 
 def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with a timezone-naive, monotonic DatetimeIndex."""
+    """
+    PHASE 4 FIX: Strict Data Alignment.
+    Return a copy with a timezone-naive, monotonic DatetimeIndex normalized to midnight.
+    Drops duplicates to prevent upstream covariance alignment failures.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
-    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
-        out.index = out.index.tz_localize(None)
+    
+    if not isinstance(out.index, pd.DatetimeIndex):
+        try:
+            out.index = pd.to_datetime(out.index, utc=True)
+        except Exception:
+            pass
+            
+    if isinstance(out.index, pd.DatetimeIndex):
+        if out.index.tz is not None:
+            out.index = out.index.tz_convert(None)
+        out.index = out.index.normalize()
+        
+        # Remove duplicate dates (keep last reported)
+        if out.index.duplicated().any():
+            out = out[~out.index.duplicated(keep='last')]
+            
+        # Sort chronologically strictly
+        out = out.sort_index()
+        
     return out
 
 
@@ -278,8 +303,7 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None) -> bool:
     - Minimum row count (5) to exclude stub responses.
     - Unique, monotonically increasing DatetimeIndex — yfinance occasionally
       returns duplicate or out-of-order dates on partial trading sessions.
-    - 'Close' column present and not entirely NaN — the only column the entire
-      engine is guaranteed to use; a fully-null Close is unusable.
+    - 'Open', 'High', 'Low', 'Close' columns present and not entirely NaN.
     """
     if df is None or df.empty or len(df) < 5:
         return False
@@ -289,13 +313,20 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None) -> bool:
         return False
     if not df.index.is_monotonic_increasing:
         return False
-    if "Close" not in df.columns or df["Close"].isnull().all():
-        return False
+        
+    # STABILITY ISSUE 4 FIX: Ensure all execution-critical OHLC columns exist
+    required_cols = ["Open", "High", "Low", "Close"]
+    for col in required_cols:
+        if col not in df.columns or df[col].isnull().all():
+            return False
+            
     if "Adj Close" not in df.columns or df["Adj Close"].isnull().all():
         return False
+        
     is_index_ticker = bool(ticker) and str(ticker).startswith("^")
     if (not is_index_ticker) and ("Volume" not in df.columns or df["Volume"].isnull().all()):
         return False
+        
     return True
 
 
@@ -303,7 +334,8 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "Adj Close" not in out.columns:
         # Column entirely absent (common for index tickers like ^NSEI).
-        out["Adj Close"] = out["Close"]
+        if "Close" in out.columns:
+            out["Adj Close"] = out["Close"]
     else:
         # BUG-1 FIX: yfinance sometimes returns an Adj Close column that is
         # present but all-NaN (e.g. recently-listed stocks, certain indices,
@@ -312,7 +344,16 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
         # silently dropped from the cache on every download.  Fill the NaN
         # cells with the corresponding raw Close so the frame passes validation
         # while still using the true adjusted price wherever it is available.
-        out["Adj Close"] = out["Adj Close"].fillna(out["Close"])
+        if "Close" in out.columns:
+            out["Adj Close"] = out["Adj Close"].fillna(out["Close"])
+            
+    # PHASE 9 FIX: Ensure Corporate Action columns exist (prevent crashes on split handling)
+    for col in ["Dividends", "Stock Splits"]:
+        if col not in out.columns:
+            out[col] = 0.0
+        else:
+            out[col] = out[col].fillna(0.0)
+            
     return out
 
 
@@ -331,11 +372,14 @@ def load_or_fetch(
     manifest = _load_manifest()
     entries = manifest["entries"]
     
-    # Ensure standard NSE suffix formatting
-    standardized_tickers = list(dict.fromkeys(
-        t if (t.endswith(".NS") or t.startswith("^")) else t + ".NS" 
-        for t in tickers
-    ))
+    # STABILITY ISSUE 3 FIX: Robust Ticker Sanitization
+    def _clean_ticker(t: str) -> str:
+        t_str = str(t).strip()
+        if t_str.startswith("^"):
+            return t_str
+        return t_str.replace(".NSE", "").replace(".NS", "") + ".NS"
+        
+    standardized_tickers = list(dict.fromkeys(_clean_ticker(t) for t in tickers))
     
     # Dynamic padding based on strategy lookback requirements (plus safety margin).
     cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
@@ -394,16 +438,6 @@ def load_or_fetch(
         for chunk in chunks:
             raw_data = None
             for provider in providers:
-                # BUG-3 FIX: The previous code caught TypeError to handle a
-                # hypothetical missing 'provider' kwarg — but _download_with_timeout
-                # has always accepted that kwarg, so TypeError was never raised from
-                # the call itself.  Worse, the fallback path re-called the function
-                # WITHOUT provider, silently retrying YFinance instead of advancing
-                # to AlphaVantage.  Any non-TypeError exception (ConnectionError,
-                # Timeout, etc.) also propagated uncaught and crashed the entire
-                # load_or_fetch call for the chunk.
-                # Fix: catch all exceptions from a provider attempt, log them, and
-                # move on to the next provider in the chain.
                 try:
                     # yfinance end= is EXCLUSIVE — add 1 day so today's close is included.
                     _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -461,7 +495,7 @@ def load_or_fetch(
                     if not _is_valid_dataframe(df, ticker=ticker):
                         logger.warning(
                             "[Cache] Structural validation failed for %s "
-                            "(non-monotonic index, duplicate dates, or null Close). Skipping.",
+                            "(non-monotonic index, duplicate dates, or null OHLC). Skipping.",
                             ticker
                         )
                         continue
@@ -469,12 +503,18 @@ def load_or_fetch(
                     parquet_path = CACHE_DIR / f"{ticker}.parquet"
                     df.to_parquet(parquet_path)
                     
+                    # STABILITY ISSUE 2 FIX: Improved Suspension Detection
+                    gap_series = df.index.to_series().diff().dt.days
+                    max_gap = gap_series.max()
+                    max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
+                    expected_gap = 7
+
                     entries[ticker] = {
                         "fetched_at": datetime.now().isoformat(),
                         "rows": len(df),
                         "last_date": df.index[-1].strftime("%Y-%m-%d"),
-                        "suspended": False,
-                        "max_gap_days": 0,
+                        "suspended": max_gap_days > expected_gap,
+                        "max_gap_days": max_gap_days,
                     }
                     market_data[ticker] = df
                     
@@ -483,6 +523,12 @@ def load_or_fetch(
                     
             # Checkpoint the manifest after every chunk
             _save_manifest(manifest)
+            
+    # STABILITY ISSUE 1 FIX: Trim Padding
+    # Ensure all returns exactly match the required window, avoiding data leakage 
+    # across mixed historical/fresh symbols
+    for t, df in market_data.items():
+        market_data[t] = df.loc[required_start:required_end]
             
     return market_data
 

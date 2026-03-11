@@ -159,6 +159,16 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     If neither source has a valid record, returns an empty list and issues
     a survivorship-bias warning.
     """
+    # ── PHASE 3 FIX: Survivorship Bias Prevention ──
+    # Do not allow present-day custom screeners to be mapped backwards in time.
+    if universe_type.lower() == "custom":
+        raise ValueError(
+            f"Survivorship Bias Guard: Cannot historically backtest a 'custom' screener list "
+            f"at {date.strftime('%Y-%m-%d')} without explicit historical constituent maps. "
+            "The current custom list only contains assets that survived to present day, "
+            "which would introduce severe survivorship bias into the simulation."
+        )
+
     hist_file = DATA_DIR / f"historical_{universe_type}.parquet"
 
     # Warn once per missing parquet file (not once per date) to keep optimizer
@@ -349,8 +359,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
         )
 
     return list(dict.fromkeys(filtered_tickers))
-
-
 
 
 # ─── Network Fetchers ─────────────────────────────────────────────────────────

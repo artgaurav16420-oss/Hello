@@ -155,23 +155,11 @@ class UltimateConfig:
     CVAR_ALPHA:                  float = 0.95
     CVAR_LOOKBACK:               int   = 90
     ADV_LOOKBACK:                int   = 90
-    # 90-day lookback forgets a crash in ~4 months instead of 10.
-    # The 200-day default kept COVID-crash tail losses in the CVaR window
-    # throughout the entire 2020 recovery, causing persistent soft breaches.
     CVAR_SENTINEL_MULTIPLIER:    float = 2.5
     CVAR_MIN_HISTORY:            int   = 20
-    # Two-tier breach architecture (implemented in backtest_engine.py):
-    #   SOFT breach (limit < CVaR ≤ limit × multiplier): run optimizer normally,
-    #     its QP CVaR constraint will build a de-risked portfolio naturally.
-    #   HARD breach (CVaR > limit × multiplier): skip optimizer, liquidate.
-    # At 1.5× (9.75% when limit=6.5%), only genuine tail events trigger HARD.
     CVAR_HARD_BREACH_MULTIPLIER: float = 1.5
 
-    # Drift tolerance: minimum weight change (as a fraction of portfolio value)
-    # required before a trade is actually executed. Prevents micro-adjustments
-    # from the soft-breach optimizer accumulating as slippage and turnover.
-    # Example: 0.02 means a position must change by ≥ 2% of portfolio to trade.
-    # This is applied per-symbol at execution time in execute_rebalance().
+    # Drift tolerance: minimum weight change
     DRIFT_TOLERANCE:             float = 0.02
 
     # Exposure management
@@ -206,7 +194,6 @@ class UltimateConfig:
     # Timing & Execution
     REBALANCE_FREQ:           str   = "W-FRI"
     ROUND_TRIP_SLIPPAGE_BPS:  float = 20.0
-    """Round-trip transaction cost in basis points (buy+sell). One-way default = bps/2."""
     DECAY_FACTOR:             float = 0.85
     MIN_ADV_CRORES:           float = 100.0
 
@@ -218,7 +205,7 @@ class UltimateConfig:
     MAX_DECAY_ROUNDS:         int   = 3
 
     # Network / data
-    YF_BATCH_TIMEOUT:         float = 120.0   # legacy
+    YF_BATCH_TIMEOUT:         float = 120.0   
     YF_CHUNK_TIMEOUT:         float = 90.0
     YF_ADV_TIMEOUT:           float = 60.0
     SECTOR_FETCH_TIMEOUT:     float = 8.0
@@ -235,9 +222,9 @@ class UltimateConfig:
     GHOST_VOL_FALLBACK:       float = 0.04
     SIMULATE_HALTS:           bool  = False
 
-    # New institutional flags
+    # Institutional flags
     DIVIDEND_SWEEP:           bool  = True
-    SPLIT_TOLERANCE:          float = 0.005 # Tightened for institutional accuracy
+    SPLIT_TOLERANCE:          float = 0.005 
     AUTO_ADJUST_PRICES:       bool  = True
 
     @property
@@ -305,9 +292,6 @@ class PortfolioState:
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
 
-        # DESIGN CHOICE: cooled_down_this_step prevents same-period clear-and-refire.
-        # This intentionally provides the portfolio one "free" period at reduced exposure
-        # to assess recovery before the next breach cycle rigidly locks it again.
         cooled_down_this_step = False
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
@@ -467,8 +451,6 @@ def compute_one_way_slip_rate(
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
         return base_rate
 
-    # ADV is notional (₹/day); retain execution semantics exactly:
-    # impact = coeff * PV / ADV, then clamp [base_rate, 5%].
     impact_rate = (cfg.IMPACT_COEFF * portfolio_value) / float(adv_notional)
     return max(base_rate, min(0.05, impact_rate))
 
@@ -514,28 +496,27 @@ def execute_rebalance(
                     sym, count, cfg.MAX_ABSENT_PERIODS,
                 )
                 symbols_to_force_close.append(sym)
-            else:
-                logger.info(
-                    "execute_rebalance: %s absent from data feed (period %d/%d); "
-                    "carrying position at effective marked price ₹%.2f.",
-                    sym, count, cfg.MAX_ABSENT_PERIODS,
-                    absent_symbol_effective_price(
-                        state.last_known_prices.get(sym, 0.0),
-                        count,
-                        cfg.MAX_ABSENT_PERIODS,
-                    ),
-                )
 
-    pv = state.cash
+    # 3. POSITION SIZING LOGIC: strictly evaluate baseline PV using T-1 prices 
+    # to avoid intraday/T+0 lookahead sizing leaks.
+    pv_t1 = state.cash
+    pv_exec = state.cash
+    
     for sym, n_shares in state.shares.items():
         if sym in active_idx:
-            pv += n_shares * float(local_prices[active_idx[sym]])
+            px_exec = float(local_prices[active_idx[sym]])
+            # Fallback to current execution if last_known absent (rare, e.g. IPO day)
+            px_t1 = float(state.last_known_prices.get(sym, px_exec))
+            pv_exec += n_shares * px_exec
+            pv_t1 += n_shares * px_t1
         elif sym not in symbols_to_force_close:
-            pv += n_shares * absent_symbol_effective_price(
+            px_absent = absent_symbol_effective_price(
                 state.last_known_prices.get(sym, 0.0),
                 state.absent_periods.get(sym, 0),
                 cfg.MAX_ABSENT_PERIODS,
             )
+            pv_exec += n_shares * px_absent
+            pv_t1 += n_shares * px_absent
 
     if apply_decay:
         state.decay_rounds += 1
@@ -585,7 +566,7 @@ def execute_rebalance(
                 state.weights      = {}
                 state.shares       = {}
                 state.entry_prices = {}
-                state.cash         = max(0.0, round(pv - total_slippage, 10))
+                state.cash         = max(0.0, round(pv_exec - total_slippage, 10))
                 state.decay_rounds = 0
                 state.consecutive_failures = 0
                 return round(total_slippage, 10)
@@ -599,22 +580,43 @@ def execute_rebalance(
         if not np.isfinite(w):
             w = 0.0
         price = max(float(local_prices[i]), 1e-6)
-        s = int(np.floor(w * pv / price)) if w > 0.001 else 0
+        
+        # Sizing intent bounded precisely by T-1 values (pv_t1)
+        s = int(np.floor(w * pv_t1 / price)) if w > 0.001 else 0
+        
+        # 4. LIQUIDITY CONSTRAINT ENFORCEMENT: Enforce strict ADV limit
+        if adv_shares is not None and i < len(adv_shares):
+            adv_notional = float(adv_shares[i])
+            if adv_notional > 0:
+                max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
+                s = min(s, max_adv_shares)
+                
         desired_shares[sym] = s
         base_notional += s * price
         if s > 0:
             score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
             valid_targets.append((i, sym, price, score))
 
-    residual_cash = max(0.0, pv - base_notional)
+    # Safely distribute residual cash bounded by the smaller of T-1 expected PV and execution T+0 PV
+    residual_cash = max(0.0, min(pv_t1, pv_exec) - base_notional)
+    
     if valid_targets:
         ranked = sorted(valid_targets, key=lambda x: x[3], reverse=True)
-        for _, sym, price, _ in ranked:
+        for i, sym, price, _ in ranked:
             if residual_cash >= price:
                 extra = int(residual_cash // price)
-                max_extra_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv - desired_shares[sym] * price
+                # Ensure we also don't break the single name limit and ADV limit on the extra allocation
+                max_extra_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_t1 - desired_shares[sym] * price
                 max_extra_shares = max(0, int(max_extra_notional // price))
                 extra = min(extra, max_extra_shares)
+                
+                if adv_shares is not None and i < len(adv_shares):
+                    adv_notional = float(adv_shares[i])
+                    if adv_notional > 0:
+                        max_adv_total_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
+                        available_adv_headroom = max(0, max_adv_total_shares - desired_shares[sym])
+                        extra = min(extra, available_adv_headroom)
+                        
                 if extra <= 0:
                     continue
                 desired_shares[sym] += extra
@@ -631,29 +633,21 @@ def execute_rebalance(
         if s > 0 or old_s > 0:
             delta = s - old_s
 
-            # Drift tolerance gate: skip micro-adjustments smaller than
-            # DRIFT_TOLERANCE × portfolio value. This prevents the soft-breach
-            # optimizer from accumulating slippage on tiny weekly weight tweaks
-            # (e.g. 1-2 shares) during periods of persistently elevated CVaR.
-            # Full exits (s == 0, old_s > 0) always execute regardless of tolerance.
-            # New entries (old_s == 0, s > 0) always execute.
             if delta != 0 and old_s > 0 and s > 0 and not force_rebalance_trades:
                 drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
-                weight_change = abs(delta * price) / max(pv, 1.0)
+                weight_change = abs(delta * price) / max(pv_exec, 1.0)
                 if weight_change < drift_threshold:
-                    # Hold existing position, absorb new target weight silently.
                     s = old_s
                     delta = 0
-                    new_weights[sym] = old_s * price / max(pv, 1.0)
+                    new_weights[sym] = old_s * price / max(pv_exec, 1.0)
                     new_shares[sym]  = old_s
                     new_entry_prices[sym] = state.entry_prices.get(sym, price)
                     actual_notional += old_s * price
                     continue
 
-            # ── FIX: Institutional Impact Alignment ──
             slip_rate = compute_one_way_slip_rate(
                 cfg=cfg,
-                portfolio_value=pv,
+                portfolio_value=pv_exec,
                 adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
             )
 
@@ -662,7 +656,7 @@ def execute_rebalance(
             actual_notional += s * price
 
             if s > 0:
-                new_weights[sym] = (s * price) / max(pv, 1.0)
+                new_weights[sym] = (s * price) / max(pv_exec, 1.0)
                 new_shares[sym]  = s
                 if delta > 0:
                     if old_s == 0:
@@ -704,7 +698,7 @@ def execute_rebalance(
             if close_price > 0:
                 slip            = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
-                pv             += n_shares * close_price
+                pv_exec        += n_shares * close_price
                 if trade_log is not None:
                     tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
                     trade_log.append(Trade(sym, tdate, -n_shares, close_price, slip, "SELL"))
@@ -727,7 +721,7 @@ def execute_rebalance(
     state.weights      = new_weights
     state.shares       = new_shares
     state.entry_prices = new_entry_prices
-    state.cash         = max(0.0, round(pv - actual_notional - total_slippage, 10))
+    state.cash         = max(0.0, round(pv_exec - actual_notional - total_slippage, 10))
     return round(total_slippage, 10)
 
 
@@ -779,18 +773,11 @@ def compute_book_cvar(
 
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
-        rng = np.random.RandomState(42)
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
         for sym in ghost_cols:
-            ghost_vol = state.last_known_volatility.get(
-                sym,
-                state.last_known_volatility.get(
-                    to_bare(sym),
-                    state.last_known_volatility.get(to_ns(sym), cfg.GHOST_VOL_FALLBACK),
-                ),
-            )
-            ghost_vol = float(max(1e-4, ghost_vol))
-            rets.loc[:, sym] = rng.normal(cfg.GHOST_RET_DRIFT, ghost_vol, size=len(rets))
+            # Hold ghost assets constant to neutralize their risk contribution, 
+            # avoiding deterministic synthetic volatility or hardcoded random seeds.
+            rets.loc[:, sym] = 0.0
 
     if len(rets) < 5:
         return 0.0
@@ -811,12 +798,6 @@ def compute_decay_targets(
     active_symbols: List[str],
     cfg:            UltimateConfig
 ) -> np.ndarray:
-    """
-    Compute single-source-of-truth gate-filtered decay targets.
-    Passed gates (in sel_idx) -> scaled by DECAY_FACTOR.
-    Failed gates (not in sel_idx) -> zeroed.
-    Ensures no decaying position exceeds MAX_SINGLE_NAME_WEIGHT concentration.
-    """
     targets = np.zeros(len(active_symbols))
     sel_set = set(sel_idx)
     for i, sym in enumerate(active_symbols):
@@ -890,8 +871,6 @@ class InstitutionalRiskEngine:
                 "portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA
             )
 
-        # Avoid matrix collapse from DataFrame-wide dropna(): with broad universes,
-        # a single symbol NaN can otherwise delete the entire row for all symbols.
         raw_rets = historical_returns.replace([np.inf, -np.inf], np.nan)
         if raw_rets.empty:
             raise OptimizationError("historical_returns is empty after sanitisation.", OptimizationErrorType.DATA)
@@ -926,6 +905,29 @@ class InstitutionalRiskEngine:
                 OptimizationErrorType.DATA,
             )
 
+        clean_rets = raw_rets.iloc[:, kept_indices].ffill()
+        clean_rets = clean_rets.fillna(0.0)
+
+        # 2. DROP ZERO-VOLATILITY ASSETS (Instead of noise injection)
+        col_stds = clean_rets.std()
+        valid_vol_mask = col_stds >= 1e-10
+
+        if not valid_vol_mask.all():
+            zero_cols = valid_vol_mask[~valid_vol_mask].index.tolist()
+            logger.warning(
+                "[Optimizer] Dropping %d zero-volatility asset(s) to prevent singular covariance matrix: %s",
+                len(zero_cols), zero_cols,
+            )
+            clean_rets = clean_rets.loc[:, valid_vol_mask]
+            kept_indices = kept_indices[valid_vol_mask.to_numpy()]
+
+        if len(kept_indices) == 0:
+            raise OptimizationError(
+                "No symbols passed optimizer minimum-history and volatility gates.",
+                OptimizationErrorType.DATA,
+            )
+
+        # Slice inputs with the FINAL kept_indices
         expected_returns = expected_returns[kept_indices]
         prices = prices[kept_indices]
         adv_shares = adv_shares[kept_indices]
@@ -933,15 +935,7 @@ class InstitutionalRiskEngine:
             prev_w = prev_w[kept_indices]
         if sector_labels is not None:
             sector_labels = np.asarray(sector_labels)[kept_indices]
-
-        clean_rets = raw_rets.iloc[:, kept_indices].ffill()
-        # Avoid synthetic zero-padding for sparse/IPO-like series. Fill residual
-        # gaps first with cross-sectional date means, then per-symbol means.
-        row_means = clean_rets.mean(axis=1)
-        clean_rets = clean_rets.T.fillna(row_means).T
-        clean_rets = clean_rets.fillna(clean_rets.mean(axis=0))
-        clean_rets = clean_rets.fillna(0.0)
-
+            
         m = len(kept_indices)
         T          = len(clean_rets)
         min_rows   = self.cfg.DIMENSIONALITY_MULTIPLIER * m
@@ -950,35 +944,12 @@ class InstitutionalRiskEngine:
                 f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
             )
 
-        # FIX (Bug-C — Zero-Vol Crash, Part 1): Replace zero-volatility columns
-        # (flatlined / circuit-breaker stocks) before fitting LedoitWolf.
-        # A zero-vol column produces an all-zero covariance row/column.  That makes
-        # np.trace(Sigma) ≈ 0, so the proportional ridge below would also be ≈ 0,
-        # leaving Sigma_reg singular and causing osqp.setup() to fail.
-        # Stocks that flatline should be caught by the ADV gate in signals.py, but
-        # this guard ensures a solver crash is impossible even if they slip through.
-        col_stds = clean_rets.std()
-        zero_vol_cols = col_stds[col_stds < 1e-10].index.tolist()
-        if zero_vol_cols:
-            logger.warning(
-                "[Optimizer] %d zero-volatility asset(s) detected before covariance "
-                "estimation: %s. Injecting minimum-noise surrogate to prevent a "
-                "singular matrix. Verify that ADV / history gates are filtering "
-                "circuit-breaker stocks correctly.",
-                len(zero_vol_cols), zero_vol_cols,
-            )
-            clean_rets = clean_rets.copy()
-            _zvol_rng = np.random.RandomState(42)
-            for _col in zero_vol_cols:
-                clean_rets[_col] = _zvol_rng.normal(0.0, 1e-6, len(clean_rets))
-
         lw = LedoitWolf()
         lw.fit(clean_rets)
         Sigma     = lw.covariance_
-        # FIX (Bug-C — Zero-Vol Crash, Part 2): Guarantee a non-zero ridge even
-        # when trace(Sigma) ≈ 0.  Use the larger of the proportional value and a
-        # dimension-scaled absolute floor so regularisation is always meaningful.
-        ridge     = max(1e-6 * float(np.trace(Sigma)), 1e-6 * m)
+        
+        # 1. COVARIANCE MATRIX CONSTRUCTION - Enforce explicit Ridge Regularisation
+        ridge     = max(1e-4 * float(np.trace(Sigma)), 1e-4 * m)
         Sigma_reg = Sigma + ridge * np.eye(m)
 
         gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
@@ -1006,12 +977,12 @@ class InstitutionalRiskEngine:
             gamma *= 0.5
             gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma)
 
-        # adv_shares carries ADV notional (₹/day), so max tradable weight is
-        # ADV-notional budget divided by portfolio value.
         adv_limit = np.clip((adv_shares * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40)
         adv_limit = np.minimum(adv_limit, self.cfg.MAX_SINGLE_NAME_WEIGHT)
+        
+        # 5. WEIGHT NORMALIZATION - Strict enforcement of dynamic exposure
         l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
-        u_gamma = min(1.0, gamma * (1.0 + self.cfg.CAPITAL_ELASTICITY))
+        u_gamma = min(1.0, gamma)  # Force optimizer to respect the exact dynamic regime exposure limits
 
         max_possible_weight = 0.0
         if sector_labels is not None:
@@ -1030,7 +1001,10 @@ class InstitutionalRiskEngine:
             l_gamma = max_possible_weight * 0.99
         if np.sum(adv_limit) < l_gamma:
             l_gamma = np.sum(adv_limit) * 0.99
+            
         u_gamma = max(u_gamma, l_gamma)
+        if l_gamma > u_gamma:
+            l_gamma = max(0.0, u_gamma - 1e-4)
 
         impact     = np.clip(
             self.cfg.IMPACT_COEFF * portfolio_value

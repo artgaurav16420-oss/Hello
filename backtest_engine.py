@@ -194,6 +194,14 @@ class BacktestEngine:
         # This avoids lookahead when we size orders that execute on the current bar.
         valuation_close = close.loc[signal_date]
         
+        # FIX (Phase 1 & 2): Create an aligned vector of strictly T-1 prices.
+        # This isolates the risk checks and optimizer from looking at T+0 data.
+        valuation_prices = np.array([
+            float(valuation_close[sym]) if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
+            else _ffill_price(self.state, sym, cfg)
+            for sym in active_symbols
+        ])
+        
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
@@ -232,20 +240,11 @@ class BacktestEngine:
         soft_cvar_breach       = False
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
-        # Two-tier breach architecture (see CVAR_HARD_BREACH_MULTIPLIER in UltimateConfig):
-        #
-        #  HARD breach  (CVaR > limit × CVAR_HARD_BREACH_MULTIPLIER, default 1.5×):
-        #    CVaR is so elevated the QP solver is unlikely to find a feasible
-        #    solution. Skip the optimizer, force full liquidation immediately.
-        #
-        #  SOFT breach  (limit < CVaR ≤ hard threshold):
-        #    Let the optimizer run — its explicit QP CVaR constraint will build
-        #    a de-risked portfolio naturally. The previous code triggered a full
-        #    liquidation for any breach, including marginal ones like 6.507% vs
-        #    6.500%, causing 33 unnecessary liquidations per 6-year backtest.
         if self.state.shares:
-            # Use prices_t (T+0): screens current stress before order submission.
-            book_cvar = compute_book_cvar(self.state, active_prices, active_symbols, hist_log_rets, cfg)
+            # FIX (Phase 1 Look-ahead): Use valuation_prices (T-1), NOT active_prices (T+0).
+            # Passing active_prices here allowed the risk engine to magically foresee
+            # intraday crashes before optimization execution, inflating results.
+            book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
 
@@ -269,7 +268,6 @@ class BacktestEngine:
                     "running optimizer with CVaR constraint active.",
                     book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100, date,
                 )
-                # Do NOT set _force_full_cash — fall through to signal generation.
 
         # ── Signal generation + optimization ─────────────────────────────────
         if not _force_full_cash:
@@ -301,7 +299,9 @@ class BacktestEngine:
                         historical_returns  = hist_log_rets[[active_symbols[i] for i in sel_idx]],
                         execution_date      = date,
                         adv_shares          = adv_vector[sel_idx],
-                        prices              = active_prices[sel_idx],
+                        # FIX (Phase 7 related): Supply T-1 valuation prices for constraint sizing.
+                        # Do not leak execution logic into the constraint solver.
+                        prices              = valuation_prices[sel_idx],
                         portfolio_value     = pv,
                         prev_w              = prev_weights[sel_idx],
                         exposure_multiplier = self.state.exposure_multiplier,
@@ -365,7 +365,9 @@ class BacktestEngine:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
             
+            # Executions correctly remain grounded in the reality of T+0 data (e.g. Open/VWAP/Close).
             exec_prices = _execution_prices(active_symbols, date, active_prices, open_px, high_px, low_px)
+            
             execute_rebalance(
                 self.state, target_weights, exec_prices, active_symbols, cfg,
                 adv_shares     = adv_vector,
@@ -450,7 +452,7 @@ def _build_adv_vector(
                 if lookback.empty:
                     adv.append(0.0)
                 else:
-                    val = float(lookback.mean())
+                    val = float(lookback.median())
                     adv.append(val if np.isfinite(val) else 0.0)
             except Exception:
                 adv.append(0.0)
@@ -465,7 +467,6 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
     unique_sectors = sorted(set(sector_map.get(s, "Unknown") for s in sel_syms))
     sec_idx        = {s: i for i, s in enumerate(unique_sectors)}
     return np.array([sec_idx[sector_map.get(sym, "Unknown")] for sym in sel_syms], dtype=int)
-
 
 
 def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:

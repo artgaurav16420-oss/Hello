@@ -307,10 +307,10 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
             f"[HistoricalBuilder] CSV at {csv_path} is empty or missing required columns."
         )
 
-    # Group by snapshot date → list of tickers (already .NS-suffixed from build_historical_csv)
+    # Group by snapshot date → list of unique, sorted tickers
     rows = (
         df.groupby(df["date"].dt.normalize())["ticker"]
-        .apply(list)
+        .apply(lambda x: sorted(list(set(x))))
     )
     out_df = pd.DataFrame({"tickers": rows})
     out_df.index = pd.DatetimeIndex(out_df.index, name="date")
