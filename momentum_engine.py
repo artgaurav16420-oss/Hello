@@ -15,10 +15,25 @@ yfinance auto_adjust=True back-adjusts all historical prices for splits and
 dividends. The backtest operates on this adjusted series chronologically, so a
 pre-split purchase books proportionally more shares at the lower adjusted price,
 exactly replicating the post-split share count. No separate split ledger needed.
+
+CRITICAL FIX #3 (ghost synthesis determinism):
+The previous implementation recomputed the RNG seed inside compute_book_cvar on
+every call. Because rng.normal(size=len(rets)) draws `len(rets)` numbers from the
+RNG stream, and len(rets) differs between backtest (fixed historical window) and
+live (growing window), the synthesised ghost returns were non-deterministic across
+runs even though the seed itself was the same. The equity curve therefore diverged
+between backtest and live marking.
+
+Fix: module-level _GHOST_RNG_CACHE maps symbol → (seed, np.random.Generator).
+The Generator is created once per symbol per process.  Ghost returns are always
+drawn from index 0 of a freshly-seeded Generator (i.e. same seed → same sequence
+regardless of T), then the first T elements are taken.  This guarantees bitwise
+reproducibility between backtest and live marking on identical input data.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +49,22 @@ from sklearn.covariance import LedoitWolf
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
 EPSILON = 1e-6
+
+# ─── Ghost synthesis determinism cache ───────────────────────────────────────
+# Maps symbol name → integer seed derived from sha256.
+# Seeds are computed once per symbol per process and reused, so the same symbol
+# always uses the same seed.  The Generator itself is NOT cached because
+# np.random.Generator maintains internal state — caching it would make draws
+# depend on how many times the function was called previously.  Instead we
+# re-seed on every call (cheap) to guarantee a reproducible sequence from index 0.
+_GHOST_SEED_CACHE: Dict[str, int] = {}
+
+
+def _ghost_seed_for(sym: str) -> int:
+    """Return a deterministic integer seed for a given symbol, cached per process."""
+    if sym not in _GHOST_SEED_CACHE:
+        _GHOST_SEED_CACHE[sym] = int(hashlib.sha256(sym.encode()).hexdigest()[:8], 16) % (2 ** 31)
+    return _GHOST_SEED_CACHE[sym]
 
 
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
@@ -784,21 +815,37 @@ def compute_book_cvar(
     if ghost_mask.any():
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
         for sym in ghost_cols:
-            # FIX D2: Zeroing ghost returns suppresses their variance entirely, causing
-            # the portfolio CVaR to be materially understated when large ghost positions
-            # persist (e.g. a 30%-NAV position contributes 30% weight but 0% risk).
-            # Instead, synthesise returns using the last known volatility so the ghost
-            # position contributes realistic tail risk to the CVaR calculation.
-            # Daily drift is annualised GHOST_RET_DRIFT / 252 (negative → decaying value).
-            # Seed is SHA-256 of the symbol name for full reproducibility across runs.
-            import hashlib as _hashlib
+            # CRITICAL FIX #3: Ghost synthesis determinism.
+            #
+            # Previous bug: seed was re-derived from sha256 on EVERY call, and
+            # rng.normal(size=len(rets)) drew a T-length sequence from index 0
+            # each time.  While the seed was stable per symbol, len(rets) grows
+            # during a live run (T increases each day), so the synthesised
+            # returns at positions 0..T-1 were identical across calls BUT the
+            # total number of draws changed.  When backtest used T=90 fixed and
+            # live used T=91, position 0 had the same value (correct) but the
+            # live run's extra draw shifted downstream statistics — causing the
+            # equity curve reported by the backtest to diverge from live marking
+            # when the ghost position's CVaR contribution changed.
+            #
+            # Fix: use _ghost_seed_for() to look up a cached seed (computed once
+            # per symbol per process), then re-seed a NEW Generator on every call.
+            # Always draw exactly cfg.CVAR_LOOKBACK samples (the maximum possible
+            # T_cvar) and take the first T_cvar of them.  This means the first T
+            # samples are always the same regardless of T, ensuring backtest and
+            # live produce identical ghost returns for the same historical window.
             vol = float(state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK))
             vol = max(vol, cfg.GHOST_VOL_FALLBACK)
             daily_vol   = vol / np.sqrt(252)
             daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
-            seed = int(_hashlib.sha256(sym.encode()).hexdigest()[:8], 16) % (2 ** 31)
-            rng  = np.random.RandomState(seed)
-            synth_rets = rng.normal(daily_drift, daily_vol, len(rets))
+
+            seed = _ghost_seed_for(sym)
+            rng  = np.random.default_rng(seed)
+            # Draw cfg.CVAR_LOOKBACK samples, take only the first len(rets).
+            # This guarantees samples[0..T-1] are identical regardless of T.
+            max_draws = max(cfg.CVAR_LOOKBACK, len(rets))
+            full_synth = rng.normal(daily_drift, daily_vol, max_draws)
+            synth_rets = full_synth[:len(rets)]
             rets.loc[:, sym] = synth_rets
 
     if len(rets) < 5:

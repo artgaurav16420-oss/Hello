@@ -6,6 +6,17 @@ and sector-diversified portfolio construction.
 
 Now properly integrated with Impact-Aligned Execution and Historical Constituents
 to eliminate Survivorship Bias. Fixes Look-Ahead PV/ADV computation biases.
+
+FIX #5 (snapped_universe survivorship bias on holiday clusters):
+When two consecutive calendar target dates (e.g. Fri Dec 31 + Mon Jan 1) both
+snap to the same last trading day (e.g. Thu Dec 30), the previous code took the
+UNION of their member sets. Union is wrong: it can include stocks that were added
+to the index on Jan 1 and back-fill them into the Dec 30 snapshot, introducing
+forward-looking survivorship bias on holiday weekends.
+
+Fix: use the EARLIEST member set for the snapped date. When multiple target dates
+collapse to the same trading day, the constituent list from the earliest target
+date is the most conservative (no future additions).
 """
 
 from __future__ import annotations
@@ -422,11 +433,6 @@ def _build_adv_vector(
     if not volume.empty:
         idx = volume.index
         if date in idx:
-            # pandas 2.x always returns an int from get_loc on a unique DatetimeIndex.
-            # The isinstance(pos, slice/ndarray) branches below guard against pandas < 2.0
-            # behaviour (where get_loc could return a slice or boolean array on duplicates).
-            # They are dead code in the current environment (pandas 2.3+) but kept for
-            # defensive compatibility should the code be run on an older environment.
             pos = idx.get_loc(date)
             if isinstance(pos, slice):
                 pos = pos.start
@@ -439,20 +445,23 @@ def _build_adv_vector(
             if pos > 0:
                 signal_date = idx[pos - 1]
             else:
-                signal_date = None  # first trading day in dataset — no prior bar, keep lookahead-free
+                signal_date = None
 
     for sym in symbols:
         if sym in volume.columns and sym in close.columns and signal_date is not None:
             try:
                 c_series = close.loc[:signal_date, sym]
                 v_series = volume.loc[:signal_date, sym]
-                notional = (c_series * v_series).dropna()
+                notional = (c_series * v_series).clip(lower=0).dropna()
                 adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
+                min_periods = max(1, adv_lookback // 2)
                 lookback = notional.tail(adv_lookback)
-                if lookback.empty:
+                if len(lookback.dropna()) < min_periods:
                     adv.append(0.0)
                 else:
-                    val = float(lookback.median())
+                    # FIX #4 (backtest_engine mirror): Use mean not median, consistent
+                    # with the fix applied to signals.compute_adv.
+                    val = float(lookback.mean())
                     adv.append(val if np.isfinite(val) else 0.0)
             except Exception:
                 adv.append(0.0)
@@ -561,6 +570,12 @@ def run_backtest(
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
     selected_universe_type = universe_type or "nse_total"
 
+    # ── Custom screener path ──────────────────────────────────────────────────
+    # get_historical_universe("custom", ...) now logs a survivorship warning and
+    # returns [] instead of raising ValueError (Fixed Issue #1). For custom
+    # backtests, `universe` is pre-populated by the caller (daily_workflow.py)
+    # so the union_universe branch below handles it correctly without needing
+    # special-casing here.
     if union_universe:
         for d in all_target_dates:
             universe_by_rebalance_date[pd.Timestamp(d)] = set(union_universe)
@@ -626,26 +641,48 @@ def run_backtest(
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
-    # FIX B3: universe_by_rebalance_date was keyed by *target* calendar dates
-    # (e.g. 2021-01-01 — New Year) but BacktestEngine.run() looks up by the
-    # *snapped* trading date (e.g. 2020-12-31). The key mismatch caused the
-    # constituent filter to silently return None on every market holiday, falling
-    # back to the full union universe and injecting survivorship bias.
-    # Now that trading_index is available we remap the dict to snapped keys so
-    # every lookup in _run_rebalance hits the correct member set.
+    # FIX B3 + FIX #5: universe_by_rebalance_date was keyed by *target* calendar dates
+    # (e.g. 2021-01-01 — New Year) but BacktestEngine.run() looks up by the *snapped*
+    # trading date (e.g. 2020-12-31). The key mismatch caused the constituent filter
+    # to silently return None on every market holiday, falling back to the full union
+    # universe and injecting survivorship bias.
+    #
+    # FIX #5 (survivorship bias on holiday clusters):
+    # The previous code used UNION when two target dates snapped to the same trading day.
+    # Union includes stocks added in the LATER target date's snapshot, which is future
+    # information relative to the EARLIER target date's trading bar. This is subtle
+    # survivorship bias that manifests around bank holidays and year-end clusters.
+    #
+    # Fix: use the EARLIEST member set. When two targets collapse to the same bar,
+    # the constituent list from the chronologically-first target date is always the
+    # most conservative — it never includes stocks that were added after that date.
     if universe_by_rebalance_date:
         snapped_universe: Dict[pd.Timestamp, set] = {}
-        for target_d, members in universe_by_rebalance_date.items():
+        # Track which calendar target date first claimed each snapped trading date.
+        snapped_universe_target_date: Dict[pd.Timestamp, pd.Timestamp] = {}
+
+        for target_d, members in sorted(universe_by_rebalance_date.items()):
             lower = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
             eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
             if len(eligible) > 0:
                 snapped_key = eligible[-1]
-                # If two target dates snap to the same trading day (back-to-back holidays),
-                # take the union of their member sets — conservative, avoids silent exclusions.
                 if snapped_key in snapped_universe:
-                    snapped_universe[snapped_key] = snapped_universe[snapped_key] | set(members)
+                    # FIX #5: A second target date snapped to the same trading day.
+                    # Keep the EARLIEST target's member set (already stored); discard
+                    # the later one. The dict is iterated in sorted order above so
+                    # snapped_universe[snapped_key] always holds the earliest target's
+                    # constituents at this point — no update needed.
+                    existing_target = snapped_universe_target_date[snapped_key]
+                    logger.debug(
+                        "[Backtest] Holiday snap collision: targets %s and %s both snap to %s. "
+                        "Keeping earliest target's member set (%s) to avoid look-ahead bias.",
+                        existing_target.date(), target_d.date(), snapped_key.date(),
+                        existing_target.date(),
+                    )
+                    # Do NOT update snapped_universe[snapped_key] — keep the earliest.
                 else:
                     snapped_universe[snapped_key] = set(members)
+                    snapped_universe_target_date[snapped_key] = target_d
             # If no eligible trading day exists for this target, the rebalance was already
             # skipped in the snapping loop above — no entry needed.
         universe_by_rebalance_date = snapped_universe

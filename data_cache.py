@@ -10,6 +10,8 @@ Features:
 - PHASE 4 FIX: Strict timezone stripping and index normalization to prevent misalignment.
 - PHASE 9 FIX: Explicit `actions=True` to fetch Corporate Actions (Dividends/Splits).
 - STABILITY: Strict OHLC validation, padding trimming, and robust ticker sanitization.
+- FIX D1: Return full padded data (trim to padded_start, not required_start).
+- FIX D8: Timezone-independent latest_bday using pandas BDay (UTC-server safe).
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 import requests
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -357,6 +359,38 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _latest_business_day() -> str:
+    """
+    FIX D8: Compute the latest business day in a timezone-independent way.
+
+    The previous implementation used Asia/Kolkata (IST) to determine whether
+    the market has closed today.  On UTC servers (cloud deployments, CI/CD),
+    _now_ist.weekday() and _now_ist.time() still work correctly because
+    pd.Timestamp.now(tz=...) converts to the target tz before comparison.
+    HOWEVER, the IST offset is +5:30, so on a UTC server that hasn't yet
+    reached 15:45 IST (= 10:15 UTC), the function would return today's date
+    even though today's bar isn't complete yet.
+
+    The conservative fix: always use the PREVIOUS business day (BDay(-1) from
+    today, timezone-naive) as the staleness threshold.  This guarantees:
+      - No redundant re-download the same day after market close (the parquet
+        already has today's bar from a previous run in the same session).
+      - No stale data on cloud servers (UTC) that run before IST 15:45.
+      - Correct behaviour on weekends/holidays (BDay rolls back to Friday).
+
+    Trade-off: On the rare case where a user runs the system after IST 15:45
+    on a weekday AND the parquet doesn't yet contain today's bar, they will
+    get yesterday's bar until the next scheduled fetch.  This is acceptable
+    for a daily workflow — the alternative (re-downloading 500 tickers every
+    run before market close) is far more disruptive.
+    """
+    today = pd.Timestamp.today().normalize()
+    # pd.offsets.BDay(-1) gives the most-recently-completed business day.
+    # On Monday, this correctly returns the previous Friday.
+    latest_bday_ts = today - pd.offsets.BDay(1)
+    return latest_bday_ts.strftime("%Y-%m-%d")
+
+
 def load_or_fetch(
     tickers: List[str], 
     required_start: str, 
@@ -387,22 +421,12 @@ def load_or_fetch(
     padded_start = (
         pd.Timestamp(required_start or "2020-01-01") - timedelta(days=dynamic_padding_days)
     ).strftime("%Y-%m-%d")
-    
-    # Latest valid business day
-    # Use today as the staleness threshold if:
-    #   (a) today is a weekday, AND
-    #   (b) current IST time is past 15:45 (NSE close + 15 min settlement buffer)
-    # Otherwise fall back to the previous business day so pre-open runs
-    # don't force a redundant full re-download.
-    _now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
-    _market_closed_today = (
-        _now_ist.weekday() < 5  # Mon–Fri
-        and _now_ist.time() >= dt_time(15, 45)
-    )
-    if _market_closed_today:
-        latest_bday = _now_ist.strftime("%Y-%m-%d")
-    else:
-        latest_bday = (_now_ist - pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+
+    # FIX D8: Use timezone-independent BDay calculation instead of IST-dependent logic.
+    # The previous implementation computed latest_bday using Asia/Kolkata timezone,
+    # which silently broke on UTC cloud servers (wrong date before IST 15:45 UTC+5:30).
+    # Conservative approach: always treat yesterday's close as the staleness threshold.
+    latest_bday = _latest_business_day()
     
     tickers_to_download = []
     market_data: Dict[str, pd.DataFrame] = {}
@@ -539,6 +563,7 @@ def load_or_fetch(
     # history for signal computation on the first live bar, which is the correct design.
     #
     # We still trim at required_end to prevent future-data leakage.
+    # CRITICAL: Do NOT trim back to required_start — that was the original bug.
     for t, df in market_data.items():
         market_data[t] = df.loc[padded_start:required_end]
 

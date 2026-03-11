@@ -1006,35 +1006,70 @@ def main_menu() -> None:
             else:
                 universe_identifier = "nifty500"
 
-            end        = datetime.today().strftime("%Y-%m-%d")
-            
+            end    = datetime.today().strftime("%Y-%m-%d")
             bt_cfg = load_optimized_config()
-            all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
-            historical_union = set()
-            for target_date in all_target_dates:
+
+            # ── Custom universe path ───────────────────────────────────────────
+            # get_historical_universe() returns [] for universe_type="custom"
+            # (Fix #1 — no longer raises ValueError). We build the union from
+            # the *current* live screener list instead, and warn the user that
+            # this introduces survivorship bias before proceeding.
+            if universe_identifier == "custom":
+                custom_syms = _get_custom_universe()
+                if not custom_syms:
+                    print(f"  {C.RED}[!] No custom universe found. Cannot run backtest.{C.RST}")
+                    print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
+                    continue
+
+                print(f"\n  {C.B_RED}⚠  SURVIVORSHIP BIAS WARNING{C.RST}")
+                print(f"  {C.YLW}Custom screener backtests use today's live stock list for ALL historical{C.RST}")
+                print(f"  {C.YLW}rebalance dates. Stocks that were delisted, merged, or removed from your{C.RST}")
+                print(f"  {C.YLW}screener between {start} and {end} are silently excluded.{C.RST}")
+                print(f"  {C.YLW}This will inflate historical returns. Use Nifty 500 or NSE Total for{C.RST}")
+                print(f"  {C.YLW}unbiased backtesting.{C.RST}")
+                confirm = input(f"\n  {C.CYN}Proceed anyway? (y/n): {C.RST}").strip().lower()
+                if confirm != "y":
+                    print(f"  {C.GRY}Cancelled. Returning to main menu.{C.RST}")
+                    continue
+
+                historical_union = set(custom_syms)
+                data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
+
                 try:
-                    historical_union.update(get_historical_universe(universe_identifier, target_date))
-                except ValueError as ve:
-                    print(f"\n  {C.B_RED}[!] BACKTEST BLOCKED — Survivorship Bias Guard{C.RST}")
-                    print(f"  {C.RED}{ve}{C.RST}")
-                    print(f"  {C.YLW}Please select 'Nifty 500' or 'NSE Total' for safe historical backtesting.{C.RST}\n")
-                    historical_union = set()
-                    break
+                    print_backtest_results(
+                        run_backtest(data, universe_identifier, start, end, cfg=bt_cfg, universe=custom_syms)
+                    )
+                except RuntimeError as exc:
+                    print(f"\n  {C.B_RED}[!] BACKTEST FAILED{C.RST}")
+                    print(f"  {C.RED}{exc}{C.RST}\n")
 
-            if not historical_union:
-                continue
+            # ── Standard path (nifty500 / nse_total) ──────────────────────────
+            else:
+                all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
+                historical_union = set()
+                for target_date in all_target_dates:
+                    members = get_historical_universe(universe_identifier, target_date)
+                    historical_union.update(members)
 
-            data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
+                if not historical_union:
+                    print(f"\n  {C.B_RED}[!] BACKTEST BLOCKED — No historical universe data found{C.RST}")
+                    print(f"  {C.YLW}Run the following command to generate required snapshots:{C.RST}")
+                    print(f"  {C.BLD}    python historical_builder.py{C.RST}")
+                    print(f"  {C.GRY}Required files:{C.RST}")
+                    print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
+                    continue
 
-            try:
-                print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
-            except RuntimeError as exc:
-                print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
-                print(f"  {C.RED}{exc}{C.RST}")
-                print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
-                print(f"  {C.BLD}    python historical_builder.py{C.RST}")
-                print(f"  {C.GRY}Required files:{C.RST}")
-                print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
+                data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
+
+                try:
+                    print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
+                except RuntimeError as exc:
+                    print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
+                    print(f"  {C.RED}{exc}{C.RST}")
+                    print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
+                    print(f"  {C.BLD}    python historical_builder.py{C.RST}")
+                    print(f"  {C.GRY}Required files:{C.RST}")
+                    print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
 
         elif c == "5":
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
