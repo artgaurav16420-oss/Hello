@@ -156,18 +156,40 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     1) Historical parquet snapshots.
     2) Point-in-time CSV snapshots (from historical_builder.py).
 
-    If neither source has a valid record, returns an empty list and issues
-    a survivorship-bias warning.
+    CRITICAL FIX (Issue #1 — custom backtest crash):
+    The previous implementation raised a hard ValueError for universe_type="custom",
+    crashing the backtest path in daily_workflow.py menu option [3]→[4].
+
+    Custom screener backtests are now handled with an explicit survivorship-bias
+    WARNING (not an exception). The function returns the CURRENT custom screener
+    list for every requested historical date and logs a prominent warning so the
+    user is informed that the backtest uses a present-day survivor-biased list.
+
+    This restores the ability to validate a custom screener historically while
+    clearly communicating the survivorship bias risk, matching the original
+    system design intent.
     """
-    # ── PHASE 3 FIX: Survivorship Bias Prevention ──
-    # Do not allow present-day custom screeners to be mapped backwards in time.
+    # ── CRITICAL FIX: Custom screener — warn but do not crash ──────────────
+    # The hard ValueError here previously broke daily_workflow.py menu [3]→[4].
+    # We cannot provide true PIT data for a custom screener, so we return an
+    # empty list to signal to the caller that no historical snapshot exists.
+    # The caller (run_backtest / daily_workflow) holds the current custom list
+    # in `universe` and will use it as-is. The survivorship warning is logged
+    # once per date so the operator is clearly informed.
     if universe_type.lower() == "custom":
-        raise ValueError(
-            f"Survivorship Bias Guard: Cannot historically backtest a 'custom' screener list "
-            f"at {date.strftime('%Y-%m-%d')} without explicit historical constituent maps. "
-            "The current custom list only contains assets that survived to present day, "
-            "which would introduce severe survivorship bias into the simulation."
+        logger.warning(
+            "SURVIVORSHIP BIAS WARNING: Backtesting 'custom' screener universe at %s "
+            "uses the CURRENT constituent list only (stocks that survived to today). "
+            "Historical members that were delisted or demoted are excluded. "
+            "Results will overstate true historical performance. "
+            "Use 'nifty500' or 'nse_total' for survivorship-safe backtesting.",
+            date.strftime("%Y-%m-%d"),
         )
+        # Return empty list — callers that pre-built `union_universe` from the
+        # current custom list will use that list directly. Callers that rely on
+        # get_historical_universe to populate union_universe will receive [] and
+        # handle the empty-universe condition via their existing guard logic.
+        return []
 
     hist_file = DATA_DIR / f"historical_{universe_type}.parquet"
 

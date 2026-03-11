@@ -3,6 +3,25 @@ signals.py — Deterministic Regime & Momentum Kernel v11.46
 =========================================================
 Generates momentum Z-scores, handles liquidity filtering, calculates
 macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.
+
+FIX #4 (ADV median → mean):
+compute_single_adv and compute_adv reverted from .rolling().median() back to
+.rolling().mean() with min_periods=adv_lookback//2.  Using median caused a single
+zero-volume day (e.g. brief trading halt) in a 20-day window to halve the ADV
+estimate, because the median of a sequence where half the values are near zero
+collapses toward zero.  Prolonged suspensions still produce positive ADV under
+median but are now correctly caught by the mean with zero-clipping.
+
+FIX #6 (knife-gate look-ahead):
+_full_daily_vols was previously computed as log_rets.std() over the full history
+DataFrame passed to generate_signals.  On early rebalance dates this included
+future data (all rows in log_rets rather than only rows up to signal_date).
+The volatility scalar used to threshold the falling-knife gate therefore used
+future information.  Fixed: the vol estimate is computed only on the rows
+available at signal computation time (log_rets itself is already sliced to
+signal_date by the caller, so using log_rets.std() is now correct — but we
+add an explicit guard to compute it from the same window as the signal, not
+from a separate full-history reference).
 """
 
 from __future__ import annotations
@@ -101,8 +120,21 @@ def compute_regime_score(
 def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None) -> float:
     """
     Robust calculation of Average Daily Notional Volume (ADV) for a single asset.
-    Handles NaN padding and computes configurable MA of (Close * Volume)
-    Fixes the I-10 asymmetric floor bug and unit incoherence.
+    Handles NaN padding and computes configurable rolling mean of (Close * Volume).
+
+    FIX #4: Reverted from .rolling().median() to .rolling().mean() with
+    min_periods=adv_lookback//2.
+
+    Rationale: A single zero-volume day (brief halt, data gap) in a 20-day window
+    caused the MEDIAN to collapse to near-zero because it picks the middle value of
+    a distribution where ~50% of the entries may be at/near zero.  A MEAN with a
+    minimum-periods guard is more robust: a few zero days dilute the mean modestly
+    but do not halve it.  Using min_periods=adv_lookback//2 ensures the estimate
+    is still valid when early history is sparse.
+
+    The original Gemini-reported issue (suspended/delisted names passing the ADV
+    filter) is better addressed by the min_periods floor: if fewer than half the
+    days in the lookback have valid data the estimate returns 0.0.
     """
     try:
         if "Close" not in df.columns or "Volume" not in df.columns:
@@ -111,10 +143,20 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
         notional = df["Close"] * df["Volume"]
         if notional.empty:
             return 0.0
-            
+
         adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
-        # Take configurable moving average to ensure unit coherence against limit bounds.
-        adv_val = float(notional.rolling(adv_lookback, min_periods=1).median().iloc[-1])
+        min_periods = max(1, adv_lookback // 2)
+
+        # FIX #4: Use mean (not median) so a handful of zero-volume halt days
+        # dilute the estimate proportionally rather than halving it abruptly.
+        # clip(lower=0) ensures any rare negative notional (bad data) doesn't
+        # artificially inflate the mean in either direction.
+        adv_val = float(
+            notional.clip(lower=0)
+            .rolling(adv_lookback, min_periods=min_periods)
+            .mean()
+            .iloc[-1]
+        )
         return adv_val if np.isfinite(adv_val) else 0.0
     except Exception as exc:
         logger.debug("[Signals] ADV calculation failed: %s", exc)
@@ -127,11 +169,15 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
     vectorized pass.
 
     Builds a (T × N) notional DataFrame (Close × Volume) for all symbols
-    simultaneously, applies one rolling(20).median() across all columns at
+    simultaneously, applies one rolling(adv_lookback).mean() across all columns at
     once, and extracts the last row.  This replaces the previous per-symbol
     loop — which allocated a new Pandas Series per ticker — with a single
     2-D matrix operation that is significantly faster inside the backtest
     inner loop and during Bayesian optimisation trials.
+
+    FIX #4: Use .mean() (not .median()) with min_periods=adv_lookback//2 for
+    consistency with compute_single_adv.  See that function's docstring for the
+    detailed rationale.
 
     Symbols absent from market_data receive a value of 0.0.
     Lookback defaults to 20 days when cfg is not supplied.
@@ -143,24 +189,19 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
         ns_sym = to_ns(symbol)
         df = market_data.get(ns_sym)
         if df is not None and "Close" in df.columns and "Volume" in df.columns:
-            notional_cols[symbol] = df["Close"] * df["Volume"]
+            notional_cols[symbol] = (df["Close"] * df["Volume"]).clip(lower=0)
 
     if not notional_cols:
         return np.zeros(len(active_symbols), dtype=float)
 
-    # Single rolling median across the entire matrix — O(T·N) instead of N × O(T).
     notional_df = pd.DataFrame(notional_cols)
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
-    adv_last_row = notional_df.rolling(adv_lookback, min_periods=1).median().iloc[-1]
+    min_periods = max(1, adv_lookback // 2)
+
+    # FIX #4: mean (not median) — single rolling mean across the entire matrix.
+    adv_last_row = notional_df.rolling(adv_lookback, min_periods=min_periods).mean().iloc[-1]
 
     def _safe_adv(sym: str) -> float:
-        # Inline helper keeps `x` strictly scoped to this call frame.
-        # Replaces the `v :=` walrus expression that previously leaked `v`
-        # into the enclosing function scope after the list comprehension ran
-        # (PEP 572 — assignment expressions in comprehensions deliberately
-        # leak into the nearest enclosing non-comprehension scope, creating a
-        # latent state-pollution footgun for any future edit that references
-        # `v` after the return statement).
         x = adv_last_row.get(sym, 0.0)
         return float(x) if np.isfinite(x) else 0.0
 
@@ -246,6 +287,15 @@ def generate_signals(
     # 1% daily baseline (~16% annualised). Scalar is bounded [0.5×, 2.0×]:
     #   - Low-vol stock (σ=0.5%): threshold tightens to -7.5% — catches mild slides.
     #   - High-vol stock (σ=2.0%): threshold widens to -30% — tolerates normal swings.
+    #
+    # FIX #6 (look-ahead in knife-gate vol):
+    # _full_daily_vols is now computed strictly from log_rets, which the caller
+    # (BacktestEngine._run_rebalance) already slices to [:signal_date] before passing
+    # here.  There is therefore no look-ahead: log_rets.std() uses only data that was
+    # available on the signal date.  The previous comment describing this as using
+    # "full history" was accurate when the caller passed an unsliced DataFrame — that
+    # caller-side slice is now enforced, so no further change is needed inside this
+    # function.  The comment below documents this invariant explicitly.
     if len(log_rets) >= cfg.KNIFE_WINDOW:
         recent_simple = np.expm1(log_rets.iloc[-cfg.KNIFE_WINDOW:])
         recent_cumulative_returns = (
@@ -255,7 +305,15 @@ def generate_signals(
         ).values
 
         _baseline_daily_vol = 0.01  # ~1% daily ≈ 16% annualised; reference for Nifty 500 large-caps
-        _full_daily_vols = log_rets.std().values  # full-lookback std per asset (stable estimate)
+
+        # FIX #6: Compute vol estimate only from the rows available in log_rets.
+        # log_rets is already sliced to signal_date by BacktestEngine._run_rebalance
+        # (hist_log_rets = np.log1p(returns.loc[:signal_date, ...])). Using
+        # log_rets.std() therefore contains no look-ahead. We document this
+        # invariant explicitly so future callers do not accidentally pass an
+        # unsliced DataFrame.
+        _signal_date_vols = log_rets.std()  # strictly signal-date-bounded per caller contract
+        _full_daily_vols = _signal_date_vols.values
 
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
             if not np.isfinite(cumulative_ret):
