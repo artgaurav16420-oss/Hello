@@ -164,6 +164,9 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
     monkeypatch.setattr(optimizer, "TEST_END", "2020-12-31")
     monkeypatch.setattr(optimizer, "fetch_nse_equity_universe", lambda: ["ABC", "^NSEI", "ABC"])
+    # apply_halt_simulation is a no-op for this test — it would crash because the
+    # fake load_or_fetch returns {"ok": True} (not real DataFrames).
+    monkeypatch.setattr(optimizer, "apply_halt_simulation", lambda md: md)
 
     captured = {}
 

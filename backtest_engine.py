@@ -636,7 +636,9 @@ def run_backtest(
         vol_dict: Dict[str, pd.Series] = {}
         for sym in list(union_universe):
             key = sym if sym.endswith(".NS") else sym + ".NS"
-            row = market_data.get(key) or market_data.get(sym)
+            row = market_data.get(key)
+            if row is None:
+                row = market_data.get(sym)
             if row is not None and not row.empty and "Volume" in row.columns:
                 import numpy as _np
                 vol_dict[sym] = row["Volume"].replace(0, _np.nan).notna().cumsum()
