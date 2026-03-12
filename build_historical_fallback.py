@@ -230,7 +230,7 @@ def build_parquet(
 
     logger.info(
         "  Building %d volume-gated snapshots from %s → today for %d symbols.",
-        len(snapshot_dates), start_date, len(symbols),
+        len(snapshot_dates), start_date, len(valid_trading_days.columns),
     )
 
     rows = []

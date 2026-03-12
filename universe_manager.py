@@ -375,9 +375,21 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             for symbol in failure["symbols"][:3]
         ][:6]
         preview_txt = ", ".join(failed_symbol_preview) if failed_symbol_preview else "n/a"
-        raise UniverseFetchError(
-            "ADV filter failed for "
-            f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
+        # MB-10 FIX: Only raise if ALL chunks failed.  Previously a single chunk
+        # failure raised UniverseFetchError, discarding all partial results from
+        # successful chunks.  The caller (_run_scan) then fell back to a completely
+        # unfiltered universe, defeating the ADV filter and admitting illiquid stocks.
+        # Now partial results from successful chunks are returned with a warning;
+        # UniverseFetchError is only raised when zero chunks succeeded.
+        if not filtered_tickers:
+            raise UniverseFetchError(
+                "ADV filter failed for ALL "
+                f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
+            )
+        logger.warning(
+            "[Universe] ADV filter: %d chunk(s) failed (sample: %s); "
+            "returning partial results from %d successful chunk(s).",
+            len(chunk_failures), preview_txt, len(chunks) - len(chunk_failures),
         )
 
     return list(dict.fromkeys(filtered_tickers))
@@ -410,21 +422,26 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         logger.info("[Universe] Fetching fresh NSE total equity master...")
         df = _fetch_csv_with_headers("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
         df.columns = [col.strip().upper() for col in df.columns]
-        
+
         # Filter for active Equity series only (exclude ETFs, bonds, etc)
         equity_df = df[df["SERIES"] == "EQ"]
         tickers = equity_df["SYMBOL"].unique().tolist()
-        
-        # Apply strict ADV liquidity filter — defined in this module.
-        logger.info("[Universe] Applying liquidity filters to %d symbols...", len(tickers))
-        liquid_tickers = _apply_adv_filter(tickers, cfg)
-        
+
+        # FIX (Patch 3): Cache strictly holds unfiltered constituent strings.
+        # Previously _apply_adv_filter(tickers, cfg) was called here using a
+        # 150-day lookback ending TODAY.  Any backtest run over 2020-2022 that
+        # fell back to this cache received a universe pre-filtered by 2026 liquidity,
+        # admitting only survivors and excluding names that were liquid in 2020 but
+        # delisted or illiquid by 2026.  This is textbook look-ahead survivorship bias.
+        # ADV filtering MUST happen at execution time inside the backtest loop via
+        # compute_adv + the generate_signals ADV gate, not at cache-population time.
+        logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
         cache["total_equity"] = {
             "fetched_at": datetime.now().isoformat(),
-            "tickers": liquid_tickers
+            "tickers":    tickers,
         }
         _save_universe_cache(cache)
-        return liquid_tickers
+        return tickers
         
     except UniverseFetchError as exc:
         logger.error("[Universe] NSE master fetch failed during ADV filtering: %s", exc)

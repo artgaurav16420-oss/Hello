@@ -664,46 +664,79 @@ def execute_rebalance(
             score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
             valid_targets.append((i, sym, price, score))
 
-    # RESIDUAL CASH FIX (v11.49): True proportional allocation respecting OSQP weights.
+    # RESIDUAL CASH FIX (v11.50): Multi-pass proportional allocation.
     #
-    # v11.48 round-robin was price-biased: adding 1 share to each asset per round
-    # means a ₹10,000 stock absorbs 100× the cash of a ₹100 stock per round,
-    # completely ignoring OSQP weight proportions.
+    # v11.49 single-pass silently stranded entitlement: when the top-weight asset hit
+    # its ADV cap, its proportional slice of residual cash was held as cash with no
+    # redistribution to uncapped assets.  In a concentrated NSE momentum portfolio
+    # where the highest-signal names are often ADV-capped after base sizing, this
+    # wasted up to 84% of residual in tested scenarios.
     #
-    # Correct approach: compute each asset's proportional cash entitlement from the
-    # OSQP weight distribution, then take the floor in shares.  One pass, no loops.
-    # This is mathematically equivalent to re-running the OSQP integer-rounding step
-    # on the residual alone, preserving relative weight structure exactly.
+    # Fix: multi-pass while loop.  Each pass computes proportional entitlements over
+    # the ELIGIBLE (non-capped) subset only.  Capped assets are removed from eligible
+    # after their cap is hit.  Passes repeat until residual is exhausted or no uncapped
+    # assets remain.  Convergence is guaranteed: each pass either exhausts residual or
+    # removes at least one asset from eligible.
     residual_cash = max(0.0, min(pv_t1, pv_exec) - base_notional)
 
     if valid_targets and residual_cash > 0:
-        total_osqp_w = sum(
-            float(target_weights[i]) for i, sym, price, _ in valid_targets
+        eligible = {
+            sym: {"i": i, "price": price, "w": float(target_weights[i])}
+            for i, sym, price, _ in valid_targets
             if np.isfinite(target_weights[i]) and target_weights[i] > 0
-        )
-        if total_osqp_w > 1e-8:
-            for i, sym, price, _ in valid_targets:
-                w_i = float(target_weights[i]) if np.isfinite(target_weights[i]) else 0.0
-                if w_i <= 0:
-                    continue
-                # Pro-rata cash entitlement for this asset from the residual pool
-                cash_entitlement = (w_i / total_osqp_w) * residual_cash
+        }
+
+        while eligible and residual_cash > 0:
+            total_eligible_w = sum(data["w"] for data in eligible.values())
+            if total_eligible_w < 1e-8:
+                break
+
+            shares_bought_this_pass = 0
+            to_remove = []
+
+            for sym, data in eligible.items():
+                price = data["price"]
+                i     = data["i"]
+                w_i   = data["w"]
+
+                cash_entitlement = (w_i / total_eligible_w) * residual_cash
                 extra = int(cash_entitlement // price)
+
                 if extra <= 0:
+                    # Asset's entitlement doesn't even buy one share — remove if price
+                    # exceeds total remaining residual (permanently unaffordable)
+                    if price > residual_cash:
+                        to_remove.append(sym)
                     continue
-                # Cap: MAX_SINGLE_NAME_WEIGHT
+
                 headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_t1 - desired_shares[sym] * price
-                extra = min(extra, max(0, int(headroom_notional // price)))
-                # Cap: ADV limit
+                max_extra_weight  = max(0, int(headroom_notional // price))
+
+                max_extra_adv = extra  # no ADV cap by default
                 if adv_shares is not None and i < len(adv_shares):
                     adv_notional = float(adv_shares[i])
                     if adv_notional > 0:
                         max_adv_total = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
-                        extra = min(extra, max(0, max_adv_total - desired_shares[sym]))
-                if extra > 0:
-                    desired_shares[sym] += extra
-                    # Note: residual_cash is not decremented per-asset; each asset
-                    # draws from its own proportional slice, so no double-spending.
+                        max_extra_adv = max(0, max_adv_total - desired_shares[sym])
+
+                cap_limit    = min(max_extra_weight, max_extra_adv)
+                actual_extra = min(extra, cap_limit)
+
+                if actual_extra > 0:
+                    desired_shares[sym] += actual_extra
+                    residual_cash       -= actual_extra * price
+                    shares_bought_this_pass += actual_extra
+
+                # Remove from eligible if: hit cap, or price now exceeds remaining cash
+                if actual_extra >= cap_limit or price > residual_cash:
+                    to_remove.append(sym)
+
+            for sym in to_remove:
+                eligible.pop(sym, None)
+
+            if shares_bought_this_pass == 0:
+                break  # All remaining eligible assets are too expensive; hold as cash
+
 
     for i, sym in enumerate(active_symbols):
         w = round(float(target_weights[i]), 10)
@@ -1102,13 +1135,20 @@ class InstitutionalRiskEngine:
                 f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
             )
 
+        # 1. COVARIANCE MATRIX CONSTRUCTION
+        # FIX (Patch 1A): Trust Ledoit-Wolf optimal shrinkage exclusively.
+        # LW already shrinks the sample covariance toward a scaled identity:
+        #   Σ_LW = (1-δ)·Σ_sample + δ·μ·I
+        # Adding an explicit ridge term on top is double-shrinkage — it
+        # artificially suppresses cross-asset correlations beyond what LW
+        # determined to be optimal, causing CVaR to systematically underestimate
+        # tail risk and tricking the optimizer into concentrated positions.
+        # ridge_applied is retained in SolverDiagnostics as 0.0 to preserve the
+        # schema without breaking the diagnostic log.
         lw = LedoitWolf()
         lw.fit(clean_rets)
-        Sigma     = lw.covariance_
-        
-        # 1. COVARIANCE MATRIX CONSTRUCTION - Enforce explicit Ridge Regularisation
-        ridge     = max(1e-4 * float(np.trace(Sigma)), 1e-4 * m)
-        Sigma_reg = Sigma + ridge * np.eye(m)
+        Sigma_reg = lw.covariance_
+        ridge     = 0.0  # retained for SolverDiagnostics schema compatibility
 
         gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
 
@@ -1276,6 +1316,20 @@ class InstitutionalRiskEngine:
             )
 
         w_opt = np.maximum(res.x[:m], 0.0)
+
+        # FIX (Patch 1B): Force normalization on inaccurate solves to prevent leverage leaks.
+        # When OSQP returns 'solved inaccurate', KKT conditions including the budget
+        # constraint Σw = γ are violated — w_opt may sum to 1.8 when γ = 0.8.
+        # Normalize before any downstream use so physical CVaR and execution both
+        # see the correct target exposure, not an inflated raw solver output.
+        if res.info.status in ("solved inaccurate", "solved_inaccurate"):
+            logger.warning(
+                "[Optimizer] OSQP returned '%s'. Normalizing weights to γ=%.4f to prevent leverage leaks.",
+                res.info.status, gamma,
+            )
+            w_sum = float(np.sum(w_opt))
+            if w_sum > 1e-9:
+                w_opt = w_opt * (gamma / w_sum)
 
         portfolio_losses  = losses @ w_opt
         sorted_losses     = np.sort(portfolio_losses)

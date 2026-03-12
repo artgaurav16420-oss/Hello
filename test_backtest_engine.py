@@ -20,7 +20,7 @@ def test_rebalance_values_portfolio_from_previous_close(monkeypatch):
     captured = {}
 
     def _fake_generate_signals(*_args, **_kwargs):
-        return np.array([0.01]), np.array([0.01]), [0]
+        return np.array([0.01]), np.array([0.01]), [0], {}
 
     def _fake_optimize(**kwargs):
         captured["pv"] = kwargs["portfolio_value"]
@@ -108,14 +108,19 @@ def test_run_backtest_uses_adjusted_close_for_valuation_when_auto_adjust_enabled
         captured["close"] = close.copy()
         return pd.DataFrame({"equity": pd.Series(dtype=float)})
 
-    monkeypatch.setattr(be.BacktestEngine, "run", _fake_run)
-
-    be.run_backtest(
-        market_data=market_data,
-        start_date="2020-01-01",
-        end_date="2020-01-02",
-        cfg=cfg,
-        universe=["AAA"],
-    )
+    # MB-21 FIX: use unittest.mock.patch.object as a context manager instead of
+    # monkeypatch.setattr(be.BacktestEngine, ...).  Class-level monkeypatching
+    # is more fragile: if teardown fails the fake leaks into subsequent tests.
+    # patch.object exits cleanly even on exception and is strictly scoped to
+    # the `with` block.
+    import unittest.mock as mock
+    with mock.patch.object(be.BacktestEngine, "run", _fake_run):
+        be.run_backtest(
+            market_data=market_data,
+            start_date="2020-01-01",
+            end_date="2020-01-02",
+            cfg=cfg,
+            universe=["AAA"],
+        )
 
     assert list(captured["close"]["AAA"]) == [100.0, 100.0]

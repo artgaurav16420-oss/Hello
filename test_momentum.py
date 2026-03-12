@@ -64,8 +64,8 @@ def test_generate_signals_deterministic():
     adv      = np.ones(6) * 1e6
     cfg      = UltimateConfig(HISTORY_GATE=90, MAX_POSITIONS=5)
     slice_t1 = log_rets.iloc[:100]
-    raw1, scores1, sel1 = generate_signals(slice_t1, adv, cfg)
-    raw2, scores2, sel2 = generate_signals(slice_t1, adv, cfg)
+    raw1, scores1, sel1, _ = generate_signals(slice_t1, adv, cfg)
+    raw2, scores2, sel2, _ = generate_signals(slice_t1, adv, cfg)
     np.testing.assert_array_equal(raw1, raw2)
     assert sel1 == sel2
 
@@ -76,7 +76,7 @@ def test_generate_signals_history_gate():
     log_rets.iloc[:90, 0] = np.nan   # SYM00 has only 10 valid rows
     adv      = np.ones(5) * 1e6
     cfg      = UltimateConfig(HISTORY_GATE=95, MAX_POSITIONS=5)
-    _, _, sel_idx = generate_signals(log_rets, adv, cfg)
+    _, _, sel_idx, _ = generate_signals(log_rets, adv, cfg)
     assert 0 not in sel_idx, "SYM00 should be excluded by history gate."
 
 
@@ -90,7 +90,7 @@ def test_generate_signals_continuity_bonus():
     adv          = np.ones(2) * 1e6
     cfg          = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=2)
     prev_weights = {"SYM0": 0.10, "SYM1": 0.0}
-    _, scores, _ = generate_signals(
+    _, scores, _, _ = generate_signals(
         log_rets, adv, cfg, prev_weights=prev_weights,
     )
     assert scores[0] > scores[1], "Held asset must receive continuity bonus."
@@ -107,7 +107,7 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
     adv = np.ones(3) * 1e6
     cfg = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3)
 
-    _, scores, _ = generate_signals(
+    _, scores, _, _ = generate_signals(
         log_rets,
         adv,
         cfg,
@@ -117,7 +117,7 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
     small_bonus = float(scores[0] - scores[2])
     large_bonus = float(scores[1] - scores[2])
 
-    raw_scores, _, _ = generate_signals(log_rets, adv, cfg)
+    raw_scores, _, _, _ = generate_signals(log_rets, adv, cfg)
     finite = raw_scores[np.isfinite(raw_scores)]
     dispersion = max(np.nanstd(finite), cfg.CONTINUITY_DISPERSION_FLOOR)
     base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR) * dispersion
@@ -136,13 +136,13 @@ def test_generate_signals_continuity_bonus_blocked_for_flatlined_symbol():
     adv = np.array([1e6, 1e6], dtype=float)
     cfg = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=2, CONTINUITY_STALE_SESSIONS=10)
 
-    _, scores_with_hold, _ = generate_signals(
+    _, scores_with_hold, _, _ = generate_signals(
         log_rets,
         adv,
         cfg,
         prev_weights={"FLAT": 0.10, "LIVE": 0.0},
     )
-    _, scores_no_hold, _ = generate_signals(log_rets, adv, cfg)
+    _, scores_no_hold, _, _ = generate_signals(log_rets, adv, cfg)
 
     assert scores_with_hold[1] == pytest.approx(scores_no_hold[1], abs=1e-12)
     assert scores_with_hold[0] > scores_with_hold[1], "Flatlined held name must not outrank active name via continuity."
@@ -186,8 +186,8 @@ def test_continuity_bonus_respects_max_scalar_cap():
     cfg_capped   = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3, CONTINUITY_BONUS=0.30, CONTINUITY_MAX_SCALAR=0.20)
     cfg_uncapped = UltimateConfig(HISTORY_GATE=10, MAX_POSITIONS=3, CONTINUITY_BONUS=0.20, CONTINUITY_MAX_SCALAR=0.20)
 
-    _, scores_capped,   _ = generate_signals(log_rets, adv, cfg_capped,   prev_weights={"A": 0.10})
-    _, scores_uncapped, _ = generate_signals(log_rets, adv, cfg_uncapped, prev_weights={"A": 0.10})
+    _, scores_capped,   _, _ = generate_signals(log_rets, adv, cfg_capped,   prev_weights={"A": 0.10})
+    _, scores_uncapped, _, _ = generate_signals(log_rets, adv, cfg_uncapped, prev_weights={"A": 0.10})
 
     # Both configs produce the same bonus for A (cap clips 0.30 → 0.20)
     assert scores_capped[0] == pytest.approx(scores_uncapped[0], abs=1e-9)
@@ -944,7 +944,7 @@ def test_e2e_ledger_parity():
                 sym: (live_state.shares.get(sym, 0) * live_state.last_known_prices.get(sym, 0.0)) / pv
                 for sym in symbols if live_state.shares.get(sym, 0) > 0 and pv > 0
             }
-            raw, adj, sel = generate_signals(
+            raw, adj, sel, _ = generate_signals(
                 hist_log_rets, adv_vector, cfg, prev_weights=prev_w_dict,
             )
             prev_weights_arr = np.array([prev_w_dict.get(sym, 0.0) for sym in symbols])
@@ -1008,7 +1008,7 @@ def test_nan_sorting_trap_no_truncation():
 
     adv = np.ones(n_syms) * 1e6
     cfg = UltimateConfig(HISTORY_GATE=5, MAX_POSITIONS=10)
-    _, adj_scores, sel_idx = generate_signals(log_rets, adv, cfg)
+    _, adj_scores, sel_idx, _ = generate_signals(log_rets, adv, cfg)
 
     assert all(np.isfinite(adj_scores[i]) for i in sel_idx), \
         "Selected indices must not contain NaN-scored assets."
@@ -1037,7 +1037,7 @@ def test_rebalance_prev_weights_use_last_known_price_on_nan_quote(monkeypatch):
 
     def _fake_generate_signals(*args, **kwargs):
         captured["prev_weights"] = kwargs.get("prev_weights", {})
-        return np.array([0.001]), np.array([1.0]), [0]
+        return np.array([0.001]), np.array([1.0]), [0], {}
 
     def _fake_optimize(*args, **kwargs):
         return np.array([0.1])
@@ -1215,8 +1215,8 @@ def test_consecutive_failures_reset_on_empty_universe():
     original = _be.generate_signals
 
     def _no_candidates(*args, **kwargs):
-        raw, scores, _ = original(*args, **kwargs)
-        return raw, scores, []
+        raw, scores, _, _gc = original(*args, **kwargs)
+        return raw, scores, [], {}
 
     import unittest.mock as mock
     with mock.patch("backtest_engine.generate_signals", side_effect=_no_candidates):

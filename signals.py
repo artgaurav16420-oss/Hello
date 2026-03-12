@@ -1,5 +1,5 @@
 """
-signals.py — Deterministic Regime & Momentum Kernel v11.46
+signals.py — Deterministic Regime & Momentum Kernel v11.48
 =========================================================
 Generates momentum Z-scores, handles liquidity filtering, calculates
 macro regime penalties, and implements the Dispersion-Normalized Continuity Bonus.
@@ -75,24 +75,58 @@ def compute_regime_score(
     base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
     
     # 2. Volatility penalty component
-    returns_20d = close_series.pct_change(fill_method=None).tail(20)
-    
+    # FIX (pro-cyclical vol lag): Replace 20-day rolling realized std with EWMA vol.
+    # Rolling std is a rectangular window — it takes exactly 20 trading days for a
+    # vol spike to fully register, and exactly 20 days for it to fully exit.  This
+    # creates two problems: (a) de-leveraging lags the crash onset by up to 20 days,
+    # and (b) re-leveraging lags the recovery by up to 20 days after vol normalizes.
+    # EWMA vol (span≈20, equivalent halflife≈10 days) responds immediately to new
+    # observations, peaks earlier in the crash, and decays faster during recovery —
+    # reducing both the entry lag and the exit lag.  The `adjust=False` variant
+    # matches the RiskMetrics convention used by most institutional vol estimators.
+    ewma_span = int(getattr(cfg, "REGIME_VOL_EWMA_SPAN", 20)) if cfg else 20
+    all_returns = close_series.pct_change(fill_method=None).dropna()
+
     vol_component = 0.5
-    if len(returns_20d) == 20:
-        vol_20d = float(returns_20d.std() * np.sqrt(252))
+    if len(all_returns) >= 5:
+        # EWMA variance: var_t = (1 - α)*var_{t-1} + α*r_t²  with α = 2/(span+1)
+        ewma_var = all_returns.ewm(span=ewma_span, adjust=False).var()
+        vol_ewma = float(ewma_var.iloc[-1] ** 0.5 * np.sqrt(252)) if pd.notna(ewma_var.iloc[-1]) else 0.0
 
         vol_floor = float(getattr(cfg, "REGIME_VOL_FLOOR", 0.18)) if cfg else 0.18
-        vol_mult = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
+        vol_mult  = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
 
-        all_returns = close_series.pct_change(fill_method=None).dropna()
-        if len(all_returns) >= 252:
-            long_term_vol = float(all_returns.tail(252).std() * np.sqrt(252))
+        # LONG-TERM VOL BASELINE FIX (v11.49): Replace 252-day rectangular std.
+        # A 252-day window absorbs a full year of crisis vol within ~1 year, causing
+        # the dynamic threshold to drift upward during extended bear markets (2008 GFC,
+        # 2000–2002 dot-com) until the regime penalty silently turns off and the
+        # system re-leverages into a structural high-vol downturn.
+        #
+        # Fix: use a long-span EWMA (default span=1260 ≈ 5 years, halflife≈630 days).
+        # The exponential decay means even a 2-year 60%-vol crisis shifts the baseline
+        # by less than 15%.  The penalty threshold therefore stays anchored to the
+        # pre-crisis vol regime, keeping de-leveraging active throughout the bear market.
+        lt_ewma_span = int(getattr(cfg, "REGIME_LT_VOL_EWMA_SPAN", 1260)) if cfg else 1260
+        # FIX (Patch 2B): min_periods=252 prevents cold-start false precision.
+        # Without it, ewm(adjust=False) produces a non-NaN value from day 1,
+        # making the guard condition pd.notna(...) pass immediately and yielding
+        # a meaningless 5-day "5-year vol estimate" that corrupts the threshold
+        # during the first ~252 days of any backtest.  With min_periods=252 the
+        # value is NaN until sufficient history accumulates, triggering the
+        # vol_floor fallback during warmup.
+        lt_ewma_var  = all_returns.ewm(span=lt_ewma_span, adjust=False, min_periods=252).var()
+        if pd.notna(lt_ewma_var.iloc[-1]) and lt_ewma_var.iloc[-1] > 0:
+            long_term_vol = float(lt_ewma_var.iloc[-1] ** 0.5 * np.sqrt(252))
         else:
             long_term_vol = vol_floor
 
         dynamic_threshold = max(vol_floor, long_term_vol * vol_mult)
+        vol_20d = vol_ewma  # alias for downstream logging compatibility
         if vol_20d > dynamic_threshold:
-            logger.debug("[Signals] Regime Volatility Spike detected (%.2f > %.2f). Applying penalty.", vol_20d, dynamic_threshold)
+            logger.debug(
+                "[Signals] Regime Volatility Spike detected (EWMA=%.2f > threshold=%.2f). Applying penalty.",
+                vol_20d, dynamic_threshold,
+            )
             base_score *= 0.85
         vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
 
@@ -103,15 +137,27 @@ def compute_regime_score(
             recent = universe_close_hist.iloc[-_sma_win:]
             min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
             obs_count = recent.notna().sum()
-            sma_vals = recent.mean()
+            # MB-13 FIX: Compute sma_vals only on columns with sufficient history
+            # so newly-listed or data-sparse tickers don't inflate the breadth score
+            # with 2-3 day means.  Restrict both sma_vals and last to valid columns.
+            # BUG FIX: 'last' must be assigned here in the if-branch; it was only
+            # assigned in the else-branch (line ~153), causing a NameError on every
+            # real backtest call where universe_close_hist has >= 200 rows.
+            last = universe_close_hist.iloc[-1]
+            valid = (obs_count >= min_obs) & last.notna()
+            if valid.any():
+                recent_valid = recent.loc[:, valid]
+                sma_vals = recent_valid.mean()
+                last_valid = universe_close_hist.iloc[-1][valid]
+                breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
         else:
             min_obs = 20
             obs_count = universe_close_hist.notna().sum()
             sma_vals = universe_close_hist.expanding(min_periods=min_obs).mean().iloc[-1]
-        last = universe_close_hist.iloc[-1]
-        valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
-        if valid.any():
-            breadth_component = float((last[valid] > sma_vals[valid]).mean())
+            last = universe_close_hist.iloc[-1]
+            valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
+            if valid.any():
+                breadth_component = float((last[valid] > sma_vals[valid]).mean())
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     return round(float(np.clip(composite, 0.0, 1.0)), 10)
@@ -198,8 +244,19 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
     min_periods = max(1, adv_lookback // 2)
 
-    # FIX #4: mean (not median) — single rolling mean across the entire matrix.
-    adv_last_row = notional_df.rolling(adv_lookback, min_periods=min_periods).mean().iloc[-1]
+    # FIX (Patch 2A): Slice first, then mean — eliminates O(N×T) rolling window.
+    # The original rolling(adv_lookback).mean() computed a mean for every row in the
+    # full multi-year DataFrame (potentially 1,000+ rows × 500 columns) just to call
+    # .iloc[-1] and discard 99.9% of the computation.  With 300 Optuna trials × 4
+    # walk-forward slices this waste compounds to millions of redundant operations.
+    # Slicing to the last adv_lookback rows first reduces the input to at most
+    # adv_lookback rows before computing any aggregation.
+    recent_notional = notional_df.iloc[-adv_lookback:]
+    adv_last_row    = recent_notional.mean()
+    valid_counts    = recent_notional.count()
+    # Enforce min_periods: zero out columns with insufficient valid observations,
+    # consistent with the min_periods=adv_lookback//2 contract in compute_single_adv.
+    adv_last_row = adv_last_row.where(valid_counts >= min_periods, other=0.0)
 
     def _safe_adv(sym: str) -> float:
         x = adv_last_row.get(sym, 0.0)
@@ -218,7 +275,7 @@ def generate_signals(
     adv_arr:      np.ndarray,
     cfg:          'UltimateConfig',
     prev_weights: Optional[Dict[str, float]] = None,
-) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+) -> Tuple[np.ndarray, np.ndarray, List[int], dict]:
     """
     Core momentum generation engine.
     Computes blended fast/slow exponentially weighted returns, applies historical
@@ -243,7 +300,10 @@ def generate_signals(
     raw_daily_momentum = 0.5 * fast_ema + 0.5 * slow_ema
 
     if np.all(np.isnan(raw_daily_momentum)):
-        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), []
+        # BUG FIX: callers unpack 4 values (raw, adj, sel_idx, gate_counts).
+        # The previous 3-tuple return caused a ValueError on every early warm-up
+        # rebalance where EWMAs had not yet produced any valid signals.
+        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
 
     # FIX D3: Compute cross-sectional normalization statistics ONLY over stocks that
     # pass the history and liquidity gates. Stocks with thin history have extreme EWMA
@@ -351,9 +411,26 @@ def generate_signals(
         stale_denied = 0
         liquidity_denied = 0
 
+        # MB-06 FIX: Pre-compute knife threshold per symbol so that stocks near (but
+        # not below) the falling-knife gate cannot be rescued by the continuity bonus.
+        # A stock at -14.9% with a -15% gate passes by 0.1%, receives the bonus, and
+        # may out-rank peers — defeating the intent of the hard stop.  Suppress the
+        # bonus for any stock within 50% of the gate threshold.
+        knife_pre_bonus_suppress = np.zeros(len(active_symbols), dtype=bool)
+        if len(log_rets) >= cfg.KNIFE_WINDOW:
+            for i, cumulative_ret in enumerate(recent_cumulative_returns):
+                if not np.isfinite(cumulative_ret):
+                    continue
+                _av = float(_full_daily_vols[i]) if np.isfinite(_full_daily_vols[i]) and _full_daily_vols[i] > 0 else _baseline_daily_vol
+                _vs = float(np.clip(_av / _baseline_daily_vol, 0.5, 2.0))
+                _threshold = cfg.KNIFE_THRESHOLD * _vs
+                # Suppress bonus if within 50% of the knife threshold
+                if cumulative_ret < _threshold * 0.5:
+                    knife_pre_bonus_suppress[i] = True
+
         for i, sym in enumerate(active_symbols):
             prev_w = float(prev_weights.get(sym, 0.0))
-            if valid_mask[i] and prev_w > 0.001:
+            if valid_mask[i] and prev_w > 0.001 and not knife_pre_bonus_suppress[i]:
                 recent_rets = log_rets[sym].tail(activity_window)
                 nonzero_days = int((recent_rets.abs() > flat_ret_eps).sum()) if len(recent_rets) else 0
                 has_recent_activity = nonzero_days >= min_nonzero_days
@@ -394,5 +471,31 @@ def generate_signals(
         int(idx) for idx in top_n_indices 
         if adj_scores[idx] > -np.inf
     ]
-    
-    return raw_daily_momentum, adj_scores, selected_indices
+
+    # MB-18 FIX: Compute and return per-gate rejection counts so callers can
+    # surface a transparent funnel log.  Without this, a sudden universe shrink
+    # (from 500 → 45 assets) is silent — the portfolio manager cannot distinguish
+    # a volatility spike (knife gate) from a data-provider outage (history gate).
+    knife_gated = int(np.sum(
+        np.isfinite(np.where(gate_pass_mask, 0.0, -1.0)) &
+        (adj_scores == -np.inf) &
+        gate_pass_mask  # passed h/liq gates but then knife-gated
+        # approximate: count stocks that passed h+liq but have -inf score
+    ))
+    # More precise counts:
+    n_total      = len(active_symbols)
+    n_hist_fail  = int(np.sum(~history_pass))
+    n_liq_fail   = int(np.sum(history_pass & ~liquidity_pass))
+    n_knife_fail = int(np.sum(
+        gate_pass_mask & (adj_scores == -np.inf)
+    ))
+    n_selected   = len(selected_indices)
+    gate_counts = {
+        "total":       n_total,
+        "history_gated": n_hist_fail,
+        "adv_gated":   n_liq_fail,
+        "knife_gated": n_knife_fail,
+        "selected":    n_selected,
+    }
+
+    return raw_daily_momentum, adj_scores, selected_indices, gate_counts

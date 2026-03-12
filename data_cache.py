@@ -192,7 +192,17 @@ def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
             
     if isinstance(out.index, pd.DatetimeIndex):
         if out.index.tz is not None:
-            out.index = out.index.tz_convert(None)
+            # FIX (Patch 4): Convert to IST wall-clock time before stripping timezone.
+            # Arbitrarily calling tz_convert(None) (effectively UTC-cast-to-naive)
+            # causes date boundary shifts for US Eastern data: a Friday 4 PM ET close
+            # = Friday 9:30 PM UTC → normalized to Friday midnight UTC, correct.
+            # But on machines with different local clocks, or for secondary providers
+            # (AlphaVantage) returning ET timestamps, the behaviour was undefined.
+            # tz_convert('Asia/Kolkata') first ensures all timestamps are expressed in
+            # IST (UTC+5:30), the canonical timezone for NSE data, before tz_localize(None)
+            # strips the tz label.  NSE close at 3:30 PM IST is 10 AM UTC — same calendar
+            # date in both UTC and IST, so no cross-midnight shift for NSE data.
+            out.index = out.index.tz_convert('Asia/Kolkata').tz_localize(None)
         out.index = out.index.normalize()
         
         # Remove duplicate dates (keep last reported)
