@@ -124,3 +124,31 @@ def test_run_backtest_uses_adjusted_close_for_valuation_when_auto_adjust_enabled
         )
 
     assert list(captured["close"]["AAA"]) == [100.0, 100.0]
+
+
+def test_backtest_run_handles_empty_close_dataframe():
+    cfg = UltimateConfig()
+    engine = InstitutionalRiskEngine(cfg)
+    bt = be.BacktestEngine(engine)
+
+    empty = pd.DataFrame()
+    out = bt.run(
+        close=empty,
+        volume=empty,
+        returns=empty,
+        rebalance_dates=pd.DatetimeIndex([]),
+        start_date="2020-01-01",
+    )
+
+    assert out.empty
+    assert list(out.columns) == ["equity"]
+
+
+def test_compute_metrics_handles_non_positive_initial_capital():
+    eq = pd.Series([100.0, 110.0], index=pd.date_range("2020-01-01", periods=2, freq="B"))
+
+    metrics = be._compute_metrics(eq, initial=0.0)
+
+    assert metrics["cagr"] == 0.0
+    assert metrics["calmar"] == 0.0
+    assert metrics["final"] == 110.0
