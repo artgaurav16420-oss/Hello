@@ -375,21 +375,9 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             for symbol in failure["symbols"][:3]
         ][:6]
         preview_txt = ", ".join(failed_symbol_preview) if failed_symbol_preview else "n/a"
-        # MB-10 FIX: Only raise if ALL chunks failed.  Previously a single chunk
-        # failure raised UniverseFetchError, discarding all partial results from
-        # successful chunks.  The caller (_run_scan) then fell back to a completely
-        # unfiltered universe, defeating the ADV filter and admitting illiquid stocks.
-        # Now partial results from successful chunks are returned with a warning;
-        # UniverseFetchError is only raised when zero chunks succeeded.
-        if not filtered_tickers:
-            raise UniverseFetchError(
-                "ADV filter failed for ALL "
-                f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
-            )
-        logger.warning(
-            "[Universe] ADV filter: %d chunk(s) failed (sample: %s); "
-            "returning partial results from %d successful chunk(s).",
-            len(chunk_failures), preview_txt, len(chunks) - len(chunk_failures),
+        raise UniverseFetchError(
+            "ADV filter failed for "
+            f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
         )
 
     return list(dict.fromkeys(filtered_tickers))
