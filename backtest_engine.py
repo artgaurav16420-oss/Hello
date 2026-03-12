@@ -396,7 +396,6 @@ class BacktestEngine:
             
             execute_rebalance(
                 self.state, target_weights, exec_prices, active_symbols, cfg,
-                adv_shares     = adv_vector,
                 date_context   = date, 
                 trade_log      = self.trades,
                 apply_decay    = apply_decay and not _exhaust_decay,
@@ -469,9 +468,8 @@ def _build_adv_vector(
                 v_series = volume.loc[:signal_date, sym]
                 notional = (c_series * v_series).clip(lower=0).dropna()
                 adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
-                min_periods = max(1, adv_lookback // 2)
                 lookback = notional.tail(adv_lookback)
-                if len(lookback.dropna()) < min_periods:
+                if lookback.empty:
                     adv.append(0.0)
                 else:
                     # FIX #4 (backtest_engine mirror): Use mean not median, consistent
