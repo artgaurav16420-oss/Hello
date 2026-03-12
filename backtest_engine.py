@@ -92,6 +92,10 @@ class BacktestEngine:
         splits:          Optional[pd.DataFrame] = None,
         universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
     ) -> pd.DataFrame:
+        if close.empty:
+            logger.warning("[Backtest] Received empty close dataframe; skipping run.")
+            return pd.DataFrame({"equity": pd.Series(dtype=float)})
+
         start_dt = pd.Timestamp(start_date)
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = list(close.columns)
@@ -837,6 +841,22 @@ def _compute_metrics(
     periods_per_year: int = 252,
     trades: Optional[List[Trade]] = None,
 ) -> Dict:
+    if initial <= 0:
+        logger.warning(
+            "[Backtest] Non-positive initial capital (%.4f) supplied; returning neutral metrics.",
+            initial,
+        )
+        return {
+            "cagr": 0.0,
+            "max_dd": 0.0,
+            "final": float(eq.iloc[-1]) if not eq.empty else float(initial),
+            "sharpe": 0.0,
+            "sortino": 0.0,
+            "calmar": 0.0,
+            "hit_rate": 0.0,
+            "turnover": 0.0,
+        }
+
     if eq.empty:
         return {
             "cagr": 0.0,
