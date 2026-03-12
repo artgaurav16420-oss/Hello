@@ -733,7 +733,23 @@ def execute_rebalance(
                 eligible.pop(sym, None)
 
             if shares_bought_this_pass == 0:
-                break  # All remaining eligible assets are too expensive; hold as cash
+                # Proportional entitlement was too small for any eligible asset to buy
+                # even 1 share (e.g. two assets at ₹80 and ₹70 each get ₹45 entitlement
+                # from ₹90 residual — neither buys, but cheapest IS affordable combined).
+                # Greedy fallback: buy 1 share of the cheapest eligible asset, then
+                # continue proportional passes on the remainder.  Convergence guaranteed:
+                # each greedy step either consumes >= 1 share worth of residual or breaks.
+                if eligible:
+                    cheapest = min(eligible, key=lambda s: eligible[s]["price"])
+                    cheapest_price = eligible[cheapest]["price"]
+                    if residual_cash >= cheapest_price:
+                        desired_shares[cheapest] += 1
+                        residual_cash -= cheapest_price
+                        eligible.pop(cheapest, None)
+                    else:
+                        break  # Nothing affordable; hold remainder as cash
+                else:
+                    break
 
 
     for i, sym in enumerate(active_symbols):
@@ -943,8 +959,8 @@ def compute_book_cvar(
             # floor-divide to days.  This is safe even for tz-aware indexes
             # because we only need a stable monotone integer per calendar date.
             days_since_epoch = (
-                rets.index.view("int64") // np.int64(86_400 * 10 ** 9)
-            ).astype(np.int64)
+                rets.index.astype(np.int64) // np.int64(86_400 * 10 ** 9)
+            )
 
             # XOR the symbol base-seed with the per-day integer.  The result is a
             # distinct seed for every (symbol, date) pair, stable across calls and
