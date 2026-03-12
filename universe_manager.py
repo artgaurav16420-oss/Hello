@@ -312,7 +312,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     """
     from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
-    from signals import compute_single_adv
 
     if cfg is None:
         cfg = UltimateConfig()
@@ -346,8 +345,14 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                 # "RELIANCE.NS" inputs without producing a double-suffix.
                 ns_sym = to_ns(symbol)
                 if ns_sym in data:
-                    adv = compute_single_adv(data[ns_sym], cfg=cfg)
-                    if adv >= min_adv_volume:
+                    frame = data[ns_sym]
+                    if "Close" in frame.columns and "Volume" in frame.columns:
+                        notional = (frame["Close"] * frame["Volume"]).clip(lower=0)
+                        lookback = int(getattr(cfg, "ADV_LOOKBACK", 20))
+                        adv = float(notional.tail(lookback).mean()) if notional.notna().any() else 0.0
+                    else:
+                        adv = 0.0
+                    if np.isfinite(adv) and adv >= min_adv_volume:
                         # FIX: append ns_sym (the normalised ".NS" key), NOT
                         # the original bare symbol.  The previous code appended
                         # `symbol` here, which silently returned bare ticker

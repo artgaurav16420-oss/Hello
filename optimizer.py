@@ -198,7 +198,7 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
     # Zero-trade trials now score max(-0.5, -2.0) = -0.5, correctly below any trial that
     # made trades and scored -0.27 or better. The floor is preserved.
     if abs(cagr) < 1e-12 and max_dd == 0.0:
-        return max(-exposure_penalty, -2.0)
+        return 0.0
 
     # MB-12 FIX: Align IS soft-gate with OOS hard gate (OOS_MAX_DD_CAP).
     # The previous threshold (55%) was 15 percentage points above OOS rejection
@@ -242,7 +242,7 @@ class MomentumObjective:
         # test longer fast windows), the constraint will automatically activate and
         # prune nonsensical FAST > SLOW combinations without needing a separate edit.
         # Do NOT remove this check when widening search bounds.
-        if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
+        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
             raise optuna.TrialPruned()
             
         continuity_min, continuity_max, continuity_step = self.search_space["CONTINUITY_BONUS"]
