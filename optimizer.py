@@ -671,6 +671,16 @@ def run_optimization(
         logger.info("")
 
     try:
+        # Suggest a high-conviction seed so TPE starts from a known robust region.
+        if hasattr(study, "enqueue_trial"):
+            study.enqueue_trial({
+                "HALFLIFE_FAST": 26,
+                "HALFLIFE_SLOW": 57,
+                "CONTINUITY_BONUS": 0.26,
+                "RISK_AVERSION": 10.5,
+                "CVAR_DAILY_LIMIT": 0.056,
+                "CVAR_LOOKBACK": 140,
+            })
         study.optimize(
             objective,
             n_trials=N_TRIALS,
