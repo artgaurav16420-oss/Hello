@@ -1378,6 +1378,8 @@ class InstitutionalRiskEngine:
             w_sum = float(np.sum(w_opt))
             if w_sum > 1e-9:
                 w_opt = w_opt * (gamma / w_sum)
+                # Preserve hard concentration caps after inaccurate-solve rescaling.
+                w_opt = np.minimum(w_opt, adv_limit)
 
         portfolio_losses  = losses @ w_opt
         sorted_losses     = np.sort(portfolio_losses)

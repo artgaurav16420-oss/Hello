@@ -91,6 +91,43 @@ def test_load_or_fetch_raises_on_chunk_failure(monkeypatch):
     raise AssertionError("Expected DataFetchError for an empty chunk response")
 
 
+
+
+def test_extract_ticker_frame_rejects_flat_payload_for_multi_ticker_chunk():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    raw = pd.DataFrame(
+        {
+            "Open": [100, 101, 102],
+            "High": [101, 102, 103],
+            "Low": [99, 100, 101],
+            "Close": [100, 101, 102],
+            "Adj Close": [100, 101, 102],
+            "Volume": [1, 1, 1],
+        },
+        index=idx,
+    )
+
+    assert data_cache._extract_ticker_frame(raw, "MISSING.NS", is_single_request=False) is None
+
+
+def test_extract_ticker_frame_accepts_flat_payload_for_single_ticker_chunk():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    raw = pd.DataFrame(
+        {
+            "Open": [100, 101, 102],
+            "High": [101, 102, 103],
+            "Low": [99, 100, 101],
+            "Close": [100, 101, 102],
+            "Adj Close": [100, 101, 102],
+            "Volume": [1, 1, 1],
+        },
+        index=idx,
+    )
+
+    out = data_cache._extract_ticker_frame(raw, "ABC.NS", is_single_request=True)
+    assert out is not None
+    assert out["Close"].iloc[-1] == 102
+
 def test_extract_ticker_frame_fills_adj_close_for_multiindex_payload():
     idx = pd.date_range("2024-01-01", periods=6, freq="D")
     raw = pd.DataFrame(

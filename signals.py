@@ -319,6 +319,8 @@ def generate_signals(
 
     # Normalise over gate-passing stocks; fall back to all stocks only if none pass.
     norm_src = raw_daily_momentum[gate_pass_mask] if gate_pass_mask.any() else raw_daily_momentum
+    if norm_src.size == 0 or not np.isfinite(norm_src).any():
+        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
     mu_cross  = np.nanmean(norm_src)
     std_cross = max(np.nanstd(norm_src), 1e-8)
 

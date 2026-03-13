@@ -215,7 +215,12 @@ def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _extract_ticker_frame(raw_data: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+def _extract_ticker_frame(
+    raw_data: pd.DataFrame,
+    ticker: str,
+    *,
+    is_single_request: bool = False,
+) -> Optional[pd.DataFrame]:
     """Robustly extract one ticker frame from varying yfinance payload shapes."""
     if raw_data is None or raw_data.empty:
         return None
@@ -232,8 +237,14 @@ def _extract_ticker_frame(raw_data: pd.DataFrame, ticker: str) -> Optional[pd.Da
             return None
         return _ensure_price_columns(_normalize_history_index(df))
 
-    # Single ticker payloads often come as flat OHLCV columns
-    return _ensure_price_columns(_normalize_history_index(raw_data.copy()))
+    # Guard against ambiguous yfinance payloads in multi-ticker requests.
+    # Some yfinance versions collapse columns to flat OHLCV when only one ticker
+    # in a multi-symbol request resolves. In that shape we cannot prove ownership
+    # for the current ticker, so only accept flat payloads for explicit single-
+    # ticker requests.
+    if is_single_request:
+        return _ensure_price_columns(_normalize_history_index(raw_data.copy()))
+    return None
 
 
 def _download_with_timeout(
@@ -531,7 +542,11 @@ def load_or_fetch(
                 
             for ticker in chunk:
                 try:
-                    df = _extract_ticker_frame(raw_data, ticker)
+                    df = _extract_ticker_frame(
+                        raw_data,
+                        ticker,
+                        is_single_request=(len(chunk) == 1),
+                    )
                     if df is None or df.empty:
                         continue
                         
