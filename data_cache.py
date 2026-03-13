@@ -52,15 +52,35 @@ class DataProvider(ABC):
 
 class YFinanceProvider(DataProvider):
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        return yf.download(
+        # group_by='ticker' was respected in yfinance 0.2.x but is silently ignored
+        # in 1.x (which always returns (price_field, ticker) MultiIndex order).
+        # Keeping it here causes a DeprecationWarning in 1.x and may become an
+        # error in future releases — removed.  _extract_ticker_frame handles both
+        # (ticker, field) and (field, ticker) MultiIndex layouts automatically.
+        result = yf.download(
             tickers,
             start=start,
             end=end,
-            group_by="ticker",
             progress=False,
             auto_adjust=False,
             actions=True,  # PHASE 9 FIX: Ensure Corporate Actions (Dividends/Splits) are downloaded
         )
+        # yfinance 1.x returns None (not an empty DataFrame) when the entire
+        # request fails at the network level.  Normalise to None so callers can
+        # use a simple `if result is None or result.empty` guard.
+        if result is None:
+            return None
+        if result.empty:
+            return result
+        # yfinance 1.x: for a multi-ticker request where all-but-one ticker
+        # fails, the library may collapse the result to a flat (non-MultiIndex)
+        # DataFrame containing only the successful ticker's data, but without
+        # labelling which ticker it belongs to.  We cannot safely attribute that
+        # frame to any specific ticker in the chunk, so return None and let the
+        # per-ticker fallback path handle it via cached parquets.
+        if len(tickers) > 1 and not isinstance(result.columns, pd.MultiIndex):
+            return None
+        return result
 
 
 class SecondaryProvider(DataProvider):
@@ -221,19 +241,48 @@ def _extract_ticker_frame(
     *,
     is_single_request: bool = False,
 ) -> Optional[pd.DataFrame]:
-    """Robustly extract one ticker frame from varying yfinance payload shapes."""
+    """Robustly extract one ticker frame from varying yfinance payload shapes.
+
+    yfinance version compatibility
+    ------------------------------
+    0.2.x: MultiIndex columns are (ticker, price_field) — level0=ticker, level1=field.
+           group_by='ticker' was required and respected.
+    1.x  : MultiIndex columns are (price_field, ticker) — level0=field, level1=ticker.
+           group_by parameter is silently ignored; the (field, ticker) order is always
+           used.  Partial-failure batches can include None-named columns for fields that
+           the provider could not return, causing 'NoneType' subscript TypeErrors if
+           those columns are not dropped before further processing.
+    """
     if raw_data is None or raw_data.empty:
         return None
 
     if isinstance(raw_data.columns, pd.MultiIndex):
+        # Drop any column entries where either level value is None — yfinance 1.x
+        # injects these for fields/tickers that partially failed in a batch request.
+        valid_mask = [
+            (a is not None and b is not None)
+            for a, b in raw_data.columns
+        ]
+        if not all(valid_mask):
+            raw_data = raw_data.loc[:, valid_mask].copy()
+        if raw_data.empty:
+            return None
+
         level0 = set(raw_data.columns.get_level_values(0))
         level1 = set(raw_data.columns.get_level_values(1))
 
+        # yfinance 0.2.x layout: (ticker, field) — ticker is in level0
         if ticker in level0:
             df = raw_data[ticker].copy()
+        # yfinance 1.x layout: (field, ticker) — ticker is in level1
         elif ticker in level1:
             df = raw_data.xs(ticker, level=1, axis=1).copy()
         else:
+            return None
+
+        # After xs() some columns may still be None-named (edge case in 1.x).
+        df = df.loc[:, df.columns.notna()]
+        if df.empty:
             return None
         return _ensure_price_columns(_normalize_history_index(df))
 
@@ -369,9 +418,16 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
 
 
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise price column names and fill gaps for both yfinance 0.2.x and 1.x."""
     out = df.copy()
+
+    # Strip any None-named columns that survived _extract_ticker_frame (belt-and-suspenders).
+    # yfinance 1.x can inject these for fields that partially failed in a batch request.
+    out = out.loc[:, out.columns.notna()]
+
     if "Adj Close" not in out.columns:
-        # Column entirely absent (common for index tickers like ^NSEI).
+        # Column entirely absent (common for index tickers like ^NSEI, and for
+        # yfinance 1.x tickers with no corporate-action records).
         if "Close" in out.columns:
             out["Adj Close"] = out["Close"]
     else:
