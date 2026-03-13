@@ -539,16 +539,13 @@ def _execution_prices(
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """In-memory suspension simulation used only during backtest runtime."""
     if len(df) < 2:
-        # MB-11 FIX: Always return a copy so subsequent operations on the returned
-        # frame never mutate the shared market_data dict.  The no-repair early-return
-        # previously returned `df` directly (the market_data value), making the
-        # function's ownership contract ambiguous and creating latent mutation risk.
+        # Always return a copy so callers never mutate shared market_data frames.
         return df.copy()
 
     gap_days = df.index.to_series().diff().dt.days
     max_gap = int(gap_days.max()) if not gap_days.empty else 0
     if max_gap <= _SUSPENSION_GAP_DAYS:
-        return df.copy()  # MB-11 FIX: copy on no-repair path too
+        return df.copy()
 
     out = df.copy()
     logger.warning(
@@ -556,32 +553,60 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         ticker,
         max_gap,
     )
-    bday_idx = pd.bdate_range(out.index[0], out.index[-1])
 
-    first_gap_positions = np.where(gap_days.values > _SUSPENSION_GAP_DAYS)[0]
-    pre_gap_close = out["Close"].iloc[: first_gap_positions[0]] if len(first_gap_positions) > 0 else out["Close"]
-    pre_gap_rets = pre_gap_close.pct_change().dropna()
-    hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
-
-    out = out.reindex(bday_idx)
-    missing_mask = out["Close"].isna()
-    if not missing_mask.any():
+    gap_end_dates = list(gap_days[gap_days > _SUSPENSION_GAP_DAYS].index)
+    if not gap_end_dates:
         return out
 
-    n_missing = int(missing_mask.sum())
-    seed = int(hashlib.sha256(ticker.encode()).hexdigest()[:8], 16) % (2**31)
-    rng = np.random.RandomState(seed)
-    noise_rets = rng.normal(0, hist_vol, n_missing)
+    for gap_end in gap_end_dates:
+        end_loc = out.index.get_loc(gap_end)
+        if isinstance(end_loc, slice):
+            end_loc = end_loc.start
+        if isinstance(end_loc, np.ndarray):
+            end_loc = int(np.flatnonzero(end_loc)[0]) if end_loc.any() else 0
+        if end_loc <= 0:
+            continue
 
-    out["Close"] = out["Close"].ffill()
-    missing_idx = out.index[missing_mask]
-    anchor_prices = out["Close"].shift(1).reindex(missing_idx).ffill().fillna(out["Close"].dropna().iloc[0])
-    walk_returns = np.cumprod(1.0 + noise_rets)
-    out.loc[missing_idx, "Close"] = anchor_prices.values * walk_returns
-    if "Adj Close" in out.columns:
-        out.loc[missing_idx, "Adj Close"] = out.loc[missing_idx, "Close"]
-    if "Volume" in out.columns:
-        out["Volume"] = out["Volume"].fillna(0)
+        gap_start = out.index[int(end_loc) - 1]
+
+        # Synthesize only inside this specific prolonged gap.
+        gap_idx = pd.bdate_range(gap_start, gap_end)
+        gap_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
+        if len(gap_idx) == 0:
+            continue
+
+        # Avoid overwriting real bars if any timestamp already exists.
+        synth_idx = gap_idx.difference(out.index)
+        if len(synth_idx) == 0:
+            continue
+
+        pre_gap_close = out["Close"].loc[:gap_start]
+        pre_gap_rets = pre_gap_close.pct_change().dropna()
+        hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
+
+        seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
+        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
+        rng = np.random.RandomState(seed)
+        noise_rets = rng.normal(0, hist_vol, len(synth_idx))
+        walk_returns = np.cumprod(1.0 + noise_rets)
+
+        synth = pd.DataFrame(index=synth_idx)
+
+        close_anchor = float(out.loc[gap_start, "Close"])
+        synth["Close"] = close_anchor * walk_returns
+
+        if "Adj Close" in out.columns:
+            adj_anchor = out.loc[gap_start, "Adj Close"]
+            if pd.isna(adj_anchor):
+                adj_anchor = close_anchor
+            synth["Adj Close"] = float(adj_anchor) * walk_returns
+
+        if "Volume" in out.columns:
+            synth["Volume"] = 0.0
+
+        out = pd.concat([out, synth])
+
+    out = out.sort_index().ffill()
     return out
 
 def apply_halt_simulation(market_data: dict) -> dict:

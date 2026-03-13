@@ -152,3 +152,57 @@ def test_compute_metrics_handles_non_positive_initial_capital():
     assert metrics["cagr"] == 0.0
     assert metrics["calmar"] == 0.0
     assert metrics["final"] == 110.0
+
+
+def test_repair_suspension_gaps_only_fills_detected_gap_not_entire_history():
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2020-01-01"),
+        pd.Timestamp("2020-01-02"),
+        pd.Timestamp("2020-01-03"),
+        pd.Timestamp("2020-03-10"),
+        pd.Timestamp("2020-03-11"),
+    ])
+    df = pd.DataFrame(
+        {
+            "Close": [100.0, 101.0, 102.0, 105.0, 106.0],
+            "Adj Close": [50.0, 50.5, 51.0, 52.5, 53.0],
+            "Volume": [1_000_000, 1_000_000, 1_000_000, 1_000_000, 1_000_000],
+        },
+        index=idx,
+    )
+
+    repaired = be._repair_suspension_gaps(df, "AAA.NS")
+
+    # Original bars remain present (function must not replace the entire history index).
+    for ts in idx:
+        assert ts in repaired.index
+
+    # Synthetic rows are created within the prolonged gap.
+    assert len(repaired.index) > len(df.index)
+
+
+def test_repair_suspension_gaps_preserves_adj_close_scale():
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2020-01-01"),
+        pd.Timestamp("2020-01-02"),
+        pd.Timestamp("2020-01-03"),
+        pd.Timestamp("2020-03-10"),
+    ])
+    # Deliberately keep Adj Close at 1/10th Close to emulate split-adjusted scaling.
+    df = pd.DataFrame(
+        {
+            "Close": [1000.0, 1020.0, 1010.0, 1030.0],
+            "Adj Close": [100.0, 102.0, 101.0, 103.0],
+            "Volume": [1_000_000, 1_000_000, 1_000_000, 1_000_000],
+        },
+        index=idx,
+    )
+
+    repaired = be._repair_suspension_gaps(df, "BBB.NS")
+    gap_rows = repaired.index.difference(df.index)
+
+    assert len(gap_rows) > 0
+
+    ratio = repaired.loc[gap_rows, "Adj Close"] / repaired.loc[gap_rows, "Close"]
+    # Synthetic Adj Close should preserve pre-gap adjusted scale, not be copied from raw Close.
+    assert np.allclose(ratio.values, 0.1, atol=1e-6)

@@ -115,6 +115,19 @@ OPTUNA_SEED = os.getenv("OPTUNA_SEED")
 # Storage backend for Optuna study persistence (SQLite by default).
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
+# Study naming/versioning.
+# The current objective is a clipped fitness score in [-2.0, 5.0]. Reusing an
+# old study (same name) from a previous objective can show impossible best
+# values (e.g., >>5) and surface stale high-risk parameter sets.
+OBJECTIVE_VERSION = "fitness_v11_48"
+DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
+
+# Plausibility guardrails: protect optimizer scoring from data/pathology-driven
+# equity explosions that can otherwise dominate TPE with meaningless extremes.
+MAX_REASONABLE_CAGR_PCT = 300.0
+MAX_REASONABLE_FINAL_MULTIPLE = 8.0
+BASE_INITIAL_CAPITAL = UltimateConfig().INITIAL_CAPITAL
+
 
 def _stdout_supports_rupee(stdout=None) -> bool:
     stream = stdout if stdout is not None else getattr(sys, "stdout", None)
@@ -192,6 +205,8 @@ def _fitness_from_metrics(
     cagr = float(metrics.get("cagr", 0.0))
     max_dd = abs(float(metrics.get("max_dd", 100.0)))
     turnover = float(metrics.get("turnover", 0.0))
+    final_equity = float(metrics.get("final", BASE_INITIAL_CAPITAL) or BASE_INITIAL_CAPITAL)
+    final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
     turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x annual turnover
     cagr_net = cagr - turnover_drag
 
@@ -217,8 +232,23 @@ def _fitness_from_metrics(
     if avg_positions < 1.0:
         exposure_penalty += 0.5
 
+    anomaly_hit = (
+        cagr > MAX_REASONABLE_CAGR_PCT
+        or final_multiple > MAX_REASONABLE_FINAL_MULTIPLE
+    )
+
+    if anomaly_hit:
+        # Penalize clearly implausible return paths to prevent score-ceiling
+        # lockups driven by data glitches/split artifacts.
+        raw = -(
+            max(cagr - MAX_REASONABLE_CAGR_PCT, 0.0) / 50.0
+            + max(final_multiple - MAX_REASONABLE_FINAL_MULTIPLE, 0.0)
+        )
+        score = max(min(raw, 5.0), -2.0)
+        ceiling_hit = False
+        dd_gate_hit = False
     # If strategy stayed entirely in cash and did nothing, enforce penalty
-    if abs(cagr) < 1e-12 and max_dd == 0.0:
+    elif abs(cagr) < 1e-12 and max_dd == 0.0:
         raw = 0.0
         score = max(-exposure_penalty, -2.0)
         ceiling_hit = False
@@ -239,6 +269,7 @@ def _fitness_from_metrics(
         "cagr":             round(cagr, 2),
         "max_dd":           round(-max_dd, 2),   # negative = drawdown convention
         "turnover":         round(turnover, 4),
+        "final_multiple":   round(final_multiple, 4),
         "cagr_net":         round(cagr_net, 2),
         "avg_cvar_pct":     round(avg_cvar * 100.0, 4),
         "avg_exposure":     round(avg_exposure, 4),
@@ -250,6 +281,7 @@ def _fitness_from_metrics(
         "score":            round(score, 6),
         "ceiling_hit":      ceiling_hit,
         "dd_gate_hit":      dd_gate_hit,
+        "anomaly_hit":      anomaly_hit,
     }
     return score, diag
 
@@ -358,16 +390,17 @@ class MomentumObjective:
             _excluded_tag = " [EXCLUDED from score]" if exclude_from_score else ""
             _ceiling_tag  = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
             _ddgate_tag   = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
+            _anomaly_tag  = " ⚠ ANOMALOUS-RETURNS" if diag.get("anomaly_hit") else ""
             logger.info(
                 "[Trial %s | %d%s] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
                 "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
-                "RiskPenalty=%.2f  ExpPenalty=%.2f  RawScore=%.4f  Score=%.4f%s%s%s",
+                "RiskPenalty=%.2f  ExpPenalty=%.2f  RawScore=%.4f  Score=%.4f%s%s%s%s",
                 trial.number, oos_year, _excluded_tag,
                 diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
                 diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
                 diag["risk_penalty"], diag["exposure_penalty"],
                 diag["raw_score"], diag["score"],
-                _ceiling_tag, _ddgate_tag, "",
+                _ceiling_tag, _ddgate_tag, _anomaly_tag, "",
             )
 
             if not pd.notna(score):
@@ -498,7 +531,11 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
     logger.info(f"Saved optimal parameters to {filepath}")
 
 
-def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
+def run_optimization(
+    universe_type: str = "nifty500",
+    in_memory: bool = False,
+    study_name: str | None = None,
+):
     # ── Storage & parallelism resolution ──────────────────────────────────────
     # Priority: explicit in_memory flag > OPTUNA_STORAGE env var > SQLite default.
     if in_memory:
@@ -539,8 +576,11 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
 
     # 1. Setup Optuna Study
     os.makedirs("data", exist_ok=True) # Ensure the data folder exists
+    effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME
+    logger.info("Using Optuna study: %s", effective_study_name)
+
     study = optuna.create_study(
-        study_name="Momentum_Risk_Parity",
+        study_name=effective_study_name,
         direction="maximize",
         sampler=_build_sampler(),
         storage=effective_storage,      # :memory: or SQLite depending on flag/env
@@ -584,6 +624,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
             if d.get("excluded"):       flags.append("EXCL")
             if d.get("ceiling_hit"):    flags.append("CEIL")
             if d.get("dd_gate_hit"):    flags.append("DD-GATE")
+            if d.get("anomaly_hit"):    flags.append("ANOM")
             logger.info(
                 "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %s",
                 d["year"],
@@ -747,9 +788,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Uses in-process execution (n_jobs=1)"
         ),
     )
+    parser.add_argument(
+        "--study-name",
+        default=DEFAULT_STUDY_NAME,
+        help=(
+            "Optuna study name. Change this to start a clean optimization track "
+            "when objective logic changes."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_optimization(universe_type=args.universe, in_memory=args.in_memory)
+    run_optimization(
+        universe_type=args.universe,
+        in_memory=args.in_memory,
+        study_name=args.study_name,
+    )
