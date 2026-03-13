@@ -73,6 +73,53 @@ def test_run_scan_returns_early_when_universe_has_no_data(monkeypatch):
     assert captured["cfg"] is cfg
 
 
+
+
+def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "BAD.NS": pd.DataFrame({"Close": [float("nan")] * 6, "Dividends": [0.0] * 6}, index=idx),
+        "GOOD.NS": pd.DataFrame({"Close": [100, 101, 102, 103, 104, 105], "Dividends": [0.0] * 6}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
+    }
+
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+    monkeypatch.setattr(dw, "execute_rebalance", lambda *args, **kwargs: 0.0)
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        import numpy as np
+        return np.array([0.0, 0.01]), np.array([0.0, 1.0]), [1], {
+            "total": 2, "history_gated": 2, "adv_gated": 2, "knife_gated": 1, "selected": 1
+        }
+
+    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **kwargs):
+            import numpy as np
+            assert np.isfinite(kwargs["portfolio_value"])
+            assert kwargs["portfolio_value"] > 0
+            return __import__("numpy").array([1.0])
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+
+    state = PortfolioState(cash=10_000.0)
+    state.shares = {"BAD": 10}
+    state.entry_prices = {"BAD": 100.0}
+    state.last_known_prices = {"BAD": 99.0}
+
+    dw._run_scan(["BAD", "GOOD"], state, "TEST", cfg_override=UltimateConfig())
+
 def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, monkeypatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
