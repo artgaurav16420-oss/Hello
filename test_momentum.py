@@ -626,7 +626,30 @@ def test_execute_rebalance_uses_notional_adv_for_impact_parity():
     assert slip_low == pytest.approx(slip_high, rel=1e-6)
 
 
-def test_execute_rebalance_force_rebalance_trades_bypasses_drift_tolerance():
+
+
+def test_execute_rebalance_drift_tolerance_does_not_block_residual_buys():
+    cfg = UltimateConfig(DRIFT_TOLERANCE=0.02, MAX_SINGLE_NAME_WEIGHT=1.0)
+
+    state = PortfolioState(cash=0.0)
+    state.shares = {"A": 100, "B": 100}
+    state.weights = {"A": 0.50, "B": 0.50}
+    state.entry_prices = {"A": 100.0, "B": 100.0}
+    state.last_known_prices = {"A": 100.0, "B": 100.0}
+
+    execute_rebalance(
+        state,
+        target_weights=np.array([0.52, 0.48]),
+        prices=np.array([100.0, 100.0]),
+        active_symbols=["A", "B"],
+        cfg=cfg,
+        force_rebalance_trades=False,
+    )
+
+    assert state.shares["A"] == 104
+    assert state.shares["B"] == 96
+
+def test_execute_rebalance_force_rebalance_trades_still_allows_small_buys():
     cfg = UltimateConfig(DRIFT_TOLERANCE=0.05, MAX_SINGLE_NAME_WEIGHT=1.0)
 
     no_force = PortfolioState(cash=0.0)
@@ -659,7 +682,7 @@ def test_execute_rebalance_force_rebalance_trades_bypasses_drift_tolerance():
         force_rebalance_trades=True,
     )
 
-    assert no_force.shares["A"] == 100
+    assert no_force.shares["A"] == 102
     assert force.shares["A"] == 102
 
 

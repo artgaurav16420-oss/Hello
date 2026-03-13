@@ -761,16 +761,19 @@ def execute_rebalance(
             delta = s - old_s
 
             if delta != 0 and old_s > 0 and s > 0 and not force_rebalance_trades:
-                drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
-                weight_change = abs(delta * price) / max(pv_exec, 1.0)
-                if weight_change < drift_threshold:
-                    s = old_s
-                    delta = 0
-                    new_weights[sym] = old_s * price / max(pv_exec, 1.0)
-                    new_shares[sym]  = old_s
-                    new_entry_prices[sym] = state.entry_prices.get(sym, price)
-                    actual_notional += old_s * price
-                    continue
+                # Apply drift tolerance only to marginal trims. If shares increase,
+                # retain the trade so residual-cash allocation is not stranded.
+                if s < old_s:
+                    drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
+                    weight_change = abs(delta * price) / max(pv_exec, 1.0)
+                    if weight_change < drift_threshold:
+                        s = old_s
+                        delta = 0
+                        new_weights[sym] = old_s * price / max(pv_exec, 1.0)
+                        new_shares[sym]  = old_s
+                        new_entry_prices[sym] = state.entry_prices.get(sym, price)
+                        actual_notional += old_s * price
+                        continue
 
             slip_rate = compute_one_way_slip_rate(
                 cfg=cfg,

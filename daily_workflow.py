@@ -518,11 +518,15 @@ def _run_scan(
     prices   = close.iloc[-1].values.astype(float)
     active_idx = {sym: i for i, sym in enumerate(active)}
 
-    mtm_notional = sum(
-        state.shares.get(sym, 0) * prices[active_idx[sym]]
-        for sym in state.shares
-        if sym in active_idx
-    )
+    # Guard live PV mark-to-market against feed corruption (e.g., all-NaN close
+    # for a held symbol). NaN here poisons pv and causes optimizer hard-fail.
+    mtm_notional = 0.0
+    for sym in state.shares:
+        if sym in active_idx:
+            px = prices[active_idx[sym]]
+            if np.isnan(px) or px <= 0:
+                px = float(state.last_known_prices.get(sym, 0.0))
+            mtm_notional += state.shares.get(sym, 0) * px
     # FIX (Bug-D — Delisting PV Gap): Include held stocks that are absent from the
     # current scan universe (possibly delisted / suspended) at their last-known
     # price.  Omitting them under-counts total equity, causing the optimizer to
