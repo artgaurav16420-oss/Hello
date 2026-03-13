@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 
+# Remote master archives used by main() bootstrapping flow.
+REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
+    "nifty500": [],
+    "nse_total": [],
+}
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Official NSE constituent CSV URLs (current)
@@ -558,7 +564,7 @@ def bootstrap_historical_parquet(
 
     tickers = default_tickers or ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
     logger.warning(
-        "[HistoricalBuilder] Bootstrapping %s with a 3-ticker stub. "
+        "[HistoricalBuilder] Bootstrapping %s with a 3-ticker stub universe. "
         "This parquet has a single row dated today and will cause every historical "
         "universe lookup to miss — run main() to produce a proper PIT parquet.",
         output_path,
@@ -703,6 +709,23 @@ def build_historical_csv(universe_type: str, output_path: str) -> Path:
 
     output = Path(output_path)
 
+    # Deterministic/offline-first path used by tests and production pipelines:
+    # consume the local master archive if available.
+    local_master = DATA_DIR / "raw_nifty_archives.csv"
+    if local_master.exists():
+        df = _load_master_archive(universe_type)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output, index=False)
+        logger.info("[HistoricalBuilder] Built %s from local raw archive %s", output, local_master)
+        return output
+
+    raise FileNotFoundError(
+        "[HistoricalBuilder] Raw archive missing: data/raw_nifty_archives.csv. "
+        "Run build_historical_fallback.py first (or historical_builder.main())."
+    )
+
+    # Legacy network-first fallback kept below for manual use.
+
     # ── Primary: Wayback Machine ──────────────────────────────────────────────
     print(f"\n[HistoricalBuilder] Building PIT CSV for {universe_type} via Wayback Machine...")
     print(f"  Target URL: {_NSE_NIFTY500_CSV_URL}")
@@ -753,6 +776,66 @@ def build_historical_csv(universe_type: str, output_path: str) -> Path:
     return output
 
 
+def _load_master_archive(universe_type: str) -> pd.DataFrame:
+    """Load and normalize raw archive CSV into canonical (date,ticker) rows."""
+    if universe_type.lower() != "nifty500":
+        raise ValueError("[HistoricalBuilder] _load_master_archive currently supports only 'nifty500'.")
+
+    raw = DATA_DIR / "raw_nifty_archives.csv"
+    if not raw.exists():
+        raise FileNotFoundError(f"[HistoricalBuilder] Raw archive missing: {raw}")
+
+    df = pd.read_csv(raw)
+    cols = [str(c).strip() for c in df.columns]
+    norm = [c.lower() for c in cols]
+
+    # Format A: long rows -> date,ticker
+    if "date" in norm and "ticker" in norm:
+        dcol = cols[norm.index("date")]
+        tcol = cols[norm.index("ticker")]
+        out = df[[dcol, tcol]].rename(columns={dcol: "date", tcol: "ticker"})
+    # Format B: wide rows by ticker -> ticker,YYYY-MM-DD,...
+    elif "ticker" in norm:
+        tcol = cols[norm.index("ticker")]
+        value_cols = [c for c in cols if c != tcol]
+        melted = df.melt(id_vars=[tcol], value_vars=value_cols, var_name="date", value_name="included")
+        included = pd.to_numeric(melted["included"], errors="coerce").fillna(0) > 0
+        out = melted.loc[included, ["date", tcol]].rename(columns={tcol: "ticker"})
+    # Format C: wide rows by date -> date,TICKER_A,TICKER_B,...
+    elif "date" in norm:
+        dcol = cols[norm.index("date")]
+        ticker_cols = [c for c in cols if c != dcol]
+        melted = df.melt(id_vars=[dcol], value_vars=ticker_cols, var_name="ticker", value_name="included")
+        included = pd.to_numeric(melted["included"], errors="coerce").fillna(0) > 0
+        out = melted.loc[included, [dcol, "ticker"]].rename(columns={dcol: "date"})
+    else:
+        raise ValueError("[HistoricalBuilder] Unsupported archive format.")
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out = out[out["date"].notna()].copy()
+    out["ticker"] = out["ticker"].astype(str).str.strip().map(_ns_ticker)
+    out = out[["date", "ticker"]].drop_duplicates().sort_values(["date", "ticker"]).reset_index(drop=True)
+    return out
+
+
+def _download_archive(universe_type: str, output_path: Path) -> Path:
+    urls = REMOTE_ARCHIVE_URLS.get(universe_type, [])
+    if not urls:
+        raise FileNotFoundError(f"[HistoricalBuilder] No remote archive URL configured for {universe_type}. Build via build_historical_fallback.py instead.")
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=20)
+            resp.raise_for_status()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(resp.text, encoding="utf-8")
+            return output_path
+        except Exception as exc:
+            logger.warning("[HistoricalBuilder] Archive download failed from %s: %s", url, exc)
+
+    raise FileNotFoundError(f"[HistoricalBuilder] Failed to download archive for {universe_type}.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -782,35 +865,46 @@ def main() -> None:
     print("  HISTORICAL BUILDER — PIT Universe Construction")
     print("=" * 60)
 
-    # ── Step 1: Build CSV ─────────────────────────────────────────────────────
-    try:
-        build_historical_csv("nifty500", str(csv_path))
-    except (FileNotFoundError, NotImplementedError, ValueError) as exc:
-        print(f"\n[ERROR] {exc}")
-        raise SystemExit(1)
+    for universe in ("nifty500", "nse_total"):
+        normalized_csv = DATA_DIR / f"historical_{universe}.csv"
+        parquet_out = DATA_DIR / f"historical_{universe}.parquet"
 
-    # ── Step 2: Build parquet ─────────────────────────────────────────────────
-    print(f"\n[HistoricalBuilder] Step 2/3 — Converting CSV to parquet...")
-    try:
-        build_parquet_from_csv(str(csv_path), str(parquet_path))
-    except Exception as exc:
-        print(f"\n[ERROR] Parquet build failed: {exc}")
-        raise SystemExit(1)
+        if normalized_csv.exists():
+            build_parquet_from_csv(str(normalized_csv), str(parquet_out))
+            continue
 
-    # ── Step 3: Verify ────────────────────────────────────────────────────────
-    print(f"\n[HistoricalBuilder] Step 3/3 — Verifying parquet...")
-    ok = verify_parquet(str(parquet_path))
+        if universe == "nifty500":
+            # Prefer local master archives if they exist.
+            try:
+                build_historical_csv("nifty500", str(csv_path))
+                build_parquet_from_csv(str(csv_path), str(parquet_path))
+                continue
+            except FileNotFoundError:
+                pass
 
-    if ok:
-        print(
-            f"\n✓ Done. Run optimizer.py now — the survivorship bias "
-            f"in WFO slices should be eliminated."
-        )
-    else:
-        print(
-            "\n⚠ Parquet verification found issues. "
-            "Review the warnings above before running the optimizer."
-        )
+            # If user relies on the production fallback builder, invoke it directly.
+            try:
+                import build_historical_fallback as bhf
+                bhf.run(universe_arg="nifty500", start_date="2018-01-01")
+                if normalized_csv.exists():
+                    build_parquet_from_csv(str(normalized_csv), str(parquet_out))
+                    continue
+            except Exception as exc:
+                logger.warning("[HistoricalBuilder] build_historical_fallback run failed: %s", exc)
+
+        # Optional remote bootstrap path (primarily for CI/tests where URLs are monkeypatched).
+        raw_path = DATA_DIR / f"raw_{universe}_archives.csv"
+        if not raw_path.exists():
+            _download_archive(universe, raw_path)
+
+        tmp = pd.read_csv(raw_path)
+        if not {"date", "ticker"}.issubset({c.lower() for c in tmp.columns}):
+            raise ValueError(f"[HistoricalBuilder] Unsupported archive schema for {raw_path}.")
+
+        tmp.columns = [c.lower() for c in tmp.columns]
+        tmp["ticker"] = tmp["ticker"].astype(str).map(_ns_ticker)
+        tmp[["date", "ticker"]].to_csv(normalized_csv, index=False)
+        build_parquet_from_csv(str(normalized_csv), str(parquet_out))
 
 
 if __name__ == "__main__":

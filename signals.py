@@ -463,6 +463,11 @@ def generate_signals(
                 stale_denied,
                 liquidity_denied,
             )
+            logging.getLogger().debug(
+                "[Signals] Continuity denied for %d stale and %d illiquid symbols.",
+                stale_denied,
+                liquidity_denied,
+            )
 
     # 4. Final Selection
     # Sort and pick the top N elements (ignoring those assigned -inf)
