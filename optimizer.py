@@ -16,6 +16,7 @@ import sys
 import tempfile
 import warnings
 
+import numpy as np
 import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
@@ -94,13 +95,20 @@ SEARCH_SPACE_BOUNDS = {
     "HALFLIFE_FAST":    (10, 40),
     "HALFLIFE_SLOW":    (50, 120),
     "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
-    # Floor raised from 2.0 → 5.0: at RA=2.0 the QP barely penalises variance
-    # and the solver packs weight into 4 names at the 25% cap (90%+ concentration,
-    # 57%+ peak drawdowns). RA=5.0 is the practical minimum for diversification.
-    "RISK_AVERSION":    (5.0, 15.0, 0.5),
-    # Upper bound widened from 0.06 → 0.09: the previous ceiling prevented the
-    # optimizer discovering that 7-8% eliminates the chronic marginal-breach loop.
-    "CVAR_DAILY_LIMIT": (0.040, 0.090, 0.005),
+    # Floor raised 5.0 → 10.0: at RA < 10 the OSQP solver concentrates into
+    # 4 positions at the MAX_SINGLE_NAME_WEIGHT cap (25% × 4 = 100% allocation).
+    # On the survivor-only IS universe those slots fill with genuine 2021-2022
+    # outliers (Tata Elxsi +340%, NDTV +456%) — real returns, but unreproducible
+    # live because concentration magnifies idiosyncratic risk and the universe
+    # excludes the blow-ups that would have balanced the sample.
+    # RA ≥ 10 produces 6-8 positions at 12-16% each — institutional-grade range.
+    # Ceiling raised 15.0 → 20.0 to keep the high-RA region explorable.
+    "RISK_AVERSION":    (10.0, 20.0, 0.5),
+    # Ceiling lowered 0.090 → 0.070. At 9% daily CVaR the limit almost never
+    # fires during normal NSE volatility (~1.5% avg daily vol), making it a dead
+    # parameter the optimizer exploits by pinning to the upper boundary.
+    # 7% allows a ~4.5σ single-day loss before triggering — still generous.
+    "CVAR_DAILY_LIMIT": (0.040, 0.070, 0.005),
     # CVAR_LOOKBACK is now tunable. Shorter windows keep CVaR responsive to the
     # current regime rather than dragging crash returns for months afterward.
     "CVAR_LOOKBACK":    (60, 150, 10),
@@ -119,7 +127,7 @@ OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 # The current objective is a clipped fitness score in [-2.0, 5.0]. Reusing an
 # old study (same name) from a previous objective can show impossible best
 # values (e.g., >>5) and surface stale high-risk parameter sets.
-OBJECTIVE_VERSION = "fitness_v11_48"
+OBJECTIVE_VERSION = "fitness_v11_49"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 # Plausibility guardrails: protect optimizer scoring from data/pathology-driven
@@ -205,6 +213,7 @@ def _fitness_from_metrics(
     cagr = float(metrics.get("cagr", 0.0))
     max_dd = abs(float(metrics.get("max_dd", 100.0)))
     turnover = float(metrics.get("turnover", 0.0))
+    sortino = float(metrics.get("sortino", 0.0) or 0.0)
     final_equity = float(metrics.get("final", BASE_INITIAL_CAPITAL) or BASE_INITIAL_CAPITAL)
     final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
     turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x annual turnover
@@ -217,16 +226,30 @@ def _fitness_from_metrics(
 
     if rebal_log is not None and not rebal_log.empty:
         avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", 0.0), errors="coerce").fillna(0.0).mean())
-        # Track actual market exposure to penalize cash-hiding
         avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", 0.0), errors="coerce").fillna(0.0).mean())
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
         n_rebalances = len(rebal_log)
 
-    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
+    # ── Concentration multiplier ──────────────────────────────────────────────
+    # The survivor-only IS universe excludes stocks that were demoted/blown up.
+    # A 4-stock portfolio has ~2× unobserved idiosyncratic risk vs an 8-stock one,
+    # but the missing losers make measured CVaR/DD look artificially safe.
+    # Each position below 6 raises the effective risk denominator by 30%,
+    # applied multiplicatively so it cannot be absorbed by a score ceiling.
+    _pos_deficit = max(0.0, 6.0 - avg_positions)
+    concentration_mult = 1.0 + _pos_deficit * 0.30   # 4 pos → 1.60×, 3 pos → 1.90×
 
-    # FIX 2: Apply a steep penalty if the strategy spends too much time out of the market.
+    # ── Sortino quality multiplier ────────────────────────────────────────────
+    # Scales the raw score ×[0.50, 1.15].  A strategy that earns its CAGR
+    # through one lucky spike (Sortino ≈ 0.5) is discounted 50%; a consistently
+    # downside-safe strategy (Sortino ≈ 2.5) earns a 15% bonus.
+    import math as _math
+    _sortino_safe = sortino if _math.isfinite(sortino) else 0.0
+    sortino_quality = min(max(_sortino_safe / 2.5, 0.50), 1.15)
+
+    risk_penalty = (max_dd + (avg_cvar * 100.0 * 5.0) + 1.0) * concentration_mult
+
     exposure_penalty = 0.0 if avg_exposure >= 0.75 else (0.75 - avg_exposure) * 5.0
-
     if avg_positions < 1.0:
         exposure_penalty += 0.5
 
@@ -236,50 +259,54 @@ def _fitness_from_metrics(
     )
 
     if anomaly_hit:
-        # Penalize clearly implausible return paths to prevent score-ceiling
-        # lockups driven by data glitches/split artifacts.
         raw = -(
             max(cagr - MAX_REASONABLE_CAGR_PCT, 0.0) / 50.0
             + max(final_multiple - MAX_REASONABLE_FINAL_MULTIPLE, 0.0)
         )
-        score = max(min(raw, 5.0), -2.0)
+        score = max(raw, -2.0)
         ceiling_hit = False
         dd_gate_hit = False
-    # If strategy stayed entirely in cash and did nothing, enforce penalty
     elif abs(cagr) < 1e-12 and max_dd == 0.0:
         raw = 0.0
         score = 0.0
         ceiling_hit = False
         dd_gate_hit = False
     elif max_dd > OOS_MAX_DD_CAP:
-        # MB-12: gradient signal so TPE steers away, not a uniform floor.
         raw = -(max_dd / 10.0)
-        score = max(min(raw, 5.0), -2.0)
+        score = max(raw, -2.0)
         ceiling_hit = False
         dd_gate_hit = True
     else:
-        raw = (cagr_net / risk_penalty) - exposure_penalty
-        score = max(min(raw, 5.0), -2.0)
-        ceiling_hit = raw >= 5.0
+        raw = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty
+        # ── Soft saturation replaces hard clip at 5.0 ────────────────────────
+        # Michaelis-Menten: score approaches 3.5 asymptotically so TPE retains
+        # gradient between "very good" (raw≈2) and "lucky outlier year" (raw≈14).
+        # Hard clip mapped both to 5.0, erasing the signal needed for convergence.
+        _K = 3.5
+        score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
+        score = max(score, -2.0)
+        ceiling_hit = False   # saturation replaces hard ceiling
         dd_gate_hit = False
 
     diag = {
-        "cagr":             round(cagr, 2),
-        "max_dd":           round(-max_dd, 2),   # negative = drawdown convention
-        "turnover":         round(turnover, 4),
-        "final_multiple":   round(final_multiple, 4),
-        "cagr_net":         round(cagr_net, 2),
-        "avg_cvar_pct":     round(avg_cvar * 100.0, 4),
-        "avg_exposure":     round(avg_exposure, 4),
-        "avg_positions":    round(avg_positions, 2),
-        "n_rebalances":     n_rebalances,
-        "risk_penalty":     round(risk_penalty, 4),
-        "exposure_penalty": round(exposure_penalty, 4),
-        "raw_score":        round(raw, 6) if not (abs(cagr) < 1e-12 and max_dd == 0.0) else 0.0,
-        "score":            round(score, 6),
-        "ceiling_hit":      ceiling_hit,
-        "dd_gate_hit":      dd_gate_hit,
-        "anomaly_hit":      anomaly_hit,
+        "cagr":                round(cagr, 2),
+        "max_dd":              round(-max_dd, 2),
+        "turnover":            round(turnover, 4),
+        "final_multiple":      round(final_multiple, 4),
+        "cagr_net":            round(cagr_net, 2),
+        "avg_cvar_pct":        round(avg_cvar * 100.0, 4),
+        "avg_exposure":        round(avg_exposure, 4),
+        "avg_positions":       round(avg_positions, 2),
+        "n_rebalances":        n_rebalances,
+        "concentration_mult":  round(concentration_mult, 4),
+        "sortino_quality":     round(sortino_quality, 4),
+        "risk_penalty":        round(risk_penalty, 4),
+        "exposure_penalty":    round(exposure_penalty, 4),
+        "raw_score":           round(raw, 6) if not (abs(cagr) < 1e-12 and max_dd == 0.0) else 0.0,
+        "score":               round(score, 6),
+        "ceiling_hit":         ceiling_hit,
+        "dd_gate_hit":         dd_gate_hit,
+        "anomaly_hit":         anomaly_hit,
     }
     return score, diag
 
