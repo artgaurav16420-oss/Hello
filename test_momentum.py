@@ -747,14 +747,29 @@ def test_record_eod_flat_day_preserved():
     assert len(ps.equity_hist) == 2, "Flat-days must be preserved, not dropped."
 
 
-def test_record_eod_history_grows_without_truncation():
+def test_record_eod_truncates_history_to_cap():
+    # MB-05/MB-19: equity_hist must be capped at equity_hist_cap to prevent
+    # unbounded growth and O(N) realised_cvar() sort cost over long backtests.
     ps                 = PortfolioState(cash=1_000_000.0)
     ps.equity_hist_cap = 10
     for i in range(20):
         ps.cash = 1_000_000.0 + i * 100.0
         ps.record_eod({})
-    assert len(ps.equity_hist) == 20
+    # After 20 appends with a cap of 10, only the last 10 entries must be kept.
+    assert len(ps.equity_hist) == 10
+    # The tail of the retained window must be the most recent value.
     assert ps.equity_hist[-1] == round(1_000_000.0 + 19 * 100.0, 10)
+    # The oldest retained entry must be the 11th-from-last (index 10 of the 20 appended).
+    assert ps.equity_hist[0] == round(1_000_000.0 + 10 * 100.0, 10)
+
+
+def test_record_eod_cap_zero_means_unlimited():
+    # A cap of 0 must disable truncation entirely.
+    ps                 = PortfolioState(cash=1_000_000.0)
+    ps.equity_hist_cap = 0
+    for i in range(20):
+        ps.record_eod({})
+    assert len(ps.equity_hist) == 20
 
 def test_record_eod_applies_absent_haircut_when_price_missing():
     ps = PortfolioState(cash=0.0)

@@ -245,7 +245,14 @@ class UltimateConfig:
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
-    REGIME_SMA_WINDOW:       int   = 200
+    REGIME_SMA_WINDOW:        int   = 200
+    # EWMA span for short-term (reactive) regime vol — used in compute_regime_score.
+    # Equivalent halflife ~10 days; responds faster than a rectangular 20-day window.
+    REGIME_VOL_EWMA_SPAN:     int   = 20
+    # EWMA span for long-term vol baseline — anchors the dynamic vol threshold so
+    # de-leveraging stays active throughout extended bear markets rather than drifting
+    # upward with the crisis vol. Default ~5 years of trading days (1260).
+    REGIME_LT_VOL_EWMA_SPAN:  int   = 1260
 
     # Ghost risk synthesis
     GHOST_VOL_LOOKBACK:       int   = 20
@@ -388,6 +395,9 @@ class PortfolioState:
         self.equity_hist.append(pv_rounded)
         # MB-05/MB-19 FIX: Enforce rolling window so realised_cvar() and memory
         # usage don't grow O(N) over long backtests.  Cap of 0 means unlimited.
+        cap = self.equity_hist_cap
+        if cap > 0 and len(self.equity_hist) > cap:
+            self.equity_hist = self.equity_hist[-cap:]
 
     def to_dict(self) -> dict:
         def _r(v):
@@ -610,12 +620,15 @@ def execute_rebalance(
             tail_n    = max(1, int(np.floor(T_sc * (1.0 - cfg.CVAR_ALPHA))))
             tail_mean = float(np.mean(np.sort(portfolio_losses)[-tail_n:]))
 
-            if tail_mean > cfg.CVAR_DAILY_LIMIT + EPSILON:
+            # FIX: Use the actual hard limit threshold, not the soft limit.
+            hard_limit = cfg.CVAR_DAILY_LIMIT * getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+
+            if tail_mean > hard_limit + EPSILON:
                 logger.error(
                     "execute_rebalance: POST-DECAY CVaR %.4f%% exceeds hard limit %.4f%%. "
                     "Liquidating all positions to cash — gate-filtered targets still "
                     "cannot satisfy the risk invariant.",
-                    tail_mean * 100, cfg.CVAR_DAILY_LIMIT * 100,
+                    tail_mean * 100, hard_limit * 100,
                 )
                 exit_slip_rate = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
                 for sym, n_shares in state.shares.items():
@@ -939,11 +952,9 @@ def compute_book_cvar(
             sym_base_seed = _ghost_seed_for(sym)  # stable int for this symbol
 
             # Convert each index timestamp to integer days since Unix epoch.
-            # rets.index is a DatetimeIndex; view as int64 nanoseconds then
-            # floor-divide to days.  This is safe even for tz-aware indexes
-            # because we only need a stable monotone integer per calendar date.
+            # FIX: Use astype(np.int64) instead of view("int64") for pandas 2.0+ safety
             days_since_epoch = (
-                rets.index.view("int64") // np.int64(86_400 * 10 ** 9)
+                rets.index.astype(np.int64) // np.int64(86_400 * 10 ** 9)
             ).astype(np.int64)
 
             # XOR the symbol base-seed with the per-day integer.  The result is a
@@ -1003,6 +1014,7 @@ class InstitutionalRiskEngine:
         # unchanged (same m and T_cvar).  Re-setup only on shape change.
         self._solver:       Optional[object] = None
         self._solver_shape: Optional[tuple]  = None  # (m, T_cvar)
+        self._solver_nnz:   Optional[tuple]  = None  # (P_upper.nnz, A.nnz)
 
     def optimize(
         self,
@@ -1290,29 +1302,45 @@ class InstitutionalRiskEngine:
 
         A, l, u = builder.build()
 
-        # OSQP warm-starting: re-factorize only when problem shape changes.
-        # When m and T_cvar are identical to the prior call the sparsity structure
-        # of P and A is unchanged — we update data vectors in-place and warm-start
-        # from the previous primal/dual solution.  This eliminates the expensive
-        # LDL decomposition on every rebalance, yielding ~10-50× speedup in the
-        # Optuna inner loop where shape is stable across hundreds of evaluations.
+        # OSQP warm-starting: re-factorize only when problem shape OR sparsity changes.
+        #
+        # Two correctness requirements for solver.update() to be safe:
+        #
+        # 1. P must be upper-triangular.  OSQP internally stores only triu(P) during
+        #    setup().  Passing full symmetric P.data on update() sends 2× the expected
+        #    number of elements, causing the "new number of elements out of bounds for P"
+        #    crash seen in production.  Fix: always extract triu(P) before any OSQP call.
+        #
+        # 2. The sparsity structure (nnz count) of P_upper and A must be identical
+        #    between setup() and update().  This can change even when (m, T_cvar) is
+        #    unchanged because:
+        #      - Sector constraint count in A varies as filtered universe composition
+        #        shifts (a sector losing its last member drops a constraint row).
+        #      - Floating-point exact zeros in Sigma_reg can alter P_upper.nnz.
+        #    Fix: include (P_upper.nnz, A.nnz) in the cache key; any nnz mismatch
+        #    triggers a clean re-setup rather than an illegal update().
+        P_upper = sp.triu(P, format="csc")  # OSQP requires upper-triangular P
         current_shape = (m, T_cvar)
-        if self._solver is None or self._solver_shape != current_shape:
+        current_nnz   = (P_upper.nnz, A.nnz)
+        if (self._solver is None
+                or self._solver_shape != current_shape
+                or self._solver_nnz   != current_nnz):
             self._solver = osqp.OSQP()
             self._solver.setup(
-                P, q, A, l, u,
+                P_upper, q, A, l, u,
                 verbose=False, eps_abs=1e-4, eps_rel=1e-4,
                 polish=True, adaptive_rho=True, max_iter=50000,
                 warm_starting=True,
             )
             self._solver_shape = current_shape
+            self._solver_nnz   = current_nnz
         else:
-            # Shape matches — update data without re-factorizing.
-            # Px/Ax: new matrix values (same sparsity indices guaranteed by
-            # identical construction path).  q/l/u: new linear/bound vectors.
+            # Shape AND sparsity match — update data vectors in-place without
+            # re-factorizing.  This skips the expensive LDL decomposition and
+            # warm-starts ADMM from the previous primal/dual solution.
             self._solver.update(
                 q=q, l=l, u=u,
-                Px=P.data, Ax=A.data,
+                Px=P_upper.data, Ax=A.data,
             )
         res = self._solver.solve()
 

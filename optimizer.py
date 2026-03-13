@@ -48,11 +48,13 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("\033[90m[%(asctime)s]\033[0m %(message)s", "%H:%M:%S"))
     logger.addHandler(handler)
 
-# --- ADD THESE 3 LINES TO SILENCE THE SPAM ---
+# Silence noisy sub-module loggers that fire on every rebalance.
+# The Optimizer logger itself stays at INFO so per-trial diagnostics are visible.
 logging.getLogger("universe_manager").setLevel(logging.ERROR)
 logging.getLogger("backtest_engine").setLevel(logging.ERROR)
 logging.getLogger("momentum_engine").setLevel(logging.ERROR)
-# ---------------------------------------------
+logging.getLogger("signals").setLevel(logging.ERROR)
+logging.getLogger("data_cache").setLevel(logging.ERROR)
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
@@ -172,7 +174,21 @@ def _iter_wfo_slices(train_start: str, train_end: str):
         )
 
 
-def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
+def _fitness_from_metrics(
+    metrics: dict,
+    rebal_log: pd.DataFrame,
+) -> tuple[float, dict]:
+    """
+    Compute a scalar fitness score plus a diagnostics dict for logging.
+
+    Returns
+    -------
+    score : float
+        Clipped to [-2.0, 5.0].
+    diag  : dict
+        All intermediate values so callers can log exactly why a score
+        came out the way it did.
+    """
     cagr = float(metrics.get("cagr", 0.0))
     max_dd = abs(float(metrics.get("max_dd", 100.0)))
     turnover = float(metrics.get("turnover", 0.0))
@@ -180,43 +196,62 @@ def _fitness_from_metrics(metrics: dict, rebal_log: pd.DataFrame) -> float:
     cagr_net = cagr - turnover_drag
 
     avg_cvar = 0.0
+    avg_exposure = 0.0
     avg_positions = 0.0
+    n_rebalances = 0
+
     if rebal_log is not None and not rebal_log.empty:
         avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", 0.0), errors="coerce").fillna(0.0).mean())
+        # Track actual market exposure to penalize cash-hiding
+        avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", 0.0), errors="coerce").fillna(0.0).mean())
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
+        n_rebalances = len(rebal_log)
 
-    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
-    exposure_penalty = 0.0 if avg_positions >= 1.0 else 0.5
+    # FIX 1: Raise the constant floor from 1.0 to 10.0.
+    # This prevents the ratio from exploding to 5.0 when max_dd is near zero.
+    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 10.0
 
-    # FIX O1: The previous early return `if abs(cagr) < 1e-12 and max_dd == 0.0: return 0.0`
-    # bypassed exposure_penalty before it was computed. A trial that produced zero trades —
-    # equity flat in cash, CAGR=0, MaxDD=0 — returned 0.0 while any losing trial returned
-    # a negative score. TPE ranked 0.0 above negative scores and converged on all-cash
-    # parameter sets (tight CVaR limit during COVID → no signals pass → zero trades → 0.0 score).
-    #
-    # Fix: compute exposure_penalty first (avg_positions=0 → penalty=0.5), then apply it.
-    # Zero-trade trials now score max(-0.5, -2.0) = -0.5, correctly below any trial that
-    # made trades and scored -0.27 or better. The floor is preserved.
+    # FIX 2: Apply a steep penalty if the strategy spends too much time out of the market.
+    exposure_penalty = 0.0 if avg_exposure >= 0.75 else (0.75 - avg_exposure) * 5.0
+
+    if avg_positions < 1.0:
+        exposure_penalty += 0.5
+
+    # If strategy stayed entirely in cash and did nothing, enforce penalty
     if abs(cagr) < 1e-12 and max_dd == 0.0:
-        return 0.0
-
-    # MB-12 FIX: Align IS soft-gate with OOS hard gate (OOS_MAX_DD_CAP).
-    # The previous threshold (55%) was 15 percentage points above OOS rejection
-    # (40%), causing IS-winners with 40-55% MaxDD to waste OOS validation runs.
-    # Using OOS_MAX_DD_CAP here ensures IS and OOS apply the same drawdown bar.
-    if max_dd > OOS_MAX_DD_CAP:
-        # Return a gradient signal so TPE steers away, not a uniform floor.
+        raw = 0.0
+        score = max(-exposure_penalty, -2.0)
+        ceiling_hit = False
+        dd_gate_hit = False
+    elif max_dd > OOS_MAX_DD_CAP:
+        # MB-12: gradient signal so TPE steers away, not a uniform floor.
         raw = -(max_dd / 10.0)
+        score = max(min(raw, 5.0), -2.0)
+        ceiling_hit = False
+        dd_gate_hit = True
     else:
         raw = (cagr_net / risk_penalty) - exposure_penalty
+        score = max(min(raw, 5.0), -2.0)
+        ceiling_hit = raw >= 5.0
+        dd_gate_hit = False
 
-    # Per-slice score floor: prevents a single catastrophic slice (e.g. a year
-    # where the strategy makes no trades or suffers extreme drawdown) from
-    # dominating the aggregate by 40×. With floor=-2.0:
-    #   worst-case trial score ≈ (-2.0 + -0.1 + +2.25) / 3 = +0.05
-    #   typical bad trial score ≈ (-0.9 + -0.1 + +2.25) / 3 = +0.42
-    # TPE now has real gradient to exploit on all three WFO dimensions.
-    return max(raw, -2.0)
+    diag = {
+        "cagr":             round(cagr, 2),
+        "max_dd":           round(-max_dd, 2),   # negative = drawdown convention
+        "turnover":         round(turnover, 4),
+        "cagr_net":         round(cagr_net, 2),
+        "avg_cvar_pct":     round(avg_cvar * 100.0, 4),
+        "avg_exposure":     round(avg_exposure, 4),
+        "avg_positions":    round(avg_positions, 2),
+        "n_rebalances":     n_rebalances,
+        "risk_penalty":     round(risk_penalty, 4),
+        "exposure_penalty": round(exposure_penalty, 4),
+        "raw_score":        round(raw, 6) if not (abs(cagr) < 1e-12 and max_dd == 0.0) else 0.0,
+        "score":            round(score, 6),
+        "ceiling_hit":      ceiling_hit,
+        "dd_gate_hit":      dd_gate_hit,
+    }
+    return score, diag
 
 
 class MomentumObjective:
@@ -285,7 +320,11 @@ class MomentumObjective:
             trial.set_user_attr("resolved_cfg", dict(vars(cfg)))
 
         # 5. Expanding-window time-series CV evaluation
-        scores = []
+        scores: list[float] = []
+        slice_diags: list[dict] = []   # per-slice diagnostics stored in trial user_attrs
+
+        first_oos_year = pd.Timestamp(TRAIN_START).year + 1
+
         for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
             oos_year = pd.Timestamp(wf_oos_start).year
 
@@ -293,7 +332,6 @@ class MomentumObjective:
             # Still run the OOS backtest so exceptions propagate (parameters
             # that produce NaN signals in 2019 should be pruned), but do not
             # append its score to the aggregate.
-            first_oos_year = pd.Timestamp(TRAIN_START).year + 1
             exclude_from_score = (oos_year == first_oos_year)
 
             oos = run_backtest(
@@ -308,7 +346,29 @@ class MomentumObjective:
                 cfg=cfg
             )
             m = oos.metrics
-            score = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
+            score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
+
+            diag["year"]             = oos_year
+            diag["excluded"]         = exclude_from_score
+            diag["eq_start"]         = wf_oos_start
+            diag["eq_end"]           = wf_oos_end
+            slice_diags.append(diag)
+
+            # ── Per-slice diagnostic log ──────────────────────────────────────
+            _excluded_tag = " [EXCLUDED from score]" if exclude_from_score else ""
+            _ceiling_tag  = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
+            _ddgate_tag   = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
+            logger.info(
+                "[Trial %s | %d%s] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
+                "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
+                "RiskPenalty=%.2f  ExpPenalty=%.2f  RawScore=%.4f  Score=%.4f%s%s%s",
+                trial.number, oos_year, _excluded_tag,
+                diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
+                diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
+                diag["risk_penalty"], diag["exposure_penalty"],
+                diag["raw_score"], diag["score"],
+                _ceiling_tag, _ddgate_tag, "",
+            )
 
             if not pd.notna(score):
                 raise optuna.TrialPruned()
@@ -318,7 +378,36 @@ class MomentumObjective:
 
         if not scores:
             raise optuna.TrialPruned()
-        return float(sum(scores) / len(scores))
+
+        aggregate = float(sum(scores) / len(scores))
+
+        # ── Per-trial summary log ─────────────────────────────────────────────
+        scored_diags   = [d for d in slice_diags if not d["excluded"]]
+        avg_cagr       = sum(d["cagr"]         for d in scored_diags) / len(scored_diags)
+        avg_dd         = sum(abs(d["max_dd"])   for d in scored_diags) / len(scored_diags)
+        ceiling_slices = sum(1 for d in scored_diags if d["ceiling_hit"])
+        ddgate_slices  = sum(1 for d in scored_diags if d["dd_gate_hit"])
+
+        logger.info(
+            "[Trial %s | AGGREGATE] score=%.4f  avg_cagr=%+.1f%%  avg_dd=%.1f%%  "
+            "ceiling_hits=%d/%d  ddgate_hits=%d/%d  params=%s",
+            trial.number, aggregate, avg_cagr, avg_dd,
+            ceiling_slices, len(scored_diags),
+            ddgate_slices,  len(scored_diags),
+            {k: v for k, v in trial.params.items()},
+        )
+
+        # Persist per-slice diagnostics in the trial so they survive to the
+        # study dashboard / CSV export and can be inspected post-run.
+        if hasattr(trial, "set_user_attr"):
+            trial.set_user_attr("slice_diags",      slice_diags)
+            trial.set_user_attr("aggregate_score",  round(aggregate, 6))
+            trial.set_user_attr("avg_cagr",         round(avg_cagr, 2))
+            trial.set_user_attr("avg_dd",           round(-avg_dd, 2))
+            trial.set_user_attr("ceiling_hits",     ceiling_slices)
+            trial.set_user_attr("ddgate_hits",      ddgate_slices)
+
+        return aggregate
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
@@ -462,6 +551,57 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
 
     # 2. Run In-Sample Optimization
     logger.info(f"Starting {N_TRIALS} Bayesian Trials (This may take a while)...")
+    def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        """Fires after every completed trial. Prints a summary table when a new best is found."""
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+        if study.best_trial.number != trial.number:
+            return  # not the new best
+
+        diags = trial.user_attrs.get("slice_diags", [])
+        scored = [d for d in diags if not d.get("excluded", False)]
+
+        hdr = (
+            f"\n\033[1;33m{'─'*72}\033[0m"
+            f"\n\033[1;33m  NEW BEST  Trial #{trial.number}  "
+            f"Aggregate={trial.value:.4f}\033[0m"
+            f"\n\033[1;33m{'─'*72}\033[0m"
+        )
+        logger.info(hdr)
+
+        # Parameter table
+        logger.info("  Parameters:")
+        for k, v in trial.params.items():
+            logger.info("    %-28s %s", k, v)
+
+        # Per-slice table
+        logger.info("")
+        logger.info("  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %s",
+                    "Year", "CAGR%", "DD%", "Turn", "AvgPos", "AvgExp", "Score", "Flags")
+        logger.info("  " + "-"*70)
+        for d in diags:
+            flags = []
+            if d.get("excluded"):       flags.append("EXCL")
+            if d.get("ceiling_hit"):    flags.append("CEIL")
+            if d.get("dd_gate_hit"):    flags.append("DD-GATE")
+            logger.info(
+                "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %s",
+                d["year"],
+                d["cagr"], abs(d["max_dd"]), d["turnover"],
+                d["avg_positions"], d["avg_exposure"],
+                d["score"], " ".join(flags) if flags else "—",
+            )
+        logger.info("  " + "-"*70)
+        if scored:
+            avg_cagr = sum(d["cagr"]       for d in scored) / len(scored)
+            avg_dd   = sum(abs(d["max_dd"]) for d in scored) / len(scored)
+            ceil_n   = sum(1 for d in scored if d.get("ceiling_hit"))
+            logger.info(
+                "  %-6s  %+7.1f%%  %6.1f%%  %54s  ceiling_hits=%d/%d",
+                "AVG", avg_cagr, avg_dd, "", ceil_n, len(scored),
+            )
+        logger.info("")
+
     try:
         study.optimize(
             objective,
@@ -469,6 +609,7 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
             show_progress_bar=True,
             n_jobs=effective_n_jobs,
             catch=(OptimizationError,),
+            callbacks=[_best_trial_callback],
         )
     except Exception:
         logger.exception("Optimization aborted due to unexpected internal error.")
@@ -492,6 +633,48 @@ def run_optimization(universe_type: str = "nifty500", in_memory: bool = False):
     print("\033[1mWinning Parameters:\033[0m")
     for k, v in best_params.items():
         print(f"  {k}: \033[33m{v}\033[0m")
+
+    # ── Diagnostic summary: top-10 trials by score ────────────────────────────
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if completed:
+        top10 = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:10]
+        print(f"\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
+        print(f"\033[90m{'Trial':>6}  {'Score':>7}  {'AvgCAGR':>8}  {'AvgDD':>7}  {'CeilHits':>9}  {'DDGate':>7}\033[0m")
+        print(f"\033[90m{'─'*58}\033[0m")
+        for t in top10:
+            avg_c   = t.user_attrs.get("avg_cagr",     "?")
+            avg_d   = t.user_attrs.get("avg_dd",       "?")
+            c_hits  = t.user_attrs.get("ceiling_hits", "?")
+            dg_hits = t.user_attrs.get("ddgate_hits",  "?")
+            scored_n = len([d for d in t.user_attrs.get("slice_diags", []) if not d.get("excluded", False)])
+            c_str   = f"{c_hits}/{scored_n}" if isinstance(c_hits, int) else "?"
+            dg_str  = f"{dg_hits}/{scored_n}" if isinstance(dg_hits, int) else "?"
+            cagr_s  = f"{avg_c:+.1f}%" if isinstance(avg_c, float) else str(avg_c)
+            dd_s    = f"{abs(avg_d):.1f}%" if isinstance(avg_d, float) else str(avg_d)
+            print(f"  #{t.number:>4}  {t.value:>7.4f}  {cagr_s:>8}  {dd_s:>7}  {c_str:>9}  {dg_str:>7}")
+        print(f"\033[90m{'─'*58}\033[0m")
+        print()
+        # Warn if the best trial hit the ceiling on most/all slices
+        if best_trial is not None:
+            c_hits   = best_trial.user_attrs.get("ceiling_hits", 0)
+            scored_n = len([d for d in best_trial.user_attrs.get("slice_diags", []) if not d.get("excluded", False)])
+            if isinstance(c_hits, int) and scored_n > 0 and c_hits == scored_n:
+                print(
+                    "\033[1;31m[WARNING] Best trial hit the 5.0 score ceiling on ALL scored slices.\033[0m"
+                )
+                print(
+                    "\033[33m          This means the optimizer cannot distinguish between parameter sets\033[0m"
+                )
+                print(
+                    "\033[33m          in the top range — TPE convergence may be unreliable.\033[0m"
+                )
+                print(
+                    "\033[33m          Consider reducing CVAR_DAILY_LIMIT upper bound or adding a\033[0m"
+                )
+                print(
+                    "\033[33m          Sharpe/Sortino term to the fitness to create more score separation.\033[0m"
+                )
+                print()
 
     # 3. Out-of-Sample Validation (The true test of robustness)
     print(f"\n\033[1;36m=== INITIATING OUT-OF-SAMPLE (OOS) VALIDATION ===\033[0m")

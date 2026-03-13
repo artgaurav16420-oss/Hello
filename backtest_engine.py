@@ -889,7 +889,12 @@ def _compute_metrics(
         sharpe  = 0.0
         sortino = 0.0
 
-    calmar = (cagr / abs(max_dd)) if max_dd < 0 else 0.0
+    # FIX: Prevent perfectly good 0% drawdown strategies from scoring a 0.0 Calmar
+    # Floor the denominator at 1.0% to yield a highly positive score for near-zero drawdowns.
+    if max_dd >= 0.0:
+        calmar = cagr  # Treat 0% drawdown as a 1% denominator so Calmar = CAGR
+    else:
+        calmar = cagr / max(abs(max_dd), 1.0)
 
     hit_rate = 0.0
     turnover = 0.0
