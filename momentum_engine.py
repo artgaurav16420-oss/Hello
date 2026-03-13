@@ -632,14 +632,21 @@ def execute_rebalance(
                 )
                 exit_slip_rate = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
                 for sym, n_shares in state.shares.items():
-                    px = state.last_known_prices.get(sym, 0.0)
-                    if px > 0 and n_shares > 0:
-                        slip = n_shares * px * exit_slip_rate
+                    if sym in active_idx:
+                        px_exec = float(local_prices[active_idx[sym]])
+                    else:
+                        px_exec = absent_symbol_effective_price(
+                            state.last_known_prices.get(sym, 0.0),
+                            state.absent_periods.get(sym, 0),
+                            cfg.MAX_ABSENT_PERIODS,
+                        )
+                    if px_exec > 0 and n_shares > 0:
+                        slip = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:
                             tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
                             trade_log.append(
-                                Trade(sym, tdate, -n_shares, px, slip, "SELL")
+                                Trade(sym, tdate, -n_shares, px_exec, slip, "SELL")
                             )
                 state.weights      = {}
                 state.shares       = {}
@@ -1018,6 +1025,7 @@ class InstitutionalRiskEngine:
         self._solver:       Optional[object] = None
         self._solver_shape: Optional[tuple]  = None  # (m, T_cvar)
         self._solver_nnz:   Optional[tuple]  = None  # (P_upper.nnz, A.nnz)
+        self._solver_struct: Optional[tuple] = None  # (P_idx, P_ptr, A_idx, A_ptr)
 
     def optimize(
         self,
@@ -1314,20 +1322,33 @@ class InstitutionalRiskEngine:
         #    number of elements, causing the "new number of elements out of bounds for P"
         #    crash seen in production.  Fix: always extract triu(P) before any OSQP call.
         #
-        # 2. The sparsity structure (nnz count) of P_upper and A must be identical
-        #    between setup() and update().  This can change even when (m, T_cvar) is
-        #    unchanged because:
+        # 2. The CSC sparsity structure of P_upper and A (indices/indptr) must be
+        #    identical between setup() and update().  nnz equality alone is not
+        #    sufficient because values may move to different coordinates while count
+        #    stays the same, which would silently remap constraints incorrectly.
+        #    This can change even when (m, T_cvar) is unchanged because:
         #      - Sector constraint count in A varies as filtered universe composition
         #        shifts (a sector losing its last member drops a constraint row).
         #      - Floating-point exact zeros in Sigma_reg can alter P_upper.nnz.
-        #    Fix: include (P_upper.nnz, A.nnz) in the cache key; any nnz mismatch
-        #    triggers a clean re-setup rather than an illegal update().
+        #    Fix: cache and compare CSC indices/indptr in addition to (nnz, shape).
         P_upper = sp.triu(P, format="csc")  # OSQP requires upper-triangular P
         current_shape = (m, T_cvar)
         current_nnz   = (P_upper.nnz, A.nnz)
-        if (self._solver is None
-                or self._solver_shape != current_shape
-                or self._solver_nnz   != current_nnz):
+
+        is_same_structure = False
+        if (self._solver is not None
+                and self._solver_shape == current_shape
+                and self._solver_nnz == current_nnz
+                and self._solver_struct is not None):
+            P_ind, P_ptr, A_ind, A_ptr = self._solver_struct
+            is_same_structure = (
+                np.array_equal(P_upper.indices, P_ind)
+                and np.array_equal(P_upper.indptr, P_ptr)
+                and np.array_equal(A.indices, A_ind)
+                and np.array_equal(A.indptr, A_ptr)
+            )
+
+        if not is_same_structure:
             self._solver = osqp.OSQP()
             self._solver.setup(
                 P_upper, q, A, l, u,
@@ -1337,8 +1358,12 @@ class InstitutionalRiskEngine:
             )
             self._solver_shape = current_shape
             self._solver_nnz   = current_nnz
+            self._solver_struct = (
+                P_upper.indices.copy(), P_upper.indptr.copy(),
+                A.indices.copy(), A.indptr.copy(),
+            )
         else:
-            # Shape AND sparsity match — update data vectors in-place without
+            # Shape AND CSC structure match — update data vectors in-place without
             # re-factorizing.  This skips the expensive LDL decomposition and
             # warm-starts ADMM from the previous primal/dual solution.
             self._solver.update(
