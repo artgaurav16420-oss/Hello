@@ -211,7 +211,7 @@ def _fitness_from_metrics(
     cagr_net = cagr - turnover_drag
 
     avg_cvar = 0.0
-    avg_exposure = 0.0
+    avg_exposure = 1.0
     avg_positions = 0.0
     n_rebalances = 0
 
@@ -222,9 +222,7 @@ def _fitness_from_metrics(
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
         n_rebalances = len(rebal_log)
 
-    # FIX 1: Raise the constant floor from 1.0 to 10.0.
-    # This prevents the ratio from exploding to 5.0 when max_dd is near zero.
-    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 10.0
+    risk_penalty = max_dd + (avg_cvar * 100.0 * 5.0) + 1.0
 
     # FIX 2: Apply a steep penalty if the strategy spends too much time out of the market.
     exposure_penalty = 0.0 if avg_exposure >= 0.75 else (0.75 - avg_exposure) * 5.0
@@ -250,7 +248,7 @@ def _fitness_from_metrics(
     # If strategy stayed entirely in cash and did nothing, enforce penalty
     elif abs(cagr) < 1e-12 and max_dd == 0.0:
         raw = 0.0
-        score = max(-exposure_penalty, -2.0)
+        score = 0.0
         ceiling_hit = False
         dd_gate_hit = False
     elif max_dd > OOS_MAX_DD_CAP:
@@ -357,6 +355,8 @@ class MomentumObjective:
 
         first_oos_year = pd.Timestamp(TRAIN_START).year + 1
 
+        trial_id = getattr(trial, "number", 0)
+
         for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
             oos_year = pd.Timestamp(wf_oos_start).year
 
@@ -395,7 +395,7 @@ class MomentumObjective:
                 "[Trial %s | %d%s] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
                 "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
                 "RiskPenalty=%.2f  ExpPenalty=%.2f  RawScore=%.4f  Score=%.4f%s%s%s%s",
-                trial.number, oos_year, _excluded_tag,
+                trial_id, oos_year, _excluded_tag,
                 diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
                 diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
                 diag["risk_penalty"], diag["exposure_penalty"],
@@ -424,7 +424,7 @@ class MomentumObjective:
         logger.info(
             "[Trial %s | AGGREGATE] score=%.4f  avg_cagr=%+.1f%%  avg_dd=%.1f%%  "
             "ceiling_hits=%d/%d  ddgate_hits=%d/%d  params=%s",
-            trial.number, aggregate, avg_cagr, avg_dd,
+            trial_id, aggregate, avg_cagr, avg_dd,
             ceiling_slices, len(scored_diags),
             ddgate_slices,  len(scored_diags),
             {k: v for k, v in trial.params.items()},
@@ -676,7 +676,8 @@ def run_optimization(
         print(f"  {k}: \033[33m{v}\033[0m")
 
     # ── Diagnostic summary: top-10 trials by score ────────────────────────────
-    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials = list(getattr(study, "trials", []))
+    completed = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
     if completed:
         top10 = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:10]
         print(f"\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
