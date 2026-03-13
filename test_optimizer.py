@@ -257,7 +257,11 @@ def test_objective_uses_configurable_search_space(monkeypatch):
         }
     )
 
-    assert round(objective(trial), 6) == round((10.0 / 6.0) - 0.5, 6)
+    # With no rebalance log: avg_positions=0 triggers concentration and min sortino quality.
+    # raw = (cagr / ((max_dd + 1) * concentration_mult)) * sortino_quality - exposure_penalty
+    #     = (10 / ((5 + 1) * 2.8)) * 0.5 - 0.5
+    expected = (10.0 / ((5.0 + 1.0) * 2.8)) * 0.5 - 0.5
+    assert round(objective(trial), 6) == round(expected, 6)
 
 
 def test_run_optimization_forces_single_job(monkeypatch):
