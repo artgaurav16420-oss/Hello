@@ -73,22 +73,19 @@ def test_secondary_provider_returns_none_without_api_key(monkeypatch):
     assert out is None
 
 
-def test_load_or_fetch_raises_on_chunk_failure(monkeypatch):
+def test_load_or_fetch_skips_symbols_on_chunk_failure(monkeypatch):
     monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
     monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)
     monkeypatch.setattr(data_cache, "_download_with_timeout", lambda *args, **kwargs: pd.DataFrame())
 
-    try:
-        data_cache.load_or_fetch(
-            tickers=["ABC"],
-            required_start="2024-01-01",
-            required_end="2024-01-31",
-            force_refresh=True,
-        )
-    except data_cache.DataFetchError:
-        return
+    out = data_cache.load_or_fetch(
+        tickers=["ABC"],
+        required_start="2024-01-01",
+        required_end="2024-01-31",
+        force_refresh=True,
+    )
 
-    raise AssertionError("Expected DataFetchError for an empty chunk response")
+    assert out == {}
 
 
 
