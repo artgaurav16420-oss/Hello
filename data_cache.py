@@ -592,9 +592,16 @@ def load_or_fetch(
                 if recovered == len(chunk):
                     continue
 
-                raise DataFetchError(
-                    f"Failed to fetch data for chunk starting with {chunk[0]} after all providers."
+                missing = len(chunk) - recovered
+                logger.error(
+                    "[Cache] Skipping %d symbols from chunk starting with %s after all providers failed.",
+                    missing,
+                    chunk[0],
                 )
+                # Soft-fail to keep scans/backtests running when upstream providers
+                # temporarily reject/rename a subset of symbols. Callers already
+                # handle sparse market_data dictionaries.
+                continue
                 
             for ticker in chunk:
                 try:
