@@ -92,8 +92,8 @@ OOS_MAX_DD_CAP = 40.0  # Raised: 35% was too tight (rejected Calmar=1.10 for 36%
 
 # Search space bounds are configurable to support high-risk/high-turnover variants.
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (10, 40),
-    "HALFLIFE_SLOW":    (50, 120),
+    "HALFLIFE_FAST":    (10, 40, 5),
+    "HALFLIFE_SLOW":    (50, 120, 5),
     "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
     # Floor raised 5.0 → 10.0: at RA < 10 the OSQP solver concentrates into
     # 4 positions at the MAX_SINGLE_NAME_WEIGHT cap (25% × 4 = 100% allocation).
@@ -322,10 +322,27 @@ class MomentumObjective:
         cfg = UltimateConfig()
 
         # 2. Define the Search Space (Group A: Alpha & Turnover)
-        halflife_fast_min, halflife_fast_max = self.search_space["HALFLIFE_FAST"]
-        halflife_slow_min, halflife_slow_max = self.search_space["HALFLIFE_SLOW"]
-        cfg.HALFLIFE_FAST = trial.suggest_int("HALFLIFE_FAST", halflife_fast_min, halflife_fast_max)
-        cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max)
+        halflife_fast_bounds = self.search_space["HALFLIFE_FAST"]
+        halflife_slow_bounds = self.search_space["HALFLIFE_SLOW"]
+
+        if len(halflife_fast_bounds) == 3:
+            halflife_fast_min, halflife_fast_max, halflife_fast_step = halflife_fast_bounds
+        else:
+            halflife_fast_min, halflife_fast_max = halflife_fast_bounds
+            halflife_fast_step = 1
+
+        if len(halflife_slow_bounds) == 3:
+            halflife_slow_min, halflife_slow_max, halflife_slow_step = halflife_slow_bounds
+        else:
+            halflife_slow_min, halflife_slow_max = halflife_slow_bounds
+            halflife_slow_step = 1
+
+        cfg.HALFLIFE_FAST = trial.suggest_int(
+            "HALFLIFE_FAST", halflife_fast_min, halflife_fast_max, step=halflife_fast_step
+        )
+        cfg.HALFLIFE_SLOW = trial.suggest_int(
+            "HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max, step=halflife_slow_step
+        )
         
         # Logical Constraint: Fast must be strictly faster than slow.
         # FIX O4: With current bounds (FAST max=40, SLOW min=50) this branch is

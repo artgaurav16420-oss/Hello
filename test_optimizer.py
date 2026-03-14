@@ -264,6 +264,36 @@ def test_objective_uses_configurable_search_space(monkeypatch):
     assert round(objective(trial), 6) == round(expected, 6)
 
 
+def test_objective_accepts_halflife_bounds_with_step(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 5.0, "turnover": 0.0}
+        rebal_log = None
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    custom_space = {
+        "HALFLIFE_FAST": (10, 40, 5),
+        "HALFLIFE_SLOW": (50, 120, 5),
+        "CONTINUITY_BONUS": (0.1, 0.1, 0.01),
+        "RISK_AVERSION": (10.0, 10.0, 0.5),
+        "CVAR_DAILY_LIMIT": (0.04, 0.04, 0.005),
+    }
+    objective = optimizer.MomentumObjective(
+        market_data={}, universe_type="nifty500", search_space=custom_space
+    )
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 15,
+            "HALFLIFE_SLOW": 55,
+            "CONTINUITY_BONUS": 0.1,
+            "RISK_AVERSION": 10.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+    )
+
+    assert isinstance(objective(trial), numbers.Real)
+
+
 def test_run_optimization_forces_single_job(monkeypatch):
     monkeypatch.setattr(optimizer, "N_TRIALS", 1)
     monkeypatch.setattr(optimizer, "N_JOBS", 3)
