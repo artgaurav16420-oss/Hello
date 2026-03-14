@@ -825,11 +825,13 @@ def execute_rebalance(
             )
 
     for sym in symbols_to_force_close:
-        close_price = absent_symbol_effective_price(
-            state.last_known_prices.get(sym, 0.0),
-            state.absent_periods.get(sym, 0),
-            cfg.MAX_ABSENT_PERIODS,
-        )
+        # Force-closes should execute at the last known tradable price, not the
+        # fully-haircut absence mark. At the delist threshold, the absence mark
+        # reaches zero by design, which can create an artificial wipeout on names
+        # that are merely missing recent bars. We still use the haircut mark for
+        # in-period MTM/risk, but final liquidation falls back to the last known
+        # positive price when available.
+        close_price = float(state.last_known_prices.get(sym, 0.0))
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:

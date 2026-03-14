@@ -1128,7 +1128,7 @@ def test_ghost_position_single_day_absence_is_preserved():
 
 
 
-def test_force_close_uses_current_absence_marked_value_without_pv_spike():
+def test_force_close_uses_last_known_price_when_symbol_hits_absence_close_threshold():
     cfg = UltimateConfig(MAX_ABSENT_PERIODS=4, ROUND_TRIP_SLIPPAGE_BPS=0.0)
     state = PortfolioState(cash=0.0)
     state.shares = {"GHOST": 10}
@@ -1147,7 +1147,7 @@ def test_force_close_uses_current_absence_marked_value_without_pv_spike():
         )
         assert state.cash + current_mtm == pytest.approx(expected_mtm)
 
-    marked_before_close = 10 * absent_symbol_effective_price(100.0, cfg.MAX_ABSENT_PERIODS, cfg.MAX_ABSENT_PERIODS)
+    marked_before_close = 10 * 100.0
     execute_rebalance(state, target_empty, np.array([]), [], cfg)
 
     assert "GHOST" not in state.shares
@@ -1174,9 +1174,9 @@ def test_ghost_position_delists_after_max_absent_periods():
     assert "DELISTED" not in state.shares, "Position must be closed after MAX_ABSENT_PERIODS."
     sell_trades = [t for t in trade_log if t.symbol == "DELISTED" and t.direction == "SELL"]
     assert sell_trades, "A SELL trade must be logged for the delisted position."
-    expected_close = absent_symbol_effective_price(900.0, cfg.MAX_ABSENT_PERIODS, cfg.MAX_ABSENT_PERIODS)
+    expected_close = 900.0
     assert sell_trades[-1].exec_price == pytest.approx(expected_close, rel=1e-4), \
-        "Delisted position must be closed at the same marked value used for current absence count."
+        "Delisted position must close at the last known price (not a fully-haircut zero mark)."
 
 
 def test_decay_rounds_increment_and_counter_reset():
