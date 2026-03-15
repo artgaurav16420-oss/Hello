@@ -688,6 +688,31 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out = out.loc[:, out.columns.notna()]
 
+    numeric_cols = [
+        "Open", "High", "Low", "Close", "Adj Close",
+        "Volume", "Dividends", "Stock Splits",
+    ]
+
+    def _coerce_numeric_series(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_numeric_dtype(series):
+            return series
+
+        # yfinance occasionally returns object-typed corporate-action values
+        # such as "2.6 INR". Strip known textual/formatting artifacts before
+        # numeric coercion so parquet writes never fail on object payloads.
+        cleaned = (
+            series.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("INR", "", regex=False)
+            .str.strip()
+        )
+        cleaned = cleaned.mask(cleaned.isin(["", "nan", "None"]))
+        return pd.to_numeric(cleaned, errors="coerce")
+
+    for col in numeric_cols:
+        if col in out.columns:
+            out[col] = _coerce_numeric_series(out[col])
+
     if "Adj Close" not in out.columns:
         if "Close" in out.columns:
             out["Adj Close"] = out["Close"]

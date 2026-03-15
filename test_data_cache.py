@@ -138,7 +138,7 @@ def test_extract_ticker_frame_fills_adj_close_for_multiindex_payload():
     )
     out = data_cache._extract_ticker_frame(raw, "ABC.NS")
     assert out is not None
-    assert out["Adj Close"].equals(out["Close"])
+    assert (out["Adj Close"] == out["Close"]).all()
 
 
 def test_is_valid_dataframe_allows_index_ticker_with_nan_volume():
@@ -183,3 +183,23 @@ def test_load_local_env_file_sets_missing_keys_only(tmp_path, monkeypatch):
 
     assert os.getenv("GROWW_API_TOKEN") == "from_file"
     assert os.getenv("EXISTING_KEY") == "already_set"
+
+
+def test_ensure_price_columns_coerces_object_dividends_and_prices():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    raw = pd.DataFrame(
+        {
+            "Close": ["100", "101.5", "102"],
+            "Adj Close": ["100", "101.5", "102"],
+            "Volume": ["1,000", "2,000", "3,000"],
+            "Dividends": ["0", "2.6 INR", None],
+            "Stock Splits": ["0", "0", "0"],
+        },
+        index=idx,
+    )
+
+    out = data_cache._ensure_price_columns(raw)
+
+    assert out["Dividends"].dtype.kind in "fc"
+    assert out["Dividends"].iloc[1] == 2.6
+    assert out["Volume"].iloc[0] == 1000
