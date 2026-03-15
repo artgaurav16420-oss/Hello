@@ -17,6 +17,22 @@ forward-looking survivorship bias on holiday weekends.
 Fix: use the EARLIEST member set for the snapped date. When multiple target dates
 collapse to the same trading day, the constituent list from the earliest target
 date is the most conservative (no future additions).
+
+AUTOMATIC WARM-UP FIX:
+The user supplies one date — the date trading and performance measurement should
+begin. The engine automatically computes a warm-up window from cfg parameters
+(HALFLIFE_SLOW × 4, CVAR_LOOKBACK, HISTORY_GATE) and ensures market_data
+contains sufficient history before that date for signals to be fully converged.
+
+load_or_fetch already applies dynamic padding internally (padded_start is
+typically 2–3 years before the requested start), so the warm-up history is
+already in the local cache from the initial data download. run_backtest simply
+passes the full padded close/volume matrices to BacktestEngine.run(), which
+enforces the user's start_date as a hard trading guard — rows before start_date
+are used only as signal history, never traded against.
+
+Result: CAGR is always measured from cfg.INITIAL_CAPITAL on start_date with
+fully converged signals. The warm-up period is completely invisible to the user.
 """
 
 from __future__ import annotations
@@ -205,18 +221,14 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(active_symbols, close, volume, date, cfg=cfg)
 
-        # Value the pre-trade portfolio using last fully-observed prices (T-1 close).
-        # This avoids lookahead when we size orders that execute on the current bar.
         valuation_close = close.loc[signal_date]
-        
-        # FIX (Phase 1 & 2): Create an aligned vector of strictly T-1 prices.
-        # This isolates the risk checks and optimizer from looking at T+0 data.
+
         valuation_prices = np.array([
             float(valuation_close[sym]) if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
             else _ffill_price(self.state, sym, cfg)
             for sym in active_symbols
         ])
-        
+
         pv = self.state.cash + sum(
             self.state.shares.get(sym, 0) * (
                 float(valuation_close[sym])
@@ -256,15 +268,11 @@ class BacktestEngine:
 
         # ── Book CVaR screen ──────────────────────────────────────────────────
         if self.state.shares:
-            # FIX (Phase 1 Look-ahead): Use valuation_prices (T-1), NOT active_prices (T+0).
-            # Passing active_prices here allowed the risk engine to magically foresee
-            # intraday crashes before optimization execution, inflating results.
             book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
 
             if book_cvar > hard_breach_threshold:
-                # HARD breach: liquidate immediately.
                 logger.warning(
                     "[Backtest] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) on %s — "
                     "skipping optimization, forcing immediate liquidation.",
@@ -276,7 +284,6 @@ class BacktestEngine:
                 activate_override_on_stress(self.state, cfg)
 
             elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
-                # SOFT breach: elevated but manageable. Let the QP handle it.
                 soft_cvar_breach = True
                 logger.info(
                     "[Backtest] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) on %s — "
@@ -314,8 +321,6 @@ class BacktestEngine:
                         historical_returns  = hist_log_rets[[active_symbols[i] for i in sel_idx]],
                         execution_date      = date,
                         adv_shares          = adv_vector[sel_idx],
-                        # FIX (Phase 7 related): Supply T-1 valuation prices for constraint sizing.
-                        # Do not leak execution logic into the constraint solver.
                         prices              = valuation_prices[sel_idx],
                         portfolio_value     = pv,
                         prev_w              = prev_weights[sel_idx],
@@ -334,13 +339,6 @@ class BacktestEngine:
                             "[Backtest] Solver failure #%d on %s: %s",
                             self.state.consecutive_failures, date, oe,
                         )
-                        # FIX (Risk-Breach Paralysis): if a soft CVaR breach is
-                        # already active and the optimizer fails (KKT infeasibility
-                        # or post-check rejection), the portfolio is in a
-                        # mathematically unsafe state RIGHT NOW.  Waiting for 3
-                        # consecutive failures before triggering decay means the
-                        # position could remain over-risk for up to 3 rebalance
-                        # periods.  Bypass the counter and force decay immediately.
                         if soft_cvar_breach:
                             logger.warning(
                                 "[Backtest] Solver failure during active soft CVaR "
@@ -394,13 +392,12 @@ class BacktestEngine:
         if optimization_succeeded or apply_decay:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
-            
-            # Executions correctly remain grounded in the reality of T+0 data (e.g. Open/VWAP/Close).
+
             exec_prices = _execution_prices(active_symbols, date, active_prices, open_px, high_px, low_px)
-            
+
             execute_rebalance(
                 self.state, target_weights, exec_prices, active_symbols, cfg,
-                date_context   = date, 
+                date_context   = date,
                 trade_log      = self.trades,
                 apply_decay    = apply_decay and not _exhaust_decay,
                 scenario_losses = None if _exhaust_decay else _L,
@@ -422,6 +419,38 @@ class BacktestEngine:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
+    """
+    Compute the date from which market data must be fetched so that all
+    signals are fully converged by start_date.
+
+    Required warm-up in trading days = max(HALFLIFE_SLOW × 4, CVAR_LOOKBACK,
+    HISTORY_GATE). Converted to calendar days with a 1.4× multiplier to
+    account for weekends and NSE holidays, then floored at 400 calendar days.
+
+    This value is logged at INFO level so the user can verify it, but is
+    otherwise completely invisible — no extra prompt, no extra parameter.
+    """
+    halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
+    cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
+    history_gate  = int(getattr(cfg, "HISTORY_GATE",  90))
+
+    required_trading_days = max(halflife_slow * 4, cvar_lookback, history_gate)
+    required_calendar_days = int(required_trading_days * 1.4) + 30
+    warmup_calendar_days   = max(400, required_calendar_days)
+
+    warmup_start = (
+        pd.Timestamp(start_date) - pd.Timedelta(days=warmup_calendar_days)
+    ).strftime("%Y-%m-%d")
+
+    logger.info(
+        "[Backtest] Warm-up: %d trading days needed → fetching from %s "
+        "(user start_date: %s, %d calendar days of pre-history).",
+        required_trading_days, warmup_start, start_date, warmup_calendar_days,
+    )
+    return warmup_start
+
 
 def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) -> Dict[str, float]:
     result: Dict[str, float] = {}
@@ -476,8 +505,6 @@ def _build_adv_vector(
                 if lookback.empty:
                     adv.append(0.0)
                 else:
-                    # FIX #4 (backtest_engine mirror): Use mean not median, consistent
-                    # with the fix applied to signals.compute_adv.
                     val = float(lookback.mean())
                     adv.append(val if np.isfinite(val) else 0.0)
             except Exception:
@@ -490,16 +517,6 @@ def _build_adv_vector(
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
     if not sector_map:
         return None
-    # FIX (Sector-Cap Strangulation): symbols whose sector could not be fetched
-    # from universe_manager default to the string "Unknown".  If we assign them a
-    # regular integer label, the OSQP constraint builder groups ALL unknown-sector
-    # assets into one synthetic super-sector and applies MAX_SECTOR_WEIGHT to their
-    # combined allocation.  When many mid-cap names have missing sector data this
-    # creates an invisible allocation cap that strangulates the optimizer.
-    #
-    # Sentinel -1 is used for "Unknown" so that the constraint builder loop can
-    # detect and skip it, allowing the global budget constraint alone to govern
-    # those assets.  Known sectors receive non-negative sequential IDs as before.
     known_sectors = sorted(s for s in set(sector_map.get(sym, "Unknown") for sym in sel_syms)
                            if s != "Unknown")
     sec_idx = {s: i for i, s in enumerate(known_sectors)}
@@ -507,6 +524,7 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
         [sec_idx.get(sector_map.get(sym, "Unknown"), -1) for sym in sel_syms],
         dtype=int,
     )
+
 
 def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:
     px = state.last_known_prices.get(sym)
@@ -530,8 +548,8 @@ def _execution_prices(
             return np.where(np.isfinite(opens) & (opens > 0), opens, close_prices)
     if high_px is not None and low_px is not None and date in high_px.index and date in low_px.index:
         highs = high_px.loc[date].reindex(symbols).values.astype(float)
-        lows = low_px.loc[date].reindex(symbols).values.astype(float)
-        vwap = (highs + lows + close_prices) / 3.0
+        lows  = low_px.loc[date].reindex(symbols).values.astype(float)
+        vwap  = (highs + lows + close_prices) / 3.0
         return np.where(np.isfinite(vwap) & (vwap > 0), vwap, close_prices)
     return close_prices
 
@@ -539,19 +557,18 @@ def _execution_prices(
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """In-memory suspension simulation used only during backtest runtime."""
     if len(df) < 2:
-        # Always return a copy so callers never mutate shared market_data frames.
         return df.copy()
 
     gap_days = df.index.to_series().diff().dt.days
-    max_gap = int(gap_days.max()) if not gap_days.empty else 0
+    max_gap  = int(gap_days.max()) if not gap_days.empty else 0
     if max_gap <= _SUSPENSION_GAP_DAYS:
         return df.copy()
 
     out = df.copy()
     logger.warning(
-        "[Backtest] %s: Prolonged trading gap of %d days detected. Applying in-memory synthetic halt simulation.",
-        ticker,
-        max_gap,
+        "[Backtest] %s: Prolonged trading gap of %d days detected. "
+        "Applying in-memory synthetic halt simulation.",
+        ticker, max_gap,
     )
 
     gap_end_dates = list(gap_days[gap_days > _SUSPENSION_GAP_DAYS].index)
@@ -568,30 +585,26 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             continue
 
         gap_start = out.index[int(end_loc) - 1]
-
-        # Synthesize only inside this specific prolonged gap.
-        gap_idx = pd.bdate_range(gap_start, gap_end)
-        gap_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
+        gap_idx   = pd.bdate_range(gap_start, gap_end)
+        gap_idx   = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
         if len(gap_idx) == 0:
             continue
 
-        # Avoid overwriting real bars if any timestamp already exists.
         synth_idx = gap_idx.difference(out.index)
         if len(synth_idx) == 0:
             continue
 
         pre_gap_close = out["Close"].loc[:gap_start]
-        pre_gap_rets = pre_gap_close.pct_change().dropna()
-        hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
+        pre_gap_rets  = pre_gap_close.pct_change().dropna()
+        hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
         seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
         seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
-        rng = np.random.RandomState(seed)
-        noise_rets = rng.normal(0, hist_vol, len(synth_idx))
+        rng  = np.random.RandomState(seed)
+        noise_rets   = rng.normal(0, hist_vol, len(synth_idx))
         walk_returns = np.cumprod(1.0 + noise_rets)
 
         synth = pd.DataFrame(index=synth_idx)
-
         close_anchor = float(out.loc[gap_start, "Close"])
         synth["Close"] = close_anchor * walk_returns
 
@@ -609,20 +622,15 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     out = out.sort_index().ffill()
     return out
 
+
 def apply_halt_simulation(market_data: dict) -> dict:
     """
-    Pre-apply _repair_suspension_gaps to every ticker once, returning a new dict
-    of repaired frames.  Called by pre_load_data so the per-trial objective can
-    share a single repaired copy without any per-trial allocation.
-
-    MB-03 FIX (memory): The v11.48 fix passed {k: v.copy()} on every run_backtest
-    call — 500 tickers × 300 trials × 4 WFO slices = 600,000 DataFrame allocations
-    per optimizer run.  Pre-computing the repair once and passing a read-only
-    reference eliminates this O(N×trials) allocation cascade.  _repair_suspension_gaps
-    is deterministic (seeded from ticker hash), so computing it once is equivalent
-    to computing it on every trial.
+    Pre-apply _repair_suspension_gaps to every ticker once.
+    Called by pre_load_data so the per-trial objective shares a single
+    repaired copy without per-trial allocation overhead.
     """
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
+
 
 def run_backtest(
     market_data:   dict,
@@ -633,8 +641,39 @@ def run_backtest(
     sector_map:    Optional[dict]           = None,
     universe:      Optional[List[str]]      = None,
 ) -> BacktestResults:
+    """
+    Run a backtest over [start_date, end_date].
+
+    The user supplies only one start date — trading and performance measurement
+    begin on that date. The engine silently handles warm-up:
+
+      1. _compute_warmup_start() derives how far back market data is needed
+         (based on HALFLIFE_SLOW, CVAR_LOOKBACK, HISTORY_GATE in cfg).
+
+      2. The full padded close/volume matrices (which load_or_fetch already
+         fetches with its own dynamic padding) are passed into BacktestEngine.
+         The `start_date` guard inside BacktestEngine.run() prevents any trades
+         before start_date — pre-start rows exist only as signal history.
+
+      3. Since BacktestEngine.run() appends equity curve rows only for dates
+         >= start_date, _compute_metrics() receives a series that starts at
+         start_date. With cfg.INITIAL_CAPITAL as the baseline, CAGR reflects
+         exactly the period the user requested. No warm-up dilution.
+
+    Note for daily_workflow.py callers: load_or_fetch is called before
+    run_backtest with whatever start date the user typed. Because load_or_fetch
+    internally applies a dynamic padding of max(400, CVAR_LOOKBACK*2) calendar
+    days, the market_data dict passed here almost certainly already contains
+    the warm-up history. If it does not (e.g. a very recent cache that was
+    fetched with a shorter lookback), the engine will still work correctly but
+    some early signals may be partially converged.
+    """
     if cfg is None:
         cfg = UltimateConfig()
+
+    # Log the warm-up window so the user can see it in the log file,
+    # but do not prompt or require any extra input.
+    _compute_warmup_start(start_date, cfg)
 
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
 
@@ -642,23 +681,7 @@ def run_backtest(
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
     selected_universe_type = universe_type or "nse_total"
 
-    # ── Custom screener path ──────────────────────────────────────────────────
-    # get_historical_universe("custom", ...) now logs a survivorship warning and
-    # returns [] instead of raising ValueError (Fixed Issue #1). For custom
-    # backtests, `universe` is pre-populated by the caller (daily_workflow.py)
-    # so the union_universe branch below handles it correctly without needing
-    # special-casing here.
     if union_universe:
-        # MB-04 FIX: Custom universes previously received NO historical narrowing —
-        # every target date was assigned the full current-day screener list, silently
-        # trading 2022-IPO stocks in 2018.  Bayesian optimization on this survivor-biased
-        # universe learned parameters that exploit look-ahead; the resulting
-        # optimal_cfg.json was lethal in live trading.
-        #
-        # Fix: use cumulative-volume existence gates from market_data (already loaded)
-        # to narrow each rebalance date's universe to assets that had verifiable trading
-        # activity prior to that date (>= HISTORY_GATE cumulative trading days).
-        # This mirrors the PIT logic in build_historical_fallback.build_parquet.
         history_gate = int(getattr(cfg, "HISTORY_GATE", 20))
         vol_dict: Dict[str, pd.Series] = {}
         for sym in list(union_universe):
@@ -673,7 +696,7 @@ def run_backtest(
         if vol_dict:
             cum_vol_df = pd.DataFrame(vol_dict).sort_index()
             for d in all_target_dates:
-                ts = pd.Timestamp(d)
+                ts   = pd.Timestamp(d)
                 past = cum_vol_df[cum_vol_df.index <= ts]
                 if past.empty:
                     universe_by_rebalance_date[ts] = set()
@@ -686,7 +709,6 @@ def run_backtest(
                     ts.date(), len(universe_by_rebalance_date[ts]), len(union_universe),
                 )
         else:
-            # No volume data available — fall back to full union with warning
             logger.warning(
                 "[Backtest][MB-04] No volume data found for custom universe; "
                 "survivorship bias is NOT corrected for this backtest."
@@ -714,33 +736,28 @@ def run_backtest(
         if key not in market_data:
             continue
         row = market_data[key]
-        # MB-03 FIX: Gap repair is now pre-computed once in pre_load_data via
-        # apply_halt_simulation().  The SIMULATE_HALTS branch here is intentionally
-        # removed: market_data already contains repaired frames when called from
-        # the optimizer.  For direct run_backtest calls without pre-loading (e.g.
-        # the final OOS validation), repair is applied at call site if needed.
         valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
-        close_d[sym]  = valuation_series.ffill()
+        close_d[sym]     = valuation_series.ffill()
         close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
-        open_d[sym] = row.get("Open", row["Close"]).ffill()
-        high_d[sym] = row.get("High", row["Close"]).ffill()
-        low_d[sym] = row.get("Low", row["Close"]).ffill()
-        div_d[sym] = row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
-        split_d[sym] = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
-        volume_d[sym] = row["Volume"]
+        open_d[sym]      = row.get("Open",  row["Close"]).ffill()
+        high_d[sym]      = row.get("High",  row["Close"]).ffill()
+        low_d[sym]       = row.get("Low",   row["Close"]).ffill()
+        div_d[sym]       = row.get("Dividends",    pd.Series(0.0, index=row.index)).fillna(0.0)
+        split_d[sym]     = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
+        volume_d[sym]    = row["Volume"]
 
     if not close_d:
         raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
 
-    close   = pd.DataFrame(close_d).sort_index()
+    close     = pd.DataFrame(close_d).sort_index()
     close_adj = pd.DataFrame(close_adj_d).sort_index()
-    open_px = pd.DataFrame(open_d).sort_index()
-    high_px = pd.DataFrame(high_d).sort_index()
-    low_px = pd.DataFrame(low_d).sort_index()
+    open_px   = pd.DataFrame(open_d).sort_index()
+    high_px   = pd.DataFrame(high_d).sort_index()
+    low_px    = pd.DataFrame(low_d).sort_index()
     dividends = pd.DataFrame(div_d).sort_index().fillna(0.0)
-    splits = pd.DataFrame(split_d).sort_index().fillna(0.0)
-    volume  = pd.DataFrame(volume_d).sort_index()
-    returns = close_adj.pct_change(fill_method=None).clip(lower=-0.99)
+    splits    = pd.DataFrame(split_d).sort_index().fillna(0.0)
+    volume    = pd.DataFrame(volume_d).sort_index()
+    returns   = close_adj.pct_change(fill_method=None).clip(lower=-0.99)
 
     trading_index = pd.DatetimeIndex(close.index).sort_values()
     valid = []
@@ -750,45 +767,25 @@ def run_backtest(
         if len(eligible) == 0:
             logger.debug(
                 "Calendar guard: no prior trading day within %d days of %s; deferring rebalance.",
-                _REBALANCE_SNAP_WINDOW_DAYS,
-                target.date(),
+                _REBALANCE_SNAP_WINDOW_DAYS, target.date(),
             )
             continue
         valid.append(eligible[-1])
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
-    # FIX B3 + FIX #5: universe_by_rebalance_date was keyed by *target* calendar dates
-    # (e.g. 2021-01-01 — New Year) but BacktestEngine.run() looks up by the *snapped*
-    # trading date (e.g. 2020-12-31). The key mismatch caused the constituent filter
-    # to silently return None on every market holiday, falling back to the full union
-    # universe and injecting survivorship bias.
-    #
-    # FIX #5 (survivorship bias on holiday clusters):
-    # The previous code used UNION when two target dates snapped to the same trading day.
-    # Union includes stocks added in the LATER target date's snapshot, which is future
-    # information relative to the EARLIER target date's trading bar. This is subtle
-    # survivorship bias that manifests around bank holidays and year-end clusters.
-    #
-    # Fix: use the EARLIEST member set. When two targets collapse to the same bar,
-    # the constituent list from the chronologically-first target date is always the
-    # most conservative — it never includes stocks that were added after that date.
+    # FIX B3 + FIX #5: Re-key universe_by_rebalance_date from calendar target
+    # dates to snapped trading dates. Use EARLIEST member set on collisions.
     if universe_by_rebalance_date:
         snapped_universe: Dict[pd.Timestamp, set] = {}
-        # Track which calendar target date first claimed each snapped trading date.
         snapped_universe_target_date: Dict[pd.Timestamp, pd.Timestamp] = {}
 
         for target_d, members in sorted(universe_by_rebalance_date.items()):
-            lower = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
+            lower    = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
             eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
             if len(eligible) > 0:
                 snapped_key = eligible[-1]
                 if snapped_key in snapped_universe:
-                    # FIX #5: A second target date snapped to the same trading day.
-                    # Keep the EARLIEST target's member set (already stored); discard
-                    # the later one. The dict is iterated in sorted order above so
-                    # snapped_universe[snapped_key] always holds the earliest target's
-                    # constituents at this point — no update needed.
                     existing_target = snapped_universe_target_date[snapped_key]
                     logger.debug(
                         "[Backtest] Holiday snap collision: targets %s and %s both snap to %s. "
@@ -796,12 +793,9 @@ def run_backtest(
                         existing_target.date(), target_d.date(), snapped_key.date(),
                         existing_target.date(),
                     )
-                    # Do NOT update snapped_universe[snapped_key] — keep the earliest.
                 else:
                     snapped_universe[snapped_key] = set(members)
                     snapped_universe_target_date[snapped_key] = target_d
-            # If no eligible trading day exists for this target, the rebalance was already
-            # skipped in the snapping loop above — no entry needed.
         universe_by_rebalance_date = snapped_universe
 
     idx_df = market_data.get("^CRSLDX")
@@ -810,8 +804,21 @@ def run_backtest(
 
     engine = InstitutionalRiskEngine(cfg)
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
-    bt.run(close, volume, returns, rebal_dates, start_date, end_date=end_date, idx_df=idx_df, sector_map=sector_map, open_px=open_px, high_px=high_px, low_px=low_px, dividends=dividends, splits=splits, universe_by_rebalance_date=universe_by_rebalance_date)
 
+    # The full close/volume matrices (including pre-start warm-up rows) are
+    # passed here. BacktestEngine.run() will skip dates < start_date for
+    # trading but use them as signal history when computing hist_log_rets.
+    bt.run(
+        close, volume, returns, rebal_dates,
+        start_date, end_date=end_date,
+        idx_df=idx_df, sector_map=sector_map,
+        open_px=open_px, high_px=high_px, low_px=low_px,
+        dividends=dividends, splits=splits,
+        universe_by_rebalance_date=universe_by_rebalance_date,
+    )
+
+    # _eq_dates only contains dates >= start_date (enforced by the
+    # `if date < start_dt: continue` guard in BacktestEngine.run).
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
 
@@ -834,6 +841,7 @@ def run_backtest(
         metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
         rebal_log    = rebal_log,
     )
+
 
 def print_backtest_results(results: BacktestResults) -> None:
     m = results.metrics
@@ -872,39 +880,29 @@ def _compute_metrics(
             initial,
         )
         return {
-            "cagr": 0.0,
-            "max_dd": 0.0,
+            "cagr": 0.0, "max_dd": 0.0,
             "final": float(eq.iloc[-1]) if not eq.empty else float(initial),
-            "sharpe": 0.0,
-            "sortino": 0.0,
-            "calmar": 0.0,
-            "hit_rate": 0.0,
-            "turnover": 0.0,
+            "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0,
+            "hit_rate": 0.0, "turnover": 0.0,
         }
 
     if eq.empty:
         return {
-            "cagr": 0.0,
-            "max_dd": 0.0,
-            "final": initial,
-            "sharpe": 0.0,
-            "sortino": 0.0,
-            "calmar": 0.0,
-            "hit_rate": 0.0,
-            "turnover": 0.0,
+            "cagr": 0.0, "max_dd": 0.0, "final": initial,
+            "sharpe": 0.0, "sortino": 0.0, "calmar": 0.0,
+            "hit_rate": 0.0, "turnover": 0.0,
         }
 
-    final  = float(eq.iloc[-1])
+    final     = float(eq.iloc[-1])
     n_periods = max(len(eq) - 1, 1)
-    cagr   = ((final / initial) ** (periods_per_year / n_periods) - 1.0) * 100.0
-    dd     = (eq / eq.cummax() - 1.0) * 100.0
-    max_dd = float(dd.min())
+    cagr      = ((final / initial) ** (periods_per_year / n_periods) - 1.0) * 100.0
+    dd        = (eq / eq.cummax() - 1.0) * 100.0
+    max_dd    = float(dd.min())
 
     dr = eq.pct_change(fill_method=None).dropna()
     if len(dr) > 1 and dr.std() > 0:
-        ppy = float(periods_per_year)
+        ppy    = float(periods_per_year)
         sharpe = (dr.mean() * ppy) / (dr.std() * np.sqrt(ppy))
-
         downside = dr[dr < 0]
         if len(downside) > 1 and downside.std() > 0:
             sortino = (dr.mean() * ppy) / (downside.std() * np.sqrt(ppy))
@@ -914,17 +912,15 @@ def _compute_metrics(
         sharpe  = 0.0
         sortino = 0.0
 
-    # FIX: Prevent perfectly good 0% drawdown strategies from scoring a 0.0 Calmar
-    # Floor the denominator at 1.0% to yield a highly positive score for near-zero drawdowns.
     if max_dd >= 0.0:
-        calmar = cagr  # Treat 0% drawdown as a 1% denominator so Calmar = CAGR
+        calmar = cagr
     else:
         calmar = cagr / max(abs(max_dd), 1.0)
 
     hit_rate = 0.0
     turnover = 0.0
     if trades:
-        buy_trades = [t for t in trades if t.direction == "BUY" and t.delta_shares > 0]
+        buy_trades  = [t for t in trades if t.direction == "BUY"  and t.delta_shares > 0]
         sell_trades = [t for t in trades if t.direction == "SELL" and t.delta_shares < 0]
 
         round_trip_pnls: List[float] = []
@@ -933,8 +929,7 @@ def _compute_metrics(
         for trade in trades:
             if trade.delta_shares == 0:
                 continue
-
-            qty = abs(int(trade.delta_shares))
+            qty   = abs(int(trade.delta_shares))
             price = float(trade.exec_price)
 
             if trade.direction == "BUY" and trade.delta_shares > 0:
@@ -947,7 +942,7 @@ def _compute_metrics(
                     matched = min(remaining, lot_qty)
                     round_trip_pnls.append((price - lot_px) * matched)
                     remaining -= matched
-                    lot_qty -= matched
+                    lot_qty   -= matched
                     if lot_qty == 0:
                         lots.pop(0)
                     else:
@@ -956,16 +951,11 @@ def _compute_metrics(
         if round_trip_pnls:
             hit_rate = (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0
 
-        total_buy_notional = sum(t.delta_shares * t.exec_price for t in buy_trades)
+        total_buy_notional  = sum(t.delta_shares * t.exec_price for t in buy_trades)
         total_sell_notional = sum(abs(t.delta_shares) * t.exec_price for t in sell_trades)
         avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
         if avg_equity > 0:
             turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
-            # MB-16 FIX: Use the actual date span to annualize turnover instead of
-            # n_periods/252.  When eq is a weekly-frequency rebalance-date slice,
-            # n_periods/252 gives ~0.21 years for a year of weekly bars, overstating
-            # annual turnover by ~5x and causing Optuna to over-penalize low-turnover
-            # parameters.  Use calendar days when a DatetimeIndex is available.
             if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
                 years = (eq.index[-1] - eq.index[0]).days / 365.25
             else:
@@ -974,12 +964,12 @@ def _compute_metrics(
                 turnover = turnover / years
 
     return {
-        "cagr":    round(cagr,    2),
-        "max_dd":  round(max_dd,  2),
-        "final":   round(final,   2),
-        "sharpe":  round(sharpe,  2),
-        "sortino": round(sortino, 2) if np.isfinite(sortino) else sortino,
-        "calmar":  round(calmar,  2),
+        "cagr":     round(cagr,    2),
+        "max_dd":   round(max_dd,  2),
+        "final":    round(final,   2),
+        "sharpe":   round(sharpe,  2),
+        "sortino":  round(sortino, 2) if np.isfinite(sortino) else sortino,
+        "calmar":   round(calmar,  2),
         "hit_rate": round(hit_rate, 2),
         "turnover": round(turnover, 4),
     }

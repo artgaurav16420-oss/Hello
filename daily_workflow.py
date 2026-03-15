@@ -5,8 +5,9 @@ Interactive CLI for live scanning, status display, and backtesting.
 Features robust capital management, direct Screener.in web scraping,
 Dividend Sweeping, and Impact-Aligned Rebalancing.
 """
-
 from __future__ import annotations
+from dotenv import load_dotenv
+load_dotenv()
 
 import argparse
 import copy
