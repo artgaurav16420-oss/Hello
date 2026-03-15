@@ -188,6 +188,45 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     assert "^CRSLDX" in captured["tickers"]
 
 
+def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
+    monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-03-31")
+    monkeypatch.setattr(optimizer, "get_nifty500", lambda: ["LIVEONLY"])
+    monkeypatch.setattr(optimizer, "apply_halt_simulation", lambda md: md)
+
+    def _fake_hist(universe_type, date):
+        assert universe_type == "nifty500"
+        if pd.Timestamp(date) == pd.Timestamp("2020-01-31"):
+            return ["OLD1", "OLD2"]
+        if pd.Timestamp(date) == pd.Timestamp("2020-02-29"):
+            return ["OLD2", "OLD3"]
+        return []
+
+    monkeypatch.setattr(optimizer, "get_historical_universe", _fake_hist)
+
+    captured = {}
+
+    def _fake_load_or_fetch(*, tickers, required_start, required_end, cfg=None):
+        captured["tickers"] = tickers
+        captured["required_start"] = required_start
+        captured["required_end"] = required_end
+        return {"ok": True}
+
+    monkeypatch.setattr(optimizer, "load_or_fetch", _fake_load_or_fetch)
+
+    result = optimizer.pre_load_data("nifty500")
+
+    assert result == {"ok": True}
+    assert captured["required_start"] == "2020-01-01"
+    assert captured["required_end"] == "2020-03-31"
+    assert "LIVEONLY" in captured["tickers"]
+    assert "OLD1" in captured["tickers"]
+    assert "OLD2" in captured["tickers"]
+    assert "OLD3" in captured["tickers"]
+    assert "^NSEI" in captured["tickers"]
+    assert "^CRSLDX" in captured["tickers"]
+
+
 def test_build_sampler_returns_tpe_sampler(monkeypatch):
     monkeypatch.setattr(optimizer, "OPTUNA_SEED", None)
     sampler_unseeded = optimizer._build_sampler()
