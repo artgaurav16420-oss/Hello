@@ -408,21 +408,60 @@ class GrowwProvider(DataProvider):
 
 class YFinanceProvider(DataProvider):
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        result = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            progress=False,
-            auto_adjust=False,
-            actions=True,
-        )
+        result = self._download_batch(tickers, start, end)
         if result is None:
             return None
+
+        # yfinance can occasionally return an empty frame for an otherwise valid
+        # multi-ticker request (crumb/rate-limit/session glitches). When that
+        # happens, degrade to one-by-one requests so healthy symbols are still
+        # captured instead of dropping the full chunk.
+        if len(tickers) > 1 and result.empty:
+            recovered = self._download_individual(tickers, start, end)
+            if recovered is not None and not recovered.empty:
+                return recovered
+
         if result.empty:
             return result
         if len(tickers) > 1 and not isinstance(result.columns, pd.MultiIndex):
             return None
         return result
+
+    def _download_batch(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        try:
+            return yf.download(
+                tickers,
+                start=start,
+                end=end,
+                progress=False,
+                auto_adjust=False,
+                actions=True,
+            )
+        except Exception as exc:
+            logger.warning("[Cache] yfinance batch download failed for %d tickers: %s", len(tickers), exc)
+            return None
+
+    def _download_individual(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
+        frames: Dict[str, pd.DataFrame] = {}
+        for ticker in tickers:
+            single = self._download_batch([ticker], start, end)
+            if single is None or single.empty:
+                continue
+
+            frame = _extract_ticker_frame(single, ticker, is_single_request=True)
+            if frame is None or frame.empty:
+                continue
+            frames[ticker] = frame
+
+        if not frames:
+            return None
+
+        combined = pd.concat(frames, axis=1)
+        combined.columns = pd.MultiIndex.from_tuples(
+            [(col, ticker) for ticker, col in combined.columns],
+            names=["Price", "Ticker"],
+        )
+        return _normalize_history_index(combined.swaplevel(0, 1, axis=1).sort_index(axis=1))
 
 
 class SecondaryProvider(DataProvider):
