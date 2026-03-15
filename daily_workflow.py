@@ -6,8 +6,12 @@ Features robust capital management, direct Screener.in web scraping,
 Dividend Sweeping, and Impact-Aligned Rebalancing.
 """
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
+import importlib.util
+
+if importlib.util.find_spec("dotenv") is not None:
+    from dotenv import load_dotenv
+
+    load_dotenv()
 
 import argparse
 import copy
@@ -50,7 +54,7 @@ from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 
-__version__ = "11.46"
+__version__ = "11.48"
 
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
