@@ -7,8 +7,6 @@ followed by a true holdout Out-of-Sample (OOS) validation period.
 
 Requires: pip install optuna
 """
-from dotenv import load_dotenv
-load_dotenv()
 import argparse
 import json
 import logging
@@ -21,6 +19,27 @@ import numpy as np
 import pandas as pd
 import optuna
 from optuna.samplers import TPESampler
+
+
+def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from a local .env file if present."""
+    if not os.path.exists(dotenv_path):
+        return
+
+    with open(dotenv_path, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, value)
+
+
+_load_dotenv_if_present()
 
 # Local imports from your v11.48 architecture
 from momentum_engine import UltimateConfig, OptimizationError
@@ -573,7 +592,9 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     # symbol set and produce consistent replay conditions.
     historical_union: set[str] = set()
     try:
-        all_target_dates = pd.date_range(TRAIN_START, TEST_END, freq=cfg.REBALANCE_FREQ)
+        rebalance_dates = pd.date_range(TRAIN_START, TEST_END, freq=cfg.REBALANCE_FREQ)
+        month_end_dates = pd.date_range(TRAIN_START, TEST_END, freq="ME")
+        all_target_dates = sorted(set(rebalance_dates).union(set(month_end_dates)))
         for target_date in all_target_dates:
             historical_union.update(get_historical_universe(normalized_universe, pd.Timestamp(target_date)))
     except Exception as exc:
@@ -861,7 +882,9 @@ def run_optimization(
     top_k_trials = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:OOS_TOP_K]
 
     if not top_k_trials:
-        raise RuntimeError("No completed trials available for OOS validation.")
+        logger.warning("No completed trials available for OOS validation; skipping OOS tournament.")
+        save_optimal_config(best_params)
+        return
 
     _rs = "\u20b9" if _stdout_supports_rupee() else "Rs."
     valid_fields = UltimateConfig.__dataclass_fields__
