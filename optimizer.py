@@ -26,7 +26,7 @@ from optuna.samplers import TPESampler
 from momentum_engine import UltimateConfig, OptimizationError
 from backtest_engine import run_backtest, apply_halt_simulation
 from data_cache import load_or_fetch
-from universe_manager import get_nifty500, fetch_nse_equity_universe
+from universe_manager import get_nifty500, fetch_nse_equity_universe, get_historical_universe
 
 # Suppress solver/sklearn warnings during the thousands of iterations
 warnings.filterwarnings("ignore")
@@ -542,9 +542,6 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         logger.warning(f"Unknown universe_type '{universe_type}', falling back to nifty500")
         base_universe = get_nifty500() 
         
-    # Ensure index data is present for regime scoring
-    symbols_to_fetch = list(dict.fromkeys(base_universe + ["^NSEI", "^CRSLDX"]))
-
     if cfg is None:
         cfg = UltimateConfig()
         cvar_bounds = SEARCH_SPACE_BOUNDS.get("CVAR_LOOKBACK")
@@ -560,6 +557,39 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
             halflife_calendar_days = halflife_slow_max * 4 * 365 // 252
             current_cvar_padding = max(400, cfg.CVAR_LOOKBACK * 2)
             cfg._pre_load_padding_days = max(current_cvar_padding, halflife_calendar_days)
+
+    # MB-18 FIX: Build the optimization preload from the SAME point-in-time
+    # historical membership snapshots that run_backtest uses.
+    #
+    # Root cause fixed:
+    # pre_load_data previously fetched only today's base universe. During
+    # run_backtest, the engine dynamically switches members by historical
+    # rebalance date. Any historical member absent from today's list had no
+    # market_data frame and was logged as "missing data", causing noisy logs
+    # and optimizer OOS vs daily_workflow backtest mismatches.
+    #
+    # By unioning historical members across TRAIN_START→TEST_END at the exact
+    # rebalance cadence, optimizer and daily_workflow now hydrate the same
+    # symbol set and produce consistent replay conditions.
+    historical_union: set[str] = set()
+    try:
+        all_target_dates = pd.date_range(TRAIN_START, TEST_END, freq=cfg.REBALANCE_FREQ)
+        for target_date in all_target_dates:
+            historical_union.update(get_historical_universe(normalized_universe, pd.Timestamp(target_date)))
+    except Exception as exc:
+        logger.warning(
+            "Historical universe preload failed for %s (%s). Falling back to base universe only.",
+            normalized_universe,
+            exc,
+        )
+
+    if historical_union:
+        preload_universe = list(dict.fromkeys(base_universe + sorted(historical_union)))
+    else:
+        preload_universe = list(base_universe)
+
+    # Ensure index data is present for regime scoring
+    symbols_to_fetch = list(dict.fromkeys(preload_universe + ["^NSEI", "^CRSLDX"]))
 
     logger.info(f"Fetching {len(symbols_to_fetch)} symbols from {TRAIN_START} to {TEST_END}...")
     kwargs = dict(tickers=symbols_to_fetch, required_start=TRAIN_START, required_end=TEST_END)
