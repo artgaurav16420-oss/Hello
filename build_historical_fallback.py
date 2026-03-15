@@ -37,12 +37,11 @@ USAGE
   python build_historical_fallback.py --universe both --start 2015-01-01
 """
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
 
 import argparse
 import io
 import logging
+import os
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -53,6 +52,37 @@ import time as _time_mod
 import numpy as np
 import pandas as pd
 import requests
+
+
+def _load_env_file_fallback(env_path: Path = Path('.env')) -> None:
+    """Minimal `.env` parser used when python-dotenv is unavailable."""
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding='utf-8').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as exc:
+        logger = logging.getLogger(__name__)
+        logger.debug('[Env] Could not parse .env fallback at %s: %s', env_path, exc)
+
+
+def _bootstrap_env() -> None:
+    """Load env vars from `.env` with optional python-dotenv dependency."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except Exception:
+        _load_env_file_fallback()
+
+
+_bootstrap_env()
 
 from data_cache import load_or_fetch
 from momentum_engine import UltimateConfig
@@ -507,6 +537,10 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
     print("\n" + "=" * 65)
     print("  HISTORICAL UNIVERSE BUILDER")
     print("=" * 65)
+
+    groww_enabled = bool(os.getenv("GROWW_API_TOKEN", "").strip())
+    provider_msg = "Groww primary + yfinance fallback" if groww_enabled else "yfinance primary (set GROWW_API_TOKEN in .env to enable Groww)"
+    print(f"  Data provider mode: {provider_msg}")
 
     # ── Nifty 500 — try Wayback Machine first ────────────────────────────────
     if want_nifty500:

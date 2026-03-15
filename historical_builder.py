@@ -364,8 +364,10 @@ def _build_pit_csv_from_yfinance_approx(
 ) -> bool:
     """
     Build an approximate PIT CSV by:
-    1. Downloading price + volume data for a broad universe of NSE tickers
-       via yfinance.
+    1. Downloading price + volume data for a broad universe of NSE tickers.
+       Uses data_cache.load_or_fetch first (Groww-enabled when
+       GROWW_API_TOKEN exists in environment/.env), then falls back to direct
+       yfinance batch downloads for any still-missing symbols.
     2. At each semi-annual rebalance date, ranking by trailing market-cap proxy.
     3. Writing the top_n at each date to the output CSV.
 
@@ -415,42 +417,59 @@ def _build_pit_csv_from_yfinance_approx(
     effective_end = pd.Timestamp.today().strftime("%Y-%m-%d")
 
     print(f"[HistoricalBuilder] Downloading {len(candidate_tickers)} tickers "
-          f"from {effective_start} to {effective_end} via yfinance...")
-    print("  (This may take 5-10 minutes depending on network speed)")
+          f"from {effective_start} to {effective_end}...")
 
     market_data: dict = {}
-    batch_size = 50
-    for i in range(0, len(candidate_tickers), batch_size):
-        batch = candidate_tickers[i : i + batch_size]
-        try:
-            raw = yf.download(
-                batch,
-                start=effective_start,
-                end=effective_end,
-                auto_adjust=False,
-                progress=False,
-                threads=True,
-            )
-            for tkr in batch:
-                try:
-                    if isinstance(raw.columns, pd.MultiIndex):
-                        df_tkr = raw.xs(tkr, axis=1, level=1).dropna(how="all")
-                    else:
-                        df_tkr = raw.copy()
-                    if not df_tkr.empty:
-                        market_data[tkr] = df_tkr
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.warning(
-                "[HistoricalBuilder] yfinance batch %d-%d failed: %s",
-                i, i + batch_size, exc,
-            )
-        n_done = min(i + batch_size, len(candidate_tickers))
-        print(f"  Downloaded {n_done}/{len(candidate_tickers)}", end="\r")
-        time.sleep(0.5)
 
-    print()
+    # Prefer the shared provider chain so Groww credentials are reused.
+    try:
+        from data_cache import load_or_fetch
+
+        cached = load_or_fetch(candidate_tickers, effective_start, effective_end)
+        for tkr, df in cached.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                market_data[tkr] = df
+        print(f"  Provider chain (Groww/yfinance) returned {len(market_data)} tickers.")
+    except Exception as exc:
+        logger.warning("[HistoricalBuilder] Provider-chain download failed: %s", exc)
+
+    # If provider chain is sparse/unavailable, augment with direct yfinance.
+    missing = [t for t in candidate_tickers if t not in market_data]
+    if missing:
+        print(f"  Fetching remaining {len(missing)} tickers via direct yfinance batches...")
+        batch_size = 50
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i : i + batch_size]
+            try:
+                raw = yf.download(
+                    batch,
+                    start=effective_start,
+                    end=effective_end,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=True,
+                )
+                for tkr in batch:
+                    try:
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            df_tkr = raw.xs(tkr, axis=1, level=1).dropna(how="all")
+                        else:
+                            df_tkr = raw.copy()
+                        if not df_tkr.empty:
+                            market_data[tkr] = df_tkr
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning(
+                    "[HistoricalBuilder] yfinance batch %d-%d failed: %s",
+                    i, i + batch_size, exc,
+                )
+            n_done = min(i + batch_size, len(missing))
+            print(f"  Downloaded {n_done}/{len(missing)} fallback tickers", end="\r")
+            time.sleep(0.5)
+
+        print()
+
     print(f"[HistoricalBuilder] Got data for {len(market_data)} tickers.")
 
     # Step 3: Build PIT membership at each rebalance date
