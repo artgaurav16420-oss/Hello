@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pandas as pd
 
 import data_cache
@@ -166,3 +167,19 @@ def test_is_valid_dataframe_rejects_non_index_ticker_with_nan_volume():
     )
 
     assert not data_cache._is_valid_dataframe(df, ticker="ABC.NS")
+
+
+def test_load_local_env_file_sets_missing_keys_only(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "GROWW_API_TOKEN=from_file\nEXISTING_KEY=from_file\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("GROWW_API_TOKEN", raising=False)
+    monkeypatch.setenv("EXISTING_KEY", "already_set")
+
+    data_cache._load_local_env_file(env_file)
+
+    assert os.getenv("GROWW_API_TOKEN") == "from_file"
+    assert os.getenv("EXISTING_KEY") == "already_set"

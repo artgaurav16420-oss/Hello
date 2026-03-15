@@ -63,6 +63,33 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+
+def _load_local_env_file(env_path: Path = Path('.env')) -> None:
+    """
+    Lightweight `.env` loader for non-interactive scripts.
+
+    This avoids requiring python-dotenv in every runtime while still honoring
+    local credentials such as GROWW_API_TOKEN when present.
+    """
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding='utf-8').splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as exc:
+        logger.debug('[Cache] Could not parse .env file at %s: %s', env_path, exc)
+
+
+_load_local_env_file()
+
 CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
