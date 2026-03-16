@@ -683,6 +683,25 @@ def execute_rebalance(
             score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
             valid_targets.append((i, sym, price, score))
 
+    # Apply drift-tolerance sell-cancellation before residual allocation so the
+    # cash budget is computed from the final base-share vector.
+    if not force_rebalance_trades:
+        drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
+        for i, sym in enumerate(active_symbols):
+            old_s = state.shares.get(sym, 0)
+            s = desired_shares.get(sym, 0)
+            price = max(float(local_prices[i]), 1e-6)
+
+            if old_s > 0 and s > 0 and s < old_s:
+                weight_change = abs((s - old_s) * price) / max(pv_exec, 1.0)
+                if weight_change < drift_threshold:
+                    desired_shares[sym] = old_s
+
+    base_notional = sum(
+        desired_shares.get(sym, 0) * max(float(local_prices[i]), 1e-6)
+        for i, sym in enumerate(active_symbols)
+    )
+
     # RESIDUAL CASH FIX (v11.50): Multi-pass proportional allocation.
     #
     # v11.49 single-pass silently stranded entitlement: when the top-weight asset hit
@@ -767,21 +786,6 @@ def execute_rebalance(
 
         if s > 0 or old_s > 0:
             delta = s - old_s
-
-            if delta != 0 and old_s > 0 and s > 0 and not force_rebalance_trades:
-                # Apply drift tolerance only to marginal trims. If shares increase,
-                # retain the trade so residual-cash allocation is not stranded.
-                if s < old_s:
-                    drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
-                    weight_change = abs(delta * price) / max(pv_exec, 1.0)
-                    if weight_change < drift_threshold:
-                        s = old_s
-                        delta = 0
-                        new_weights[sym] = old_s * price / max(pv_exec, 1.0)
-                        new_shares[sym]  = old_s
-                        new_entry_prices[sym] = state.entry_prices.get(sym, price)
-                        actual_notional += old_s * price
-                        continue
 
             slip_rate = compute_one_way_slip_rate(
                 cfg=cfg,
@@ -977,14 +981,11 @@ def compute_book_cvar(
                 np.int64(sym_base_seed) ^ days_since_epoch
             ) & np.int64(0x7FFFFFFF)
 
-            # One draw per row.  Instantiating a Generator per row is O(1) and the
-            # total number of rows is at most CVAR_LOOKBACK (~63–252), so the loop
-            # is negligible compared to the OSQP solve that follows.
-            synth_rets = np.empty(len(rets), dtype=float)
-            for _i, _seed in enumerate(row_seeds):
-                synth_rets[_i] = np.random.default_rng(int(_seed)).normal(
-                    daily_drift, daily_vol
-                )
+            # Vectorized deterministic draws: spawn generators once from a
+            # SeedSequence instead of constructing one RNG per row in Python loop.
+            ss = np.random.SeedSequence(row_seeds.to_numpy(dtype=np.uint32, copy=False).tolist())
+            rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]
+            synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
             rets.loc[:, sym] = synth_rets
 
     if len(rets) < 5:
@@ -1403,18 +1404,18 @@ class InstitutionalRiskEngine:
         # see the correct target exposure, not an inflated raw solver output.
         if res.info.status in ("solved inaccurate", "solved_inaccurate"):
             logger.warning(
-                "[Optimizer] OSQP returned '%s'. Normalizing weights to γ=%.4f to prevent leverage leaks.",
+                "[Optimizer] OSQP returned '%s'. Normalizing weights to γ=%.4f.",
                 res.info.status, gamma,
             )
             w_sum = float(np.sum(w_opt))
             if w_sum > 1e-9:
+                # Enforce physical ADV caps before any scaling decision.
                 w_opt = np.minimum(w_opt, adv_limit)
-                # Preserve hard concentration caps and avoid scaling up capped
-                # assets back into liquidity breaches. For inaccurate solves,
-                # correcting leverage leaks takes precedence over forcing exact γ.
+
+                # Scale toward gamma only when feasible without violating ADV caps.
                 clipped_sum = float(np.sum(w_opt))
-                if clipped_sum > 1e-9 and clipped_sum > gamma:
-                    w_opt = w_opt * (gamma / clipped_sum)
+                if clipped_sum > 1e-9:
+                    w_opt = w_opt * min(gamma / clipped_sum, 1.0)
 
         portfolio_losses  = losses @ w_opt
         sorted_losses     = np.sort(portfolio_losses)
