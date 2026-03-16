@@ -1408,9 +1408,13 @@ class InstitutionalRiskEngine:
             )
             w_sum = float(np.sum(w_opt))
             if w_sum > 1e-9:
-                w_opt = w_opt * (gamma / w_sum)
-                # Preserve hard concentration caps after inaccurate-solve rescaling.
                 w_opt = np.minimum(w_opt, adv_limit)
+                # Preserve hard concentration caps and avoid scaling up capped
+                # assets back into liquidity breaches. For inaccurate solves,
+                # correcting leverage leaks takes precedence over forcing exact γ.
+                clipped_sum = float(np.sum(w_opt))
+                if clipped_sum > 1e-9 and clipped_sum > gamma:
+                    w_opt = w_opt * (gamma / clipped_sum)
 
         portfolio_losses  = losses @ w_opt
         sorted_losses     = np.sort(portfolio_losses)

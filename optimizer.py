@@ -253,9 +253,10 @@ def _fitness_from_metrics(
     n_rebalances = 0
 
     if rebal_log is not None and not rebal_log.empty:
-        avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", 0.0), errors="coerce").fillna(0.0).mean())
-        avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", 0.0), errors="coerce").fillna(0.0).mean())
-        avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", 0.0), errors="coerce").fillna(0.0).mean())
+        fallback_series = pd.Series([0.0])
+        avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", fallback_series), errors="coerce").fillna(0.0).mean())
+        avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", fallback_series), errors="coerce").fillna(0.0).mean())
+        avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0).mean())
         n_rebalances = len(rebal_log)
 
     # ── Concentration multiplier ──────────────────────────────────────────────
