@@ -118,9 +118,7 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
     large_bonus = float(scores[1] - scores[2])
 
     raw_scores, _, _, _ = generate_signals(log_rets, adv, cfg)
-    finite = raw_scores[np.isfinite(raw_scores)]
-    dispersion = max(np.nanstd(finite), cfg.CONTINUITY_DISPERSION_FLOOR)
-    base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR) * dispersion
+    base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR)
 
     assert small_bonus == pytest.approx(base_bonus * 0.25, abs=1e-9)
     assert large_bonus == pytest.approx(base_bonus * 1.0, abs=1e-9)
@@ -1425,6 +1423,49 @@ def test_volume_first_day_adv_is_zero_no_lookahead():
     assert np.allclose(adv_day0, 0.0)
 
 
+
+
+def test_compute_adv_respects_target_date_no_lookahead():
+    idx = pd.date_range("2024-01-01", periods=6, freq="B")
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {"Close": [100.0] * 6, "Volume": [1, 2, 3, 4, 5, 100]},
+            index=idx,
+        )
+    }
+
+    adv_all = compute_adv(market_data, ["ABC"], cfg=UltimateConfig(ADV_LOOKBACK=3))
+    adv_t3 = compute_adv(
+        market_data,
+        ["ABC"],
+        cfg=UltimateConfig(ADV_LOOKBACK=3),
+        target_date=idx[3].strftime("%Y-%m-%d"),
+    )
+
+    assert adv_all[0] == pytest.approx((4 + 5 + 100) / 3 * 100.0)
+    assert adv_t3[0] == pytest.approx((2 + 3 + 4) / 3 * 100.0)
+
+
+def test_generate_signals_knife_gate_uses_recent_vol_regime():
+    n = 300
+    stable = np.full(n, 0.002)
+    # high-vol ancient history, quiet recent regime
+    stable[:174] = np.where(np.arange(174) % 2 == 0, 0.03, -0.03)
+    stable[-20:] = np.log1p(-0.01)
+
+    crisis = np.full(n, 0.002)
+    # quiet ancient history, high-vol recent regime
+    crisis[-126:-20] = np.where(np.arange(106) % 2 == 0, 0.03, -0.03)
+    crisis[-20:] = np.log1p(-0.01)
+
+    log_rets = pd.DataFrame({"STABLE": stable, "CRISIS": crisis})
+    adv = np.array([1e9, 1e9], dtype=float)
+    cfg = UltimateConfig(HISTORY_GATE=20, MAX_POSITIONS=2, KNIFE_THRESHOLD=-0.15, KNIFE_WINDOW=20)
+
+    _, scores, _, _ = generate_signals(log_rets, adv, cfg)
+
+    assert not np.isfinite(scores[0]), "Low recent-vol symbol should be knife-gated."
+    assert np.isfinite(scores[1]), "High recent-vol symbol should survive a modest drop."
 def test_compute_adv_respects_configurable_lookback():
     idx = pd.date_range("2024-01-01", periods=5, freq="B")
     market_data = {

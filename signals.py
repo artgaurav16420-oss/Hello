@@ -209,7 +209,12 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
         return 0.0
 
 
-def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['UltimateConfig'] = None) -> np.ndarray:
+def compute_adv(
+    market_data: dict,
+    active_symbols: List[str],
+    cfg: Optional['UltimateConfig'] = None,
+    target_date: Optional[str] = None,
+) -> np.ndarray:
     """
     Compute Average Daily Notional Volume for every symbol in a single
     vectorized pass.
@@ -227,6 +232,8 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
 
     Symbols absent from market_data receive a value of 0.0.
     Lookback defaults to 20 days when cfg is not supplied.
+    When target_date is supplied, ADV is computed using rows up to and
+    including that date.
     """
     from momentum_engine import to_ns
 
@@ -241,6 +248,11 @@ def compute_adv(market_data: dict, active_symbols: List[str], cfg: Optional['Ult
         return np.zeros(len(active_symbols), dtype=float)
 
     notional_df = pd.DataFrame(notional_cols)
+    if target_date is not None:
+        notional_df = notional_df.loc[:target_date]
+
+    if notional_df.empty:
+        return np.zeros(len(active_symbols), dtype=float)
     adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
     min_periods = max(1, adv_lookback // 2)
 
@@ -374,7 +386,8 @@ def generate_signals(
         # log_rets.std() therefore contains no look-ahead. We document this
         # invariant explicitly so future callers do not accidentally pass an
         # unsliced DataFrame.
-        _signal_date_vols = log_rets.std()  # strictly signal-date-bounded per caller contract
+        recent_lookback = min(len(log_rets), 126)
+        _signal_date_vols = log_rets.iloc[-recent_lookback:].std()
         _full_daily_vols = _signal_date_vols.values
 
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
@@ -387,22 +400,13 @@ def generate_signals(
             if cumulative_ret < vol_adj_threshold:
                 adj_scores[i] = -np.inf
 
-    # 3. FIX: Dispersion-Normalized Continuity Bonus
-    # Standardizing the bonus against the current cross-sectional dispersion
-    # ensures it isn't over-dominant in tight low-vol markets or invisible in wide high-vol ones.
+    # 3. Continuity Bonus
+    # Apply directly in Z-score units; scores are already cross-sectionally normalized.
     valid_mask = np.isfinite(adj_scores)
     
     if prev_weights and valid_mask.any():
-        # Guard: nanstd on a single-element array returns NaN (0/0 in ddof=1 mode),
-        # which would poison base_bonus.  Default strictly to the floor when fewer
-        # than 2 finite scores are available (e.g. extreme crash states where all but
-        # one asset is gated out).
-        if valid_mask.sum() >= 2:
-            current_dispersion = max(np.nanstd(adj_scores[valid_mask]), cfg.CONTINUITY_DISPERSION_FLOOR)
-        else:
-            current_dispersion = cfg.CONTINUITY_DISPERSION_FLOOR
         cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
-        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * current_dispersion
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap)
 
         activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
         stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)
