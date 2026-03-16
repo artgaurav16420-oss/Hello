@@ -666,8 +666,9 @@ def execute_rebalance(
             w = 0.0
         price = max(float(local_prices[i]), 1e-6)
         
-        # Sizing intent bounded precisely by T-1 values (pv_t1)
-        s = int(np.floor(w * pv_t1 / price)) if w > 0.001 else 0
+        # Size strictly against executable T+0 portfolio value to avoid oversizing
+        # into gap-down opens that can force negative cash and phantom P&L.
+        s = int(np.floor(w * pv_exec / price)) if w > 0.001 else 0
         
         # 4. LIQUIDITY CONSTRAINT ENFORCEMENT: Enforce strict ADV limit
         if adv_shares is not None and i < len(adv_shares):
@@ -695,7 +696,7 @@ def execute_rebalance(
     # after their cap is hit.  Passes repeat until residual is exhausted or no uncapped
     # assets remain.  Convergence is guaranteed: each pass either exhausts residual or
     # removes at least one asset from eligible.
-    residual_cash = max(0.0, min(pv_t1, pv_exec) - base_notional)
+    residual_cash = max(0.0, pv_exec - base_notional)
 
     if valid_targets and residual_cash > 0:
         eligible = {
@@ -727,7 +728,7 @@ def execute_rebalance(
                         to_remove.append(sym)
                     continue
 
-                headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_t1 - desired_shares[sym] * price
+                headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_exec - desired_shares[sym] * price
                 max_extra_weight  = max(0, int(headroom_notional // price))
 
                 max_extra_adv = extra  # no ADV cap by default
