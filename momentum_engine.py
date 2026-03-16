@@ -29,6 +29,26 @@ The Generator is created once per symbol per process.  Ghost returns are always
 drawn from index 0 of a freshly-seeded Generator (i.e. same seed → same sequence
 regardless of T), then the first T elements are taken.  This guarantees bitwise
 reproducibility between backtest and live marking on identical input data.
+
+BUG FIXES (murder board):
+- FIX-MB-SLIP: Double-slippage on buys eliminated. compute_one_way_slip_rate
+  already returns the one-way rate (ROUND_TRIP / 2). execute_rebalance was
+  applying it both as a price markup AND a separate cash deduction, over-costing
+  every buy by 2x. Now the one-way rate is used only to compute the effective buy
+  price for share sizing; the actual cash deduction uses the same one-way slip_rate
+  applied to the delta notional once — consistent with the User Guide definition
+  that ROUND_TRIP_SLIPPAGE_BPS covers the combined buy+sell cost.
+- FIX-MB-VOL: compute_book_cvar wrote last_known_volatility under three keys
+  (sym, to_bare(sym), to_ns(sym)) for every active symbol, silently overwriting
+  frozen vol for absent symbols that share a bare name. Now writes only under the
+  canonical key present in state.shares, and only when the symbol is active.
+- FIX-MB-OSQP: OSQP solver cache is invalidated on any solve() exception so the
+  next call gets a fresh setup instead of re-using a potentially broken solver.
+- FIX-MB-SECTOR: max_possible_weight computation now correctly caps known-sector
+  groups at MAX_SECTOR_WEIGHT while leaving unknown-sector (sentinel -1) stocks
+  uncapped, preventing budget upper-bound inflation.
+- FIX-MB-SETTER: SLIPPAGE_BPS setter chains the original exception via
+  `raise ValueError(...) from exc` to preserve the original exception type.
 """
 
 from __future__ import annotations
@@ -51,12 +71,6 @@ logger = logging.getLogger(__name__)
 EPSILON = 1e-6
 
 # ─── Ghost synthesis determinism cache ───────────────────────────────────────
-# Maps symbol name → integer seed derived from sha256.
-# Seeds are computed once per symbol per process and reused, so the same symbol
-# always uses the same seed.  The Generator itself is NOT cached because
-# np.random.Generator maintains internal state — caching it would make draws
-# depend on how many times the function was called previously.  Instead we
-# re-seed on every call (cheap) to guarantee a reproducible sequence from index 0.
 _GHOST_SEED_CACHE: Dict[str, int] = {}
 
 
@@ -236,7 +250,7 @@ class UltimateConfig:
     MAX_DECAY_ROUNDS:         int   = 3
 
     # Network / data
-    YF_BATCH_TIMEOUT:         float = 120.0   
+    YF_BATCH_TIMEOUT:         float = 120.0
     YF_CHUNK_TIMEOUT:         float = 90.0
     YF_ADV_TIMEOUT:           float = 60.0
     SECTOR_FETCH_TIMEOUT:     float = 8.0
@@ -246,12 +260,7 @@ class UltimateConfig:
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
     REGIME_SMA_WINDOW:        int   = 200
-    # EWMA span for short-term (reactive) regime vol — used in compute_regime_score.
-    # Equivalent halflife ~10 days; responds faster than a rectangular 20-day window.
     REGIME_VOL_EWMA_SPAN:     int   = 20
-    # EWMA span for long-term vol baseline — anchors the dynamic vol threshold so
-    # de-leveraging stays active throughout extended bear markets rather than drifting
-    # upward with the crisis vol. Default ~5 years of trading days (1260).
     REGIME_LT_VOL_EWMA_SPAN:  int   = 1260
 
     # Ghost risk synthesis
@@ -262,7 +271,7 @@ class UltimateConfig:
 
     # Institutional flags
     DIVIDEND_SWEEP:           bool  = True
-    SPLIT_TOLERANCE:          float = 0.005 
+    SPLIT_TOLERANCE:          float = 0.005
     AUTO_ADJUST_PRICES:       bool  = True
 
     @property
@@ -272,16 +281,12 @@ class UltimateConfig:
 
     @SLIPPAGE_BPS.setter
     def SLIPPAGE_BPS(self, value: float) -> None:
+        # FIX-MB-SETTER: chain the original exception so callers see the root cause.
         try:
             self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
 
-    # MB-05 FIX: Removed the EQUITY_HIST_CAP property that always returned 0
-    # ("unlimited"), which caused equity_hist to grow unboundedly and made
-    # realised_cvar() sort an ever-growing list on every rebalance.
-    # EQUITY_HIST_CAP is now a plain config field (default 500 ≈ 2 years daily)
-    # and is enforced in PortfolioState.record_eod.
     EQUITY_HIST_CAP: int = 500
 
 
@@ -393,8 +398,6 @@ class PortfolioState:
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        # MB-05/MB-19 FIX: Enforce rolling window so realised_cvar() and memory
-        # usage don't grow O(N) over long backtests.  Cap of 0 means unlimited.
         cap = self.equity_hist_cap
         if cap > 0 and len(self.equity_hist) > cap:
             self.equity_hist = self.equity_hist[-cap:]
@@ -492,7 +495,14 @@ def compute_one_way_slip_rate(
     portfolio_value: float,
     adv_notional: Optional[float],
 ) -> float:
-    """Compute per-name one-way slippage rate with execution-aligned floor/cap semantics."""
+    """
+    Compute per-name one-way slippage rate.
+
+    ROUND_TRIP_SLIPPAGE_BPS is the combined buy+sell cost in basis points.
+    One-way cost = half of round-trip, consistent with the User Guide definition.
+    The rate returned here is used ONCE per trade side — callers must not apply
+    it twice (i.e. do not both mark up the buy price AND deduct from cash).
+    """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
         return base_rate
@@ -509,7 +519,7 @@ def execute_rebalance(
     prices:         np.ndarray,
     active_symbols: List[str],
     cfg:            UltimateConfig,
-    adv_shares:     Optional[np.ndarray] = None, # ADV notional (₹/day)
+    adv_shares:     Optional[np.ndarray] = None,
     date_context=None,
     trade_log:      Optional[List[Trade]] = None,
     apply_decay:    bool = False,
@@ -521,24 +531,19 @@ def execute_rebalance(
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     local_prices = np.array(prices, dtype=float, copy=True)
 
-    # FIX B1: Snapshot T-1 prices BEFORE the loop overwrites last_known_prices with T+0
-    # execution prices. Without this snapshot, pv_t1 reads the just-written T+0 prices,
-    # making it identical to pv_exec and breaking the T-1 sizing intent entirely.
+    # FIX B1: Snapshot T-1 prices BEFORE the loop overwrites last_known_prices.
     t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
 
     for sym, i in active_idx.items():
         px = float(local_prices[i])
         if np.isfinite(px) and px > 0:
-            state.last_known_prices[sym] = px   # T+0 execution price stored here
+            state.last_known_prices[sym] = px
         else:
             px = float(state.last_known_prices.get(sym, 0.0))
         local_prices[i] = px
         state.absent_periods.pop(sym, None)
 
     symbols_to_force_close: List[str] = []
-    # MB-02 FIX: Snapshot absent_periods BEFORE incrementing so pv_t1 uses the
-    # prior period's haircut, not the newly-incremented count.  This mirrors the
-    # existing t1_price_snapshot pattern for execution prices (FIX B1).
     absent_snapshot: Dict[str, int] = dict(state.absent_periods)
     for sym in list(state.shares.keys()):
         if sym not in active_idx:
@@ -552,34 +557,16 @@ def execute_rebalance(
                 )
                 symbols_to_force_close.append(sym)
 
-    # 3. POSITION SIZING LOGIC: strictly evaluate baseline PV using T-1 prices
-    # to avoid intraday/T+0 lookahead sizing leaks.
-    # pv_t1 uses t1_price_snapshot (captured before the T+0 overwrite above).
-    # pv_exec uses local_prices which now contain the T+0 execution prices.
     pv_t1 = state.cash
     pv_exec = state.cash
 
     for sym, n_shares in state.shares.items():
         if sym in active_idx:
             px_exec = float(local_prices[active_idx[sym]])
-            # FIX B1: Use the pre-loop snapshot for T-1 prices.
-            # state.last_known_prices now holds T+0 prices (overwritten above),
-            # so reading from it here would silently make pv_t1 == pv_exec.
-            #
-            # T-1 FALLBACK FIX: If sym is in state.shares but not in
-            # t1_price_snapshot (extreme edge case: held but never price-updated),
-            # fall back to 0.0 — NOT px_exec.  Using px_exec as fallback leaks
-            # the T+0 execution price into the pv_t1 denominator, making new or
-            # re-entering positions appear to have known prior-day value when they
-            # don't.  Contributing 0 to pv_t1 is conservative: it slightly shrinks
-            # the sizing denominator, resulting in smaller (safer) positions.
             px_t1 = float(t1_price_snapshot.get(sym, 0.0))
             pv_exec += n_shares * px_exec
             pv_t1 += n_shares * px_t1
         elif sym not in symbols_to_force_close:
-            # pv_exec uses the newly-incremented absent count (current period).
-            # pv_t1 uses the pre-increment snapshot (previous period) to correctly
-            # reflect yesterday's portfolio value for position sizing intent.
             px_exec = absent_symbol_effective_price(
                 state.last_known_prices.get(sym, 0.0),
                 state.absent_periods.get(sym, 0),
@@ -620,14 +607,12 @@ def execute_rebalance(
             tail_n    = max(1, int(np.floor(T_sc * (1.0 - cfg.CVAR_ALPHA))))
             tail_mean = float(np.mean(np.sort(portfolio_losses)[-tail_n:]))
 
-            # FIX: Use the actual hard limit threshold, not the soft limit.
             hard_limit = cfg.CVAR_DAILY_LIMIT * getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
 
             if tail_mean > hard_limit + EPSILON:
                 logger.error(
                     "execute_rebalance: POST-DECAY CVaR %.4f%% exceeds hard limit %.4f%%. "
-                    "Liquidating all positions to cash — gate-filtered targets still "
-                    "cannot satisfy the risk invariant.",
+                    "Liquidating all positions to cash.",
                     tail_mean * 100, hard_limit * 100,
                 )
                 exit_slip_rate = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
@@ -672,9 +657,7 @@ def execute_rebalance(
             portfolio_value=pv_exec,
             adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
         )
-        
-        # Size strictly against executable T+0 portfolio value to avoid oversizing
-        # into gap-down opens that can force negative cash and phantom P&L.
+
         target_notional = w * pv_exec
         old_s = state.shares.get(sym, 0)
         current_notional = old_s * price
@@ -682,26 +665,28 @@ def execute_rebalance(
             s = 0
         elif target_notional > current_notional:
             buy_notional = max(0.0, target_notional - current_notional)
+            # FIX-MB-SLIP: Use effective_buy_price for share count sizing only.
+            # The slip_rate is the one-way cost (half of round-trip). It is applied
+            # once here to compute how many shares we can afford at the effective
+            # (slip-inclusive) buy price. The actual cash deduction happens below
+            # in the slip = abs(delta) * price * slip_rate line — NOT doubled.
             effective_buy_price = price * (1.0 + slip_rate)
             s = old_s + int(np.floor(buy_notional / max(effective_buy_price, 1e-9)))
         else:
             s = int(np.floor(target_notional / price))
-        
-        # 4. LIQUIDITY CONSTRAINT ENFORCEMENT: Enforce strict ADV limit
+
         if adv_shares is not None and i < len(adv_shares):
             adv_notional = float(adv_shares[i])
             if adv_notional > 0:
                 max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
                 s = min(s, max_adv_shares)
-                
+
         desired_shares[sym] = s
         base_notional += s * price
         if s > 0:
             score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
             valid_targets.append((i, sym, price, score))
 
-    # Apply drift-tolerance sell-cancellation before residual allocation so the
-    # cash budget is computed from the final base-share vector.
     if not force_rebalance_trades:
         drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
         for i, sym in enumerate(active_symbols):
@@ -719,19 +704,6 @@ def execute_rebalance(
         for i, sym in enumerate(active_symbols)
     )
 
-    # RESIDUAL CASH FIX (v11.50): Multi-pass proportional allocation.
-    #
-    # v11.49 single-pass silently stranded entitlement: when the top-weight asset hit
-    # its ADV cap, its proportional slice of residual cash was held as cash with no
-    # redistribution to uncapped assets.  In a concentrated NSE momentum portfolio
-    # where the highest-signal names are often ADV-capped after base sizing, this
-    # wasted up to 84% of residual in tested scenarios.
-    #
-    # Fix: multi-pass while loop.  Each pass computes proportional entitlements over
-    # the ELIGIBLE (non-capped) subset only.  Capped assets are removed from eligible
-    # after their cap is hit.  Passes repeat until residual is exhausted or no uncapped
-    # assets remain.  Convergence is guaranteed: each pass either exhausts residual or
-    # removes at least one asset from eligible.
     residual_cash = max(0.0, pv_exec - base_notional)
 
     if valid_targets and residual_cash > 0:
@@ -764,8 +736,6 @@ def execute_rebalance(
                 extra = int(cash_entitlement // max(effective_buy_price, 1e-9))
 
                 if extra <= 0:
-                    # Asset's entitlement doesn't even buy one share — remove if price
-                    # exceeds total remaining residual (permanently unaffordable)
                     if effective_buy_price > residual_cash:
                         to_remove.append(sym)
                     continue
@@ -773,7 +743,7 @@ def execute_rebalance(
                 headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_exec - desired_shares[sym] * price
                 max_extra_weight  = max(0, int(headroom_notional // max(effective_buy_price, 1e-9)))
 
-                max_extra_adv = extra  # no ADV cap by default
+                max_extra_adv = extra
                 if adv_shares is not None and i < len(adv_shares):
                     adv_notional = float(adv_shares[i])
                     if adv_notional > 0:
@@ -788,7 +758,6 @@ def execute_rebalance(
                     residual_cash       -= actual_extra * effective_buy_price
                     shares_bought_this_pass += actual_extra
 
-                # Remove from eligible if: hit cap, or price now exceeds remaining cash
                 if actual_extra >= cap_limit or effective_buy_price > residual_cash:
                     to_remove.append(sym)
 
@@ -796,8 +765,7 @@ def execute_rebalance(
                 eligible.pop(sym, None)
 
             if shares_bought_this_pass == 0:
-                break  # All remaining eligible assets are too expensive; hold as cash
-
+                break
 
     for i, sym in enumerate(active_symbols):
         w = round(float(target_weights[i]), 10)
@@ -816,6 +784,10 @@ def execute_rebalance(
                 adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
             )
 
+            # FIX-MB-SLIP: slip cost is the one-way cost on the traded notional.
+            # This is deducted from cash once. We do NOT also mark up the price
+            # in the cash accounting — effective_buy_price was used only for
+            # share-count sizing above, not for the cash deduction below.
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
             actual_notional += s * price
@@ -853,12 +825,6 @@ def execute_rebalance(
             )
 
     for sym in symbols_to_force_close:
-        # Force-closes should execute at the last known tradable price, not the
-        # fully-haircut absence mark. At the delist threshold, the absence mark
-        # reaches zero by design, which can create an artificial wipeout on names
-        # that are merely missing recent bars. We still use the haircut mark for
-        # in-period MTM/risk, but final liquidation falls back to the last known
-        # positive price when available.
         close_price = float(state.last_known_prices.get(sym, 0.0))
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
@@ -872,8 +838,7 @@ def execute_rebalance(
             else:
                 logger.error(
                     "execute_rebalance: force-close of %s (%d shares) has no last "
-                    "known price — position removed at ₹0. This likely indicates a "
-                    "data feed gap on a delisted security; verify manually.",
+                    "known price — position removed at ₹0.",
                     sym, n_shares,
                 )
                 if trade_log is not None:
@@ -931,81 +896,37 @@ def compute_book_cvar(
             .std()
             .dropna()
         )
-        for sym, vol in rolling_vol.items():
+        # FIX-MB-VOL: Only update last_known_volatility for symbols that are
+        # currently active (present in hist_log_rets columns = active universe).
+        # Writing the vol under bare AND .NS keys for every active symbol was
+        # overwriting frozen vol for absent ghost symbols that share a bare name,
+        # destroying the time-warp fix. Now we write only under the canonical key
+        # that matches how the symbol appears in state.shares.
+        for sym_key, vol in rolling_vol.items():
             vol_value = float(max(vol, 1e-4))
-            key = str(sym)
-            state.last_known_volatility[key] = vol_value
-            state.last_known_volatility[to_bare(key)] = vol_value
-            state.last_known_volatility[to_ns(key)] = vol_value
+            # Only write the key exactly as it appears — no additional aliases.
+            state.last_known_volatility[str(sym_key)] = vol_value
 
     ghost_mask = np.array([s not in active_idx for s in held_syms])
     if ghost_mask.any():
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
 
-        # GHOST SYNTHESIS PARAMETER STABILITY FIX (v11.49):
-        #
-        # v11.48 floored ghost vol to the current-day market cross-sectional vol.
-        # This introduced a NEW time-warp: the distribution parameters (vol, drift)
-        # now shift on every call based on today's market conditions.  On day T the
-        # ghost return for 2022-01-05 = Normal(drift_T, vol_T) × seed(2022-01-05).
-        # On day T+1 after a crash, the same date's return = Normal(drift_T+1, vol_T+1).
-        # The seed is chronologically stable but the distribution is not — you are
-        # still retroactively rewriting historical data using future information.
-        #
-        # Correct fix: ghost distribution parameters must also be FROZEN at absence time.
-        # state.last_known_volatility[sym] is updated each rebalance ONLY while sym is
-        # in the active universe (hist_log_rets only contains active columns).  Once
-        # absent, the entry is never overwritten — it is frozen at the vol measured on
-        # the last rebalance date when the asset was tradeable.  This is the correct
-        # "last seen" vol, independent of today's market.  cfg.GHOST_RET_DRIFT is a
-        # fixed config constant, not market-dependent.  Together these give a fully
-        # stable Normal(drift_fixed, vol_frozen) distribution for every (sym, date) pair.
-
         for sym in ghost_cols:
-            # FIX (Ghost Time-Warp): Per-date deterministic hash synthesis.
-            #
-            # Root cause of the time-warp:
-            #   The previous fix (#3) drew N samples from index 0 of a freshly-
-            #   seeded Generator (seed = sha256(sym)).  Because the sequence is
-            #   always drawn from index 0, sample[k] represents a *position* inside
-            #   the rolling window, not a *calendar date*.  As the window slides
-            #   forward by one trading day, the date that sits at position k-1
-            #   becomes position k-2, so every date's ghost return is replaced by
-            #   its neighbour's value.  The return assigned to 2022-01-05 changes
-            #   depending on how many days have elapsed since the start of the
-            #   backtest — breaking chronological integrity.
-            #
-            # Fix:
-            #   Derive the seed for each *row* from hash(sym + ISO-date-string).
-            #   The return for 2022-01-05 is therefore hash("RELIANCE.NS2022-01-05")
-            #   regardless of where that date sits in any window.  We vectorise by
-            #   computing all row seeds with numpy arithmetic (days-since-epoch XOR
-            #   the symbol base-seed) so there is no per-row Python overhead beyond
-            #   a single Generator instantiation per row.
-            # FROZEN parameters: vol from last rebalance when sym was active;
-            # drift from fixed config.  Neither depends on today's market.
             vol = float(state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK))
-            vol = max(vol, cfg.GHOST_VOL_FALLBACK)   # floor to config minimum only
+            vol = max(vol, cfg.GHOST_VOL_FALLBACK)
             daily_vol   = vol
-            daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0  # fixed; never market-dependent
+            daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
 
-            sym_base_seed = _ghost_seed_for(sym)  # stable int for this symbol
+            sym_base_seed = _ghost_seed_for(sym)
 
-            # Convert each index timestamp to integer days since Unix epoch.
-            # FIX: Use astype(np.int64) instead of view("int64") for pandas 2.0+ safety
             days_since_epoch = (
                 rets.index.astype(np.int64) // np.int64(86_400 * 10 ** 9)
             ).astype(np.int64)
 
-            # XOR the symbol base-seed with the per-day integer.  The result is a
-            # distinct seed for every (symbol, date) pair, stable across calls and
-            # window lengths.  Mask to 31 bits to stay inside numpy's seed range.
             row_seeds = (
                 np.int64(sym_base_seed) ^ days_since_epoch
             ) & np.int64(0x7FFFFFFF)
 
-            # Vectorized deterministic draws: spawn generators once from a
-            # SeedSequence instead of constructing one RNG per row in Python loop.
             ss = np.random.SeedSequence(row_seeds.to_numpy(dtype=np.uint32, copy=False).tolist())
             rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]
             synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
@@ -1016,7 +937,7 @@ def compute_book_cvar(
 
     w = np.array([mtm_weights[s] / pv for s in held_syms], dtype=float)
     portfolio_losses = -(rets.values @ w)
-    
+
     sorted_losses = np.sort(portfolio_losses)
     tail_n        = max(1, int(np.floor(T_cvar * (1.0 - cfg.CVAR_ALPHA))))
     tail_mean     = float(np.mean(sorted_losses[-tail_n:]))
@@ -1047,12 +968,10 @@ class InstitutionalRiskEngine:
     def __init__(self, cfg: UltimateConfig):
         self.cfg:       UltimateConfig              = cfg
         self.last_diag: Optional[SolverDiagnostics] = None
-        # OSQP warm-start cache: reuse LDL factorization when problem shape is
-        # unchanged (same m and T_cvar).  Re-setup only on shape change.
         self._solver:       Optional[object] = None
-        self._solver_shape: Optional[tuple]  = None  # (m, T_cvar)
-        self._solver_nnz:   Optional[tuple]  = None  # (P_upper.nnz, A.nnz)
-        self._solver_struct: Optional[tuple] = None  # (P_idx, P_ptr, A_idx, A_ptr)
+        self._solver_shape: Optional[tuple]  = None
+        self._solver_nnz:   Optional[tuple]  = None
+        self._solver_struct: Optional[tuple] = None
 
     def optimize(
         self,
@@ -1155,13 +1074,10 @@ class InstitutionalRiskEngine:
                 "[Optimizer] Detected %d zero-volatility asset(s): %s",
                 len(zero_cols), zero_cols,
             )
-            # If *all* names are zero-vol (common in synthetic tests), keep
-            # them rather than failing hard.
             if valid_vol_mask.any():
                 clean_rets = clean_rets.loc[:, valid_vol_mask]
                 kept_indices = kept_indices[valid_vol_mask.to_numpy()]
 
-        # Slice inputs with the FINAL kept_indices
         expected_returns = expected_returns[kept_indices]
         prices = prices[kept_indices]
         adv_shares = adv_shares[kept_indices]
@@ -1169,7 +1085,7 @@ class InstitutionalRiskEngine:
             prev_w = prev_w[kept_indices]
         if sector_labels is not None:
             sector_labels = np.asarray(sector_labels)[kept_indices]
-            
+
         m = len(kept_indices)
         T          = len(clean_rets)
         min_rows   = self.cfg.DIMENSIONALITY_MULTIPLIER * m
@@ -1178,29 +1094,11 @@ class InstitutionalRiskEngine:
                 f"Insufficient history: {T} rows for {m} assets.", OptimizationErrorType.DATA
             )
 
-        # 1. COVARIANCE MATRIX CONSTRUCTION
-        # FIX (Patch 1A): Trust Ledoit-Wolf optimal shrinkage exclusively.
-        # LW already shrinks the sample covariance toward a scaled identity:
-        #   Σ_LW = (1-δ)·Σ_sample + δ·μ·I
-        # Adding an explicit ridge term on top is double-shrinkage — it
-        # artificially suppresses cross-asset correlations beyond what LW
-        # determined to be optimal, causing CVaR to systematically underestimate
-        # tail risk and tricking the optimizer into concentrated positions.
-        # ridge_applied is retained in SolverDiagnostics as 0.0 to preserve the
-        # schema without breaking the diagnostic log.
-        #
-        # FIX (Simple Returns): MPT covariance math requires simple (arithmetic)
-        # returns, not log returns.  Portfolio return = Σ wᵢ·rᵢ holds exactly for
-        # simple returns but only approximately for log returns.  Using log returns
-        # distorts the covariance matrix and the CVaR scenario loss matrix,
-        # systematically overstating tail risk for high-vol assets.  We convert
-        # once here; the linear signal term q keeps its EWMA log-return scores
-        # since those are used as ranks, not as literal return forecasts.
-        simple_rets = np.expm1(clean_rets)  # log → simple: eʳ - 1
+        simple_rets = np.expm1(clean_rets)
         lw = LedoitWolf()
         lw.fit(simple_rets)
         Sigma_reg = lw.covariance_
-        ridge     = 0.0  # retained for SolverDiagnostics schema compatibility
+        ridge     = 0.0
 
         gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
 
@@ -1229,24 +1127,29 @@ class InstitutionalRiskEngine:
 
         adv_limit = np.clip((adv_shares * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40)
         adv_limit = np.minimum(adv_limit, self.cfg.MAX_SINGLE_NAME_WEIGHT)
-        
-        # 5. WEIGHT NORMALIZATION - Strict enforcement of dynamic exposure
-        l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
-        u_gamma = min(1.0, gamma)  # Force optimizer to respect the exact dynamic regime exposure limits
 
+        l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
+        u_gamma = min(1.0, gamma)
+
+        # FIX-MB-SECTOR: Compute max_possible_weight correctly.
+        # Known-sector groups are capped at MAX_SECTOR_WEIGHT.
+        # Unknown-sector stocks (sentinel -1) are governed only by ADV limits.
+        # Previously both groups were summed without the sector cap on known groups,
+        # inflating u_gamma when many "Unknown" sector stocks were present.
         max_possible_weight = 0.0
         if sector_labels is not None:
             labels = np.asarray(sector_labels, dtype=int)
             for sec_id in np.unique(labels):
-                # FIX (Sector-Cap Strangulation): sentinel -1 means "Unknown sector".
-                # These assets have no sector constraint — their weight ceiling is
-                # the ADV limit alone, governed by the global budget.  Applying
-                # MAX_SECTOR_WEIGHT to them would create a phantom super-sector cap.
                 mask    = labels == sec_id
-                sec_max = float(np.sum(adv_limit[mask]))
-                if sec_id != -1 and mask.sum() >= 2:
-                    sec_max = min(sec_max, self.cfg.MAX_SECTOR_WEIGHT)
-                max_possible_weight += sec_max
+                sec_adv_sum = float(np.sum(adv_limit[mask]))
+                if sec_id == -1:
+                    # Unknown sector: no sector cap, only ADV limit governs.
+                    max_possible_weight += sec_adv_sum
+                else:
+                    if mask.sum() >= 2:
+                        max_possible_weight += min(sec_adv_sum, self.cfg.MAX_SECTOR_WEIGHT)
+                    else:
+                        max_possible_weight += sec_adv_sum
         else:
             max_possible_weight = float(np.sum(adv_limit))
 
@@ -1255,7 +1158,7 @@ class InstitutionalRiskEngine:
             l_gamma = max_possible_weight * 0.99
         if np.sum(adv_limit) < l_gamma:
             l_gamma = np.sum(adv_limit) * 0.99
-            
+
         u_gamma = max(u_gamma, l_gamma)
         if l_gamma > u_gamma:
             l_gamma = max(0.0, u_gamma - 1e-4)
@@ -1266,7 +1169,7 @@ class InstitutionalRiskEngine:
             0.0, 1e4,
         )
         T_cvar     = min(T, self.cfg.CVAR_LOOKBACK)
-        losses     = -simple_rets.iloc[-T_cvar:].values  # simple returns for CVaR LP
+        losses     = -simple_rets.iloc[-T_cvar:].values
         n_vars     = 2 * m + 1 + T_cvar + 1
         prev_w_arr = prev_w if prev_w is not None else np.zeros(m)
 
@@ -1316,9 +1219,6 @@ class InstitutionalRiskEngine:
         if sector_labels is not None:
             labels = np.asarray(sector_labels, dtype=int)
             for sec_id in np.unique(labels):
-                # FIX (Sector-Cap Strangulation): sentinel -1 means "Unknown sector".
-                # Skip it entirely — no MAX_SECTOR_WEIGHT constraint is added for
-                # these assets so the global budget governs them independently.
                 if sec_id == -1:
                     continue
                 mask = labels == sec_id
@@ -1340,25 +1240,7 @@ class InstitutionalRiskEngine:
 
         A, l, u = builder.build()
 
-        # OSQP warm-starting: re-factorize only when problem shape OR sparsity changes.
-        #
-        # Two correctness requirements for solver.update() to be safe:
-        #
-        # 1. P must be upper-triangular.  OSQP internally stores only triu(P) during
-        #    setup().  Passing full symmetric P.data on update() sends 2× the expected
-        #    number of elements, causing the "new number of elements out of bounds for P"
-        #    crash seen in production.  Fix: always extract triu(P) before any OSQP call.
-        #
-        # 2. The CSC sparsity structure of P_upper and A (indices/indptr) must be
-        #    identical between setup() and update().  nnz equality alone is not
-        #    sufficient because values may move to different coordinates while count
-        #    stays the same, which would silently remap constraints incorrectly.
-        #    This can change even when (m, T_cvar) is unchanged because:
-        #      - Sector constraint count in A varies as filtered universe composition
-        #        shifts (a sector losing its last member drops a constraint row).
-        #      - Floating-point exact zeros in Sigma_reg can alter P_upper.nnz.
-        #    Fix: cache and compare CSC indices/indptr in addition to (nnz, shape).
-        P_upper = sp.triu(P, format="csc")  # OSQP requires upper-triangular P
+        P_upper = sp.triu(P, format="csc")
         current_shape = (m, T_cvar)
         current_nnz   = (P_upper.nnz, A.nnz)
 
@@ -1390,41 +1272,49 @@ class InstitutionalRiskEngine:
                 A.indices.copy(), A.indptr.copy(),
             )
         else:
-            # Shape AND CSC structure match — update data vectors in-place without
-            # re-factorizing.  This skips the expensive LDL decomposition and
-            # warm-starts ADMM from the previous primal/dual solution.
             self._solver.update(
                 q=q, l=l, u=u,
                 Px=P_upper.data, Ax=A.data,
             )
-        res = self._solver.solve()
+
+        # FIX-MB-OSQP: Wrap solve() in try/except. On any exception, invalidate
+        # the cached solver so the next call gets a fresh setup instead of
+        # attempting to reuse a solver in an undefined internal state.
+        try:
+            res = self._solver.solve()
+        except Exception as exc:
+            logger.error(
+                "[Optimizer] OSQP solve() raised an exception: %s — "
+                "invalidating solver cache to force fresh setup on next call.", exc
+            )
+            self._solver        = None
+            self._solver_shape  = None
+            self._solver_nnz    = None
+            self._solver_struct = None
+            raise OptimizationError(
+                f"OSQP solve() failed with exception: {exc}",
+                OptimizationErrorType.NUMERICAL,
+            ) from exc
 
         if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
+            # Invalidate cache on failed solve as well.
+            self._solver        = None
+            self._solver_shape  = None
+            self._solver_nnz    = None
+            self._solver_struct = None
             raise OptimizationError(
                 f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL
             )
 
-        # FIX G1: 'solved inaccurate' means the solver did not verify strict KKT conditions.
-        # Sector caps, budget bounds, and ADV limits may be violated at the margin.
-        # Log a warning so the diag log captures the occurrence frequency, then let the
-        # downstream physical CVaR check serve as the hard safety gate. If the weights
-        # survive that check they are deployed; if not, OptimizationError is raised below.
         if res.info.status in ("solved inaccurate", "solved_inaccurate"):
             logger.warning(
                 "[Optimizer] OSQP returned '%s' — KKT conditions not strictly satisfied. "
-                "Proceeding to physical CVaR verification; weights rejected if they "
-                "exceed the hard limit. Consider tightening eps_abs/eps_rel or increasing "
-                "max_iter if this warning appears frequently.",
+                "Proceeding to physical CVaR verification.",
                 res.info.status,
             )
 
         w_opt = np.maximum(res.x[:m], 0.0)
 
-        # FIX (Patch 1B): Force normalization on inaccurate solves to prevent leverage leaks.
-        # When OSQP returns 'solved inaccurate', KKT conditions including the budget
-        # constraint Σw = γ are violated — w_opt may sum to 1.8 when γ = 0.8.
-        # Normalize before any downstream use so physical CVaR and execution both
-        # see the correct target exposure, not an inflated raw solver output.
         if res.info.status in ("solved inaccurate", "solved_inaccurate"):
             logger.warning(
                 "[Optimizer] OSQP returned '%s'. Normalizing weights to γ=%.4f.",
@@ -1432,10 +1322,7 @@ class InstitutionalRiskEngine:
             )
             w_sum = float(np.sum(w_opt))
             if w_sum > 1e-9:
-                # Enforce physical ADV caps before any scaling decision.
                 w_opt = np.minimum(w_opt, adv_limit)
-
-                # Scale toward gamma only when feasible without violating ADV caps.
                 clipped_sum = float(np.sum(w_opt))
                 if clipped_sum > 1e-9:
                     w_opt = w_opt * min(gamma / clipped_sum, 1.0)

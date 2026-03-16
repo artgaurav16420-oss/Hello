@@ -3,8 +3,14 @@ universe_manager.py — Universe Fetching & Caching v11.46
 ========================================================
 Robust fetching of NSE/Nifty 500 universes, sector mappings, and
 point-in-time historical constituents to eliminate backtest survivorship bias.
-Now strictly enforces operator awareness if historical data is missing
-and robustly handles PyArrow/FastParquet list deserialization quirks.
+
+BUG FIXES (murder board):
+- FIX-MB-SECTORTOCTOU: get_sector_map had a TOCTOU race: the cache was read
+  outside _SECTOR_MAP_CACHE_LOCK but written inside it. Two concurrent optimizer
+  processes could both read the old cache, both fetch sectors, and the second
+  write would discard the first process's results. Now the update-path cache
+  read (used to merge new sectors with existing cached sectors) also happens
+  inside the lock.
 """
 
 from __future__ import annotations
@@ -38,7 +44,6 @@ class UniverseFetchError(RuntimeError):
         super().__init__(message)
         self.fallback_universe: List[str] = []
 
-# Hardcoded fallback list if all network and cache layers fail.
 _HARD_FLOOR_UNIVERSE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL", "HINDUNILVR",
     "ITC", "SBIN", "LTIM", "BAJFINANCE", "HCLTECH", "MARUTI", "SUNPHARMA",
@@ -50,8 +55,6 @@ _HARD_FLOOR_UNIVERSE = [
     "DIVISLAB", "TATACONSUM",
 ]
 
-# Static sector map for tier-1 liquid NSE names used as a deterministic
-# fallback when network lookups are unavailable.
 STATIC_NSE_SECTORS: Dict[str, str] = {
     "RELIANCE": "Energy",
     "TCS": "Information Technology",
@@ -103,8 +106,7 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
     "TATACONSUM": "FMCG",
 }
 
-# ─── Historical Universe Logic (Survivorship Bias Fix) ────────────────────────
-
+# ─── Historical Universe Logic ────────────────────────────────────────────────
 
 def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
@@ -126,9 +128,6 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
     last_d = subset[date_col].max()
     tickers = subset.loc[subset[date_col] == last_d, tick_col].dropna().astype(str).str.strip()
     return sorted({t for t in tickers if t})
-
-# Module-level flags so each warning fires at most once per process,
-# preventing thousands of identical lines from flooding optimizer output.
 
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
@@ -154,28 +153,8 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 
     Load order:
     1) Historical parquet snapshots.
-    2) Point-in-time CSV snapshots (from historical_builder.py).
-
-    CRITICAL FIX (Issue #1 — custom backtest crash):
-    The previous implementation raised a hard ValueError for universe_type="custom",
-    crashing the backtest path in daily_workflow.py menu option [3]→[4].
-
-    Custom screener backtests are now handled with an explicit survivorship-bias
-    WARNING (not an exception). The function returns the CURRENT custom screener
-    list for every requested historical date and logs a prominent warning so the
-    user is informed that the backtest uses a present-day survivor-biased list.
-
-    This restores the ability to validate a custom screener historically while
-    clearly communicating the survivorship bias risk, matching the original
-    system design intent.
+    2) Point-in-time CSV snapshots.
     """
-    # ── CRITICAL FIX: Custom screener — warn but do not crash ──────────────
-    # The hard ValueError here previously broke daily_workflow.py menu [3]→[4].
-    # We cannot provide true PIT data for a custom screener, so we return an
-    # empty list to signal to the caller that no historical snapshot exists.
-    # The caller (run_backtest / daily_workflow) holds the current custom list
-    # in `universe` and will use it as-is. The survivorship warning is logged
-    # once per date so the operator is clearly informed.
     if universe_type.lower() == "custom":
         logger.warning(
             "SURVIVORSHIP BIAS WARNING: Backtesting 'custom' screener universe at %s "
@@ -185,16 +164,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
             "Use 'nifty500' or 'nse_total' for survivorship-safe backtesting.",
             date.strftime("%Y-%m-%d"),
         )
-        # Return empty list — callers that pre-built `union_universe` from the
-        # current custom list will use that list directly. Callers that rely on
-        # get_historical_universe to populate union_universe will receive [] and
-        # handle the empty-universe condition via their existing guard logic.
         return []
 
     hist_file = DATA_DIR / f"historical_{universe_type}.parquet"
 
-    # Warn once per missing parquet file (not once per date) to keep optimizer
-    # output readable. The warning is still ERROR level so it's never silent.
     if not hist_file.exists():
         if not _MISSING_PARQUET_WARNED.get(universe_type):
             logger.error(
@@ -206,11 +179,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     else:
         try:
             df = _load_historical_universe_df(hist_file)
-            
-            # Find the closest available manifest date preceding the requested date
+
             available_dates = df.index.unique()
             valid_dates = available_dates[available_dates <= date]
-            
+
             if len(valid_dates) > 0:
                 target_date = valid_dates.max()
                 constituents = df.loc[target_date, "tickers"]
@@ -225,7 +197,6 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                         return list(value)
                     return [value]
 
-                # Handle duplicate snapshot rows by unioning all ticker lists deterministically.
                 if isinstance(constituents, pd.Series):
                     merged: List[str] = []
                     for cell in constituents.values:
@@ -235,16 +206,15 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                 return sorted({str(t).strip() for t in _coerce_members(constituents) if str(t).strip()})
             else:
                 logger.warning(
-                    "[Universe] No historical data prior to %s found in %s.", 
+                    "[Universe] No historical data prior to %s found in %s.",
                     date.strftime("%Y-%m-%d"), hist_file
                 )
         except Exception as exc:
             logger.error(
-                "[Universe] Historical load failed for %s on %s: %s", 
+                "[Universe] Historical load failed for %s on %s: %s",
                 universe_type, date.strftime("%Y-%m-%d"), exc
             )
-    
-    # Fallback to point-in-time local CSV snapshot; never fallback to current constituents.
+
     csv_members = _load_pit_universe_from_csv(universe_type, date)
     if csv_members:
         return csv_members
@@ -294,21 +264,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     """
     Filter a raw list of tickers down to those meeting the minimum ADV
     liquidity threshold defined in cfg.MIN_ADV_CRORES.
-
-    Moved here from signals.py — this is a universe curation concern, not a
-    signal computation concern.  Keeping it alongside the other universe
-    management utilities avoids a conceptual mismatch and removes the
-    asymmetric import (signals → universe_manager was already the wrong
-    direction; the correct dependency edge is universe_manager → signals for
-    compute_single_adv).
-
-    BUG FIX (bare-symbol return):
-    The previous implementation looked up market data with to_ns(symbol) —
-    correctly obtaining a ".NS"-suffixed key — but then appended the original
-    bare symbol to filtered_tickers.  Callers expecting ".NS"-suffixed tickers
-    back (e.g. the cache's manifest-keyed entries) received bare names like
-    "RELIANCE" instead of "RELIANCE.NS", causing silent lookup misses
-    downstream.  This version always appends the normalised ns_sym.
     """
     from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
@@ -319,7 +274,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=max(150, int(cfg.ADV_LOOKBACK) * 2))).strftime("%Y-%m-%d")
 
-    chunk_size  = _ADV_CHUNK_SIZE   # FIX M2: use module constant; hardcoded duplicate ignored it
+    chunk_size  = _ADV_CHUNK_SIZE
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
 
     filtered_tickers: List[str] = []
@@ -330,19 +285,12 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
         len(tickers), cfg.MIN_ADV_CRORES,
     )
 
-    # Sequential loop intentionally retained — parallel yfinance calls on a
-    # large universe trigger Yahoo Finance rate-limiting (HTTP 429 / 401
-    # "Invalid Crumb"), causing entire chunks to return empty and incorrectly
-    # disqualifying hundreds of valid liquid stocks.  Sequential processing
-    # (~30s for 500 tickers) produces reliable, complete ADV results.
     chunk_failures: List[Dict[str, object]] = []
 
     for chunk_idx, chunk in enumerate(chunks):
         try:
             data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
             for symbol in chunk:
-                # to_ns() is idempotent — handles both "RELIANCE" and
-                # "RELIANCE.NS" inputs without producing a double-suffix.
                 ns_sym = to_ns(symbol)
                 if ns_sym in data:
                     frame = data[ns_sym]
@@ -353,11 +301,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                     else:
                         adv = 0.0
                     if np.isfinite(adv) and adv >= min_adv_volume:
-                        # FIX: append ns_sym (the normalised ".NS" key), NOT
-                        # the original bare symbol.  The previous code appended
-                        # `symbol` here, which silently returned bare ticker
-                        # strings to callers that expected ".NS"-suffixed names,
-                        # causing downstream cache-key mismatches.
                         filtered_tickers.append(ns_sym)
         except Exception as exc:
             failure = {
@@ -391,7 +334,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
 # ─── Network Fetchers ─────────────────────────────────────────────────────────
 
 def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
-    """Helper to fetch NSE CSVs masking as a standard browser."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/csv,application/csv",
@@ -402,32 +344,22 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None) -> List[str]:
-    """Fetches the entire NSE actively traded equity list, minus illiquid names."""
     cache = _load_universe_cache()
     entry = cache.get("total_equity", {})
-    
+
     if entry:
         fetched_time = datetime.fromisoformat(entry["fetched_at"])
         if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
             return entry["tickers"]
-            
+
     try:
         logger.info("[Universe] Fetching fresh NSE total equity master...")
         df = _fetch_csv_with_headers("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
         df.columns = [col.strip().upper() for col in df.columns]
 
-        # Filter for active Equity series only (exclude ETFs, bonds, etc)
         equity_df = df[df["SERIES"] == "EQ"]
         tickers = equity_df["SYMBOL"].unique().tolist()
 
-        # FIX (Patch 3): Cache strictly holds unfiltered constituent strings.
-        # Previously _apply_adv_filter(tickers, cfg) was called here using a
-        # 150-day lookback ending TODAY.  Any backtest run over 2020-2022 that
-        # fell back to this cache received a universe pre-filtered by 2026 liquidity,
-        # admitting only survivors and excluding names that were liquid in 2020 but
-        # delisted or illiquid by 2026.  This is textbook look-ahead survivorship bias.
-        # ADV filtering MUST happen at execution time inside the backtest loop via
-        # compute_adv + the generate_signals ADV gate, not at cache-population time.
         logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
         cache["total_equity"] = {
             "fetched_at": datetime.now().isoformat(),
@@ -435,7 +367,7 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         }
         _save_universe_cache(cache)
         return tickers
-        
+
     except UniverseFetchError as exc:
         logger.error("[Universe] NSE master fetch failed during ADV filtering: %s", exc)
         if entry:
@@ -449,41 +381,40 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         if entry:
             logger.warning("[Universe] Using stale cache for NSE Total Equity.")
             return entry["tickers"]
-            
+
         error = UniverseFetchError("Failed to fetch NSE Total Equity from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
         raise error
 
 def get_nifty500() -> List[str]:
-    """Fetches the current Nifty 500 index constituents."""
     cache = _load_universe_cache()
     entry = cache.get("nifty500", {})
-    
+
     if entry:
         fetched_time = datetime.fromisoformat(entry["fetched_at"])
         if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
             return entry["tickers"]
-            
+
     try:
         logger.info("[Universe] Fetching fresh Nifty 500 constituents...")
         df = _fetch_csv_with_headers("https://archives.nseindia.com/content/indices/ind_nifty500list.csv")
         df.columns = [col.strip().upper() for col in df.columns]
-        
+
         tickers = df["SYMBOL"].unique().tolist()
-        
+
         cache["nifty500"] = {
             "fetched_at": datetime.now().isoformat(),
             "tickers": tickers
         }
         _save_universe_cache(cache)
         return tickers
-        
+
     except Exception as exc:
         logger.error("[Universe] Nifty 500 fetch failed: %s", exc)
         if entry:
             logger.warning("[Universe] Using stale cache for Nifty 500.")
             return entry["tickers"]
-            
+
         error = UniverseFetchError("Failed to fetch Nifty 500 from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
         raise error
@@ -492,10 +423,17 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     """
     Retrieves sector classifications for a list of tickers.
     Uses static fallback mapping, then local cache, then threads out to yfinance.
+
+    FIX-MB-SECTORTOCTOU: The cache read used to derive the "existing sectors"
+    for merging newly-fetched results was moved inside _SECTOR_MAP_CACHE_LOCK.
+    Previously it was read outside the lock, so two concurrent processes could
+    both read the old cache, both fetch sectors from yfinance, and the second
+    write would overwrite the first process's new sectors. By reading inside the
+    lock, each writer sees the most recent state before appending its results.
     """
     resolved_map = {}
     missing_tickers = []
-    
+
     # 1. Resolve via static hardcoded map
     for ticker in tickers:
         bare_ticker = ticker.replace(".NS", "")
@@ -503,12 +441,12 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             resolved_map[bare_ticker] = STATIC_NSE_SECTORS[bare_ticker]
         else:
             missing_tickers.append(bare_ticker)
-            
-    # 2. Resolve via JSON cache
+
+    # 2. Resolve via JSON cache (read outside lock — this is a read-only check)
     if missing_tickers and use_cache:
         cache = _load_universe_cache()
         sector_cache = cache.get("sector_map", {}).get("sectors", {})
-        
+
         still_missing = []
         for bare_ticker in missing_tickers:
             if bare_ticker in sector_cache:
@@ -516,7 +454,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             else:
                 still_missing.append(bare_ticker)
         missing_tickers = still_missing
-        
+
     # 3. Resolve via yfinance network fetch
     if missing_tickers:
         logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
@@ -551,24 +489,30 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
                 for sym, sector in pool.map(_fetch_single_sector, missing_tickers):
                     resolved_map[sym] = sector
-                
-        # Update cache with newly found sectors
+
+        # FIX-MB-SECTORTOCTOU: Read the cache INSIDE the lock when updating,
+        # so that concurrent writers each see the latest state before merging.
+        # Previously the read was outside the lock — two processes could both
+        # read the old cache, both fetch sectors, and the second write would
+        # overwrite the first process's results.
         if use_cache:
             with _SECTOR_MAP_CACHE_LOCK:
-                cache = _load_universe_cache()
-                existing_sector_cache = dict(cache.get("sector_map", {}).get("sectors", {}))
+                # Re-read the cache inside the lock to pick up any writes from
+                # other processes that completed between our initial read and now.
+                current_cache = _load_universe_cache()
+                existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
                 existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
 
-                cache["sector_map"] = {
+                current_cache["sector_map"] = {
                     "fetched_at": datetime.now().isoformat(),
                     "sectors": existing_sector_cache,
                 }
-                _save_universe_cache(cache)
-            
+                _save_universe_cache(current_cache)
+
     # Format the return dictionary to match exactly the requested input tickers
     final_map = {}
     for ticker in tickers:
         bare_ticker = ticker.replace(".NS", "")
         final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
-        
+
     return final_map

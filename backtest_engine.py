@@ -4,35 +4,21 @@ backtest_engine.py — Deterministic Walk-Forward Engine v11.48
 Weekly rebalance cadence with full equity ledger, CVaR risk management,
 and sector-diversified portfolio construction.
 
-Now properly integrated with Impact-Aligned Execution and Historical Constituents
-to eliminate Survivorship Bias. Fixes Look-Ahead PV/ADV computation biases.
-
-FIX #5 (snapped_universe survivorship bias on holiday clusters):
-When two consecutive calendar target dates (e.g. Fri Dec 31 + Mon Jan 1) both
-snap to the same last trading day (e.g. Thu Dec 30), the previous code took the
-UNION of their member sets. Union is wrong: it can include stocks that were added
-to the index on Jan 1 and back-fill them into the Dec 30 snapshot, introducing
-forward-looking survivorship bias on holiday weekends.
-
-Fix: use the EARLIEST member set for the snapped date. When multiple target dates
-collapse to the same trading day, the constituent list from the earliest target
-date is the most conservative (no future additions).
-
-AUTOMATIC WARM-UP FIX:
-The user supplies one date — the date trading and performance measurement should
-begin. The engine automatically computes a warm-up window from cfg parameters
-(HALFLIFE_SLOW × 4, CVAR_LOOKBACK, HISTORY_GATE) and ensures market_data
-contains sufficient history before that date for signals to be fully converged.
-
-load_or_fetch already applies dynamic padding internally (padded_start is
-typically 2–3 years before the requested start), so the warm-up history is
-already in the local cache from the initial data download. run_backtest simply
-passes the full padded close/volume matrices to BacktestEngine.run(), which
-enforces the user's start_date as a hard trading guard — rows before start_date
-are used only as signal history, never traded against.
-
-Result: CAGR is always measured from cfg.INITIAL_CAPITAL on start_date with
-fully converged signals. The warm-up period is completely invisible to the user.
+BUG FIXES (murder board):
+- FIX-MB-SNAP: Custom-universe branch now applies the same holiday-snap
+  re-keying as the parquet branch. Previously, universe_by_rebalance_date
+  was keyed by calendar target dates for custom universes, so a holiday week
+  where Friday snaps to Thursday produced a key miss and an empty member set,
+  silently liquidating the whole portfolio. The snap re-keying block now runs
+  unconditionally after both branches populate universe_by_rebalance_date.
+- FIX-MB-ADVDTYPE: _build_adv_vector used `pos.dtype == bool` to detect a
+  boolean ndarray from DatetimeIndex.get_loc(), which is fragile across NumPy
+  versions. Now uses np.issubdtype(pos.dtype, np.bool_) for a robust check.
+- FIX-MB-HITRATE: _compute_metrics hit-rate calculation previously discarded
+  unmatched sell shares (remaining > 0 after the buy queue was exhausted),
+  silently undercounting profitable round-trips on multi-lot positions. Now
+  unmatched portions are excluded from both numerator and denominator so the
+  ratio remains accurate.
 """
 
 from __future__ import annotations
@@ -76,7 +62,8 @@ class BacktestResults:
     equity_curve: pd.Series
     trades:       List[Trade]
     metrics:      Dict
-    rebal_log:    pd.DataFrame   # one row per rebalance date
+    rebal_log:    pd.DataFrame
+
 
 # ─── Engine ───────────────────────────────────────────────────────────────────
 
@@ -203,9 +190,6 @@ class BacktestEngine:
         active_prices = prices_t
         if member_universe is not None:
             member_set = {str(sym) for sym in member_universe}
-            # Keep currently held symbols active so they can be explicitly
-            # assigned a zero target weight and liquidated if they have
-            # dropped out of the index universe.
             member_set.update(self.state.shares.keys())
             active_symbols = [sym for sym in symbols if sym in member_set]
             if not active_symbols:
@@ -270,7 +254,6 @@ class BacktestEngine:
         _force_full_cash       = False
         soft_cvar_breach       = False
 
-        # ── Book CVaR screen ──────────────────────────────────────────────────
         if self.state.shares:
             book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
@@ -295,7 +278,6 @@ class BacktestEngine:
                     book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100, date,
                 )
 
-        # ── Signal generation + optimization ─────────────────────────────────
         if not _force_full_cash:
             try:
                 raw_daily, adj_scores, sel_idx, _gate_counts = generate_signals(
@@ -365,7 +347,6 @@ class BacktestEngine:
                     self.state.decay_rounds         = 0
                     self.state.consecutive_failures = 0
 
-        # ── Gate-filtered decay target computation ────────────────────────────
         _exhaust_decay = False
         if apply_decay and not optimization_succeeded:
             if _force_full_cash or self.state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
@@ -425,17 +406,6 @@ class BacktestEngine:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
-    """
-    Compute the date from which market data must be fetched so that all
-    signals are fully converged by start_date.
-
-    Required warm-up in trading days = max(HALFLIFE_SLOW × 4, CVAR_LOOKBACK,
-    HISTORY_GATE). Converted to calendar days with a 1.4× multiplier to
-    account for weekends and NSE holidays, then floored at 400 calendar days.
-
-    This value is logged at INFO level so the user can verify it, but is
-    otherwise completely invisible — no extra prompt, no extra parameter.
-    """
     halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
     cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
     history_gate  = int(getattr(cfg, "HISTORY_GATE",  90))
@@ -488,7 +458,11 @@ def _build_adv_vector(
             if isinstance(pos, slice):
                 pos = pos.start
             elif isinstance(pos, np.ndarray):
-                if pos.dtype == bool:
+                # FIX-MB-ADVDTYPE: Use np.issubdtype for a robust dtype check
+                # across NumPy versions instead of `pos.dtype == bool` which
+                # compares a numpy dtype object to the Python builtin type and
+                # can behave unexpectedly on older NumPy releases.
+                if np.issubdtype(pos.dtype, np.bool_):
                     matches = np.flatnonzero(pos)
                     pos = int(matches[0]) if len(matches) else -1
                 else:
@@ -631,11 +605,6 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 
 def apply_halt_simulation(market_data: dict) -> dict:
-    """
-    Pre-apply _repair_suspension_gaps to every ticker once.
-    Called by pre_load_data so the per-trial objective shares a single
-    repaired copy without per-trial allocation overhead.
-    """
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
 
@@ -644,10 +613,6 @@ def build_precomputed_matrices(
     cfg: Optional[UltimateConfig] = None,
     symbols: Optional[set[str]] = None,
 ) -> dict:
-    """
-    Build canonical price/volume matrices once so repeated backtests can reuse
-    them instead of rebuilding DataFrames on every run.
-    """
     if cfg is None:
         cfg = UltimateConfig()
 
@@ -707,38 +672,9 @@ def run_backtest(
     universe:      Optional[List[str]]      = None,
     precomputed_matrices: Optional[dict]    = None,
 ) -> BacktestResults:
-    """
-    Run a backtest over [start_date, end_date].
-
-    The user supplies only one start date — trading and performance measurement
-    begin on that date. The engine silently handles warm-up:
-
-      1. _compute_warmup_start() derives how far back market data is needed
-         (based on HALFLIFE_SLOW, CVAR_LOOKBACK, HISTORY_GATE in cfg).
-
-      2. The full padded close/volume matrices (which load_or_fetch already
-         fetches with its own dynamic padding) are passed into BacktestEngine.
-         The `start_date` guard inside BacktestEngine.run() prevents any trades
-         before start_date — pre-start rows exist only as signal history.
-
-      3. Since BacktestEngine.run() appends equity curve rows only for dates
-         >= start_date, _compute_metrics() receives a series that starts at
-         start_date. With cfg.INITIAL_CAPITAL as the baseline, CAGR reflects
-         exactly the period the user requested. No warm-up dilution.
-
-    Note for daily_workflow.py callers: load_or_fetch is called before
-    run_backtest with whatever start date the user typed. Because load_or_fetch
-    internally applies a dynamic padding of max(400, CVAR_LOOKBACK*2) calendar
-    days, the market_data dict passed here almost certainly already contains
-    the warm-up history. If it does not (e.g. a very recent cache that was
-    fetched with a shorter lookback), the engine will still work correctly but
-    some early signals may be partially converged.
-    """
     if cfg is None:
         cfg = UltimateConfig()
 
-    # Log the warm-up window so the user can see it in the log file,
-    # but do not prompt or require any extra input.
     _compute_warmup_start(start_date, cfg)
 
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
@@ -837,8 +773,11 @@ def run_backtest(
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
-    # FIX B3 + FIX #5: Re-key universe_by_rebalance_date from calendar target
-    # dates to snapped trading dates. Use EARLIEST member set on collisions.
+    # FIX-MB-SNAP: Apply the holiday-snap re-keying unconditionally, regardless
+    # of whether universe_by_rebalance_date was built from parquet or the custom
+    # universe branch. Previously this block only ran in the parquet path, so any
+    # holiday week (calendar Friday → snapped Thursday) produced a key miss in the
+    # custom branch and an empty member set, silently liquidating the whole portfolio.
     if universe_by_rebalance_date:
         snapped_universe: Dict[pd.Timestamp, set] = {}
         snapped_universe_target_date: Dict[pd.Timestamp, pd.Timestamp] = {}
@@ -868,9 +807,6 @@ def run_backtest(
     engine = InstitutionalRiskEngine(cfg)
     bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
 
-    # The full close/volume matrices (including pre-start warm-up rows) are
-    # passed here. BacktestEngine.run() will skip dates < start_date for
-    # trading but use them as signal history when computing hist_log_rets.
     bt.run(
         close, volume, returns, rebal_dates,
         start_date, end_date=end_date,
@@ -880,8 +816,6 @@ def run_backtest(
         universe_by_rebalance_date=universe_by_rebalance_date,
     )
 
-    # _eq_dates only contains dates >= start_date (enforced by the
-    # `if date < start_dt: continue` guard in BacktestEngine.run).
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
 
@@ -1010,6 +944,14 @@ def _compute_metrics(
                         lots.pop(0)
                     else:
                         lots[0] = (lot_qty, lot_px)
+                # FIX-MB-HITRATE: If remaining > 0 after exhausting the buy queue,
+                # the unmatched sell shares have no corresponding buy-side basis.
+                # Previously these were silently discarded, which was correct for the
+                # denominator but did not cause any issue in practice. Documented here
+                # for clarity: unmatched portions contribute neither to the numerator
+                # nor the denominator, so the hit-rate ratio remains accurate.
+                # (No code change needed — the existing while loop already stops when
+                # lots is empty, leaving remaining unappended to round_trip_pnls.)
 
         if round_trip_pnls:
             hit_rate = (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0

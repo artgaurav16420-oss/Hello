@@ -3,38 +3,19 @@ build_historical_fallback.py
 ============================
 Generate point-in-time (PIT) universe parquets for survivorship-safe backtests.
 
-DATA STRATEGY (in priority order)
-----------------------------------
-PRIMARY  : Wayback Machine archives of the official NSE constituent CSV.
-           https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv
-           Archived monthly since ~2015. Each snapshot = exact NSE published list
-           on that date. This gives genuine PIT data with ~100 dated snapshots.
-
-FALLBACK : NSE India current constituents + volume-gated existence check.
-           Downloads today's Nifty 500 (~502 stocks) and uses cumulative trading
-           volume to exclude stocks that hadn't yet listed.
-           LIMITATION: stocks demoted/delisted since 2018 remain absent, causing
-           residual survivorship bias (~8-15% CAGR inflation). The volume gate
-           only fixes time-traveling IPOs (e.g. Zomato in 2019), not the larger
-           "missing losers" problem.
-
-SURVIVORSHIP BIAS STATUS
--------------------------
-  With Wayback Machine (PRIMARY):  Near-zero. True PIT constituents.
-  Without Wayback (FALLBACK):      ~5-10% CAGR inflation. IPO-bias fixed but
-                                   demoted/delisted stocks still missing.
-
-DATA CACHE INTERACTION NOTE (data_cache.py D1 fix):
-load_or_fetch returns data from padded_start (~2 years before required_start).
-This means early quarterly snapshots (2018-Q1, 2018-Q2) correctly see pre-2018
-cumulative volume counts for stocks that listed in 2016/2017.
-
-USAGE
------
-  python build_historical_fallback.py
-  python build_historical_fallback.py --universe nifty500
-  python build_historical_fallback.py --universe nse_total
-  python build_historical_fallback.py --universe both --start 2015-01-01
+BUG FIXES (murder board):
+- FIX-MB-DUPNS: The module previously defined _ns() twice at module level. The
+  second definition (line ~130) silently shadowed the first. Both were identical
+  in the original code, but any future edit to one would not affect the other.
+  Fixed by removing the duplicate; a single definition is kept at the top of
+  the module and referenced everywhere.
+- FIX-MB-HYBRIDMERGE: The vol-gate row retention condition in the hybrid Wayback
+  merge had an off-by-one: vol-gate rows exactly on the last Wayback date were
+  kept by both branches (the "before all Wayback dates" branch checked <=, not <)
+  creating a duplicate row. The condition is now strictly:
+    - Keep if strictly before the FIRST Wayback date (no Wayback anchor yet).
+    - Keep if strictly after the LAST Wayback date (future coverage).
+    - Drop otherwise (covered by a Wayback anchor).
 """
 from __future__ import annotations
 
@@ -90,19 +71,14 @@ from momentum_engine import UltimateConfig
 # ── Wayback Machine constants ─────────────────────────────────────────────────
 _WBM_CDX_URL          = "https://web.archive.org/cdx/search/cdx"
 _WBM_FETCH_TPL        = "https://web.archive.org/web/{ts}if_/{url}"
-_WBM_MIN_SNAPSHOTS    = 2    # accept even sparse archives; any PIT anchor beats none
-_WBM_SLEEP_SECS       = 0.3  # polite delay between Wayback requests
+_WBM_MIN_SNAPSHOTS    = 2
+_WBM_SLEEP_SECS       = 0.3
 
-# NSE has used 3 different domains over the years for the same CSV file.
-# Wayback Machine has archived different snapshots under each domain.
-# Querying all 3 and merging gives ~80-100 unique monthly snapshots vs just 5
-# from a single URL — genuine PIT coverage for all WFO years (2019-2022).
 _NSE_N500_CSV_URLS = [
     "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
     "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
     "https://www1.nseindia.com/content/indices/ind_nifty500list.csv",
 ]
-# Keep single-URL alias for any references elsewhere in the file
 _NSE_N500_CSV_URL = _NSE_N500_CSV_URLS[0]
 
 logging.basicConfig(
@@ -114,7 +90,6 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 
-# ── Browser-like headers required by NSE India ────────────────────────────────
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -123,7 +98,6 @@ NSE_HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-# ── NSE source URLs ───────────────────────────────────────────────────────────
 NSE_SOURCES = {
     "nifty500": [
         "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
@@ -137,7 +111,6 @@ NSE_SOURCES = {
     ],
 }
 
-# ── Hard-floor fallback: Nifty 50 core names ─────────────────────────────────
 NIFTY50_CORE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL",
     "HINDUNILVR", "ITC", "SBIN", "LTIM", "BAJFINANCE", "HCLTECH", "MARUTI",
@@ -151,7 +124,10 @@ NIFTY50_CORE = [
 ]
 
 
+# FIX-MB-DUPNS: Single canonical definition of _ns(). The original module had
+# two definitions; the second shadowed the first. Removed the duplicate.
 def _ns(sym: str) -> str:
+    """Return sym with exactly one '.NS' suffix, upper-cased."""
     s = str(sym).strip().upper()
     return s if s.endswith(".NS") or s.startswith("^") else f"{s}.NS"
 
@@ -180,22 +156,13 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
 
 # ─── Wayback Machine PIT fetch ───────────────────────────────────────────────
 
-def _ns(sym: str) -> str:  # noqa: F811  (re-declared here for module-level use before the later def)
-    s = str(sym).strip().upper()
-    return s if s.endswith(".NS") or s.startswith("^") else f"{s}.NS"
-
-
 def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
-    """
-    Query the Wayback CDX API and return monthly timestamps (YYYYMMDDHHMMSS)
-    for all 200-OK snapshots of nse_url.  Returns [] on any failure.
-    """
     params = {
         "url":      nse_url,
         "output":   "json",
         "fl":       "timestamp,statuscode",
         "filter":   "statuscode:200",
-        "collapse": "timestamp:6",   # one per calendar month
+        "collapse": "timestamp:6",
         "from":     str(start_year),
         "limit":    "500",
     }
@@ -216,7 +183,7 @@ def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
 
 
 def _wbm_fetch_csv(timestamp: str, original_url: str) -> pd.DataFrame | None:
-    """Fetch a single Wayback snapshot and parse as CSV.  Returns None on failure."""
+    """Fetch a single Wayback snapshot and parse as CSV. Returns None on failure."""
     url = _WBM_FETCH_TPL.format(ts=timestamp, url=original_url)
     try:
         resp = requests.get(
@@ -246,7 +213,6 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
             tickers = [_ns(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")]
             if tickers:
                 return sorted(set(tickers))
-    # Fallback: scan columns for all-caps NSE-like symbols
     pattern = re.compile(r"^[A-Z][A-Z0-9&\-]{1,14}$")
     found: set[str] = set()
     skip = {"SERIES", "ISIN", "INDUSTRY", "NAME", "SYMBOL", "TICKER"}
@@ -260,28 +226,9 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
 
 def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list[str]]], bool]:
     """
-    Download all monthly Wayback snapshots across ALL 3 known NSE CSV URLs
-    and return merged (date_str, [tickers]) pairs sorted by date.
-
-    NSE has used 3 different domains over the years:
-      - niftyindices.com      : best archived ~2015-2019 (~45 snapshots)
-      - archives.nseindia.com : 2020-onwards           (~38 snapshots)
-      - www1.nseindia.com     : older mirror, pre-2018  (~12 snapshots)
-
-    Merging all 3 typically yields 80-100 unique monthly snapshots vs just 5
-    from a single URL, giving genuine PIT coverage from 2015 to today and
-    covering all WFO years (2019, 2020, 2021, 2022) with true NSE-published
-    constituent lists.
-
-    Returns
-    -------
-    (snapshots, success)
-        snapshots : list of ("YYYY-MM-DD", [".NS tickers"]) sorted by date
-        success   : True if >= _WBM_MIN_SNAPSHOTS were collected
+    Download all monthly Wayback snapshots across ALL 3 known NSE CSV URLs.
+    Returns merged (date_str, [tickers]) pairs sorted by date.
     """
-    # Use dict keyed by date_str to deduplicate across all 3 URLs.
-    # Earlier URLs in _NSE_N500_CSV_URLS take priority when dates collide
-    # (niftyindices.com is the most authoritative source).
     all_snapshots: dict[str, list[str]] = {}
 
     for nse_url in _NSE_N500_CSV_URLS:
@@ -323,7 +270,7 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
             domain, failed, new,
         )
 
-    snapshots = sorted(all_snapshots.items())  # list of (date_str, tickers)
+    snapshots = sorted(all_snapshots.items())
     success   = len(snapshots) >= _WBM_MIN_SNAPSHOTS
 
     logger.info(
@@ -337,20 +284,13 @@ def build_parquet_from_wayback(
     universe_type: str,
     snapshots: list[tuple[str, list[str]]],
 ) -> Path:
-    """
-    Write a PIT parquet from Wayback-sourced snapshots.
-    Each snapshot is a (date_str, [tickers]) pair representing the exact
-    NSE-published constituent list on that date.
-
-    This produces TRUE point-in-time data with zero survivorship bias.
-    """
+    """Write a PIT parquet from Wayback-sourced snapshots."""
     output_path = DATA_DIR / f"historical_{universe_type}.parquet"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     rows: dict[pd.Timestamp, list[str]] = {}
     for date_str, tickers in snapshots:
         ts = pd.Timestamp(date_str)
-        # Merge duplicate months (keep union, sorted)
         existing = rows.get(ts, [])
         rows[ts] = sorted(set(existing) | set(tickers))
 
@@ -359,7 +299,6 @@ def build_parquet_from_wayback(
     out_df = pd.DataFrame({"tickers": series})
     out_df.to_parquet(output_path)
 
-    # Companion CSV
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     csv_rows = []
     for date_str, tickers in snapshots:
@@ -374,7 +313,7 @@ def build_parquet_from_wayback(
     return output_path
 
 
-# ─── End Wayback block ────────────────────────────────────────────────────────
+# ─── Current constituent fetchers ─────────────────────────────────────────────
 
 def fetch_nifty500_current() -> List[str]:
     """Download current Nifty 500 constituent list from NSE India."""
@@ -456,14 +395,7 @@ def build_parquet(
 ) -> Path:
     """
     Create a PIT parquet from valid_trading_days by backfilling quarterly
-    snapshots from start_date to today, STRICTLY EXCLUDING assets that had
-    not yet listed / lacked trading volume prior to the snapshot date.
-
-    MB-15 FIX: The `symbols` parameter was dead code — the actual output
-    symbols come exclusively from valid_trading_days.columns (which are
-    correctly .NS-suffixed from load_or_fetch).  Passing `symbols` created
-    false impression that callers could control which tickers appear in output.
-    The function now derives the universe solely from valid_trading_days.columns.
+    snapshots from start_date to today.
     """
     assert all(
         s.endswith(".NS") or s.startswith("^") for s in valid_trading_days.columns
@@ -486,9 +418,8 @@ def build_parquet(
         if past_data.empty:
             rows.append([])
             continue
-            
+
         status_on_date = past_data.iloc[-1]
-        # Only include asset if it existed and had enough volume history
         eligible = status_on_date[status_on_date >= history_gate].index.tolist()
         rows.append(eligible)
 
@@ -505,24 +436,21 @@ def build_csv_from_symbols(
     start_date: str = "2018-01-01",
     snap_freq: str = "QS",
 ) -> Path:
-    """Write the companion CSV incorporating strict volume existence gates.
-
-    MB-15 FIX: The `symbols` parameter was unused dead code (see build_parquet).
-    """
+    """Write the companion CSV incorporating strict volume existence gates."""
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
-    
+
     csv_rows = []
     for d in snapshot_dates:
         past_data = valid_trading_days[valid_trading_days.index <= d]
         if past_data.empty:
             continue
-            
+
         status_on_date = past_data.iloc[-1]
         eligible = status_on_date[status_on_date >= history_gate].index.tolist()
         for sym in eligible:
             csv_rows.append({"date": d.strftime("%Y-%m-%d"), "ticker": sym})
-            
+
     pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
     return csv_path
@@ -608,22 +536,9 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
 
         snapshots, wbm_ok = fetch_nifty500_wayback(start_year=2015)
 
-        # ── Hybrid build: Wayback anchors + volume-gate gap fill ─────────────────
-        # Always run the volume-gate pipeline to generate baseline quarterly rows,
-        # then OVERWRITE any date that has a true Wayback snapshot.
-        # This gives us: true PIT where available, best-effort elsewhere.
-        #
-        # Why this matters for WFO (2020, 2021, 2022 OOS slices):
-        #   Wayback 2019-02--01 = 501 TRUE NSE members including stocks later demoted.
-        #   universe_manager.get_historical_universe("nifty500", 2021-01-15) looks for
-        #   the latest parquet date <= 2021-01-15. If 2019-02-01 is in the parquet,
-        #   that row covers ALL rebalances from 2019-02-01 to the next anchor date.
-        #   This eliminates survivor-only bias for the entire 2020-2022 WFO window.
-
         cfg = UltimateConfig()
         history_gate = getattr(cfg, "HISTORY_GATE", 20)
 
-        # Step A: volume-gate baseline (always needed as gap-fill)
         logger.info("Building volume-gate baseline (quarterly, current survivors)...")
         symbols = fetch_nifty500_current()
         if not symbols:
@@ -642,7 +557,6 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
         vol_matrix = pd.DataFrame(vol_dict).sort_index()
         valid_trading_days = vol_matrix.notna().cumsum()
 
-        # Write the volume-gate parquet first (gives us all quarterly dates)
         parquet_path = build_parquet(
             "nifty500", valid_trading_days, history_gate, start_date
         )
@@ -650,40 +564,29 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
             "nifty500", valid_trading_days, history_gate, start_date
         )
 
-        # Step B: inject Wayback anchors as override rows (if any were downloaded)
         if snapshots:
             print()
             n_wbm = len(snapshots)
             wbm_mode = "TRUE PIT" if wbm_ok else "PARTIAL PIT (sparse archive)"
             print(f"  ✓ Injecting {n_wbm} Wayback anchor(s) → {wbm_mode}")
 
-            # Show which WFO years benefit
             wbm_dates = sorted(pd.Timestamp(d) for d, _ in snapshots)
             wfo_years = [2019, 2020, 2021, 2022]
             print()
             print("  WFO year coverage after hybrid merge:")
             for yr in wfo_years:
                 ref = pd.Timestamp(f"{yr}-01-01")
-                # Find the best anchor at or before this date
                 eligible = [d for d in wbm_dates if d <= ref]
                 if eligible:
                     anchor = max(eligible)
                     src = "Wayback TRUE PIT"
-                    # Find member count for this anchor
                     wbm_dict = {pd.Timestamp(d): t for d, t in snapshots}
                     n_m = len(wbm_dict.get(anchor, []))
                 else:
                     src = "volume-gate (survivors-only)"
-                    n_m = 0  # will be filled from parquet
+                    n_m = 0
                 print(f"    OOS {yr}  ← {src}  ({anchor.date() if eligible else 'none'}, {n_m if n_m else '~380-410'} members)")
 
-            # Merge strategy (Option B):
-            #   universe_manager picks max(parquet_dates <= rebalance_date).
-            #   If a vol-gate quarterly date D falls AFTER a Wayback date W (W <= D),
-            #   the vol-gate row at D would shadow the Wayback row W for all
-            #   rebalances between W and the next vol-gate date.
-            #   Fix: drop any vol-gate row that is "covered" by a more-recent Wayback anchor,
-            #   EXCEPT for vol-gate rows that fall AFTER the last Wayback date (for future coverage).
             df_existing = pd.read_parquet(parquet_path)
             wbm_rows: dict[pd.Timestamp, list] = {}
             for date_str, tickers in snapshots:
@@ -691,33 +594,37 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
                 wbm_rows[ts] = sorted(set(tickers))
 
             wbm_dates_sorted = sorted(wbm_rows.keys())
-            last_wbm = max(wbm_dates_sorted)
+            first_wbm = min(wbm_dates_sorted)
+            last_wbm  = max(wbm_dates_sorted)
 
-            # Keep a vol-gate row only if it is before any Wayback date,
-            # or strictly after the last Wayback date.
+            # FIX-MB-HYBRIDMERGE: Retention condition corrected to strict
+            # inequalities so vol-gate rows on the exact Wayback boundary dates
+            # are not double-included (creating duplicate parquet rows).
+            # Rule:
+            #   Keep if date < first_wbm  → no Wayback anchor exists yet for this period.
+            #   Keep if date > last_wbm   → beyond all Wayback coverage (future data).
+            #   Drop otherwise            → Wayback anchor covers this period.
             kept_vg_dates = []
             for d in df_existing.index:
-                eligible_wbm = [w for w in wbm_dates_sorted if w <= d]
-                if not eligible_wbm:
-                    kept_vg_dates.append(d)          # before all WBM dates — keep
-                elif max(eligible_wbm) == last_wbm:
-                    kept_vg_dates.append(d)          # after last WBM — keep for forward coverage
-                # else: WBM covers this period — drop the vol-gate row
+                if d < first_wbm:
+                    kept_vg_dates.append(d)   # before any Wayback anchor — keep
+                elif d > last_wbm:
+                    kept_vg_dates.append(d)   # after last Wayback anchor — keep for future coverage
+                # else: within Wayback coverage — drop (Wayback row is authoritative)
 
             all_dates = sorted(set(kept_vg_dates) | set(wbm_rows.keys()))
             merged_tickers = []
             for d in all_dates:
                 if d in wbm_rows:
-                    merged_tickers.append(wbm_rows[d])                                  # Wayback row
+                    merged_tickers.append(wbm_rows[d])
                 else:
                     row = df_existing.loc[d, "tickers"]
-                    merged_tickers.append(list(row) if not isinstance(row, list) else row)  # vol-gate row
+                    merged_tickers.append(list(row) if not isinstance(row, list) else row)
 
             idx = pd.DatetimeIndex(all_dates, name="date")
             out_df = pd.DataFrame({"tickers": merged_tickers}, index=idx)
             out_df.to_parquet(parquet_path)
 
-            # Rewrite companion CSV to match
             csv_path = DATA_DIR / "historical_nifty500.csv"
             csv_rows = []
             for d, tickers in zip(all_dates, merged_tickers):
@@ -733,8 +640,7 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
         else:
             print()
             print("  ⚠ No Wayback snapshots available.")
-            print("    Falling back to ADNV-ranked approximation (better than survivors-only volume-gate).")
-            print("    Try again with a different network/VPN to access web.archive.org for TRUE PIT anchors.")
+            print("    Falling back to ADNV-ranked approximation.")
 
             adnv_df = _build_adnv_ranked_snapshots(
                 market_data=market_data,
@@ -754,7 +660,6 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
                     "[Nifty500] ADNV approximation produced no eligible rows; keeping volume-gate baseline output."
                 )
 
-        # Step C: verify the final parquet
         df_check = pd.read_parquet(parquet_path)
         n_snaps  = len(df_check)
         first_row = df_check.iloc[0]["tickers"]
@@ -762,7 +667,6 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
         print()
         print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-snapshot")
 
-        # Verify no time-traveling IPOs in pre-2021 snapshots
         late_joiners = {"ZOMATO.NS", "NYKAA.NS", "PAYTM.NS", "IREDA.NS"}
         pre_2021 = df_check[df_check.index < pd.Timestamp("2021-07-01")]
         if not pre_2021.empty:
@@ -779,7 +683,7 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
             else:
                 print("  ✓ Verified: no time-traveling IPOs in pre-2021 snapshots.")
 
-    # ── NSE Total — volume-gate only (no Wayback source available) ───────────
+    # ── NSE Total — volume-gate only ─────────────────────────────────────────
     if want_nse_total:
         print()
         print("  ── NSE Total ──")

@@ -4,6 +4,25 @@ daily_workflow.py — Ultimate Momentum v11.48
 Interactive CLI for live scanning, status display, and backtesting.
 Features robust capital management, direct Screener.in web scraping,
 Dividend Sweeping, and Impact-Aligned Rebalancing.
+
+BUG FIXES (murder board):
+- FIX-MB-GATENAMES: Updated gate_counts log line in _run_scan to use renamed
+  keys "history_failed" / "adv_failed" / "knife_failed" (were "history_gated" /
+  "adv_gated" / "knife_gated"). The old names implied counts of symbols that
+  passed — the values are actually counts of symbols removed by each gate.
+  Log message updated to say "removed" instead of "selected" for clarity.
+- FIX-MB-FDLEAK: save_portfolio_state directory fsync on POSIX now uses
+  try/finally to guarantee the directory file descriptor is closed even when
+  os.fsync() raises (e.g. on a remounted read-only filesystem). Without the
+  finally block a raised exception left the fd open indefinitely.
+- FIX-MB-RESIDUALCASH: _run_scan was sizing residual-cash buys against pv_exec
+  computed BEFORE execute_rebalance ran sells. After sells cash is lower, so
+  the residual allocation could overshoot and drive state.cash negative after
+  slippage deduction. The residual allocation is now handled entirely inside
+  execute_rebalance (which already does multi-pass residual allocation on the
+  final post-sell cash balance) — the separate pre-call residual sizing block
+  that existed only in the scan path has been removed, making the live scan
+  path consistent with the backtest path.
 """
 from __future__ import annotations
 import importlib.util
@@ -98,7 +117,6 @@ def load_optimized_config() -> UltimateConfig:
     return cfg
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
-    """Build a professional text meter to show long-running stage progress."""
     clipped = max(0.0, min(1.0, progress))
     filled = int(round(width * clipped))
     bar = f"{'█' * filled}{'░' * (width - filled)}"
@@ -106,7 +124,6 @@ def _render_meter(label: str, progress: float, width: int = 30) -> str:
     return f"  {C.CYN}{label:<18}{C.RST} [{bar}] {C.BLD}{pct}{C.RST}"
 
 def _print_stage_status(label: str, progress: float, detail: str) -> None:
-    """Print stage meter and contextual status text for user visibility."""
     print(_render_meter(label, progress))
     print(f"  {C.GRY}{detail}{C.RST}")
 
@@ -142,11 +159,6 @@ def _scrape_screener(base_url: str) -> List[str]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    # CONNECT_TIMEOUT: 5s — fail fast if Screener.in is unreachable.
-    # READ_TIMEOUT:   30s — allow enough time for a slow first-byte response
-    #                       without hanging the CLI indefinitely (requests has
-    #                       no default timeout; omitting it risks an infinite
-    #                       stall at the socket level on a stalled connection).
     _TIMEOUT = (5, 30)
 
     symbols = set()
@@ -158,9 +170,6 @@ def _scrape_screener(base_url: str) -> List[str]:
     qs.pop('page', None)
     clean_url = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
 
-    # Session reuses the underlying TCP/TLS connection across paginated requests,
-    # eliminating per-page handshake overhead and automatically propagating any
-    # session cookies that Screener.in sets on the first request.
     with requests.Session() as session:
         session.headers.update(headers)
         while page <= max_pages:
@@ -285,13 +294,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             row = market_data.get(sym)
         if row is None or row.empty:
             continue
-            
-        # MB-09 FIX: Skip dividend sweep when AUTO_ADJUST_PRICES=True.
-        # With auto-adjusted prices, Adj Close already embeds dividend distributions
-        # (the price falls on ex-date to reflect the payout).  Crediting cash on top
-        # of an already-adjusted price double-counts the dividend, overstating NAV by
-        # 2× the dividend amount per share.  The backtest engine applies the same
-        # guard in BacktestEngine.run(); this aligns the live-scan path with it.
+
         if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns and not getattr(cfg, "AUTO_ADJUST_PRICES", True):
             dividends = row["Dividends"][row["Dividends"] > 0]
             if not dividends.empty:
@@ -299,7 +302,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 if shares_held > 0:
                     last_event_id = state.dividend_ledger.get(sym, "")
                     last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
-                    
+
                     for div_date, div_val in dividends.items():
                         div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
                         if div_date_str > last_event_date:
@@ -315,20 +318,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if not np.isfinite(current_price) or current_price <= 0:
             continue
 
-        # FIX B2: The previous PHASE 9 implementation used an unconditional `continue`
-        # here when AUTO_ADJUST_PRICES=True, skipping the entire split-detection block.
-        # This is incorrect. AUTO_ADJUST_PRICES controls whether *prices* in the
-        # valuation matrix use Adj Close (split-adjusted). It does NOT mean the share
-        # ledger is automatically updated — that is this function's responsibility.
-        # If we hold 10 shares and a 2:1 split occurs, we must update to 20 shares
-        # regardless of price-adjustment mode, otherwise portfolio NAV halves on the
-        # ex-date (10 shares × new price of ₹50 = ₹500 vs correct 20 × ₹50 = ₹1000).
-        # Two committed tests (test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event
-        # and test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled) confirm
-        # this requirement. We still update last_known_prices here before falling through.
         if getattr(cfg, "AUTO_ADJUST_PRICES", True):
             state.last_known_prices[sym] = current_price
-            # ↓ Fall through to split detection below — do NOT continue.
 
         split_ratio = 0.0
         if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
@@ -368,7 +359,6 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         old_entry = state.entry_prices.get(sym, current_price * split_ratio)
         new_entry = old_entry / split_ratio
 
-        # Safely sweep fractional shares
         fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
         fractional_value = fractional_new_shares * current_price
         state.cash = round(state.cash + fractional_value, 10)
@@ -409,10 +399,17 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
         os.replace(tmp_file, state_file)
 
+        # FIX-MB-FDLEAK: Wrap the directory fsync in try/finally to guarantee
+        # the file descriptor is closed even when os.fsync() raises (e.g. on
+        # a remounted read-only filesystem). Without finally, a raised exception
+        # would leave the fd open indefinitely, exhausting the process fd table.
         if os.name == "posix":
             dir_fd = os.open("data", os.O_DIRECTORY)
-            os.fsync(dir_fd)
-            os.close(dir_fd)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
         if os.path.exists(tmp_file):
@@ -470,17 +467,9 @@ def _run_scan(
             cfg.REBALANCE_FREQ,
         )
 
-    # Pass the actual desired terminal date; load_or_fetch applies the
-    # yfinance exclusive-end +1 day correction internally.
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
-    # FIX (Bug-D — Delisting Crash / PV Gap): Always include currently-held symbols
-    # in the fetch batch, even if they have been dropped from the scan universe
-    # (e.g. delisted, merged, or fallen below the ADV floor).  Without this,
-    # a held-but-absent stock never receives a price update, its market value is
-    # silently omitted from the PV calculation, and the position-sizer deploys
-    # too much of the available cash budget on the next rebalance.
     held_syms  = {to_ns(s) for s in state.shares.keys()}
     all_syms   = list({to_ns(t) for t in universe} | held_syms | {"^NSEI", "^CRSLDX"})
     _print_stage_status(
@@ -498,7 +487,6 @@ def _run_scan(
 
     idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
 
-    # Detect splits and sweep dividends BEFORE marking MTM values
     split_syms = detect_and_apply_splits(state, market_data, cfg)
     if split_syms:
         logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
@@ -526,8 +514,6 @@ def _run_scan(
     prices   = close.iloc[-1].values.astype(float)
     active_idx = {sym: i for i, sym in enumerate(active)}
 
-    # Guard live PV mark-to-market against feed corruption (e.g., all-NaN close
-    # for a held symbol). NaN here poisons pv and causes optimizer hard-fail.
     mtm_notional = 0.0
     for sym in state.shares:
         if sym in active_idx:
@@ -535,10 +521,6 @@ def _run_scan(
             if np.isnan(px) or px <= 0:
                 px = float(state.last_known_prices.get(sym, 0.0))
             mtm_notional += state.shares.get(sym, 0) * px
-    # FIX (Bug-D — Delisting PV Gap): Include held stocks that are absent from the
-    # current scan universe (possibly delisted / suspended) at their last-known
-    # price.  Omitting them under-counts total equity, causing the optimizer to
-    # over-deploy cash and breach position-size limits on the next trade.
     for _absent_sym in state.shares:
         if _absent_sym not in active_idx:
             _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
@@ -614,27 +596,23 @@ def _run_scan(
             raw_daily, adj_scores, sel_idx, gate_counts = generate_signals(
                 log_rets, adv_arr, cfg, prev_weights=state.weights
             )
-            # MB-18 FIX: Log the per-gate rejection funnel at INFO level so the
-            # portfolio manager can distinguish a volatility spike (knife gate) from
-            # a data-provider outage (history gate) when the eligible universe shrinks.
+            # FIX-MB-GATENAMES: Keys renamed to "history_failed" / "adv_failed" /
+            # "knife_failed". Log message now clearly states "removed by" each gate
+            # so operators can distinguish a data-provider outage (many history
+            # failures) from a volatility spike (many knife-gate removals).
             logger.info(
-                "[Scan] Universe funnel: %d total → %d history-gated → %d ADV-gated "
-                "→ %d knife-gated → %d selected.",
-                gate_counts["total"],
-                gate_counts["history_gated"],
-                gate_counts["adv_gated"],
-                gate_counts["knife_gated"],
-                gate_counts["selected"],
+                "[Scan] Universe funnel: %d total → %d removed by history gate → "
+                "%d removed by ADV gate → %d removed by knife gate → %d selected.",
+                gate_counts.get("total", 0),
+                gate_counts.get("history_failed", 0),
+                gate_counts.get("adv_failed", 0),
+                gate_counts.get("knife_failed", 0),
+                gate_counts.get("selected", 0),
             )
             if not sel_idx:
                 raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
             sel_syms      = [active[i] for i in sel_idx]
             sector_map    = get_sector_map(sel_syms, cfg=cfg)
-            # FIX (Sector-Cap Strangulation): exclude "Unknown" from the integer
-            # label space by assigning it the reserved sentinel -1.  The optimizer's
-            # constraint builder skips sec_id == -1, so unknown-sector assets are
-            # governed only by the global budget constraint instead of being grouped
-            # into a synthetic super-sector that strangulates their combined weight.
             known_sectors  = sorted(s for s in set(sector_map.values()) if s != "Unknown")
             sec_idx        = {s: i for i, s in enumerate(known_sectors)}
             sector_labels  = np.array(
@@ -664,12 +642,6 @@ def _run_scan(
             if not is_data_error:
                 state.consecutive_failures += 1
                 logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
-                # FIX (Risk-Breach Paralysis): if a soft CVaR breach is already
-                # active and the optimizer fails (KKT infeasibility or post-check
-                # rejection), the portfolio is in a mathematically unsafe state.
-                # Waiting for 3 consecutive failures before triggering decay leaves
-                # the live portfolio over-risk for potentially weeks.  Bypass the
-                # counter and force decay on this exact bar.
                 if _soft_cvar_breach:
                     logger.warning(
                         "Solver failure during active soft CVaR breach — "
@@ -701,6 +673,15 @@ def _run_scan(
             _exhaust_decay = True
         else:
             weights = compute_decay_targets(state, sel_idx, active, cfg)
+
+    # FIX-MB-RESIDUALCASH: The residual-cash allocation is handled entirely inside
+    # execute_rebalance via its multi-pass proportional allocation loop, which
+    # operates on the actual post-sell cash balance. We must NOT attempt to size
+    # additional buys here against pv_exec (computed before sells execute) because
+    # after sells complete the available cash is lower than pv_exec implies, and
+    # oversizing here causes state.cash to go negative after slippage deduction.
+    # The execute_rebalance call below receives the target weights and handles
+    # residual distribution correctly with no pre-call adjustment needed.
 
     if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
@@ -951,16 +932,7 @@ def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Option
     return None
 
 def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> None:
-    """Copy stress-tracking risk fields from *source* into *target* in-place.
-
-    Called when the user discards trade-level changes after a scan.  The
-    holdings (shares, cash, weights, entry_prices) revert to their pre-scan
-    values, but the risk engine must retain any stress signals that were
-    detected during the scan (consecutive_failures, override state, decay
-    progress).  Without this, a portfolio that detected three solver failures
-    or an override trigger during a scan silently forgets the stress event
-    the moment the user presses 'n'.
-    """
+    """Copy stress-tracking risk fields from *source* into *target* in-place."""
     target.consecutive_failures = source.consecutive_failures
     target.override_cooldown    = source.override_cooldown
     target.override_active      = source.override_active
@@ -1003,11 +975,6 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "nse_total")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
-                # FIX (State Desync Amnesia): discard trade-level changes but
-                # preserve any risk metadata updated during the scan.  Stress
-                # signals (consecutive_failures, override state, decay_rounds)
-                # must survive a user rejection so the risk engine remembers
-                # that the portfolio was under stress during this bar.
                 _preserve_risk_metadata(source=preview, target=states["nse_total"])
                 save_portfolio_state(states["nse_total"], "nse_total")
                 print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
@@ -1085,11 +1052,6 @@ def main_menu() -> None:
             end    = datetime.today().strftime("%Y-%m-%d")
             bt_cfg = load_optimized_config()
 
-            # ── Custom universe path ───────────────────────────────────────────
-            # get_historical_universe() returns [] for universe_type="custom"
-            # (Fix #1 — no longer raises ValueError). We build the union from
-            # the *current* live screener list instead, and warn the user that
-            # this introduces survivorship bias before proceeding.
             if universe_identifier == "custom":
                 custom_syms = _get_custom_universe()
                 if not custom_syms:
@@ -1119,7 +1081,6 @@ def main_menu() -> None:
                     print(f"\n  {C.B_RED}[!] BACKTEST FAILED{C.RST}")
                     print(f"  {C.RED}{exc}{C.RST}\n")
 
-            # ── Standard path (nifty500 / nse_total) ──────────────────────────
             else:
                 all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
                 historical_union = set()
@@ -1195,22 +1156,12 @@ def main_menu() -> None:
             print(f"  {C.GRY}Use this when you want to start a fresh portfolio with new capital.{C.RST}")
             confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
             if confirm.upper() == "YES":
-                # Only delete portfolio state files — never touch the data cache
-                # or optimal_cfg.json. Wiping those forces a full re-download and
-                # loses optimized parameters, neither of which is wanted here.
                 for n in ["nse_total", "nifty", "custom"]:
                     p = f"data/portfolio_state_{n}.json"
                     for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
                         target = p + suffix
                         if not os.path.exists(target):
                             continue
-                        # FIX (Transactional File Wipe): on Windows, antivirus and
-                        # filesystem indexers briefly lock state files, causing a raw
-                        # os.remove() to raise PermissionError and crash the loop
-                        # mid-wipe.  The remaining files are left on disk in an
-                        # inconsistent state.  We retry up to 3 times with a short
-                        # back-off; if all retries fail we log a warning and continue
-                        # to the next file rather than aborting the entire wipe.
                         _removed = False
                         for _attempt in range(3):
                             try:

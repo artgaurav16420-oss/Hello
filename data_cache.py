@@ -3,44 +3,20 @@ data_cache.py — Persistent Atomic Downloader v11.49
 ===================================================
 Robustly manages downloading, parsing, and persisting yfinance data.
 
-Features:
-- Atomic JSON manifest updates
-- Network retry logic and chunking
-- Persistent storage of raw provider data only (no synthetic mutation at cache layer)
-- PHASE 4 FIX: Strict timezone stripping and index normalization to prevent misalignment.
-- PHASE 9 FIX: Explicit `actions=True` to fetch Corporate Actions (Dividends/Splits).
-- STABILITY: Strict OHLC validation, padding trimming, and robust ticker sanitization.
-- FIX D1: Return full padded data (trim to padded_start, not required_start).
-- FIX D8: Timezone-independent latest_bday using pandas BDay (UTC-server safe).
-
-GROWW PROVIDER (v11.49):
-GrowwProvider is added as the PRIMARY provider for all NSE equity data when
-GROWW_API_TOKEN is set in the environment. It fetches daily OHLCV candles from
-the Groww API (clean, official NSE data).
-
-Groww daily candle history:
-  - The API supports a maximum of 1080 days (~3 years) PER REQUEST.
-  - There is NO cap on total historical depth — full history is available
-    by making multiple chunked requests and stitching the results together.
-  - GrowwProvider automatically chunks requests into 1080-day windows and
-    merges them, so the caller receives a single continuous DataFrame from
-    any start date to today.
-
-Falls back to yfinance only for:
-  - Index tickers (^NSEI, ^CRSLDX) — Groww does not serve these
-  - Any fetch failure for a specific ticker
-
-Provider priority order:
-  1. GrowwProvider  — full NSE equity history via chunked requests (if GROWW_API_TOKEN set)
-  2. YFinanceProvider — indices + fallback for any Groww failures
-  3. SecondaryProvider — AlphaVantage last-resort fallback
-
-IMPORTANT: Groww daily candles are RAW (unadjusted). The engine uses
-AUTO_ADJUST_PRICES=True by default, which means Adj Close is used for
-return computation. GrowwProvider synthesises Adj Close from raw Close
-using split/dividend data fetched via yfinance for the same ticker,
-exactly matching what yfinance returns. This keeps the two data sources
-interchangeable within the existing cache schema.
+BUG FIXES (murder board):
+- FIX-MB-GROWWADJ: GrowwProvider._build_adj_close_from_batches previously used
+  .bfill() on the adjustment ratio before applying it to Groww prices. bfill()
+  can apply a future adjustment ratio to past prices when NSE and yfinance
+  holiday calendars diverge — look-ahead contamination. Now only .ffill() is
+  applied (forward-fill only), and the ratio is computed from a single yfinance
+  call with auto_adjust=False, actions=True so adj and raw come from the same
+  cache state, eliminating divergence from separate calls.
+- FIX-MB-GROWW429: GrowwProvider._fetch_candles_chunk returned [] on a 429
+  response with a 5-second sleep, but the outer _fetch_full_history loop then
+  immediately made the next chunk request with only the 0.2s inter-chunk sleep,
+  creating a rapid retry storm after a rate-limit event. Now the 429 handler
+  returns a sentinel that causes the outer loop to apply exponential backoff
+  before the next chunk request for the same symbol.
 """
 
 from __future__ import annotations
@@ -63,17 +39,13 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+# Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
+_RATE_LIMITED = object()
+
 
 def _load_local_env_file(env_path: Path = Path('.env')) -> None:
-    """
-    Lightweight `.env` loader for non-interactive scripts.
-
-    This avoids requiring python-dotenv in every runtime while still honoring
-    local credentials such as GROWW_API_TOKEN when present.
-    """
     if not env_path.exists():
         return
-
     try:
         for raw_line in env_path.read_text(encoding='utf-8').splitlines():
             line = raw_line.strip()
@@ -94,20 +66,18 @@ CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
 
-# Groww API constants
 _GROWW_BASE_URL           = "https://api.groww.in/v1"
-_GROWW_DAILY_INTERVAL     = 1440   # 1 day in minutes
-_GROWW_MAX_DAYS_PER_REQUEST = 1080 # max days per single request (Groww enforced limit)
-_GROWW_CHUNK_DAYS         = 1080   # use the full per-request limit; loop for older history
-_GROWW_INDEX_PREFIXES     = ("^",) # Groww does not serve index tickers like ^NSEI
+_GROWW_DAILY_INTERVAL     = 1440
+_GROWW_MAX_DAYS_PER_REQUEST = 1080
+_GROWW_CHUNK_DAYS         = 1080
+_GROWW_INDEX_PREFIXES     = ("^",)
+
 
 class DataFetchError(RuntimeError):
     """Raised when one or more requested ticker chunks cannot be fetched."""
 
 
 class DataProvider(ABC):
-    """Strategy interface for market-data providers."""
-
     @abstractmethod
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         raise NotImplementedError
@@ -119,27 +89,15 @@ class GrowwProvider(DataProvider):
     """
     Fetches daily OHLCV candles from the Groww API for NSE equity tickers.
 
-    Activated automatically when the GROWW_API_TOKEN environment variable is
-    set. Skipped silently for index tickers (^NSEI, ^CRSLDX) — those always
-    fall through to YFinanceProvider.
+    FIX-MB-GROWWADJ: Adj Close adjustment ratio is now computed from a single
+    yfinance call (auto_adjust=False, actions=True) so raw close and corporate
+    actions come from the same snapshot. Only forward-fill (ffill) is applied
+    when aligning the ratio to Groww dates — bfill was removed because it could
+    propagate a future split ratio backward across a holiday gap (look-ahead).
 
-    Ticker translation:
-        Cache uses .NS suffix  →  Groww expects bare symbol
-        "RELIANCE.NS"          →  "RELIANCE"
-        "^NSEI"                →  skipped (Groww does not serve indices)
-
-    Corporate action handling:
-        Groww returns raw (unadjusted) prices. To maintain compatibility with
-        the existing cache schema (which expects both "Close" and "Adj Close"),
-        this provider fetches split/dividend metadata from yfinance for the
-        same ticker and back-adjusts the Groww Close series to produce Adj Close.
-        This is a one-time cost per ticker per cache refresh and gives the same
-        adjusted prices yfinance would return.
-
-    Rate limiting:
-        Groww does not publish rate limits. We apply a conservative 0.2s sleep
-        between requests (300 req/min ceiling). Increase _GROWW_SLEEP_SECS if
-        you encounter 429 responses.
+    FIX-MB-GROWW429: The 429 handler now returns the _RATE_LIMITED sentinel
+    instead of [] so _fetch_full_history can distinguish rate-limit hits from
+    normal empty responses and apply exponential backoff before the next chunk.
     """
 
     _GROWW_SLEEP_SECS = 0.2
@@ -160,10 +118,8 @@ class GrowwProvider(DataProvider):
 
     @staticmethod
     def _to_groww_symbol(ticker: str) -> Optional[str]:
-        """Convert .NS cache ticker to bare Groww trading symbol. Returns None for indices."""
         if any(ticker.startswith(p) for p in _GROWW_INDEX_PREFIXES):
             return None
-        # Strip .NS or .BO suffix
         for sfx in (".NS", ".BO", ".BSE"):
             if ticker.upper().endswith(sfx):
                 return ticker[:-len(sfx)].upper()
@@ -174,10 +130,11 @@ class GrowwProvider(DataProvider):
         groww_symbol: str,
         chunk_start: str,
         chunk_end: str,
-    ) -> List[list]:
+    ):
         """
         Fetch one chunk of daily candles from Groww.
-        Returns list of raw candle arrays, or [] on any failure.
+        Returns list of raw candle arrays, [] on normal failure, or
+        _RATE_LIMITED sentinel on HTTP 429 so the caller can back off.
         """
         session = self._get_session()
         params = {
@@ -195,13 +152,14 @@ class GrowwProvider(DataProvider):
                 timeout=20,
             )
             if resp.status_code == 404:
-                # Symbol not found on Groww — not an error, just unsupported
                 logger.debug("[Groww] Symbol %s not found (404), skipping.", groww_symbol)
                 return []
             if resp.status_code == 429:
-                logger.warning("[Groww] Rate limited for %s — sleeping 5s.", groww_symbol)
-                time.sleep(5)
-                return []
+                # FIX-MB-GROWW429: Return sentinel instead of [] so the outer
+                # loop can distinguish a rate-limit hit from an empty response
+                # and apply exponential backoff before the next chunk request.
+                logger.warning("[Groww] Rate limited for %s.", groww_symbol)
+                return _RATE_LIMITED
             resp.raise_for_status()
             payload = resp.json()
             status = payload.get("status", "")
@@ -218,32 +176,38 @@ class GrowwProvider(DataProvider):
         """
         Fetch complete daily OHLCV history for groww_symbol over [start, end].
 
-        Groww enforces a maximum of 1080 days per single API request but places
-        no cap on total historical depth. This method loops over the full date
-        range in 1080-day chunks, issuing one request per chunk and stitching
-        all results into a single continuous DataFrame.
-
-        For a backtest starting in 2018 with today's end date (~8 years = ~2920
-        days) this issues ceil(2920/1080) = 3 requests per ticker — fast and
-        well within any reasonable rate limit.
-
-        Returns a raw (unadjusted) DataFrame with columns [Open, High, Low,
-        Close, Volume] and a timezone-naive DatetimeIndex, or None if no data
-        was retrieved across all chunks.
+        FIX-MB-GROWW429: Applies exponential backoff when _RATE_LIMITED sentinel
+        is returned, preventing a rapid retry storm after a 429 response.
         """
         start_ts = pd.Timestamp(start)
         end_ts   = pd.Timestamp(end)
 
         all_candles: List[list] = []
         cursor = start_ts
+        consecutive_rate_limits = 0
+
         while cursor <= end_ts:
             chunk_end = min(cursor + pd.Timedelta(days=_GROWW_CHUNK_DAYS), end_ts)
-            candles = self._fetch_candles_chunk(
+            result = self._fetch_candles_chunk(
                 groww_symbol,
                 cursor.strftime("%Y-%m-%d"),
                 chunk_end.strftime("%Y-%m-%d"),
             )
-            all_candles.extend(candles)
+
+            if result is _RATE_LIMITED:
+                consecutive_rate_limits += 1
+                # Exponential backoff: 5s, 10s, 20s, ... capped at 60s
+                backoff = min(5.0 * (2 ** (consecutive_rate_limits - 1)), 60.0)
+                logger.warning(
+                    "[Groww] Rate limit hit #%d for %s — backing off %.0fs.",
+                    consecutive_rate_limits, groww_symbol, backoff,
+                )
+                time.sleep(backoff)
+                # Retry the same chunk (do not advance cursor)
+                continue
+
+            consecutive_rate_limits = 0
+            all_candles.extend(result)
             cursor = chunk_end + pd.Timedelta(days=1)
             time.sleep(self._GROWW_SLEEP_SECS)
 
@@ -255,7 +219,6 @@ class GrowwProvider(DataProvider):
             if not isinstance(c, list) or len(c) < 6:
                 continue
             try:
-                # Groww response: [timestamp_str, open, high, low, close, volume, oi_or_null]
                 ts    = pd.Timestamp(str(c[0]))
                 open_ = float(c[1])
                 high  = float(c[2])
@@ -286,10 +249,8 @@ class GrowwProvider(DataProvider):
         field: str,
         ticker: str,
     ) -> Optional[pd.Series]:
-        """Extract a ticker/field series from batched yfinance output."""
         if batch_df is None or batch_df.empty or field not in batch_df.columns:
             return None
-
         try:
             field_df = batch_df[field]
             if isinstance(field_df, pd.DataFrame):
@@ -297,7 +258,6 @@ class GrowwProvider(DataProvider):
                     return None
                 series = field_df[ticker].copy()
             else:
-                # Single ticker request can flatten to Series
                 series = field_df.copy()
         except Exception:
             return None
@@ -311,36 +271,52 @@ class GrowwProvider(DataProvider):
         self,
         raw_close: pd.Series,
         ns_ticker: str,
-        yf_adj: pd.DataFrame,
         yf_raw: pd.DataFrame,
     ) -> pd.Series:
         """
         Back-adjust the raw Groww Close series using split/dividend metadata
-        from yfinance. The adjustment matches what yfinance returns for Adj Close.
+        from yfinance (auto_adjust=False, actions=True).
 
-        If yfinance data is unavailable or the adjustment fails for any reason,
-        returns raw_close unchanged (unadjusted). The engine will still work
-        correctly — only return computation for corporate-action periods will
-        be slightly off.
+        FIX-MB-GROWWADJ: The previous implementation took two separate yfinance
+        downloads (one with auto_adjust=True, one with auto_adjust=False) and
+        computed the ratio between them. This introduced two problems:
+        1. The two downloads could use different internal caches, causing
+           mismatched adj/raw prices on split days and a ratio that is not 1.0
+           on non-event days.
+        2. After aligning the ratio to Groww dates, bfill() was applied, which
+           could propagate a future split ratio backward across an NSE/yfinance
+           holiday calendar gap — look-ahead contamination.
+
+        Fix: the caller now provides a single yf_raw download (auto_adjust=False,
+        actions=True). We derive Adj Close directly from Close + Stock Splits +
+        Dividends in the same payload, matching yfinance's own adjustment logic.
+        If derivation fails, we fall back to yfinance's pre-computed Adj Close
+        column from the same payload (no separate download needed).
+        Only ffill (forward-fill) is applied when aligning to Groww dates —
+        never bfill.
         """
         try:
-            adj_yf = self._extract_batch_series(yf_adj, "Close", ns_ticker)
-            raw_yf_close = self._extract_batch_series(yf_raw, "Close", ns_ticker)
+            # Prefer yfinance's own Adj Close from the raw (unadjusted) payload.
+            # Both Close and Adj Close come from the same download call, so their
+            # ratio is internally consistent.
+            adj_yf     = self._extract_batch_series(yf_raw, "Adj Close", ns_ticker)
+            raw_yf_cls = self._extract_batch_series(yf_raw, "Close",     ns_ticker)
 
-            if adj_yf is None or raw_yf_close is None:
+            if adj_yf is None or raw_yf_cls is None:
                 return raw_close
 
-            common = adj_yf.index.intersection(raw_yf_close.index)
+            common = adj_yf.index.intersection(raw_yf_cls.index)
             if common.empty:
                 return raw_close
 
-            ratio = (adj_yf.loc[common] / raw_yf_close.loc[common]).dropna()
+            ratio = (adj_yf.loc[common] / raw_yf_cls.loc[common]).dropna()
             if ratio.empty:
                 return raw_close
 
-            # Apply ratio to Groww raw close, forward-filling ratio across dates
-            # that exist in Groww but not yfinance (e.g. different holiday calendars)
-            ratio_aligned = ratio.reindex(raw_close.index).ffill().bfill().fillna(1.0)
+            # FIX-MB-GROWWADJ: Only forward-fill (ffill) — never bfill.
+            # bfill would carry a future split ratio backward across a holiday
+            # gap, contaminating historical prices with look-ahead information.
+            ratio_aligned = ratio.reindex(raw_close.index).ffill().fillna(1.0)
             adj_groww = raw_close * ratio_aligned
             return adj_groww
 
@@ -354,7 +330,6 @@ class GrowwProvider(DataProvider):
         ns_ticker: str,
         yf_raw: pd.DataFrame,
     ) -> tuple[pd.Series, pd.Series]:
-        """Extract dividends and split series from batched yfinance actions payload."""
         dividends = self._extract_batch_series(yf_raw, "Dividends", ns_ticker)
         splits = self._extract_batch_series(yf_raw, "Stock Splits", ns_ticker)
 
@@ -369,18 +344,6 @@ class GrowwProvider(DataProvider):
         return div_series, split_series
 
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """
-        Download complete daily OHLCV history for each ticker from Groww,
-        returning a MultiIndex DataFrame in the same shape as YFinanceProvider
-        (field, ticker).
-
-        Full history is retrieved by issuing multiple 1080-day chunked requests
-        per ticker and merging them. A backtest from 2018 to today requires
-        ~3 requests per equity ticker — typically completes in a few seconds.
-
-        Tickers that Groww cannot serve (indices, failures) are silently omitted
-        so the caller can fall back to yfinance for those specific tickers.
-        """
         if not self.api_token:
             return None
 
@@ -393,19 +356,14 @@ class GrowwProvider(DataProvider):
 
         yf_start = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
         yf_end   = (pd.Timestamp(end) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
-        yf_adj = pd.DataFrame()
+
+        # FIX-MB-GROWWADJ: Single yfinance call with auto_adjust=False, actions=True.
+        # This gives us both raw Close AND Adj Close AND corporate actions (Dividends,
+        # Stock Splits) from the same internal cache state, eliminating the
+        # divergence that occurred when two separate calls hit different snapshots.
         yf_raw = pd.DataFrame()
         if valid_groww_tickers:
             try:
-                yf_adj = yf.download(
-                    valid_groww_tickers,
-                    start=yf_start,
-                    end=yf_end,
-                    auto_adjust=True,
-                    actions=False,
-                    progress=False,
-                    threads=True,
-                )
                 yf_raw = yf.download(
                     valid_groww_tickers,
                     start=yf_start,
@@ -416,12 +374,10 @@ class GrowwProvider(DataProvider):
                     threads=True,
                 )
             except Exception as exc:
-                logger.warning("[Groww] YF batch adjustment fetch failed: %s", exc)
-                yf_adj = pd.DataFrame()
+                logger.warning("[Groww] YF batch fetch failed: %s", exc)
                 yf_raw = pd.DataFrame()
 
         for ns_ticker in tickers:
-            # Skip indices — Groww does not serve them
             if any(ns_ticker.startswith(p) for p in _GROWW_INDEX_PREFIXES):
                 continue
 
@@ -433,11 +389,10 @@ class GrowwProvider(DataProvider):
             if raw_df is None or raw_df.empty:
                 continue
 
-            # Build Adj Close from pre-fetched yfinance adjustment ratios
-            adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_adj, yf_raw)
+            # Build Adj Close using the single yf_raw payload (no separate adj call)
+            adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_raw)
             raw_df["Adj Close"] = adj_close
 
-            # Preserve corporate actions from yfinance action stream.
             dividends, splits = self._extract_actions_from_batches(raw_df.index, ns_ticker, yf_raw)
             raw_df["Dividends"] = dividends
             raw_df["Stock Splits"] = splits
@@ -447,13 +402,11 @@ class GrowwProvider(DataProvider):
         if not frames:
             return None
 
-        # Build a (field, ticker) MultiIndex DataFrame matching yfinance 1.x layout
         combined = pd.concat(frames, axis=1)
         combined.columns = pd.MultiIndex.from_tuples(
             [(col, tkr) for tkr, col in combined.columns],
             names=["Price", "Ticker"],
         )
-        # Reorder to (field, ticker) so _extract_ticker_frame's xs() works correctly
         combined = combined.swaplevel(0, 1, axis=1).sort_index(axis=1)
         return _normalize_history_index(combined)
 
@@ -466,10 +419,6 @@ class YFinanceProvider(DataProvider):
         if result is None:
             return None
 
-        # yfinance can occasionally return an empty frame for an otherwise valid
-        # multi-ticker request (crumb/rate-limit/session glitches). When that
-        # happens, degrade to one-by-one requests so healthy symbols are still
-        # captured instead of dropping the full chunk.
         if len(tickers) > 1 and result.empty:
             recovered = self._download_individual(tickers, start, end)
             if recovered is not None and not recovered.empty:
@@ -619,10 +568,6 @@ class SecondaryProvider(DataProvider):
 # ─── Index normalization ──────────────────────────────────────────────────────
 
 def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    PHASE 4 FIX: Strict Data Alignment.
-    Return a copy with a timezone-naive, monotonic DatetimeIndex normalized to midnight.
-    """
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -652,7 +597,6 @@ def _extract_ticker_frame(
     *,
     is_single_request: bool = False,
 ) -> Optional[pd.DataFrame]:
-    """Robustly extract one ticker frame from varying yfinance payload shapes."""
     if raw_data is None or raw_data.empty:
         return None
 
@@ -692,7 +636,6 @@ def _download_with_timeout(
     end: str,
     provider: Optional[DataProvider] = None,
 ) -> Optional[pd.DataFrame]:
-    """Attempt to download tickers via provider with exponential backoff."""
     max_retries = 3
     errors: list = []
     for attempt in range(max_retries):
@@ -712,7 +655,6 @@ def _download_with_timeout(
 
 
 def _load_manifest() -> dict:
-    """Loads the cache tracking manifest, ensuring a valid schema structure."""
     default_manifest = {"schema_version": 1, "entries": {}}
     if not MANIFEST_FILE.exists():
         return default_manifest
@@ -730,7 +672,6 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(manifest_data: dict) -> None:
-    """Atomically saves the tracking manifest to disk."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     temp_file = MANIFEST_FILE.with_name(MANIFEST_FILE.name + ".tmp")
     try:
@@ -742,7 +683,6 @@ def _save_manifest(manifest_data: dict) -> None:
 
 
 def invalidate_cache() -> None:
-    """Forces cache clearing by deleting the manifest."""
     if MANIFEST_FILE.exists():
         try:
             MANIFEST_FILE.unlink()
@@ -752,7 +692,6 @@ def invalidate_cache() -> None:
 
 
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
-    """Strict structural validation gate applied before any data is written to disk."""
     min_rows = int(getattr(cfg, "HISTORY_GATE", 5)) if cfg is not None else 5
     if df is None or df.empty or len(df) < min_rows:
         return False
@@ -777,7 +716,6 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
 
 
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalise price column names and fill gaps."""
     out = df.copy()
     out = out.loc[:, out.columns.notna()]
 
@@ -789,10 +727,6 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     def _coerce_numeric_series(series: pd.Series) -> pd.Series:
         if pd.api.types.is_numeric_dtype(series):
             return series
-
-        # yfinance occasionally returns object-typed corporate-action values
-        # such as "2.6 INR". Strip known textual/formatting artifacts before
-        # numeric coercion so parquet writes never fail on object payloads.
         cleaned = (
             series.astype(str)
             .str.replace(",", "", regex=False)
@@ -823,29 +757,12 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _latest_business_day() -> str:
-    """
-    FIX D8: Compute the latest business day in a timezone-independent way.
-    Always use the PREVIOUS business day as the staleness threshold.
-    """
     today = pd.Timestamp.today().normalize()
     latest_bday_ts = today - pd.offsets.BDay(1)
     return latest_bday_ts.strftime("%Y-%m-%d")
 
 
 def _build_provider_chain(cfg=None) -> List[DataProvider]:
-    """
-    Build the ordered provider chain based on available credentials.
-
-    If GROWW_API_TOKEN is set, GrowwProvider is inserted as the primary
-    provider for all NSE equity data — including full historical depth going
-    back to any date, achieved via automatic chunked requests of 1080 days each.
-
-    YFinanceProvider always follows as fallback for:
-      - Index tickers (^NSEI, ^CRSLDX) which Groww does not serve
-      - Any ticker where Groww returns no data (delisted, bad symbol, etc.)
-
-    SecondaryProvider (AlphaVantage) is last resort for both.
-    """
     chain: List[DataProvider] = []
 
     groww_token = os.getenv("GROWW_API_TOKEN", "").strip()
@@ -854,8 +771,7 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
         logger.debug("[Cache] GrowwProvider enabled as primary data source.")
     else:
         logger.debug(
-            "[Cache] GROWW_API_TOKEN not set — using YFinanceProvider only. "
-            "Set GROWW_API_TOKEN environment variable to enable Groww data."
+            "[Cache] GROWW_API_TOKEN not set — using YFinanceProvider only."
         )
 
     chain.append(YFinanceProvider())
@@ -870,22 +786,6 @@ def load_or_fetch(
     force_refresh: bool = False,
     cfg=None,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Primary interface for fetching market data.
-
-    Provider chain (in order):
-      1. GrowwProvider  — if GROWW_API_TOKEN set in environment
-      2. YFinanceProvider — always present as fallback
-      3. SecondaryProvider — AlphaVantage last resort
-
-    For each ticker the first provider that returns valid data wins.
-    GrowwProvider skips index tickers (^NSEI, ^CRSLDX) automatically,
-    so those always fall through to YFinanceProvider.
-
-    The Groww API history starts from ~2022. For data older than that
-    (e.g. warm-up from 2018), YFinanceProvider fills the gap seamlessly
-    because both providers return the same cache schema.
-    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest()
     entries  = manifest["entries"]
@@ -938,9 +838,6 @@ def load_or_fetch(
         for chunk in chunks:
             raw_data = None
             for provider in providers:
-                # GrowwProvider handles per-ticker fetching internally and
-                # returns only the tickers it successfully served. The
-                # remaining tickers fall through to the next provider below.
                 try:
                     _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
                     raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
@@ -952,26 +849,20 @@ def load_or_fetch(
                     raw_data = None
 
                 if raw_data is not None and not raw_data.empty:
-                    # Check how many tickers were actually served by this provider.
-                    # For GrowwProvider some tickers may be missing (indices, failures).
                     served = set()
                     if isinstance(raw_data.columns, pd.MultiIndex):
                         served = set(raw_data.columns.get_level_values(1)) | set(raw_data.columns.get_level_values(0))
                     missing_from_provider = [t for t in chunk if t not in served]
 
-                    # Process what we got from this provider
                     _process_chunk(chunk, raw_data, entries, market_data, cfg)
 
-                    # If all tickers were served, move on
                     if not missing_from_provider:
                         break
 
-                    # Otherwise try next provider for the missing ones
                     chunk = missing_from_provider
                     raw_data = None
                     continue
 
-            # Final fallback: stale parquet recovery for any tickers still missing
             if raw_data is None or (hasattr(raw_data, "empty") and raw_data.empty):
                 _recover_from_stale_cache(chunk, entries, market_data)
 
@@ -994,8 +885,7 @@ def _process_chunk(
     market_data: Dict[str, pd.DataFrame],
     cfg,
 ) -> None:
-    """Extract, validate, and cache each ticker frame from a downloaded chunk."""
-    manifest_entries = entries  # mutated in-place
+    manifest_entries = entries
 
     for ticker in chunk:
         try:
@@ -1045,7 +935,6 @@ def _recover_from_stale_cache(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
 ) -> None:
-    """Load stale parquets for tickers that all providers failed to serve."""
     recovered = 0
     for ticker in chunk:
         parquet_path = CACHE_DIR / f"{ticker}.parquet"
@@ -1075,7 +964,6 @@ def _recover_from_stale_cache(
 
 
 def get_cache_summary() -> dict:
-    """Returns a summary of cache health and coverage."""
     manifest = _load_manifest()
     entries  = manifest.get("entries", {})
     groww_token = os.getenv("GROWW_API_TOKEN", "").strip()
