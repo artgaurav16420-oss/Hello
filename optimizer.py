@@ -638,7 +638,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     precomputed_matrices = None
     if all(isinstance(v, pd.DataFrame) for v in market_data.values()):
-        precomputed_matrices = build_precomputed_matrices(market_data, cfg=cfg)
+        precomputed_matrices = build_precomputed_matrices(market_data, cfg=cfg, symbols=set(preload_universe))
 
     logger.info("Data pre-load complete. Commencing Bayesian Optimization.")
     return {
