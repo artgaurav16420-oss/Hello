@@ -281,11 +281,38 @@ class GrowwProvider(DataProvider):
         return df
 
     @staticmethod
-    def _build_adj_close(
+    def _extract_batch_series(
+        batch_df: pd.DataFrame,
+        field: str,
+        ticker: str,
+    ) -> Optional[pd.Series]:
+        """Extract a ticker/field series from batched yfinance output."""
+        if batch_df is None or batch_df.empty or field not in batch_df.columns:
+            return None
+
+        try:
+            field_df = batch_df[field]
+            if isinstance(field_df, pd.DataFrame):
+                if ticker not in field_df.columns:
+                    return None
+                series = field_df[ticker].copy()
+            else:
+                # Single ticker request can flatten to Series
+                series = field_df.copy()
+        except Exception:
+            return None
+
+        if hasattr(series.index, "tz") and series.index.tz is not None:
+            series.index = series.index.tz_convert("Asia/Kolkata").tz_localize(None)
+        series.index = pd.DatetimeIndex(series.index).normalize()
+        return pd.to_numeric(series, errors="coerce")
+
+    def _build_adj_close_from_batches(
+        self,
         raw_close: pd.Series,
         ns_ticker: str,
-        start: str,
-        end: str,
+        yf_adj: pd.DataFrame,
+        yf_raw: pd.DataFrame,
     ) -> pd.Series:
         """
         Back-adjust the raw Groww Close series using split/dividend metadata
@@ -297,37 +324,11 @@ class GrowwProvider(DataProvider):
         be slightly off.
         """
         try:
-            yf_start = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
-            yf_end   = (pd.Timestamp(end)   + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
-            ticker_obj = yf.Ticker(ns_ticker)
-            hist = ticker_obj.history(
-                start=yf_start,
-                end=yf_end,
-                auto_adjust=True,
-                actions=True,
-            )
-            if hist.empty or "Close" not in hist.columns:
+            adj_yf = self._extract_batch_series(yf_adj, "Close", ns_ticker)
+            raw_yf_close = self._extract_batch_series(yf_raw, "Close", ns_ticker)
+
+            if adj_yf is None or raw_yf_close is None:
                 return raw_close
-
-            # Align on common dates and compute adjustment ratio
-            adj_yf = hist["Close"].copy()
-            if hasattr(adj_yf.index, "tz") and adj_yf.index.tz is not None:
-                adj_yf.index = adj_yf.index.tz_convert("Asia/Kolkata").tz_localize(None)
-            adj_yf.index = adj_yf.index.normalize()
-
-            raw_yf = ticker_obj.history(
-                start=yf_start,
-                end=yf_end,
-                auto_adjust=False,
-                actions=False,
-            )
-            if raw_yf.empty or "Close" not in raw_yf.columns:
-                return raw_close
-
-            raw_yf_close = raw_yf["Close"].copy()
-            if hasattr(raw_yf_close.index, "tz") and raw_yf_close.index.tz is not None:
-                raw_yf_close.index = raw_yf_close.index.tz_convert("Asia/Kolkata").tz_localize(None)
-            raw_yf_close.index = raw_yf_close.index.normalize()
 
             common = adj_yf.index.intersection(raw_yf_close.index)
             if common.empty:
@@ -347,6 +348,26 @@ class GrowwProvider(DataProvider):
             logger.debug("[Groww] Adj Close build failed for %s: %s", ns_ticker, exc)
             return raw_close
 
+    def _extract_actions_from_batches(
+        self,
+        index: pd.DatetimeIndex,
+        ns_ticker: str,
+        yf_raw: pd.DataFrame,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Extract dividends and split series from batched yfinance actions payload."""
+        dividends = self._extract_batch_series(yf_raw, "Dividends", ns_ticker)
+        splits = self._extract_batch_series(yf_raw, "Stock Splits", ns_ticker)
+
+        div_series = pd.Series(0.0, index=index, dtype=float)
+        split_series = pd.Series(0.0, index=index, dtype=float)
+
+        if dividends is not None and not dividends.empty:
+            div_series = dividends.reindex(index).fillna(0.0).astype(float)
+        if splits is not None and not splits.empty:
+            split_series = splits.reindex(index).fillna(0.0).astype(float)
+
+        return div_series, split_series
+
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         """
         Download complete daily OHLCV history for each ticker from Groww,
@@ -365,6 +386,40 @@ class GrowwProvider(DataProvider):
 
         frames: Dict[str, pd.DataFrame] = {}
 
+        valid_groww_tickers = [
+            t for t in tickers
+            if not any(t.startswith(p) for p in _GROWW_INDEX_PREFIXES)
+        ]
+
+        yf_start = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        yf_end   = (pd.Timestamp(end) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+        yf_adj = pd.DataFrame()
+        yf_raw = pd.DataFrame()
+        if valid_groww_tickers:
+            try:
+                yf_adj = yf.download(
+                    valid_groww_tickers,
+                    start=yf_start,
+                    end=yf_end,
+                    auto_adjust=True,
+                    actions=False,
+                    progress=False,
+                    threads=True,
+                )
+                yf_raw = yf.download(
+                    valid_groww_tickers,
+                    start=yf_start,
+                    end=yf_end,
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    threads=True,
+                )
+            except Exception as exc:
+                logger.warning("[Groww] YF batch adjustment fetch failed: %s", exc)
+                yf_adj = pd.DataFrame()
+                yf_raw = pd.DataFrame()
+
         for ns_ticker in tickers:
             # Skip indices — Groww does not serve them
             if any(ns_ticker.startswith(p) for p in _GROWW_INDEX_PREFIXES):
@@ -378,15 +433,14 @@ class GrowwProvider(DataProvider):
             if raw_df is None or raw_df.empty:
                 continue
 
-            # Build Adj Close from yfinance adjustment ratios
-            adj_close = self._build_adj_close(raw_df["Close"], ns_ticker, start, end)
+            # Build Adj Close from pre-fetched yfinance adjustment ratios
+            adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_adj, yf_raw)
             raw_df["Adj Close"] = adj_close
 
-            # Add placeholder corporate-action columns so _is_valid_dataframe passes
-            if "Dividends" not in raw_df.columns:
-                raw_df["Dividends"]    = 0.0
-            if "Stock Splits" not in raw_df.columns:
-                raw_df["Stock Splits"] = 0.0
+            # Preserve corporate actions from yfinance action stream.
+            dividends, splits = self._extract_actions_from_batches(raw_df.index, ns_ticker, yf_raw)
+            raw_df["Dividends"] = dividends
+            raw_df["Stock Splits"] = splits
 
             frames[ns_ticker] = raw_df
 

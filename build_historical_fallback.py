@@ -528,6 +528,62 @@ def build_csv_from_symbols(
     return csv_path
 
 
+def _build_adnv_ranked_snapshots(
+    market_data: dict[str, pd.DataFrame],
+    start_date: str,
+    top_n: int = 500,
+    lookback_days: int = 126,
+    min_trading_days: int = 60,
+    snap_freq: str = "QS",
+) -> pd.DataFrame:
+    """Build quarterly PIT rows using ADNV ranking over available candidate symbols."""
+    snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
+    rows: list[list[str]] = []
+
+    for d in snapshot_dates:
+        ref = pd.Timestamp(d)
+        scores: dict[str, float] = {}
+        for sym, df in market_data.items():
+            if df is None or df.empty or "Close" not in df.columns or "Volume" not in df.columns:
+                continue
+            try:
+                hist = df.loc[:ref].tail(lookback_days)
+                if len(hist) < min_trading_days:
+                    continue
+                close = pd.to_numeric(hist["Close"], errors="coerce")
+                volume = pd.to_numeric(hist["Volume"], errors="coerce").replace(0, np.nan)
+                adnv = float((close * volume).mean())
+                if pd.isna(adnv) or adnv <= 0:
+                    continue
+                scores[sym] = adnv
+            except Exception:
+                continue
+
+        ranked = sorted(scores, key=scores.get, reverse=True)[:top_n]
+        rows.append(ranked)
+
+    return pd.DataFrame({"tickers": rows}, index=pd.DatetimeIndex(snapshot_dates, name="date"))
+
+
+def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Path:
+    """Write parquet+CSV outputs from a DataFrame with a `tickers` list column."""
+    output_path = DATA_DIR / f"historical_{universe_type}.parquet"
+    csv_path = DATA_DIR / f"historical_{universe_type}.csv"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    snapshot_df.to_parquet(output_path)
+
+    csv_rows = []
+    for d, tickers in snapshot_df["tickers"].items():
+        for tkr in (tickers if isinstance(tickers, list) else list(tickers)):
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
+    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+
+    logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))
+    logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
+    return output_path
+
+
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
 def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
@@ -677,9 +733,26 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
         else:
             print()
             print("  ⚠ No Wayback snapshots available.")
-            print("    RESIDUAL SURVIVORSHIP BIAS: ~8-15% CAGR inflation.")
-            print("    All WFO years use volume-gate (survivors-only) universe.")
-            print("    Try again with a different network/VPN to access web.archive.org.")
+            print("    Falling back to ADNV-ranked approximation (better than survivors-only volume-gate).")
+            print("    Try again with a different network/VPN to access web.archive.org for TRUE PIT anchors.")
+
+            adnv_df = _build_adnv_ranked_snapshots(
+                market_data=market_data,
+                start_date=start_date,
+                top_n=500,
+            )
+            non_empty = int(sum(bool(x) for x in adnv_df["tickers"]))
+            if non_empty > 0:
+                parquet_path = _write_snapshot_outputs("nifty500", adnv_df)
+                logger.warning(
+                    "[Nifty500] Wayback unavailable: wrote ADNV approximation with %d/%d non-empty snapshots.",
+                    non_empty,
+                    len(adnv_df),
+                )
+            else:
+                logger.warning(
+                    "[Nifty500] ADNV approximation produced no eligible rows; keeping volume-gate baseline output."
+                )
 
         # Step C: verify the final parquet
         df_check = pd.read_parquet(parquet_path)
