@@ -238,6 +238,26 @@ def test_build_sampler_returns_tpe_sampler(monkeypatch):
     assert isinstance(sampler_seeded, optimizer.TPESampler)
 
 
+def test_fitness_from_metrics_handles_missing_rebalance_columns_without_crash():
+    metrics = {
+        "cagr": 12.0,
+        "max_dd": 10.0,
+        "turnover": 5.0,
+        "sortino": 1.2,
+        "final": optimizer.BASE_INITIAL_CAPITAL * 1.1,
+    }
+    # Missing realised_cvar / exposure_multiplier / n_positions columns used in
+    # diagnostics extraction. Function must use a Series fallback and not raise.
+    rebal_log = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=2, freq="D")})
+
+    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+
+    assert isinstance(score, float)
+    assert diag["avg_cvar_pct"] == pytest.approx(0.0)
+    assert diag["avg_exposure"] == pytest.approx(0.0)
+    assert diag["avg_positions"] == pytest.approx(0.0)
+
+
 
 
 def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
