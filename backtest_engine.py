@@ -639,6 +639,64 @@ def apply_halt_simulation(market_data: dict) -> dict:
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
 
+def build_precomputed_matrices(
+    market_data: dict,
+    cfg: Optional[UltimateConfig] = None,
+    symbols: Optional[set[str]] = None,
+) -> dict:
+    """
+    Build canonical price/volume matrices once so repeated backtests can reuse
+    them instead of rebuilding DataFrames on every run.
+    """
+    if cfg is None:
+        cfg = UltimateConfig()
+
+    target_symbols = set(symbols or set())
+    if not target_symbols:
+        for key in market_data.keys():
+            if isinstance(key, str) and key.endswith(".NS"):
+                target_symbols.add(key[:-3])
+
+    close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
+    max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
+
+    for sym in target_symbols:
+        if not sym:
+            continue
+        key = sym if sym.endswith(".NS") else sym + ".NS"
+        row = market_data.get(key)
+        if row is None or row.empty:
+            continue
+
+        valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        close_d[sym] = valuation_series.ffill(limit=max_absent_periods)
+        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill(limit=max_absent_periods)
+        open_d[sym] = row.get("Open", row["Close"]).ffill(limit=max_absent_periods)
+        high_d[sym] = row.get("High", row["Close"]).ffill(limit=max_absent_periods)
+        low_d[sym] = row.get("Low", row["Close"]).ffill(limit=max_absent_periods)
+        div_d[sym] = row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
+        split_d[sym] = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
+        volume_d[sym] = row["Volume"]
+
+    if not close_d:
+        return {}
+
+    close = pd.DataFrame(close_d).sort_index()
+    close_adj = pd.DataFrame(close_adj_d).sort_index()
+
+    return {
+        "close": close,
+        "close_adj": close_adj,
+        "open": pd.DataFrame(open_d).sort_index(),
+        "high": pd.DataFrame(high_d).sort_index(),
+        "low": pd.DataFrame(low_d).sort_index(),
+        "dividends": pd.DataFrame(div_d).sort_index().fillna(0.0),
+        "splits": pd.DataFrame(split_d).sort_index().fillna(0.0),
+        "volume": pd.DataFrame(volume_d).sort_index(),
+        "returns": close_adj.pct_change(fill_method=None).clip(lower=-0.99),
+    }
+
+
 def run_backtest(
     market_data:   dict,
     universe_type: Optional[str] = None,
@@ -647,6 +705,7 @@ def run_backtest(
     cfg:           Optional[UltimateConfig] = None,
     sector_map:    Optional[dict]           = None,
     universe:      Optional[List[str]]      = None,
+    precomputed_matrices: Optional[dict]    = None,
 ) -> BacktestResults:
     """
     Run a backtest over [start_date, end_date].
@@ -735,37 +794,33 @@ def run_backtest(
                 "verify universe snapshots or date range."
             )
 
-    close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
-    max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
-    for sym in union_universe:
-        if not sym:
-            continue
-        key = sym if sym.endswith(".NS") else sym + ".NS"
-        if key not in market_data:
-            continue
-        row = market_data[key]
-        valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
-        close_d[sym]     = valuation_series.ffill(limit=max_absent_periods)
-        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill(limit=max_absent_periods)
-        open_d[sym]      = row.get("Open",  row["Close"]).ffill(limit=max_absent_periods)
-        high_d[sym]      = row.get("High",  row["Close"]).ffill(limit=max_absent_periods)
-        low_d[sym]       = row.get("Low",   row["Close"]).ffill(limit=max_absent_periods)
-        div_d[sym]       = row.get("Dividends",    pd.Series(0.0, index=row.index)).fillna(0.0)
-        split_d[sym]     = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
-        volume_d[sym]    = row["Volume"]
-
-    if not close_d:
-        raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
-
-    close     = pd.DataFrame(close_d).sort_index()
-    close_adj = pd.DataFrame(close_adj_d).sort_index()
-    open_px   = pd.DataFrame(open_d).sort_index()
-    high_px   = pd.DataFrame(high_d).sort_index()
-    low_px    = pd.DataFrame(low_d).sort_index()
-    dividends = pd.DataFrame(div_d).sort_index().fillna(0.0)
-    splits    = pd.DataFrame(split_d).sort_index().fillna(0.0)
-    volume    = pd.DataFrame(volume_d).sort_index()
-    returns   = close_adj.pct_change(fill_method=None).clip(lower=-0.99)
+    matrices = precomputed_matrices
+    if matrices:
+        selected = [sym for sym in union_universe if sym in matrices["close"].columns]
+        if not selected:
+            raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
+        close = matrices["close"][selected]
+        close_adj = matrices["close_adj"][selected]
+        open_px = matrices["open"][selected]
+        high_px = matrices["high"][selected]
+        low_px = matrices["low"][selected]
+        dividends = matrices["dividends"][selected]
+        splits = matrices["splits"][selected]
+        volume = matrices["volume"][selected]
+        returns = matrices["returns"][selected]
+    else:
+        matrices = build_precomputed_matrices(market_data, cfg=cfg, symbols=union_universe)
+        if not matrices:
+            raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
+        close = matrices["close"]
+        close_adj = matrices["close_adj"]
+        open_px = matrices["open"]
+        high_px = matrices["high"]
+        low_px = matrices["low"]
+        dividends = matrices["dividends"]
+        splits = matrices["splits"]
+        volume = matrices["volume"]
+        returns = matrices["returns"]
 
     trading_index = pd.DatetimeIndex(close.index).sort_values()
     valid = []
