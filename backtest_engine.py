@@ -203,6 +203,10 @@ class BacktestEngine:
         active_prices = prices_t
         if member_universe is not None:
             member_set = {str(sym) for sym in member_universe}
+            # Keep currently held symbols active so they can be explicitly
+            # assigned a zero target weight and liquidated if they have
+            # dropped out of the index universe.
+            member_set.update(self.state.shares.keys())
             active_symbols = [sym for sym in symbols if sym in member_set]
             if not active_symbols:
                 return
@@ -542,16 +546,19 @@ def _execution_prices(
     high_px: Optional[pd.DataFrame],
     low_px: Optional[pd.DataFrame],
 ) -> np.ndarray:
-    if open_px is not None and date in open_px.index:
-        opens = open_px.loc[date].reindex(symbols).values.astype(float)
-        if np.isfinite(opens).any():
-            return np.where(np.isfinite(opens) & (opens > 0), opens, close_prices)
+    exec_px = close_prices.copy()
+
     if high_px is not None and low_px is not None and date in high_px.index and date in low_px.index:
         highs = high_px.loc[date].reindex(symbols).values.astype(float)
         lows  = low_px.loc[date].reindex(symbols).values.astype(float)
         vwap  = (highs + lows + close_prices) / 3.0
-        return np.where(np.isfinite(vwap) & (vwap > 0), vwap, close_prices)
-    return close_prices
+        exec_px = np.where(np.isfinite(vwap) & (vwap > 0), vwap, exec_px)
+
+    if open_px is not None and date in open_px.index:
+        opens = open_px.loc[date].reindex(symbols).values.astype(float)
+        exec_px = np.where(np.isfinite(opens) & (opens > 0), opens, exec_px)
+
+    return exec_px
 
 
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
@@ -729,6 +736,7 @@ def run_backtest(
             )
 
     close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
+    max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
     for sym in union_universe:
         if not sym:
             continue
@@ -737,11 +745,11 @@ def run_backtest(
             continue
         row = market_data[key]
         valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
-        close_d[sym]     = valuation_series.ffill()
-        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill()
-        open_d[sym]      = row.get("Open",  row["Close"]).ffill()
-        high_d[sym]      = row.get("High",  row["Close"]).ffill()
-        low_d[sym]       = row.get("Low",   row["Close"]).ffill()
+        close_d[sym]     = valuation_series.ffill(limit=max_absent_periods)
+        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill(limit=max_absent_periods)
+        open_d[sym]      = row.get("Open",  row["Close"]).ffill(limit=max_absent_periods)
+        high_d[sym]      = row.get("High",  row["Close"]).ffill(limit=max_absent_periods)
+        low_d[sym]       = row.get("Low",   row["Close"]).ffill(limit=max_absent_periods)
         div_d[sym]       = row.get("Dividends",    pd.Series(0.0, index=row.index)).fillna(0.0)
         split_d[sym]     = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
         volume_d[sym]    = row["Volume"]
