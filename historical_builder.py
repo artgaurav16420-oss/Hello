@@ -340,16 +340,15 @@ def _approximate_nifty500_at_date(
             hist = df.loc[:ref].tail(lookback_days)
             if len(hist) < min_trading_days:
                 continue
-            # Use close price as market-cap proxy (equal-weighted — we don't have
-            # shares-outstanding data, but price ranking is highly correlated with
-            # market cap for NSE stocks as larger companies tend to have higher prices)
-            avg_close = float(hist["Close"].mean())
-            avg_vol   = float(hist["Volume"].replace(0, float("nan")).mean())
-            if pd.isna(avg_close) or pd.isna(avg_vol) or avg_close <= 0 or avg_vol <= 0:
+            # Score by Average Daily Notional Value (ADNV = price * volume),
+            # a robust proxy for institutional liquidity and market footprint
+            # when true free-float market cap is unavailable.
+            close = pd.to_numeric(hist["Close"], errors="coerce")
+            volume = pd.to_numeric(hist["Volume"], errors="coerce").replace(0, float("nan"))
+            adnv = float((close * volume).mean())
+            if pd.isna(adnv) or adnv <= 0:
                 continue
-            # Score = log(price) + 0.5 * log(volume) — emphasizes large liquid stocks
-            import math
-            scores[ticker] = math.log(avg_close) + 0.5 * math.log(avg_vol)
+            scores[ticker] = adnv
         except Exception:
             continue
 

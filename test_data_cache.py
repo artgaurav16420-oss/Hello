@@ -203,3 +203,59 @@ def test_ensure_price_columns_coerces_object_dividends_and_prices():
     assert out["Dividends"].dtype.kind in "fc"
     assert out["Dividends"].iloc[1] == 2.6
     assert out["Volume"].iloc[0] == 1000
+
+
+def test_groww_provider_batches_yfinance_and_maps_actions(monkeypatch):
+    monkeypatch.setenv("GROWW_API_TOKEN", "token")
+    provider = data_cache.GrowwProvider(api_token="token")
+
+    idx = pd.DatetimeIndex(["2024-01-01", "2024-01-02"])
+
+    def _fake_fetch_full_history(symbol, start, end):
+        return pd.DataFrame(
+            {
+                "Open": [100.0, 200.0],
+                "High": [101.0, 201.0],
+                "Low": [99.0, 199.0],
+                "Close": [100.0, 200.0],
+                "Volume": [10.0, 20.0],
+            },
+            index=idx,
+        )
+
+    monkeypatch.setattr(provider, "_fetch_full_history", _fake_fetch_full_history)
+
+    calls = []
+
+    def _fake_download(tickers, start, end, auto_adjust, actions, progress, threads):
+        calls.append({
+            "tickers": tuple(tickers),
+            "auto_adjust": auto_adjust,
+            "actions": actions,
+        })
+        cols = pd.MultiIndex.from_product(
+            [["Close", "Dividends", "Stock Splits"], tickers],
+            names=["Price", "Ticker"],
+        )
+        frame = pd.DataFrame(index=idx, columns=cols, dtype=float)
+        for t in tickers:
+            if auto_adjust:
+                frame[("Close", t)] = [90.0, 180.0]
+            else:
+                frame[("Close", t)] = [100.0, 200.0]
+                frame[("Dividends", t)] = [0.0, 1.25]
+                frame[("Stock Splits", t)] = [0.0, 0.0]
+        return frame
+
+    monkeypatch.setattr(data_cache.yf, "download", _fake_download)
+
+    out = provider.download(["AAA.NS", "BBB.NS", "^NSEI"], "2024-01-01", "2024-01-10")
+
+    assert out is not None
+    assert len(calls) == 2
+    assert all(call["tickers"] == ("AAA.NS", "BBB.NS") for call in calls)
+
+    aaa = out.xs("AAA.NS", axis=1, level=0)
+    assert aaa["Adj Close"].tolist() == [90.0, 180.0]
+    assert aaa["Dividends"].tolist() == [0.0, 1.25]
+    assert aaa["Stock Splits"].tolist() == [0.0, 0.0]
