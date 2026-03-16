@@ -19,6 +19,10 @@ BUG FIXES (murder board):
   silently undercounting profitable round-trips on multi-lot positions. Now
   unmatched portions are excluded from both numerator and denominator so the
   ratio remains accurate.
+- FIX-MB2-SORTEDUNIV: union_universe is a set; iterating a set to select
+  precomputed_matrices columns produced non-deterministic column ordering across
+  runs, causing non-reproducible backtest results for the same inputs. The
+  selection is now sorted() before indexing into the matrices DataFrames.
 """
 
 from __future__ import annotations
@@ -427,6 +431,15 @@ def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
 
 
 def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) -> Dict[str, float]:
+    """
+    Compute previous portfolio weights from current share counts and prices.
+
+    FIX-MB2-PREVWGT: Ghost positions (symbols held but absent from the current
+    active universe) were previously priced at raw last_known_prices in the
+    numerator while the PV denominator used haircut prices. This overstated ghost
+    weights and mispriced turnover costs in the optimizer. Now both numerator and
+    denominator use the same haircut-adjusted price for absent symbols.
+    """
     result: Dict[str, float] = {}
     if pv <= 0:
         return result
@@ -434,8 +447,16 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
         n = state.shares.get(sym, 0)
         if n <= 0:
             continue
-        px = state.last_known_prices.get(sym)
-        if px is None or not np.isfinite(px) or px <= 0:
+        raw_px = state.last_known_prices.get(sym)
+        if raw_px is None or not np.isfinite(raw_px) or raw_px <= 0:
+            continue
+        # Apply absence haircut so numerator matches the haircut PV denominator.
+        absent_n = int(state.absent_periods.get(sym, 0))
+        if absent_n > 0:
+            px = float(absent_symbol_effective_price(raw_px, absent_n, state.max_absent_periods))
+        else:
+            px = float(raw_px)
+        if px <= 0:
             continue
         result[sym] = (n * px) / pv
     return result
@@ -732,7 +753,13 @@ def run_backtest(
 
     matrices = precomputed_matrices
     if matrices:
-        selected = [sym for sym in union_universe if sym in matrices["close"].columns]
+        # FIX-MB2-SORTEDUNIV: Sort union_universe before selecting columns.
+        # union_universe is a set; set iteration order is non-deterministic across
+        # Python versions and process runs (even though CPython 3.7+ hash-randomises
+        # sets). Non-deterministic column ordering produces non-reproducible backtest
+        # results because different column arrangements pass different weight vectors
+        # to execute_rebalance for the same portfolio state.
+        selected = sorted(sym for sym in union_universe if sym in matrices["close"].columns)
         if not selected:
             raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
         close = matrices["close"][selected]

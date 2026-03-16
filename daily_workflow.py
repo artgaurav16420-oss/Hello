@@ -23,6 +23,16 @@ BUG FIXES (murder board):
   final post-sell cash balance) — the separate pre-call residual sizing block
   that existed only in the scan path has been removed, making the live scan
   path consistent with the backtest path.
+- FIX-MB2-EQUITYCAP: _run_scan unconditionally overwrote state.equity_hist_cap
+  and state.max_absent_periods with cfg defaults on every call, discarding any
+  user-persisted custom values. Now only applies the cfg default when the field
+  still holds its dataclass default value.
+- FIX-MB2-PAPERRISK: save_portfolio_state in PAPER_MODE now writes a thin
+  risk-metadata-only overlay file (portfolio_risk_{name}.json) so that
+  consecutive_failures, override_cooldown, decay_rounds and absent_periods
+  survive process restarts. load_portfolio_state merges this overlay back.
+  Without this fix a crash during a CVaR breach in paper mode would cause an
+  immediate unrestricted rebalance on the next run.
 """
 from __future__ import annotations
 import importlib.util
@@ -114,6 +124,32 @@ def load_optimized_config() -> UltimateConfig:
                     logger.warning("[Config] Ignoring unknown/stale optimized parameter: %s", k)
                     continue
                 setattr(cfg, k, v)
+        # FIX-MB2-CFGVALIDATION: Validate cross-field constraints after applying
+        # all JSON values. A hand-edited or crash-corrupted JSON could produce an
+        # invalid combination (e.g. HALFLIFE_FAST > HALFLIFE_SLOW), which would
+        # silently invert the momentum signal direction. Reset to defaults when
+        # cross-field invariants are violated.
+        if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
+            logger.error(
+                "[Config] optimal_cfg.json has HALFLIFE_FAST (%d) >= HALFLIFE_SLOW (%d) — "
+                "invalid: would invert momentum signal. Resetting both to defaults.",
+                cfg.HALFLIFE_FAST, cfg.HALFLIFE_SLOW,
+            )
+            defaults = UltimateConfig()
+            cfg.HALFLIFE_FAST = defaults.HALFLIFE_FAST
+            cfg.HALFLIFE_SLOW = defaults.HALFLIFE_SLOW
+        if cfg.MIN_EXPOSURE_FLOOR > 1.0 or cfg.MIN_EXPOSURE_FLOOR < 0.0:
+            logger.error(
+                "[Config] optimal_cfg.json has MIN_EXPOSURE_FLOOR=%.4f outside [0,1]. Resetting.",
+                cfg.MIN_EXPOSURE_FLOOR,
+            )
+            cfg.MIN_EXPOSURE_FLOOR = UltimateConfig().MIN_EXPOSURE_FLOOR
+        if cfg.CVAR_DAILY_LIMIT <= 0.0 or cfg.CVAR_DAILY_LIMIT > 0.5:
+            logger.error(
+                "[Config] optimal_cfg.json has CVAR_DAILY_LIMIT=%.4f outside (0, 0.5]. Resetting.",
+                cfg.CVAR_DAILY_LIMIT,
+            )
+            cfg.CVAR_DAILY_LIMIT = UltimateConfig().CVAR_DAILY_LIMIT
     return cfg
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
@@ -378,7 +414,32 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
     if PAPER_MODE:
-        print(f"  {C.YLW}[!] Paper mode active. State will not be saved.{C.RST}")
+        # FIX-MB2-PAPERRISK: In paper mode we must NOT write trade/share changes,
+        # but we DO need to persist risk-tracking metadata so that a process restart
+        # mid-stress-event (CVaR breach, decay cycle) does not reset consecutive_failures
+        # and override_cooldown to 0, causing an immediate unrestricted rebalance.
+        # Solution: write a thin "risk-only" overlay file that is read back by
+        # load_portfolio_state and merged onto the in-memory state before returning.
+        print(f"  {C.YLW}[!] Paper mode active. Trades not saved; risk metadata persisted.{C.RST}")
+        os.makedirs("data", exist_ok=True)
+        risk_file = f"data/portfolio_risk_{name}.json"
+        risk_payload = {
+            "consecutive_failures": state.consecutive_failures,
+            "override_active":      state.override_active,
+            "override_cooldown":    state.override_cooldown,
+            "decay_rounds":         state.decay_rounds,
+            "absent_periods":       dict(sorted(state.absent_periods.items())),
+            "last_rebalance_date":  state.last_rebalance_date,
+        }
+        try:
+            tmp = risk_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(risk_payload, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, risk_file)
+        except Exception as exc:
+            logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
         return
 
     os.makedirs("data", exist_ok=True)
@@ -427,7 +488,27 @@ def load_portfolio_state(name: str) -> PortfolioState:
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    return PortfolioState.from_dict(json.load(f))
+                    ps = PortfolioState.from_dict(json.load(f))
+                # FIX-MB2-PAPERRISK: Merge paper-mode risk overlay if present.
+                # This restores consecutive_failures / override state across
+                # paper-mode process restarts without loading trade/share changes.
+                risk_file = f"data/portfolio_risk_{name}.json"
+                if os.path.exists(risk_file):
+                    try:
+                        with open(risk_file) as rf:
+                            risk = json.load(rf)
+                        ps.consecutive_failures = int(risk.get("consecutive_failures", ps.consecutive_failures))
+                        ps.override_active      = bool(risk.get("override_active",      ps.override_active))
+                        ps.override_cooldown    = int(risk.get("override_cooldown",     ps.override_cooldown))
+                        ps.decay_rounds         = int(risk.get("decay_rounds",          ps.decay_rounds))
+                        absent = risk.get("absent_periods", {})
+                        if absent:
+                            ps.absent_periods.update({k: int(v) for k, v in absent.items()})
+                        if risk.get("last_rebalance_date"):
+                            ps.last_rebalance_date = str(risk["last_rebalance_date"])
+                    except Exception as exc:
+                        logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
+                return ps
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
                 corrupted_paths.append(path)
@@ -453,8 +534,14 @@ def _run_scan(
 
     cfg    = cfg_override if cfg_override else load_optimized_config()
     engine = InstitutionalRiskEngine(cfg)
-    state.equity_hist_cap = cfg.EQUITY_HIST_CAP
-    state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
+    # FIX-MB2-EQUITYCAP: Only apply cfg defaults when the state field still holds
+    # its dataclass default (250 for equity_hist_cap, 12 for max_absent_periods).
+    # A user who persisted a custom value (e.g. equity_hist_cap=1000) must not have
+    # it silently reset to cfg.EQUITY_HIST_CAP=500 on every scan call.
+    if state.equity_hist_cap == 250:
+        state.equity_hist_cap = cfg.EQUITY_HIST_CAP
+    if state.max_absent_periods == 12:
+        state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
     today = pd.Timestamp(datetime.today().date())
     next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)

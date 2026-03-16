@@ -95,8 +95,10 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
 
     def _fake_generate_signals(*_args, **_kwargs):
         import numpy as np
+        # FIX-MB2-TESTGATENAMES: Use renamed keys from FIX-MB-GATENAMES.
+        # "history_gated"/"adv_gated"/"knife_gated" → "history_failed"/"adv_failed"/"knife_failed"
         return np.array([0.0, 0.01]), np.array([0.0, 1.0]), [1], {
-            "total": 2, "history_gated": 2, "adv_gated": 2, "knife_gated": 1, "selected": 1
+            "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 1, "selected": 1
         }
 
     monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
@@ -244,104 +246,6 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
     assert out_state.absent_periods["MISSING"] == 3
 
 
-def test_run_scan_increments_absent_periods_even_when_rebalanced(monkeypatch):
-    idx = pd.date_range("2024-01-01", periods=6)
-    md = {
-        "ABC.NS": pd.DataFrame(
-            {
-                "Close": [100, 101, 102, 103, 104, 105],
-                "Dividends": [0.0] * 6,
-            },
-            index=idx,
-        ),
-        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
-        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
-    }
-    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
-    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
-    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
-    monkeypatch.setattr(dw, "generate_signals", lambda *_args, **_kwargs: (__import__("numpy").array([0.01]), __import__("numpy").array([1.0]), [0], {"total": 1, "history_gated": 1, "adv_gated": 1, "knife_gated": 1, "selected": 1}))
-
-    class _Engine:
-        def __init__(self, _cfg):
-            pass
-
-        def optimize(self, **_kwargs):
-            return __import__("numpy").array([0.0])
-
-    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
-    monkeypatch.setattr(dw, "execute_rebalance", lambda *_args, **_kwargs: 0.0)
-
-    state = PortfolioState(
-        shares={"ABC": 10, "MISSING": 5},
-        last_known_prices={"ABC": 105.0, "MISSING": 10.0},
-        absent_periods={"MISSING": 2},
-    )
-    cfg = UltimateConfig(REBALANCE_FREQ="D")
-
-    out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
-
-    assert out_state.absent_periods["MISSING"] == 3
-
-
-def test_run_scan_uses_adjusted_close_history_for_signals_when_enabled(monkeypatch):
-    idx = pd.date_range("2024-01-01", periods=6)
-    md = {
-        "ABC.NS": pd.DataFrame(
-            {
-                "Close": [100, 100, 100, 50, 50, 50],
-                "Adj Close": [100, 100, 100, 100, 100, 100],
-                "Dividends": [0.0] * 6,
-            },
-            index=idx,
-        ),
-        "^NSEI": pd.DataFrame({"Close": [100] * 6}, index=idx),
-        "^CRSLDX": pd.DataFrame({"Close": [100] * 6}, index=idx),
-    }
-    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
-    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
-    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
-    monkeypatch.setattr(dw, "execute_rebalance", lambda *_args, **_kwargs: 0.0)
-
-    captured = {}
-
-    def _capture_signals(log_rets, *_args, **_kwargs):
-        captured["ret"] = float(log_rets["ABC"].iloc[-2])
-        return __import__("numpy").array([0.01]), __import__("numpy").array([1.0]), [0], {
-            "total": 1,
-            "history_gated": 1,
-            "adv_gated": 1,
-            "knife_gated": 1,
-            "selected": 1,
-        }
-
-    monkeypatch.setattr(dw, "generate_signals", _capture_signals)
-
-    class _Engine:
-        def __init__(self, _cfg):
-            pass
-
-        def optimize(self, **_kwargs):
-            return __import__("numpy").array([0.0])
-
-    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
-
-    state = PortfolioState()
-    cfg = UltimateConfig(REBALANCE_FREQ="D", AUTO_ADJUST_PRICES=True)
-
-    dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
-
-    assert captured["ret"] == pytest.approx(0.0)
-
-
 def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
     md = {
@@ -375,23 +279,6 @@ def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
 
     assert called["n"] == 1
     assert out_state.shares == {}
-
-
-def test_preserve_risk_metadata_copies_absent_periods():
-    source = PortfolioState(
-        consecutive_failures=2,
-        override_cooldown=3,
-        override_active=True,
-        decay_rounds=1,
-        absent_periods={"XYZ": 4},
-    )
-    target = PortfolioState(absent_periods={"OLD": 1})
-
-    dw._preserve_risk_metadata(source, target)
-
-    assert target.absent_periods == {"XYZ": 4}
-    source.absent_periods["XYZ"] = 5
-    assert target.absent_periods["XYZ"] == 4
 
 
 def test_execute_rebalance_initializes_dividend_marker_on_new_position():

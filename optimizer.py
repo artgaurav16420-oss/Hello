@@ -10,11 +10,23 @@ BUG FIXES (murder board):
   concentration_mult and subtracted it flat. A 4-position portfolio with a 25%
   drawdown therefore received the same dd_penalty as an 8-position portfolio
   with the same drawdown, even though the 4-position portfolio carries 2x the
-  unobserved idiosyncratic risk. This made the IS fitness gradient near the
-  IS_DD_PENALTY_PCT boundary blind to concentration.
-  Fix: dd_penalty is now scaled by concentration_mult before subtracting, so
-  concentrated portfolios pay a proportionally larger drawdown penalty consistent
-  with how risk_penalty already handles them.
+  unobserved idiosyncratic risk.
+- FIX-MB2-DDPENALTY2: The original FIX-MB-DDPENALTY fix over-corrected by
+  multiplying dd_penalty by concentration_mult. Since risk_penalty already
+  contains concentration_mult in its denominator, applying it again to dd_penalty
+  created an asymmetric double-hit: concentrated portfolios near IS_DD_PENALTY_PCT
+  received a combinatorial penalty that dominated the fitness score and pruned
+  otherwise valid parameter sets. dd_penalty is now a flat quadratic correction
+  independent of concentration; concentration risk is fully covered by risk_penalty.
+- FIX-MB2-WFOSLICE: Each WFO fold's precomputed_matrices is now sliced to
+  [start, wf_oos_end] before passing to run_backtest. Without this slice the
+  full matrix (TRAIN_START→TEST_END) was visible to every OOS fold, allowing
+  e.g. the Year-2020 fold to see 2021-2022 returns — genuine walk-forward
+  look-ahead that inflated IS fitness scores.
+- FIX-MB2-CFGCOPY: Removed dead cfg._pre_load_padding_days assignment in
+  pre_load_data — the attribute was set but never read anywhere in the codebase,
+  and writing undeclared attributes onto a dataclass is fragile and invisible to
+  serialisation.
 
 Requires: pip install optuna
 """
@@ -218,10 +230,17 @@ def _fitness_from_metrics(
         return score, diag
 
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
-    # FIX-MB-DDPENALTY: Scale dd_penalty by concentration_mult so concentrated
-    # portfolios near the IS_DD_PENALTY_PCT boundary pay a proportionally larger
-    # penalty consistent with how risk_penalty already handles concentration risk.
-    dd_penalty = ((dd_excess ** 2) / 100.0) * concentration_mult
+    # FIX-MB-DDPENALTY / FIX-MB2-DDPENALTY2: The original fix applied
+    # concentration_mult to dd_penalty. However risk_penalty already contains
+    # concentration_mult in its denominator (division = lower score for concentrated
+    # portfolios). Adding concentration_mult to dd_penalty as well creates an
+    # additive double-hit: a 4-position portfolio with a 30% drawdown and
+    # concentration_mult=2.8 gets dd_penalty = (100²/100)*2.8 = 280, which
+    # dominates the entire score and prunes trials that should be evaluated.
+    # The correct formulation: dd_penalty is a flat quadratic correction that
+    # represents the raw drawdown severity above the threshold — concentration
+    # risk is already accounted for via risk_penalty. Revert to unscaled.
+    dd_penalty = (dd_excess ** 2) / 100.0
 
     exposure_penalty = 0.0 if avg_exposure >= 0.25 else (0.25 - avg_exposure) * 2.0
     if avg_positions < 1.0:
@@ -362,9 +381,26 @@ class MomentumObjective:
             oos_year = pd.Timestamp(wf_oos_start).year
             exclude_from_score = (oos_year == first_oos_year)
 
+            # FIX-MB2-WFOSLICE: Slice precomputed_matrices to [start, wf_oos_end]
+            # so that signals computed during this OOS fold cannot see return data
+            # from future folds. The full matrix covering TRAIN_START→TEST_END was
+            # pre-loaded for data-fetch efficiency, but each fold must only see its
+            # own window. Without this slice, e.g. the Year-2020 OOS fold sees
+            # 2021-2022 returns in hist_log_rets inside the backtest engine, which
+            # is genuine walk-forward look-ahead and inflates IS fitness scores.
+            fold_matrices = None
+            if self.precomputed_matrices is not None:
+                oos_end_ts = pd.Timestamp(wf_oos_end)
+                fold_matrices = {}
+                for key, df in self.precomputed_matrices.items():
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        fold_matrices[key] = df.loc[:oos_end_ts]
+                    else:
+                        fold_matrices[key] = df
+
             oos = run_backtest(
                 market_data=self.market_data,
-                precomputed_matrices=self.precomputed_matrices,
+                precomputed_matrices=fold_matrices,
                 universe_type=self.universe_type,
                 start_date=wf_oos_start,
                 end_date=wf_oos_end,
@@ -454,11 +490,11 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         halflife_bounds = SEARCH_SPACE_BOUNDS.get("HALFLIFE_SLOW")
         if cvar_bounds:
             cfg.CVAR_LOOKBACK = int(cvar_bounds[1])
-        if halflife_bounds:
-            halflife_slow_max = int(halflife_bounds[1])
-            halflife_calendar_days = halflife_slow_max * 4 * 365 // 252
-            current_cvar_padding = max(400, cfg.CVAR_LOOKBACK * 2)
-            cfg._pre_load_padding_days = max(current_cvar_padding, halflife_calendar_days)
+        # FIX-MB2-CFGCOPY: Removed dead cfg._pre_load_padding_days assignment.
+        # The attribute was set but never read anywhere in the codebase, and
+        # writing an undeclared field onto a dataclass is fragile (invisible to
+        # to_dict/from_dict, flagged by static analysis). The padding behaviour
+        # is handled inside load_or_fetch via its own dynamic padding logic.
 
     historical_union: set[str] = set()
     try:

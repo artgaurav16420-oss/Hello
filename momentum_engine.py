@@ -49,6 +49,12 @@ BUG FIXES (murder board):
   uncapped, preventing budget upper-bound inflation.
 - FIX-MB-SETTER: SLIPPAGE_BPS setter chains the original exception via
   `raise ValueError(...) from exc` to preserve the original exception type.
+- FIX-MB2-GHOSTPV: compute_book_cvar previously used fill_value=0.0 when
+  reindexing hist_log_rets onto held_syms. This silently zeroed the return
+  series of any active held symbol that was absent from hist_log_rets (e.g. a
+  symbol added intraday), understating CVaR. Now reindex uses fill_value=np.nan
+  and ghost synthesis covers both true off-universe ghosts AND active symbols
+  with missing history, before a final fillna(0.0) cleans up any residual NaN.
 """
 
 from __future__ import annotations
@@ -885,8 +891,15 @@ def compute_book_cvar(
     held_syms = list(mtm_weights.keys())
     T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
 
-    rets = hist_log_rets.reindex(columns=held_syms, fill_value=0.0)
-    rets = rets.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).iloc[-T_cvar:]
+    # FIX-MB2-GHOSTPV: Reindex with fill_value=np.nan (not 0.0) so that any
+    # held symbol absent from hist_log_rets — whether it is a ghost off-universe
+    # position OR an active symbol whose history is missing — receives synthetic
+    # returns via ghost synthesis below, not a silent zero-return series.
+    # Zero-filling active missing columns understates CVaR and misrepresents risk.
+    rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
+    rets = rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-T_cvar:]
+    # We do NOT fillna(0.0) here; that happens after ghost synthesis so NaN
+    # columns are properly synthesised rather than treated as flat zero.
 
     vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
     if not hist_log_rets.empty:
@@ -907,7 +920,11 @@ def compute_book_cvar(
             # Only write the key exactly as it appears — no additional aliases.
             state.last_known_volatility[str(sym_key)] = vol_value
 
-    ghost_mask = np.array([s not in active_idx for s in held_syms])
+    # ghost_mask covers both off-universe ghosts AND active symbols with no history.
+    ghost_mask = np.array([
+        (s not in active_idx) or (s in rets.columns and rets[s].isna().all())
+        for s in held_syms
+    ])
     if ghost_mask.any():
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
 
@@ -931,6 +948,10 @@ def compute_book_cvar(
             rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]
             synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
             rets.loc[:, sym] = synth_rets
+
+    # All ghost columns have been synthesised; any remaining NaN (e.g. active
+    # symbol with partial history not fully forward-filled) becomes 0.0.
+    rets = rets.fillna(0.0)
 
     if len(rets) < 5:
         return 0.0

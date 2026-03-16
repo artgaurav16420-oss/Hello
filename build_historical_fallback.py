@@ -633,9 +633,13 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
             pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
 
             logger.info(
+                # FIX-MB2-WBMMERGE: Previously used len(df_existing) for the
+                # volume-gate count, but after FIX-MB-HYBRIDMERGE only a subset of
+                # df_existing rows are kept (those strictly outside the Wayback range).
+                # The correct count is len(kept_vg_dates).
                 "[Hybrid] Merged parquet: %d total snapshots "
-                "(%d Wayback + %d volume-gate). Written → %s",
-                len(out_df), len(wbm_rows), len(df_existing), parquet_path,
+                "(%d Wayback + %d volume-gate kept). Written → %s",
+                len(out_df), len(wbm_rows), len(kept_vg_dates), parquet_path,
             )
         else:
             print()

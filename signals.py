@@ -15,6 +15,14 @@ BUG FIXES (murder board):
   for the first ~252 trading days of any backtest. This does not introduce
   incorrect results — it is conservative (uses the hard-coded floor) — but is
   now clearly documented so users understand the first year's regime calibration.
+- FIX-MB2-BREADTHNONE: compute_regime_score short-history branch hard-coded
+  min_obs=20, ignoring cfg.REGIME_SMA_WINDOW. With a large SMA window config
+  a symbol with only 21 rows trivially beats its own 20-row expanding mean,
+  producing a false-bullish breadth signal on thin data. Now uses the same 80%
+  proportional floor as the full-history branch (min 5 rows).
+- FIX-MB2-GATETOCTOU: knife_failed gate count now includes symbols softly
+  suppressed by knife_pre_bonus_suppress (continuity bonus blocked but adj_score
+  not set to -inf), not just hard-gated symbols with adj_score == -inf.
 """
 
 from __future__ import annotations
@@ -119,7 +127,14 @@ def compute_regime_score(
                 last_valid = universe_close_hist.iloc[-1][valid]
                 breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
         else:
-            min_obs = 20
+            # FIX-MB2-BREADTHNONE: The short-history branch previously hard-coded
+            # min_obs=20, ignoring cfg.REGIME_SMA_WINDOW. With a large SMA window
+            # config (e.g. 200), requiring only 20 observations to qualify a symbol
+            # for the breadth calculation produces a false-bullish signal on thin
+            # data — a symbol with 21 rows easily beats its own 20-row expanding
+            # mean. Now uses the same 80% proportional floor as the full-history
+            # branch, clamped to a minimum of 5 to handle very early warm-up days.
+            min_obs = max(5, int(np.ceil(len(universe_close_hist) * 0.8)))
             obs_count = universe_close_hist.notna().sum()
             sma_vals = universe_close_hist.expanding(min_periods=min_obs).mean().iloc[-1]
             last = universe_close_hist.iloc[-1]
@@ -299,6 +314,9 @@ def generate_signals(
 
     # Continuity Bonus
     valid_mask = np.isfinite(adj_scores)
+    # Initialise here so gate_counts can reference it even when the continuity
+    # block is skipped (no prev_weights or no valid scores).
+    knife_pre_bonus_suppress = np.zeros(len(active_symbols), dtype=bool)
 
     if prev_weights and valid_mask.any():
         cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
@@ -374,9 +392,14 @@ def generate_signals(
     n_total      = len(active_symbols)
     n_hist_fail  = int(np.sum(~history_pass))
     n_liq_fail   = int(np.sum(history_pass & ~liquidity_pass))
-    n_knife_fail = int(np.sum(
-        gate_pass_mask & (adj_scores == -np.inf)
-    ))
+    # FIX-MB2-GATETOCTOU: knife_failed now counts both hard-gated symbols
+    # (adj_scores set to -inf by the falling-knife loop) AND softly-suppressed
+    # symbols (knife_pre_bonus_suppress, which blocks the continuity bonus but
+    # does NOT set adj_scores to -inf). Previously only the -inf group was
+    # counted, understating knife gate removals in the diagnostic log.
+    knife_hard_mask = gate_pass_mask & (adj_scores == -np.inf)
+    knife_soft_mask = gate_pass_mask & knife_pre_bonus_suppress
+    n_knife_fail = int(np.sum(knife_hard_mask | knife_soft_mask))
     n_selected   = len(selected_indices)
 
     # FIX-MB-GATENAMES: Keys renamed with "_failed" suffix to be unambiguous.

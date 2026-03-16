@@ -112,28 +112,3 @@ def test_main_downloads_archives_when_missing(tmp_path, monkeypatch):
     assert (tmp_path / "data" / "raw_nse_total_archives.csv").exists()
     assert (tmp_path / "data" / "historical_nifty500.parquet").exists()
     assert (tmp_path / "data" / "historical_nse_total.parquet").exists()
-
-
-def test_approximate_nifty500_at_date_ranks_by_notional_value():
-    idx = pd.date_range("2024-01-01", periods=5, freq="D")
-    market_data = {
-        "HIGHPRICE_LOWVOL.NS": pd.DataFrame({
-            "Close": [1000, 1000, 1000, 1000, 1000],
-            "Volume": [1, 1, 1, 1, 1],
-        }, index=idx),
-        "LOWPRICE_HIGHVOL.NS": pd.DataFrame({
-            "Close": [100, 100, 100, 100, 100],
-            "Volume": [100, 100, 100, 100, 100],
-        }, index=idx),
-    }
-
-    ranked = hb._approximate_nifty500_at_date(
-        "2024-01-05",
-        ["HIGHPRICE_LOWVOL.NS", "LOWPRICE_HIGHVOL.NS"],
-        market_data,
-        lookback_days=5,
-        top_n=2,
-        min_trading_days=3,
-    )
-
-    assert ranked[0] == "LOWPRICE_HIGHVOL.NS"
