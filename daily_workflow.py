@@ -503,11 +503,14 @@ def _run_scan(
     if split_syms:
         logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
 
+    use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
+
     close_d: Dict[str, pd.Series] = {}
     for sym in universe:
         ns = to_ns(sym)
         if ns in market_data:
-            close_d[to_bare(ns)] = market_data[ns]["Close"].ffill()
+            col = "Adj Close" if use_adj and "Adj Close" in market_data[ns].columns else "Close"
+            close_d[to_bare(ns)] = market_data[ns][col].ffill()
 
     if not close_d:
         logger.warning("[Scan] No data available for any universe symbol.")
@@ -725,12 +728,11 @@ def _run_scan(
     price_dict = {sym: prices[active_idx[sym]] for sym in active}
     state.record_eod(price_dict)
 
-    if not rebalanced_this_scan:
-        for held_sym in list(state.shares.keys()):
-            if held_sym not in active_idx:
-                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
-            else:
-                state.absent_periods.pop(held_sym, None)
+    for held_sym in list(state.shares.keys()):
+        if held_sym not in active_idx:
+            state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+        else:
+            state.absent_periods.pop(held_sym, None)
 
     final_pv = state.equity_hist[-1] if state.equity_hist else pv
 
@@ -963,6 +965,7 @@ def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> N
     target.override_cooldown    = source.override_cooldown
     target.override_active      = source.override_active
     target.decay_rounds         = source.decay_rounds
+    target.absent_periods       = copy.deepcopy(source.absent_periods)
 
 
 # ─── Main menu ────────────────────────────────────────────────────────────────
