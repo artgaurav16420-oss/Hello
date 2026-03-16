@@ -206,3 +206,110 @@ def test_repair_suspension_gaps_preserves_adj_close_scale():
     ratio = repaired.loc[gap_rows, "Adj Close"] / repaired.loc[gap_rows, "Close"]
     # Synthetic Adj Close should preserve pre-gap adjusted scale, not be copied from raw Close.
     assert np.allclose(ratio.values, 0.1, atol=1e-6)
+
+
+def test_rebalance_keeps_dropped_holding_in_active_symbols(monkeypatch):
+    cfg = UltimateConfig(CVAR_MIN_HISTORY=9999)
+    engine = InstitutionalRiskEngine(cfg)
+    bt = be.BacktestEngine(engine, initial_cash=100.0)
+    bt.state.shares["ZZZ"] = 5
+    bt.state.last_known_prices["ZZZ"] = 10.0
+
+    dates = pd.DatetimeIndex([pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
+    close = pd.DataFrame({"AAA": [10.0, 10.0], "ZZZ": [10.0, 10.0]}, index=dates)
+    volume = pd.DataFrame({"AAA": [1_000_000, 1_000_000], "ZZZ": [1_000_000, 1_000_000]}, index=dates)
+    returns = close.pct_change(fill_method=None).fillna(0.0)
+
+    captured = {}
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        # No selected symbols -> decay path should create liquidation target.
+        return np.array([0.0, 0.0]), np.array([0.0, 0.0]), [], {}
+
+    def _fake_execute_rebalance(state, target_weights, _exec_prices, active_symbols, _cfg, **_kwargs):
+        captured["active_symbols"] = list(active_symbols)
+        captured["target_weights"] = np.asarray(target_weights)
+
+    monkeypatch.setattr(be, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr(be, "compute_regime_score", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(be, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(be, "execute_rebalance", _fake_execute_rebalance)
+
+    bt._run_rebalance(
+        pd.Timestamp("2020-01-02"),
+        close,
+        volume,
+        returns,
+        ["AAA", "ZZZ"],
+        close.loc[pd.Timestamp("2020-01-02")].values.astype(float),
+        idx_df=None,
+        sector_map=None,
+        open_px=close,
+        high_px=close,
+        low_px=close,
+        member_universe={"AAA"},
+    )
+
+    assert captured["active_symbols"] == ["AAA", "ZZZ"]
+    assert captured["target_weights"][1] == 0.0
+
+
+def test_execution_prices_uses_vwap_when_open_missing():
+    symbols = ["AAA", "BBB"]
+    date = pd.Timestamp("2020-01-02")
+    close_prices = np.array([100.0, 200.0])
+
+    idx = pd.DatetimeIndex([date])
+    open_px = pd.DataFrame({"AAA": [np.nan], "BBB": [190.0]}, index=idx)
+    high_px = pd.DataFrame({"AAA": [120.0], "BBB": [210.0]}, index=idx)
+    low_px = pd.DataFrame({"AAA": [90.0], "BBB": [180.0]}, index=idx)
+
+    out = be._execution_prices(symbols, date, close_prices, open_px, high_px, low_px)
+
+    # AAA uses VWAP fallback because open is missing.
+    assert np.isclose(out[0], (120.0 + 90.0 + 100.0) / 3.0)
+    # BBB uses open price when available.
+    assert np.isclose(out[1], 190.0)
+
+
+def test_run_backtest_limits_forward_fill_to_max_absent_periods(monkeypatch):
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=1, REBALANCE_FREQ="W-FRI")
+
+    idx = pd.bdate_range("2020-01-01", periods=4)
+    market_data = {
+        "AAA.NS": pd.DataFrame(
+            {
+                "Close": [100.0, np.nan, np.nan, np.nan],
+                "Adj Close": [100.0, np.nan, np.nan, np.nan],
+                "Open": [100.0, np.nan, np.nan, np.nan],
+                "High": [100.0, np.nan, np.nan, np.nan],
+                "Low": [100.0, np.nan, np.nan, np.nan],
+                "Volume": [1_000_000, 0.0, 0.0, 0.0],
+                "Dividends": [0.0, 0.0, 0.0, 0.0],
+                "Stock Splits": [0.0, 0.0, 0.0, 0.0],
+            },
+            index=idx,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [1.0, 1.0, 1.0, 1.0]}, index=idx),
+    }
+
+    captured = {}
+
+    def _fake_run(self, close, *_args, **_kwargs):
+        captured["close"] = close.copy()
+        return pd.DataFrame({"equity": pd.Series(dtype=float)})
+
+    import unittest.mock as mock
+    with mock.patch.object(be.BacktestEngine, "run", _fake_run):
+        be.run_backtest(
+            market_data=market_data,
+            start_date="2020-01-01",
+            end_date="2020-01-06",
+            cfg=cfg,
+            universe=["AAA"],
+        )
+
+    series = captured["close"]["AAA"]
+    assert pd.notna(series.iloc[0])
+    assert pd.notna(series.iloc[1])
+    assert pd.isna(series.iloc[2])
