@@ -204,7 +204,7 @@ class UltimateConfig:
     HALFLIFE_SLOW:            int   = 63
     SIGNAL_LAG_DAYS:          int   = 21
     RISK_AVERSION:            float = 5.0
-    SLACK_PENALTY:            float = 10.0
+    SLACK_PENALTY:            float = 1000.0
     DIMENSIONALITY_MULTIPLIER:int   = 3
     MAX_SECTOR_WEIGHT:        float = 1.0
 
@@ -963,7 +963,7 @@ def compute_book_cvar(
             # drift from fixed config.  Neither depends on today's market.
             vol = float(state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK))
             vol = max(vol, cfg.GHOST_VOL_FALLBACK)   # floor to config minimum only
-            daily_vol   = vol / np.sqrt(252)
+            daily_vol   = vol
             daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0  # fixed; never market-dependent
 
             sym_base_seed = _ghost_seed_for(sym)  # stable int for this symbol
@@ -1186,7 +1186,7 @@ class InstitutionalRiskEngine:
         aligned_w       = adv_w_series.reindex(clean_rets.columns).fillna(0.0).values
         aligned_w       = aligned_w / np.maximum(aligned_w.sum(), 1e-9)
         adv_weighted_rets = pd.Series(
-            clean_rets.values.dot(aligned_w), index=clean_rets.index
+            simple_rets.values.dot(aligned_w), index=simple_rets.index
         )
         var_95   = adv_weighted_rets.quantile(1 - self.cfg.CVAR_ALPHA)
         ew_cvar  = (
