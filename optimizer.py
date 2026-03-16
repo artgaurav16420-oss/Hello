@@ -43,7 +43,7 @@ _load_dotenv_if_present()
 
 # Local imports from your v11.48 architecture
 from momentum_engine import UltimateConfig, OptimizationError
-from backtest_engine import run_backtest, apply_halt_simulation
+from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices
 from data_cache import load_or_fetch
 from universe_manager import get_nifty500, fetch_nse_equity_universe, get_historical_universe
 
@@ -366,10 +366,17 @@ def _fitness_from_metrics(
 
 
 class MomentumObjective:
-    def __init__(self, market_data: dict, universe_type: str, search_space: dict | None = None):
+    def __init__(
+        self,
+        market_data: dict,
+        universe_type: str,
+        search_space: dict | None = None,
+        precomputed_matrices: dict | None = None,
+    ):
         self.market_data = market_data
         self.universe_type = universe_type
         self.search_space = search_space or SEARCH_SPACE_BOUNDS
+        self.precomputed_matrices = precomputed_matrices
 
     def __call__(self, trial: optuna.Trial) -> float:
         # 1. Base Configuration
@@ -470,6 +477,7 @@ class MomentumObjective:
                 # back to in the post-repair path (close_d etc. are new Series derived from
                 # .ffill() on the frame values, not in-place mutations of the frames).
                 market_data=self.market_data,
+                precomputed_matrices=self.precomputed_matrices,
                 universe_type=self.universe_type,
                 start_date=wf_oos_start,
                 end_date=wf_oos_end,
@@ -502,6 +510,9 @@ class MomentumObjective:
             )
 
             if not pd.notna(score):
+                raise optuna.TrialPruned()
+
+            if diag.get("dd_gate_hit") or score <= -2.0:
                 raise optuna.TrialPruned()
 
             if not exclude_from_score:
@@ -625,8 +636,15 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     # 500 tickers × 300 trials × 4 slices = 600,000 DataFrame allocations per run.
     market_data = apply_halt_simulation(market_data)
 
+    precomputed_matrices = None
+    if all(isinstance(v, pd.DataFrame) for v in market_data.values()):
+        precomputed_matrices = build_precomputed_matrices(market_data, cfg=cfg)
+
     logger.info("Data pre-load complete. Commencing Bayesian Optimization.")
-    return market_data
+    return {
+        "market_data": market_data,
+        "precomputed_matrices": precomputed_matrices,
+    }
 
 
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
@@ -702,7 +720,13 @@ def run_optimization(
     print(f"\033[90mTrials            : {N_TRIALS}\033[0m\n")
 
     logger.info(f"Optimization universe: {universe_type}")
-    market_data = pre_load_data(universe_type)
+    preloaded = pre_load_data(universe_type)
+    if isinstance(preloaded, dict) and "market_data" in preloaded:
+        market_data = preloaded["market_data"]
+        precomputed_matrices = preloaded.get("precomputed_matrices")
+    else:
+        market_data = preloaded
+        precomputed_matrices = None
 
     # 1. Setup Optuna Study
     os.makedirs("data", exist_ok=True) # Ensure the data folder exists
@@ -717,7 +741,11 @@ def run_optimization(
         load_if_exists=True
     )
      
-    objective = MomentumObjective(market_data, universe_type)
+    objective = MomentumObjective(
+        market_data,
+        universe_type,
+        precomputed_matrices=precomputed_matrices,
+    )
 
     # 2. Run In-Sample Optimization
     logger.info(f"Starting {N_TRIALS} Bayesian Trials (This may take a while)...")
@@ -906,6 +934,7 @@ def run_optimization(
         try:
             oos_result = run_backtest(
                 market_data=market_data,
+                precomputed_matrices=precomputed_matrices,
                 universe_type=universe_type,
                 start_date=TEST_START,
                 end_date=TEST_END,
