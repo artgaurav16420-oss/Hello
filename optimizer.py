@@ -155,7 +155,7 @@ OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 # The current objective is a clipped fitness score in [-2.0, 5.0]. Reusing an
 # old study (same name) from a previous objective can show impossible best
 # values (e.g., >>5) and surface stale high-risk parameter sets.
-OBJECTIVE_VERSION = "fitness_v11_50"  # IS DD gate + quadratic penalty added
+OBJECTIVE_VERSION = "fitness_v11_51"  # relaxed IS DD gate + softer penalties
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 # Plausibility guardrails: protect optimizer scoring from data/pathology-driven
@@ -244,7 +244,7 @@ def _fitness_from_metrics(
     sortino = float(metrics.get("sortino", 0.0) or 0.0)
     final_equity = float(metrics.get("final", BASE_INITIAL_CAPITAL) or BASE_INITIAL_CAPITAL)
     final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
-    turnover_drag = turnover * 0.15  # 15 bps = 0.15% per 1x annual turnover
+    turnover_drag = turnover * 0.05  # 5 bps regularization per 1x annual turnover
     cagr_net = cagr - turnover_drag
 
     avg_cvar = 0.0
@@ -276,7 +276,7 @@ def _fitness_from_metrics(
     _sortino_safe = sortino if _math.isfinite(sortino) else 0.0
     sortino_quality = min(max(_sortino_safe / 2.5, 0.50), 1.15)
 
-    risk_penalty = (max_dd + (avg_cvar * 100.0 * 5.0) + 1.0) * concentration_mult
+    risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
 
     # ── IS Drawdown gate ──────────────────────────────────────────────────────
     # IS trials show ~21% MaxDD but blow out to ~42% OOS. The 2x gap is caused
@@ -285,7 +285,7 @@ def _fitness_from_metrics(
     # Quadratic penalty above 20% creates a smooth gradient toward lower DD.
     # A param set surviving 2020+2022 with <20% IS DD is far more likely to
     # survive unseen regimes without breaching the 35% OOS DD cap.
-    IS_DD_GATE        = 30.0   # hard fail above this IS MaxDD
+    IS_DD_GATE        = 40.0   # hard fail above this IS MaxDD
     IS_DD_PENALTY_PCT = 20.0   # quadratic penalty kicks in above this
 
     if max_dd > IS_DD_GATE:
@@ -305,9 +305,9 @@ def _fitness_from_metrics(
 
     # Quadratic IS DD penalty: 0 at 20%, 0.2 at 25%, 0.8 at 30%
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
-    dd_penalty = (dd_excess ** 2) / 50.0
+    dd_penalty = (dd_excess ** 2) / 100.0
 
-    exposure_penalty = 0.0 if avg_exposure >= 0.60 else (0.60 - avg_exposure) * 3.0
+    exposure_penalty = 0.0 if avg_exposure >= 0.25 else (0.25 - avg_exposure) * 2.0
     if avg_positions < 1.0:
         exposure_penalty += 0.5
 
@@ -329,11 +329,6 @@ def _fitness_from_metrics(
         score = 0.0
         ceiling_hit = False
         dd_gate_hit = False
-    elif max_dd > OOS_MAX_DD_CAP:
-        raw = -(max_dd / 10.0)
-        score = max(raw, -2.0)
-        ceiling_hit = False
-        dd_gate_hit = True
     else:
         raw = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty
         # ── Soft saturation replaces hard clip at 5.0 ────────────────────────
