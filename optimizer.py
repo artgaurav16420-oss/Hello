@@ -306,7 +306,7 @@ def _fitness_from_metrics(
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
     dd_penalty = (dd_excess ** 2) / 50.0
 
-    exposure_penalty = 0.0 if avg_exposure >= 0.75 else (0.75 - avg_exposure) * 5.0
+    exposure_penalty = 0.0 if avg_exposure >= 0.60 else (0.60 - avg_exposure) * 3.0
     if avg_positions < 1.0:
         exposure_penalty += 0.5
 
