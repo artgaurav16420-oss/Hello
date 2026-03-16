@@ -641,6 +641,8 @@ def execute_rebalance(
                             cfg.MAX_ABSENT_PERIODS,
                         )
                     if px_exec > 0 and n_shares > 0:
+                        if sym in symbols_to_force_close:
+                            pv_exec += n_shares * px_exec
                         slip = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:
@@ -665,10 +667,25 @@ def execute_rebalance(
         if not np.isfinite(w):
             w = 0.0
         price = max(float(local_prices[i]), 1e-6)
+        slip_rate = compute_one_way_slip_rate(
+            cfg=cfg,
+            portfolio_value=pv_exec,
+            adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+        )
         
         # Size strictly against executable T+0 portfolio value to avoid oversizing
         # into gap-down opens that can force negative cash and phantom P&L.
-        s = int(np.floor(w * pv_exec / price)) if w > 0.001 else 0
+        target_notional = w * pv_exec
+        old_s = state.shares.get(sym, 0)
+        current_notional = old_s * price
+        if w <= 0.001:
+            s = 0
+        elif target_notional > current_notional:
+            buy_notional = max(0.0, target_notional - current_notional)
+            effective_buy_price = price * (1.0 + slip_rate)
+            s = old_s + int(np.floor(buy_notional / max(effective_buy_price, 1e-9)))
+        else:
+            s = int(np.floor(target_notional / price))
         
         # 4. LIQUIDITY CONSTRAINT ENFORCEMENT: Enforce strict ADV limit
         if adv_shares is not None and i < len(adv_shares):
@@ -692,7 +709,7 @@ def execute_rebalance(
             s = desired_shares.get(sym, 0)
             price = max(float(local_prices[i]), 1e-6)
 
-            if old_s > 0 and s > 0 and s < old_s:
+            if old_s > 0 and s > 0 and s != old_s:
                 weight_change = abs((s - old_s) * price) / max(pv_exec, 1.0)
                 if weight_change < drift_threshold:
                     desired_shares[sym] = old_s
@@ -736,25 +753,31 @@ def execute_rebalance(
                 price = data["price"]
                 i     = data["i"]
                 w_i   = data["w"]
+                slip_rate = compute_one_way_slip_rate(
+                    cfg=cfg,
+                    portfolio_value=pv_exec,
+                    adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+                )
+                effective_buy_price = price * (1.0 + slip_rate)
 
                 cash_entitlement = (w_i / total_eligible_w) * residual_cash
-                extra = int(cash_entitlement // price)
+                extra = int(cash_entitlement // max(effective_buy_price, 1e-9))
 
                 if extra <= 0:
                     # Asset's entitlement doesn't even buy one share — remove if price
                     # exceeds total remaining residual (permanently unaffordable)
-                    if price > residual_cash:
+                    if effective_buy_price > residual_cash:
                         to_remove.append(sym)
                     continue
 
                 headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_exec - desired_shares[sym] * price
-                max_extra_weight  = max(0, int(headroom_notional // price))
+                max_extra_weight  = max(0, int(headroom_notional // max(effective_buy_price, 1e-9)))
 
                 max_extra_adv = extra  # no ADV cap by default
                 if adv_shares is not None and i < len(adv_shares):
                     adv_notional = float(adv_shares[i])
                     if adv_notional > 0:
-                        max_adv_total = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
+                        max_adv_total = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / max(effective_buy_price, 1e-9)))
                         max_extra_adv = max(0, max_adv_total - desired_shares[sym])
 
                 cap_limit    = min(max_extra_weight, max_extra_adv)
@@ -762,11 +785,11 @@ def execute_rebalance(
 
                 if actual_extra > 0:
                     desired_shares[sym] += actual_extra
-                    residual_cash       -= actual_extra * price
+                    residual_cash       -= actual_extra * effective_buy_price
                     shares_bought_this_pass += actual_extra
 
                 # Remove from eligible if: hit cap, or price now exceeds remaining cash
-                if actual_extra >= cap_limit or price > residual_cash:
+                if actual_extra >= cap_limit or effective_buy_price > residual_cash:
                     to_remove.append(sym)
 
             for sym in to_remove:

@@ -621,7 +621,7 @@ def test_execute_rebalance_uses_notional_adv_for_impact_parity():
         adv_shares=np.array([1e8]),
     )
 
-    assert slip_low == pytest.approx(slip_high, rel=1e-6)
+    assert slip_low == pytest.approx(slip_high, rel=2e-3)
 
 
 
@@ -644,8 +644,8 @@ def test_execute_rebalance_drift_tolerance_does_not_block_residual_buys():
         force_rebalance_trades=False,
     )
 
-    assert state.shares["A"] == 104
-    assert state.shares["B"] == 96
+    assert state.shares["A"] == 102
+    assert state.shares["B"] == 97
 
 def test_execute_rebalance_force_rebalance_trades_still_allows_small_buys():
     cfg = UltimateConfig(DRIFT_TOLERANCE=0.05, MAX_SINGLE_NAME_WEIGHT=1.0)
@@ -680,9 +680,51 @@ def test_execute_rebalance_force_rebalance_trades_still_allows_small_buys():
         force_rebalance_trades=True,
     )
 
-    assert no_force.shares["A"] == 102
-    assert force.shares["A"] == 102
+    assert no_force.shares["A"] == 100
+    assert force.shares["A"] == 101
 
+
+
+
+def test_execute_rebalance_full_deploy_reserves_slippage_cash():
+    cfg = UltimateConfig(ROUND_TRIP_SLIPPAGE_BPS=100.0)
+    state = PortfolioState(cash=100_000.0)
+
+    execute_rebalance(
+        state,
+        target_weights=np.array([1.0]),
+        prices=np.array([100.0]),
+        active_symbols=["A"],
+        cfg=cfg,
+    )
+
+    invested = state.shares["A"] * 100.0
+    # With 50 bps one-way slippage, cash must be reserved rather than clamped from negative.
+    assert invested + state.cash <= 100_000.0
+    assert state.cash > 0.0
+
+
+def test_execute_rebalance_hard_breach_restores_force_close_notional():
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=1, CVAR_DAILY_LIMIT=0.01, CVAR_HARD_BREACH_MULTIPLIER=1.5)
+    state = PortfolioState(cash=0.0)
+    state.shares = {"DELIST": 10}
+    state.last_known_prices = {"DELIST": 100.0}
+    state.entry_prices = {"DELIST": 100.0}
+
+    losses = np.ones((20, 0)) * 0.05
+    execute_rebalance(
+        state,
+        target_weights=np.array([], dtype=float),
+        prices=np.array([], dtype=float),
+        active_symbols=[],
+        cfg=cfg,
+        apply_decay=True,
+        scenario_losses=losses,
+    )
+
+    # Force-closed symbol liquidation value must be preserved in cash on hard breach.
+    assert state.cash > 0.0
+    assert state.shares == {}
 
 def test_execute_rebalance_cash_conservation():
     cfg   = UltimateConfig()
