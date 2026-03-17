@@ -29,6 +29,12 @@ BUG FIXES (murder board):
   meaning CONTINUITY_DISPERSION_FLOOR in UltimateConfig was defined but never
   used. This made the bonus scale-invariant and caused tests asserting
   dispersion-scaled values to fail.
+- FIX-MB-H-03: std_cross is set to CONTINUITY_DISPERSION_FLOOR when
+  gate_pass_mask is all-False, preventing the continuity bonus from being
+  inflated by a degenerate all-symbol pool that includes illiquid and
+  thin-history names.
+- FIX-MB-L-02: compute_regime_score breadth fallback now explicitly assigns
+  breadth_component = 0.5 and logs at DEBUG, replacing a silent `pass`.
 """
 
 from __future__ import annotations
@@ -121,32 +127,46 @@ def compute_regime_score(
     breadth_component = 0.5
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty:
-        if len(universe_close_hist) >= _sma_win:
-            recent = universe_close_hist.iloc[-_sma_win:]
-            min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
-            obs_count = recent.notna().sum()
-            last = universe_close_hist.iloc[-1]
-            valid = (obs_count >= min_obs) & last.notna()
-            if valid.any():
-                recent_valid = recent.loc[:, valid]
-                sma_vals = recent_valid.mean()
-                last_valid = universe_close_hist.iloc[-1][valid]
-                breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
+        # FIX-NEW-SIG-02: exclude benchmark index columns (names starting with
+        # "^") before computing breadth.  When the active universe is empty or
+        # not yet passed, universe_close_hist may contain only index tickers such
+        # as ^NSEI / ^CRSLDX.  A rising index trivially beats its own SMA,
+        # producing breadth_component=1.0 and inflating the composite regime
+        # score — causing the engine to hold full exposure when there are in fact
+        # no eligible equity positions to allocate to.
+        equity_cols = [c for c in universe_close_hist.columns if not str(c).startswith("^")]
+        if not equity_cols:
+            # FIX-MB-L-02: All columns are benchmarks (e.g. ^NSEI / ^CRSLDX only).
+            # Set breadth explicitly to 0.5 so the fallback is robust to future
+            # refactoring that moves the initialisation, and log at DEBUG so
+            # operators can correlate benchmark-only universes with neutral breadth.
+            breadth_component = 0.5
+            logger.debug(
+                "[Signals] universe_close_hist contains only benchmark columns; "
+                "breadth_component defaulting to 0.5."
+            )
         else:
-            # FIX-MB2-BREADTHNONE: The short-history branch previously hard-coded
-            # min_obs=20, ignoring cfg.REGIME_SMA_WINDOW. With a large SMA window
-            # config (e.g. 200), requiring only 20 observations to qualify a symbol
-            # for the breadth calculation produces a false-bullish signal on thin
-            # data — a symbol with 21 rows easily beats its own 20-row expanding
-            # mean. Now uses the same 80% proportional floor as the full-history
-            # branch, clamped to a minimum of 5 to handle very early warm-up days.
-            min_obs = max(5, int(np.ceil(len(universe_close_hist) * 0.8)))
-            obs_count = universe_close_hist.notna().sum()
-            sma_vals = universe_close_hist.expanding(min_periods=min_obs).mean().iloc[-1]
-            last = universe_close_hist.iloc[-1]
-            valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
-            if valid.any():
-                breadth_component = float((last[valid] > sma_vals[valid]).mean())
+            _hist = universe_close_hist[equity_cols]
+            if len(_hist) >= _sma_win:
+                recent = _hist.iloc[-_sma_win:]
+                min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
+                obs_count = recent.notna().sum()
+                last = _hist.iloc[-1]
+                valid = (obs_count >= min_obs) & last.notna()
+                if valid.any():
+                    recent_valid = recent.loc[:, valid]
+                    sma_vals = recent_valid.mean()
+                    last_valid = _hist.iloc[-1][valid]
+                    breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
+            else:
+                # FIX-MB2-BREADTHNONE: proportional floor, min 5 rows.
+                min_obs = max(5, int(np.ceil(len(_hist) * 0.8)))
+                obs_count = _hist.notna().sum()
+                sma_vals = _hist.expanding(min_periods=min_obs).mean().iloc[-1]
+                last = _hist.iloc[-1]
+                valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
+                if valid.any():
+                    breadth_component = float((last[valid] > sma_vals[valid]).mean())
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     return round(float(np.clip(composite, 0.0, 1.0)), 10)
@@ -277,8 +297,16 @@ def generate_signals(
     norm_src = raw_daily_momentum[gate_pass_mask] if gate_pass_mask.any() else raw_daily_momentum
     if norm_src.size == 0 or not np.isfinite(norm_src).any():
         return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
-    mu_cross  = np.nanmean(norm_src)
-    std_cross = max(np.nanstd(norm_src), 1e-8)
+    mu_cross = np.nanmean(norm_src)
+    # FIX-MB-H-03: when gate_pass_mask is all-False, norm_src is the full
+    # unfiltered pool (illiquid + thin-history symbols), producing an
+    # artificially large std_cross that inflates the continuity bonus beyond
+    # CONTINUITY_MAX_SCALAR * CONTINUITY_DISPERSION_FLOOR.  Use the floor
+    # value directly in this degenerate case.
+    if not gate_pass_mask.any():
+        std_cross = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
+    else:
+        std_cross = max(np.nanstd(norm_src), 1e-8)
 
     adj_scores = np.clip(
         (raw_daily_momentum - mu_cross) / std_cross,
@@ -291,6 +319,13 @@ def generate_signals(
             adj_scores[i] = -np.inf
         if not liquidity_pass[i]:
             adj_scores[i] = -np.inf
+
+    # FIX-NEW-SIG-01: snapshot adj_scores here — after history/ADV gates have set
+    # their -inf values but BEFORE the knife gate runs.  knife_hard_mask is then
+    # computed as symbols that were finite in this snapshot but became -inf after
+    # the knife loop, giving a precise count of knife-only removals that cannot
+    # accidentally absorb history/ADV-failed symbols.
+    _adj_scores_pre_knife = adj_scores.copy()
 
     # Falling-knife gate with vol-adjusted threshold
     recent_cumulative_returns = None
@@ -413,8 +448,12 @@ def generate_signals(
     # symbols (knife_pre_bonus_suppress, which blocks the continuity bonus but
     # does NOT set adj_scores to -inf). Previously only the -inf group was
     # counted, understating knife gate removals in the diagnostic log.
-    knife_hard_mask = gate_pass_mask & (adj_scores == -np.inf)
-    knife_soft_mask = gate_pass_mask & knife_pre_bonus_suppress
+    # FIX-NEW-SIG-01: knife_hard_mask is derived from _adj_scores_pre_knife
+    # (finite before knife gate) vs final adj_scores (now -inf), not from
+    # gate_pass_mask & (adj_scores == -inf) which would absorb history/ADV
+    # failures that also happen to share the -inf sentinel value.
+    knife_hard_mask = np.isfinite(_adj_scores_pre_knife) & (adj_scores == -np.inf)
+    knife_soft_mask = gate_pass_mask & knife_pre_bonus_suppress & np.isfinite(adj_scores)
     n_knife_fail = int(np.sum(knife_hard_mask | knife_soft_mask))
     n_selected   = len(selected_indices)
 

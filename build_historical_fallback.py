@@ -36,7 +36,16 @@ import requests
 
 
 def _load_env_file_fallback(env_path: Path = Path('.env')) -> None:
-    """Minimal `.env` parser used when python-dotenv is unavailable."""
+    """Minimal `.env` parser used when python-dotenv is unavailable.
+
+    FIX-NEW-BHF-01: This function is intentionally duplicated from
+    data_cache._load_local_env_file.  build_historical_fallback.py is a
+    standalone CLI script that may be invoked before data_cache is importable
+    (e.g. missing dependencies), so it cannot import from data_cache.
+    Both copies must be kept in sync.  If the parsing logic changes, update
+    both functions and both test suites (test_build_historical_fallback.py
+    and test_data_cache.py) together.
+    """
     if not env_path.exists():
         return
     try:
@@ -50,8 +59,8 @@ def _load_env_file_fallback(env_path: Path = Path('.env')) -> None:
             if key and key not in os.environ:
                 os.environ[key] = value
     except Exception as exc:
-        logger = logging.getLogger(__name__)
-        logger.debug('[Env] Could not parse .env fallback at %s: %s', env_path, exc)
+        _bhf_logger = logging.getLogger(__name__)
+        _bhf_logger.debug('[Env] Could not parse .env fallback at %s: %s', env_path, exc)
 
 
 def _bootstrap_env() -> None:

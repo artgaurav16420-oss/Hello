@@ -549,7 +549,10 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_parquet(path)
+    try:
+        out_df.to_parquet(path, engine="pyarrow")
+    except Exception:
+        out_df.to_parquet(path)
     logger.info(
         "[HistoricalBuilder] Wrote %d PIT snapshots → %s",
         len(out_df),
@@ -591,7 +594,13 @@ def bootstrap_historical_parquet(
     idx = pd.DatetimeIndex([pd.Timestamp.today().normalize()], name="date")
     df = pd.DataFrame({"tickers": [tickers]}, index=idx)
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path)
+    # FIX-NEW-HB-01: pin engine="pyarrow" so list-valued tickers cells round-trip
+    # correctly.  universe_manager._load_historical_universe_df also pins pyarrow,
+    # so both ends of the parquet channel now use the same engine.
+    try:
+        df.to_parquet(path, engine="pyarrow")
+    except Exception:
+        df.to_parquet(path)
     return path
 
 
@@ -611,7 +620,10 @@ def verify_parquet(parquet_path: str) -> bool:
         print(f"[Verify] MISSING: {parquet_path}")
         return False
 
-    df = pd.read_parquet(path)
+    try:
+        df = pd.read_parquet(path, engine="pyarrow")
+    except Exception:
+        df = pd.read_parquet(path)
     dates = df.index.unique().sort_values()
     n_dates = len(dates)
 
@@ -818,6 +830,11 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
         tcol = cols[norm.index("ticker")]
         value_cols = [c for c in cols if c != tcol]
         melted = df.melt(id_vars=[tcol], value_vars=value_cols, var_name="date", value_name="included")
+        # FIX-NEW-HB-02: pd.to_numeric(errors="coerce") converts any non-numeric
+        # cell (e.g. empty string, "N/A") to NaN; fillna(0) then maps NaN → 0;
+        # "> 0" rejects zeros, negatives, and the coerced NaN placeholders.
+        # This means only strictly positive numeric values count as "present",
+        # which is the correct semantics for membership flags in all known formats.
         included = pd.to_numeric(melted["included"], errors="coerce").fillna(0) > 0
         out = melted.loc[included, ["date", tcol]].rename(columns={tcol: "ticker"})
     # Format C: wide rows by date -> date,TICKER_A,TICKER_B,...
@@ -825,6 +842,7 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
         dcol = cols[norm.index("date")]
         ticker_cols = [c for c in cols if c != dcol]
         melted = df.melt(id_vars=[dcol], value_vars=ticker_cols, var_name="ticker", value_name="included")
+        # Same truthy filter as Format B — see comment above.
         included = pd.to_numeric(melted["included"], errors="coerce").fillna(0) > 0
         out = melted.loc[included, [dcol, "ticker"]].rename(columns={dcol: "date"})
     else:

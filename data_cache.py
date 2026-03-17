@@ -877,6 +877,17 @@ def _process_chunk(
                 is_single_request=(len(chunk) == 1),
             )
             if df is None or df.empty:
+                # FIX-NEW-DC-02: log at WARNING rather than silently skipping so
+                # callers can distinguish a provider returning no data for a ticker
+                # (possible fetch failure) from a ticker genuinely absent in the
+                # response.  Silent skips make it impossible to diagnose partial
+                # provider outages or symbol delisting from logs alone.
+                logger.warning(
+                    "[Cache] No usable data extracted for %s "
+                    "(provider returned None or empty frame for this symbol; "
+                    "check symbol name, market hours, or provider status).",
+                    ticker,
+                )
                 continue
 
             df.dropna(how="all", inplace=True)

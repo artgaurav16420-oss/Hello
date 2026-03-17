@@ -13,6 +13,10 @@ BUG FIXES (murder board):
 - FIX-MB-UM-02: get_historical_universe logs a warning when it detects a
   duplicate-index parquet (constituents is a pd.Series) so operators are
   aware of the structural issue rather than it being silently handled.
+- FIX-MB-M-03: _apply_adv_filter relaxed from all-or-nothing to symbol-level
+  ADV=0 fallback. Missing symbols (delisted / no history / provider gap) are
+  treated as ADV=0 and logged at DEBUG rather than failing the entire chunk.
+  UniverseFetchError is only raised when a chunk returns zero symbols total.
 """
 
 from __future__ import annotations
@@ -148,7 +152,21 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     if cached is not None and cached[0] == mtime:
         return cached[1]
 
-    df = pd.read_parquet(hist_file)
+    # FIX-NEW-UM-02: the parquet files written by historical_builder store list-
+    # valued cells in the "tickers" column.  pyarrow preserves Python lists
+    # natively via its list<string> type; fastparquet serialises them differently
+    # and may fail on read or return strings instead of lists.  Pin engine="pyarrow"
+    # so the roundtrip is deterministic regardless of which parquet engine is
+    # installed as the default.  If pyarrow is unavailable fall back to the
+    # default engine with a warning so the problem is surfaced at import time.
+    try:
+        df = pd.read_parquet(hist_file, engine="pyarrow")
+    except Exception:
+        logger.warning(
+            "[Universe] pyarrow not available or failed; falling back to default "
+            "parquet engine.  List-valued tickers column may not round-trip correctly."
+        )
+        df = pd.read_parquet(hist_file)
     _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
     return df
 
@@ -304,6 +322,35 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     for chunk_idx, chunk in enumerate(chunks):
         try:
             data = load_or_fetch(chunk, start_date, end_date, cfg=cfg)
+            # FIX-MB-M-03: relax the all-or-nothing policy introduced in
+            # FIX-NEW-UM-01.  The previous guard raised RuntimeError whenever
+            # ANY symbol in a 75-symbol chunk had no data, breaking the entire
+            # ADV filter for universes that contain even one recently-listed,
+            # delisted, or provider-unavailable stock.  The Nifty 500 routinely
+            # has a handful of such stocks.
+            #
+            # New policy:
+            #   - Missing symbols are treated as ADV=0 (they fail the liquidity
+            #     gate anyway) and logged at DEBUG.
+            #   - Only a TOTAL chunk failure (zero symbols returned) is an error
+            #     worthy of appending to chunk_failures and eventually raising
+            #     UniverseFetchError.
+            expected_ns = {to_ns(s) for s in chunk}
+            returned_ns = set(data.keys())
+            missing_ns  = expected_ns - returned_ns
+            if missing_ns:
+                logger.debug(
+                    "[Universe] ADV chunk %d: %d symbol(s) not returned by "
+                    "load_or_fetch (no history / delisted / provider gap): %s. "
+                    "Treating as ADV=0 (will fail liquidity gate).",
+                    chunk_idx, len(missing_ns), sorted(missing_ns)[:5],
+                )
+            if not data:
+                # Total fetch failure — no symbols returned at all.
+                raise RuntimeError(
+                    f"load_or_fetch returned empty dict for entire chunk "
+                    f"(size={len(chunk)}): {list(chunk)[:3]}"
+                )
             for symbol in chunk:
                 ns_sym = to_ns(symbol)
                 if ns_sym in data:
@@ -316,6 +363,8 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                         adv = 0.0
                     if np.isfinite(adv) and adv >= min_adv_volume:
                         filtered_tickers.append(ns_sym)
+                # Missing symbols (not in data) contribute ADV=0 implicitly
+                # by being absent from filtered_tickers.
         except Exception as exc:
             failure = {
                 "chunk_index": chunk_idx,
@@ -484,6 +533,16 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 sector = "Unknown"
                 try:
                     info = getattr(ticker_obj, "info", {}) or {}
+                    # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
+                    # a rate limit or the symbol is delisted.  Log at DEBUG so
+                    # operators can correlate missing sector data with provider
+                    # throttling without flooding production logs.
+                    if not info:
+                        logger.debug(
+                            "[Universe] Empty info dict for %s — "
+                            "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
+                            bare_sym,
+                        )
                     sector = str(info.get("sector", "Unknown") or "Unknown")
                 except Exception as e:
                     logger.debug("Failed to fetch sector for %s: %s", bare_sym, e)

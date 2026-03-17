@@ -33,6 +33,11 @@ BUG FIXES (murder board):
   survive process restarts. load_portfolio_state merges this overlay back.
   Without this fix a crash during a CVaR breach in paper mode would cause an
   immediate unrestricted rebalance on the next run.
+- FIX-MB-H-04: _run_scan post-scan absent_periods loop now only runs when
+  execute_rebalance did NOT fire (rebalanced_this_scan=False). On rebalance
+  days execute_rebalance owns absent_periods accounting; the post-scan loop
+  was incrementing it a second time, halving the effective MAX_ABSENT_PERIODS
+  grace period and causing premature force-close of suspended stocks.
 """
 from __future__ import annotations
 import importlib.util
@@ -385,7 +390,12 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
                 window = split_series.loc[(split_series.index > last_scan_date) & (split_series.index <= split_series.index.max())]
             else:
-                window = split_series.tail(1)
+                # FIX-NEW-DW-04: on first run (no last_rebalance_date) the
+                # previous code used tail(1), which silently dropped any splits
+                # that occurred on earlier dates.  A symbol with two splits and
+                # no prior scan date would only have the most recent one applied.
+                # Use the full series so every positive split entry is compounded.
+                window = split_series
 
             if not window.empty:
                 positive = window[window > 0]
@@ -487,6 +497,12 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
 def load_portfolio_state(name: str) -> PortfolioState:
     state_file = f"data/portfolio_state_{name}.json"
+    # FIX-NEW-DW-03: backups list covers the primary file plus all BACKUP_GENERATIONS
+    # rotation slots (bak.0 … bak.{BACKUP_GENERATIONS-1}).  All slots are tried in
+    # order; only files that exist AND parse successfully are returned.  Files that
+    # exist but fail JSON parsing are recorded in corrupted_paths — a RuntimeError
+    # is raised only when every *existing* file is corrupted, not when some slots
+    # are simply absent (normal on a fresh installation).
     backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
     corrupted_paths = []
 
@@ -503,15 +519,35 @@ def load_portfolio_state(name: str) -> PortfolioState:
                     try:
                         with open(risk_file) as rf:
                             risk = json.load(rf)
-                        ps.consecutive_failures = int(risk.get("consecutive_failures", ps.consecutive_failures))
-                        ps.override_active      = bool(risk.get("override_active",      ps.override_active))
-                        ps.override_cooldown    = int(risk.get("override_cooldown",     ps.override_cooldown))
-                        ps.decay_rounds         = int(risk.get("decay_rounds",          ps.decay_rounds))
-                        absent = risk.get("absent_periods", {})
-                        if absent:
-                            ps.absent_periods.update({k: int(v) for k, v in absent.items()})
-                        if risk.get("last_rebalance_date"):
-                            ps.last_rebalance_date = str(risk["last_rebalance_date"])
+                        # FIX-NEW-DW-01: wrap each field merge individually so a
+                        # corrupted or missing key in one field does not silently
+                        # skip ALL merges.  Each int/bool coercion is guarded so
+                        # a stale or hand-edited overlay cannot produce a TypeError
+                        # or ValueError that leaves the state at an unsafe default.
+                        def _ri(key, fallback):
+                            v = risk.get(key)
+                            return int(v) if v is not None else fallback
+                        def _rb(key, fallback):
+                            v = risk.get(key)
+                            if v is None:
+                                return fallback
+                            if isinstance(v, bool):
+                                return v
+                            return bool(int(v))
+                        ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
+                        ps.override_active      = _rb("override_active",      ps.override_active)
+                        ps.override_cooldown    = _ri("override_cooldown",     ps.override_cooldown)
+                        ps.decay_rounds         = _ri("decay_rounds",          ps.decay_rounds)
+                        absent_raw = risk.get("absent_periods")
+                        if isinstance(absent_raw, dict):
+                            for k, v in absent_raw.items():
+                                try:
+                                    ps.absent_periods[str(k)] = int(v)
+                                except (TypeError, ValueError):
+                                    pass
+                        lrd = risk.get("last_rebalance_date")
+                        if lrd and isinstance(lrd, str):
+                            ps.last_rebalance_date = lrd
                     except Exception as exc:
                         logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
                 return ps
@@ -606,6 +642,16 @@ def _run_scan(
     active   = list(close.columns)
     prices   = close.iloc[-1].values.astype(float)
     active_idx = {sym: i for i, sym in enumerate(active)}
+
+    # FIX-NEW-DW-02: replace NaN or non-positive prices with last_known_prices
+    # before any downstream computation (compute_book_cvar, execute_rebalance,
+    # record_eod).  compute_book_cvar does not guard against NaN in its prices
+    # argument — a NaN propagates into notional → pv → weights → CVaR, producing
+    # an incorrect (often zero) CVaR that suppresses the risk gate.
+    for _sym, _i in active_idx.items():
+        if not np.isfinite(prices[_i]) or prices[_i] <= 0:
+            _lkp = state.last_known_prices.get(_sym, 0.0)
+            prices[_i] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
 
     mtm_notional = 0.0
     for sym in state.shares:
@@ -802,11 +848,21 @@ def _run_scan(
     price_dict = {sym: prices[active_idx[sym]] for sym in active}
     state.record_eod(price_dict)
 
-    for held_sym in list(state.shares.keys()):
-        if held_sym not in active_idx:
-            state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
-        else:
-            state.absent_periods.pop(held_sym, None)
+    # FIX-MB-H-04: execute_rebalance already increments absent_periods for
+    # every held symbol not found in active_idx (and clears it for symbols
+    # that ARE present).  Running the same loop here after a rebalance causes
+    # a double-increment, halving the effective MAX_ABSENT_PERIODS grace period.
+    #
+    # Rule: absent_periods accounting belongs exclusively to execute_rebalance
+    # on rebalance days.  This post-scan loop only runs on mark-to-market-only
+    # days (cadence gate blocked the rebalance) so that absent positions are
+    # still tracked even when no rebalance fires.
+    if not rebalanced_this_scan:
+        for held_sym in list(state.shares.keys()):
+            if held_sym not in active_idx:
+                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+            else:
+                state.absent_periods.pop(held_sym, None)
 
     final_pv = state.equity_hist[-1] if state.equity_hist else pv
 

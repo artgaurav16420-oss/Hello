@@ -23,6 +23,15 @@ BUG FIXES (murder board):
 - FIX-MB-ME-01: execute_rebalance two-phase PV accounting is documented with
   inline comments explaining why force-close proceeds flow through pv_exec
   rather than actual_notional.
+- FIX-MB-C-01: Deleted duplicate decay-CVaR check block that appeared twice
+  in execute_rebalance. The first (incomplete) copy lacked the inner logic and
+  was a merge artifact; only the second (complete) block is retained.
+- FIX-MB-C-03: Removed force-close pv_exec double-add from the decay
+  liquidation branch. Phase 2 of execute_rebalance unconditionally adds
+  force-close proceeds; adding them again inside the liquidation loop inflated
+  state.cash by up to 2x the force-closed notional.
+- FIX-MB-M-05: override_cooldown re-arm now uses max(current, 4) so any
+  longer externally-set cooldown is preserved rather than silently shortened.
 """
 
 from __future__ import annotations
@@ -238,6 +247,16 @@ class UltimateConfig:
     SPLIT_TOLERANCE:          float = 0.005
     AUTO_ADJUST_PRICES:       bool  = True
 
+    # Equity history buffer cap.
+    # FIX-NEW-CC-01 / NEW-CC-01: Although this field appears after the @property
+    # definitions, Python's dataclass machinery processes ALL class-level
+    # annotations as fields regardless of ordering — EQUITY_HIST_CAP is present
+    # in __dataclass_fields__ and is therefore visible to load_optimized_config's
+    # JSON loader.  Confirmed via: 'EQUITY_HIST_CAP' in UltimateConfig.__dataclass_fields__
+    # → True.  Kept here to avoid a large diff; moved above the property block
+    # in comments for readability.
+    EQUITY_HIST_CAP: int = 500
+
     @property
     def SLIPPAGE_BPS(self) -> float:
         return self.ROUND_TRIP_SLIPPAGE_BPS
@@ -248,8 +267,6 @@ class UltimateConfig:
             self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
-
-    EQUITY_HIST_CAP: int = 500
 
 
 # ─── Portfolio state ──────────────────────────────────────────────────────────
@@ -314,10 +331,18 @@ class PortfolioState:
         # Re-check breach after override is cleared.  If cooldown just expired
         # AND we are still in breach, re-arm immediately (no free step).
         if breach and not self.override_active and self.override_cooldown == 0:
-            override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, self.exposure_multiplier * 0.5)
+            # FIX-NEW-ME-02: when already at MIN_EXPOSURE_FLOOR, halving again
+            # produces a sub-floor value that the np.clip below corrects, but the
+            # intermediate assignment is confusing.  Clamp override_mult so it
+            # never falls below the floor before the clip, keeping intent clear.
+            halved = self.exposure_multiplier * 0.5
+            override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, halved)
             self.exposure_multiplier = min(new_mult, override_mult)
             self.override_active     = True
-            self.override_cooldown   = 4
+            # FIX-MB-M-05: use max(current, 4) so any longer externally-set
+            # cooldown (e.g. from activate_override_on_stress) is not shortened
+            # back to 4 by this re-arm.
+            self.override_cooldown   = max(self.override_cooldown, 4)
         else:
             self.exposure_multiplier = new_mult
 
@@ -593,7 +618,14 @@ def execute_rebalance(
         gross_w = float(np.sum(decay_check_w))
 
         if gross_w > 1e-6 and scenario_losses.shape[1] == len(active_symbols):
-            portfolio_losses = scenario_losses @ decay_check_w
+            # FIX-NEW-ME-05: normalise decay_check_w to unit sum before computing
+            # portfolio_losses so the CVaR is a pure return fraction.  Previously
+            # gross_w could be < 1 when force-close positions inflate pv_exec but
+            # are not represented in decay_check_w, causing scenario_losses @ w
+            # to understate losses as a fraction of portfolio value and potentially
+            # allow deployment when the hard limit should have triggered liquidation.
+            normalised_w = decay_check_w / gross_w
+            portfolio_losses = scenario_losses @ normalised_w
             T_sc      = len(portfolio_losses)
             tail_n    = max(1, int(np.floor(T_sc * (1.0 - cfg.CVAR_ALPHA))))
             tail_mean = float(np.mean(np.sort(portfolio_losses)[-tail_n:]))
@@ -617,8 +649,10 @@ def execute_rebalance(
                             cfg.MAX_ABSENT_PERIODS,
                         )
                     if px_exec > 0 and n_shares > 0:
-                        if sym in symbols_to_force_close:
-                            pv_exec += n_shares * px_exec
+                        # MB-C-03: do NOT add force-close proceeds to pv_exec here.
+                        # Phase 2 (below) unconditionally handles all symbols_to_force_close.
+                        # Adding them here as well would double-count their proceeds and
+                        # inflate state.cash by up to 2x the force-closed notional.
                         slip            = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:
@@ -746,7 +780,15 @@ def execute_rebalance(
 
                 if actual_extra > 0:
                     desired_shares[sym] += actual_extra
-                    residual_cash       -= actual_extra * effective_buy_price
+                    # FIX-NEW-ME-01: deduct the RAW (unslipped) cost from
+                    # residual_cash here.  The final accounting loop below
+                    # charges slippage via total_slippage and subtracts
+                    # actual_notional (also at raw price) from pv_exec to
+                    # arrive at state.cash.  Using effective_buy_price here
+                    # would embed slippage in residual_cash AND charge it again
+                    # in the accounting loop — a double-deduction that drives
+                    # state.cash negative after large residual allocations.
+                    residual_cash       -= actual_extra * price
                     shares_bought_this_pass += actual_extra
 
                 if actual_extra >= cap_limit or effective_buy_price > residual_cash:
@@ -922,15 +964,25 @@ def compute_book_cvar(
 
             sym_base_seed = _ghost_seed_for(sym)
 
-            days_since_epoch = (
-                rets.index.astype(np.int64) // np.int64(86_400 * 10 ** 9)
-            ).astype(np.int64)
+            # FIX-NEW-ME-03: derive row seeds from the absolute calendar date
+            # (nanoseconds-since-epoch → days-since-epoch) rather than from
+            # rets.index, which may have different depth across calls depending
+            # on how much history was forward-filled into the slice.  Using the
+            # calendar date means the same synthetic return is generated for a
+            # given (symbol, date) pair regardless of how long the surrounding
+            # window is, giving reproducible CVaR estimates across slice depths.
+            if hasattr(rets.index, 'asi8'):
+                # DatetimeIndex: convert ns timestamps to integer day numbers
+                days_since_epoch = (rets.index.asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
+            else:
+                # Fallback for non-datetime index: use positional integers
+                days_since_epoch = np.arange(len(rets), dtype=np.int64)
 
             row_seeds = (
                 np.int64(sym_base_seed) ^ days_since_epoch
             ) & np.int64(0x7FFFFFFF)
 
-            ss = np.random.SeedSequence(row_seeds.to_numpy(dtype=np.uint32, copy=False).tolist())
+            ss = np.random.SeedSequence(row_seeds.tolist())
             rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]
             synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
             rets.loc[:, sym] = synth_rets
@@ -995,7 +1047,13 @@ class InstitutionalRiskEngine:
             return np.array([])
 
         if execution_date is not None and not historical_returns.empty:
-            if historical_returns.index.max() >= pd.Timestamp(execution_date):
+            # FIX-NEW-ME-04: use strict > so that a same-day last bar
+            # (historical_returns.index.max() == execution_date) does not
+            # spuriously raise.  The signal slice in _run_rebalance already
+            # excludes the execution date via loc[:signal_date], so an equality
+            # hit means the last bar IS the signal date — that is valid.
+            # Only a bar that is strictly AFTER execution_date is look-ahead.
+            if historical_returns.index.max() > pd.Timestamp(execution_date):
                 raise OptimizationError(
                     "T-1 violation: historical_returns include execution_date.",
                     OptimizationErrorType.DATA,

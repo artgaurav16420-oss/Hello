@@ -20,6 +20,18 @@ BUG FIXES (murder board):
   now consistent.
 - FIX-MB-BE-03: _compute_metrics CAGR uses len(eq) not len(eq)-1 for the
   periods count to eliminate the systematic off-by-one overstatement.
+- FIX-MB-C-02: run_backtest now slices precomputed_matrices to [warmup_start,
+  end_date] on the time axis before handing them to BacktestEngine.run.
+  Previously any caller that pre-built a full TRAIN_START→TEST_END matrix
+  gave signal generation look-ahead access to data beyond end_date.
+- FIX-MB-H-02: _repair_suspension_gaps refactored to process all gaps against
+  the original df before concatenating, eliminating incremental-frame
+  contamination across multiple gaps and ensuring each gap's noise array is
+  deterministically length-consistent with its seed.
+- FIX-MB-M-01: _compute_metrics non-datetime turnover fallback now clamps
+  years to at least 1/252 to prevent near-zero values from inflating
+  annualised turnover by orders of magnitude in short test series.
+- FIX-MB-M-04: Holiday-snap collision logging elevated from DEBUG to WARNING.
 """
 
 from __future__ import annotations
@@ -134,6 +146,22 @@ class BacktestEngine:
                     old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
                     self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
 
+            # FIX-NEW-BE-04: Run rebalance BEFORE sweeping dividends on the same
+            # day.  Previously dividends were added to state.cash first, so the
+            # dividend income inflated pv inside _run_rebalance (T+0 optimism).
+            # Real settlement is T+1: the dividend is received after the market
+            # closes, so it should not be available for reinvestment on the same
+            # rebalance bar.  Rebalancing first ensures the PV used for sizing
+            # reflects only pre-dividend capital, consistent with the live scan
+            # path in daily_workflow._run_scan (which only calls
+            # detect_and_apply_splits after computing pv, never before).
+            if date in rebal_set:
+                self._run_rebalance(
+                    date, close, volume, returns, symbols, prices_t,
+                    idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
+                    member_universe=(universe_by_rebalance_date or {}).get(pd.Timestamp(date)),
+                )
+
             if (
                 dividends is not None
                 and date in dividends.index
@@ -147,13 +175,6 @@ class BacktestEngine:
                     div_val = div_row[sym]
                     if pd.notna(div_val) and float(div_val) > 0:
                         self.state.cash = round(self.state.cash + float(div_val) * shares, 10)
-
-            if date in rebal_set:
-                self._run_rebalance(
-                    date, close, volume, returns, symbols, prices_t,
-                    idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
-                    member_universe=(universe_by_rebalance_date or {}).get(pd.Timestamp(date)),
-                )
 
             price_dict = {
                 sym: prices_t[active_idx[sym]]
@@ -480,7 +501,18 @@ def _build_adv_vector(
             if pos > 0:
                 signal_date = idx[pos - 1]
             else:
+                # FIX-NEW-BE-05: date is the first entry in the volume index, so
+                # there is no prior bar to use as the ADV signal date.  All symbols
+                # will receive ADV=0 and fail the liquidity gate, producing a
+                # zero-position portfolio on this bar.  Log a warning so operators
+                # can distinguish this intentional guard from a data problem.
                 signal_date = None
+                logger.warning(
+                    "[Backtest] ADV signal_date is None on %s (first bar in volume index). "
+                    "All symbols receive ADV=0; liquidity gate will suppress all positions "
+                    "on this rebalance. Consider advancing start_date by one bar.",
+                    date,
+                )
 
     for sym in symbols:
         if sym in volume.columns and sym in close.columns and signal_date is not None:
@@ -546,7 +578,21 @@ def _execution_prices(
 
 
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """In-memory suspension simulation used only during backtest runtime."""
+    """In-memory suspension simulation used only during backtest runtime.
+
+    FIX-MB-H-02: All gap fills are computed against the original df (before any
+    synthetic rows are added), then all synthetic DataFrames are concatenated at
+    once.  The previous approach grew 'out' incrementally, which caused:
+      (a) gap_idx.difference(out.index) for a second gap to exclude dates that
+          were already filled synthetically by gap 1, silently truncating the
+          second gap's noise array;
+      (b) the random walk for gap 2 to be seeded from gap_start_2 but only
+          generate len(synth_idx_2) draws, where synth_idx_2 < full gap_idx_2
+          if any dates coincided with gap 1 synthetics.
+    Processing against the original df guarantees each gap's synth_idx equals
+    the full business-day range (gap_start, gap_end), making the price path
+    deterministic and length-consistent with the seed.
+    """
     if len(df) < 2:
         return df.copy()
 
@@ -555,7 +601,6 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if max_gap <= _SUSPENSION_GAP_DAYS:
         return df.copy()
 
-    out = df.copy()
     logger.warning(
         "[Backtest] %s: Prolonged trading gap of %d days detected. "
         "Applying in-memory synthetic halt simulation.",
@@ -564,10 +609,13 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     gap_end_dates = list(gap_days[gap_days > _SUSPENSION_GAP_DAYS].index)
     if not gap_end_dates:
-        return out
+        return df.copy()
+
+    synth_frames = []
 
     for gap_end in gap_end_dates:
-        end_loc = out.index.get_loc(gap_end)
+        # Locate gap boundaries in the ORIGINAL df (not a growing frame).
+        end_loc = df.index.get_loc(gap_end)
         if isinstance(end_loc, slice):
             end_loc = end_loc.start
         if isinstance(end_loc, np.ndarray):
@@ -575,17 +623,18 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         if end_loc <= 0:
             continue
 
-        gap_start = out.index[int(end_loc) - 1]
+        gap_start = df.index[int(end_loc) - 1]
         gap_idx   = pd.bdate_range(gap_start, gap_end)
         gap_idx   = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
         if len(gap_idx) == 0:
             continue
 
-        synth_idx = gap_idx.difference(out.index)
+        # Exclude dates already in the ORIGINAL df (not the growing frame).
+        synth_idx = gap_idx.difference(df.index)
         if len(synth_idx) == 0:
             continue
 
-        pre_gap_close = out["Close"].loc[:gap_start]
+        pre_gap_close = df["Close"].loc[:gap_start]
         pre_gap_rets  = pre_gap_close.pct_change().dropna()
         hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
@@ -596,20 +645,27 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         walk_returns = np.cumprod(1.0 + noise_rets)
 
         synth = pd.DataFrame(index=synth_idx)
-        close_anchor = float(out.loc[gap_start, "Close"])
+        close_anchor = float(df.loc[gap_start, "Close"])
         synth["Close"] = close_anchor * walk_returns
 
-        if "Adj Close" in out.columns:
-            adj_anchor = out.loc[gap_start, "Adj Close"]
+        if "Adj Close" in df.columns:
+            adj_anchor = df.loc[gap_start, "Adj Close"]
             if pd.isna(adj_anchor):
                 adj_anchor = close_anchor
-            synth["Adj Close"] = float(adj_anchor) * walk_returns
+            # FIX-NEW-BE-03: preserve the pre-gap Adj Close / Close ratio.
+            adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
+            synth["Adj Close"] = synth["Close"] * adj_close_ratio
 
-        if "Volume" in out.columns:
+        if "Volume" in df.columns:
             synth["Volume"] = 0.0
 
-        out = pd.concat([out, synth])
+        synth_frames.append(synth)
 
+    if not synth_frames:
+        return df.copy()
+
+    # Concatenate original + all synthetic frames in one pass, then sort/ffill.
+    out = pd.concat([df] + synth_frames)
     out = out.sort_index().ffill()
     return out
 
@@ -757,21 +813,43 @@ def run_backtest(
         selected = sorted(sym for sym in union_universe if sym in matrices["close"].columns)
         if not selected:
             raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
-        close = matrices["close"][selected]
-        close_adj = matrices["close_adj"][selected]
-        open_px = matrices["open"][selected]
-        high_px = matrices["high"][selected]
-        low_px = matrices["low"][selected]
-        dividends = matrices["dividends"][selected]
-        splits = matrices["splits"][selected]
-        volume = matrices["volume"][selected]
-        returns = matrices["returns"][selected]
+
+        # FIX-MB-C-02: restrict the time axis of passed-in matrices to
+        # [warmup_start, end_date].  Without this, callers that build a full
+        # TRAIN_START→TEST_END matrix and pass it here give every backtest
+        # (and every WFO fold called via run_backtest) visibility of data
+        # beyond end_date in signal generation, constituting look-ahead bias.
+        _warmup_ts = pd.Timestamp(warmup_start)
+        _end_ts    = pd.Timestamp(end_date) if end_date else None
+
+        def _clip(df):
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return df
+            result = df.loc[_warmup_ts:] if _warmup_ts is not None else df
+            if _end_ts is not None:
+                result = result.loc[:_end_ts]
+            return result
+
+        close     = _clip(matrices["close"])[selected]
+        close_adj = _clip(matrices["close_adj"])[selected]
+        open_px   = _clip(matrices["open"])[selected]
+        high_px   = _clip(matrices["high"])[selected]
+        low_px    = _clip(matrices["low"])[selected]
+        dividends = _clip(matrices["dividends"])[selected]
+        splits    = _clip(matrices["splits"])[selected]
+        volume    = _clip(matrices["volume"])[selected]
+        returns   = _clip(matrices["returns"])[selected]
     else:
-        # FIX-MB-BE-01: pass warmup_start as the effective start for data fetch
-        # so that the matrices contain the full warm-up history.
+        # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
+        # which kept almost every DataFrame (any series starting before warmup_start
+        # trivially passes) and silently dropped symbols whose data starts between
+        # warmup_start+30 days and start_date — exactly the IPO-era symbols that do
+        # have valid warm-up history.  The correct guard is: keep any DataFrame whose
+        # LAST row is at or after warmup_start, meaning the data overlaps the window.
         matrices = build_precomputed_matrices(
             {k: v for k, v in market_data.items()
-             if not isinstance(v, pd.DataFrame) or v.empty or v.index[0] <= pd.Timestamp(warmup_start) + pd.Timedelta(days=30)},
+             if not isinstance(v, pd.DataFrame) or v.empty
+                or v.index[-1] >= pd.Timestamp(warmup_start)},
             cfg=cfg,
             symbols=union_universe,
         )
@@ -814,7 +892,10 @@ def run_backtest(
                 snapped_key = eligible[-1]
                 if snapped_key in snapped_universe:
                     existing_target = snapped_universe_target_date[snapped_key]
-                    logger.debug(
+                    # FIX-MB-M-04: log at WARNING so operators can audit
+                    # holiday-snap collisions in production and detect
+                    # off-by-one membership window shifts.
+                    logger.warning(
                         "[Backtest] Holiday snap collision: targets %s and %s both snap to %s. "
                         "Keeping earliest target's member set (%s) to avoid using a later "
                         "membership snapshot earlier than it was known.",
@@ -1002,7 +1083,14 @@ def _compute_metrics(
             if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
                 years = (eq.index[-1] - eq.index[0]).days / 365.25
             else:
-                years = n_periods / float(periods_per_year)
+                # FIX-NEW-BE-01: n_periods was removed in FIX-MB-BE-03; use
+                # len(eq)-1 (number of return intervals) as the fallback for
+                # non-datetime equity index series.
+                # FIX-MB-M-01: clamp to at least 1/252 to prevent near-zero
+                # years from inflating annualised turnover by orders of
+                # magnitude in short test series (e.g. len(eq)=5, ppy=252
+                # would give years≈0.016 and 28× overstated turnover).
+                years = max((len(eq) - 1) / float(periods_per_year), 1.0 / 252)
             if years > 0:
                 turnover = turnover / years
 

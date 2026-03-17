@@ -42,6 +42,14 @@ BUG FIXES (murder board):
   when DEFAULT_STUDY_NAME matches an existing study with a different objective.
 - FIX-MB-OPT-03: OOS tournament table now prints abs(oos_maxdd) so the MaxDD
   column shows a positive percentage consistent with the column header.
+- FIX-MB-H-01: WFO fold matrices now sliced to [is_start, oos_end] on both
+  bounds. Previously only the upper bound (:oos_end) was applied, leaving
+  each fold with full history back to TRAIN_START and cross-fold IS/OOS
+  window contamination.
+- FIX-MB-M-02: MomentumObjective tolerates a single gate-hit fold (dd_gate
+  or anomaly) per trial instead of pruning immediately. Only trials with
+  more than one bad fold are pruned, allowing strategies that dip into one
+  recessionary year to still be evaluated on their healthy-year aggregate.
 
 Requires: pip install optuna
 """
@@ -241,9 +249,18 @@ def _fitness_from_metrics(
     _pos_deficit = max(0.0, 6.0 - avg_positions)
     concentration_mult = 1.0 + _pos_deficit * 0.30
 
+    # FIX-NEW-OPT-01: when sortino is NaN (no downside returns in the IS window,
+    # e.g. an all-positive bull-year fold), the previous code mapped NaN → 0.0
+    # via the "or 0.0" default, then clamped to quality=0.50 — the worst-case
+    # floor.  This penalised the best IS folds and biased TPE toward noisier
+    # strategies that happen to produce some losses and thus a finite Sortino.
+    # NaN means "insufficient downside data", not "bad Sortino" — treat it as
+    # neutral (1.0) so it neither rewards nor penalises the fold.
     import math as _math
-    _sortino_safe = sortino if _math.isfinite(sortino) else 0.0
-    sortino_quality = min(max(_sortino_safe / 2.5, 0.50), 1.15)
+    if sortino is None or not _math.isfinite(sortino):
+        sortino_quality = 1.0
+    else:
+        sortino_quality = min(max(sortino / 2.5, 0.50), 1.15)
 
     risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
 
@@ -402,17 +419,31 @@ class MomentumObjective:
 
         trial_id = getattr(trial, "number", 0)
 
-        for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
+        # FIX-MB-M-02: accumulate bad-fold counts rather than pruning on the
+        # first dd_gate_hit or anomaly_hit.  A strategy that performs well in
+        # all years except one recessionary year with a 41% drawdown was
+        # previously eliminated entirely, even if its aggregate fitness over
+        # 4 healthy years beat every alternative.  We now collect all fold
+        # scores and prune only if MORE THAN ONE fold triggers a gate.
+        n_gate_hits = 0
+
+        for wf_is_start, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
             oos_year = pd.Timestamp(wf_oos_start).year
 
-            # FIX-MB2-WFOSLICE: slice precomputed_matrices to [start, wf_oos_end]
+            # FIX-MB2-WFOSLICE / FIX-MB-H-01: slice precomputed_matrices to
+            # [is_start, oos_end] so each fold's signal history is bounded on
+            # both ends.  The original code only applied an upper bound
+            # (:oos_end_ts), leaving the lower bound unconstrained — meaning
+            # folds for OOS year 2022 could see 2018-2021 data that was the
+            # OOS period of prior folds.
             fold_matrices = None
             if self.precomputed_matrices is not None:
-                oos_end_ts = pd.Timestamp(wf_oos_end)
+                is_start_ts = pd.Timestamp(wf_is_start)
+                oos_end_ts  = pd.Timestamp(wf_oos_end)
                 fold_matrices = {}
                 for key, df in self.precomputed_matrices.items():
                     if isinstance(df, pd.DataFrame) and not df.empty:
-                        fold_matrices[key] = df.loc[:oos_end_ts]
+                        fold_matrices[key] = df.loc[is_start_ts:oos_end_ts]
                     else:
                         fold_matrices[key] = df
 
@@ -427,8 +458,8 @@ class MomentumObjective:
             m = oos.metrics
             score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
 
-            diag["year"]    = oos_year
-            diag["excluded"] = False  # FIX-MB-OPT-01: first-year exclusion removed (thin folds now skipped entirely)
+            diag["year"]     = oos_year
+            diag["excluded"] = False  # FIX-MB-OPT-01: thin folds skipped at iterator level
             diag["eq_start"] = wf_oos_start
             diag["eq_end"]   = wf_oos_end
             slice_diags.append(diag)
@@ -451,11 +482,23 @@ class MomentumObjective:
             if not pd.notna(score):
                 raise optuna.TrialPruned()
 
-            # FIX-MB-OPT-04: prune on anomaly_hit in addition to dd_gate_hit.
-            # Anomalous-return slices (data gaps, 300%+ CAGR) would otherwise
-            # contribute a near-floor score to the aggregate, distorting TPE.
-            if diag.get("dd_gate_hit") or diag.get("anomaly_hit") or score <= -2.0:
-                raise optuna.TrialPruned()
+            # FIX-MB-M-02: count gate hits; prune only when MORE THAN ONE fold
+            # triggers dd_gate_hit or anomaly_hit.  A single bad fold is
+            # tolerated as market noise; only pervasively bad strategies prune.
+            # NaN-score and score <= -2.0 remain immediate hard prunes.
+            is_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit") or score <= -2.0
+            if is_gate_hit:
+                n_gate_hits += 1
+                if n_gate_hits > 1:
+                    raise optuna.TrialPruned()
+                # Single gate hit: log and skip this fold's score from aggregate.
+                logger.debug(
+                    "[Trial %s | %d] Single gate-hit fold tolerated "
+                    "(dd_gate=%s anomaly=%s score=%.4f); excluding from aggregate.",
+                    trial_id, oos_year,
+                    diag.get("dd_gate_hit"), diag.get("anomaly_hit"), score,
+                )
+                continue
 
             scores.append(float(score))
 
@@ -707,7 +750,21 @@ def run_optimization(
     # FIX-MB-OPT-06: re-read best_trial AFTER study.optimize() returns so that
     # the OOS tournament references the true best trial, not a pre-run capture
     # that may have been None or from a prior loaded study.
-    best_trial = study.best_trial
+    # FIX-NEW-OPT-02: study.best_trial raises ValueError when every trial was
+    # pruned (possible when all folds trigger anomaly_hit or IS_DD_GATE).  The
+    # study.best_trials guard above catches the "no completed trials" case, but
+    # best_trial itself can still raise if Optuna considers pruned trials
+    # "complete" in some storage backends.  Wrap with an explicit try/except so
+    # the error message is actionable rather than a bare ValueError traceback.
+    try:
+        best_trial = study.best_trial
+    except ValueError as exc:
+        raise RuntimeError(
+            "Optimization finished but no best trial is available "
+            f"(all {len(study.trials)} trial(s) may have been pruned): {exc}. "
+            "Widen the search space, reduce CVAR_DAILY_LIMIT lower bound, "
+            "or check that the training data covers the full warmup window."
+        ) from exc
     best_params = best_trial.params
     best_is_fitness = study.best_value
 
