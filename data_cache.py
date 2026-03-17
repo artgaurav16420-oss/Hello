@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
-_MAX_RATE_LIMIT_RETRIES = 5
+_MAX_RATE_LIMIT_RETRIES = 10
 
 
 def _load_local_env_file(env_path: Path = Path('.env')) -> None:

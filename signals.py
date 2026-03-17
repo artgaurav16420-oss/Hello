@@ -23,6 +23,12 @@ BUG FIXES (murder board):
 - FIX-MB2-GATETOCTOU: knife_failed gate count now includes symbols softly
   suppressed by knife_pre_bonus_suppress (continuity bonus blocked but adj_score
   not set to -inf), not just hard-gated symbols with adj_score == -inf.
+- FIX-MB-DISPERSION: Continuity bonus now multiplied by cross-sectional return
+  dispersion (std_cross clamped at CONTINUITY_DISPERSION_FLOOR). Previously
+  base_bonus = min(CONTINUITY_BONUS, cap) was applied without dispersion scaling,
+  meaning CONTINUITY_DISPERSION_FLOOR in UltimateConfig was defined but never
+  used. This made the bonus scale-invariant and caused tests asserting
+  dispersion-scaled values to fail.
 """
 
 from __future__ import annotations
@@ -320,7 +326,17 @@ def generate_signals(
 
     if prev_weights and valid_mask.any():
         cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
-        base_bonus = min(cfg.CONTINUITY_BONUS, cap)
+        # FIX-MB-DISPERSION: Scale the continuity bonus by the cross-sectional
+        # return dispersion, clamped at CONTINUITY_DISPERSION_FLOOR. std_cross
+        # was computed above from gate-passing symbols; using it here makes the
+        # bonus proportional to how much spread exists in the momentum signal,
+        # preventing the bonus from dominating in low-dispersion (range-bound)
+        # markets. Without this scaling, CONTINUITY_DISPERSION_FLOOR in
+        # UltimateConfig was defined but never used, and tests that expected
+        # dispersion-scaled bonus values would fail.
+        dispersion_floor = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
+        dispersion = max(std_cross, dispersion_floor)
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion
 
         activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
         stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)

@@ -925,8 +925,18 @@ def _compute_metrics(
     # performance libraries define the period count for a series of equity values
     # (treating each row as one period).  The original code used len(eq)-1 which
     # would overstate CAGR by roughly 1/N.  We switch to len(eq) for consistency.
-    n_periods = max(len(eq), 1)
-    cagr      = ((final / initial) ** (periods_per_year / n_periods) - 1.0) * 100.0
+    # FIX-MB-BE-04: Use calendar days not trading days for annualization
+    if not eq.empty and len(eq) >= 2:
+        first_date = pd.Timestamp(eq.index[0])
+        last_date = pd.Timestamp(eq.index[-1])
+        days_elapsed = (last_date - first_date).days
+        years_elapsed = max(days_elapsed / 365.25, 0.001)
+    else:
+        years_elapsed = 1.0
+    if years_elapsed > 0.001:
+        cagr = ((final / initial) ** (1.0 / years_elapsed) - 1.0) * 100.0
+    else:
+        cagr = 0.0
     dd        = (eq / eq.cummax() - 1.0) * 100.0
     max_dd    = float(dd.min())
 

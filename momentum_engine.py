@@ -848,7 +848,14 @@ def execute_rebalance(
     state.weights      = new_weights
     state.shares       = new_shares
     state.entry_prices = new_entry_prices
+    # FIX-MB-CASH-FLOOR: Validate cash doesn't go negative
+    raw_cash = pv_exec - actual_notional - total_slippage
     state.cash         = max(0.0, round(pv_exec - actual_notional - total_slippage, 10))
+    if raw_cash < -1e-6:
+        logger.warning(
+            "execute_rebalance: Slippage overshoot; raw cash would be %.4f",
+            raw_cash
+        )
     return round(total_slippage, 10)
 
 

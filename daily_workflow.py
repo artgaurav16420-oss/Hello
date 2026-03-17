@@ -117,7 +117,11 @@ def load_optimized_config() -> UltimateConfig:
     cfg = UltimateConfig()
     if os.path.exists("data/optimal_cfg.json"):
         with open("data/optimal_cfg.json", "r") as f:
-            best_params = json.load(f)
+            try:
+                best_params = json.load(f)
+            except json.JSONDecodeError as e:
+                logger.error("[Config] optimal_cfg.json is corrupted: %s. Using defaults.", e)
+                return cfg
             valid_fields = UltimateConfig.__dataclass_fields__
             for k, v in best_params.items():
                 if k not in valid_fields:
@@ -129,9 +133,11 @@ def load_optimized_config() -> UltimateConfig:
         # invalid combination (e.g. HALFLIFE_FAST > HALFLIFE_SLOW), which would
         # silently invert the momentum signal direction. Reset to defaults when
         # cross-field invariants are violated.
-        if cfg.HALFLIFE_FAST >= cfg.HALFLIFE_SLOW:
+        # NOTE: HALFLIFE_FAST == HALFLIFE_SLOW is permitted (degenerates to a
+        # single EMA signal) — only strictly FAST > SLOW inverts the signal.
+        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
             logger.error(
-                "[Config] optimal_cfg.json has HALFLIFE_FAST (%d) >= HALFLIFE_SLOW (%d) — "
+                "[Config] optimal_cfg.json has HALFLIFE_FAST (%d) > HALFLIFE_SLOW (%d) — "
                 "invalid: would invert momentum signal. Resetting both to defaults.",
                 cfg.HALFLIFE_FAST, cfg.HALFLIFE_SLOW,
             )
