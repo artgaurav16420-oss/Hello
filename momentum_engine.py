@@ -3,58 +3,26 @@ momentum_engine.py — Institutional Risk Engine v11.48
 =====================================================
 CVaR-constrained Mean-Variance Optimizer with full Transaction Cost formulation.
 
-Architecture
-------------
-InstitutionalRiskEngine is a stateless optimizer. All persistent portfolio
-state — including exposure_multiplier, override flags, and equity history —
-lives exclusively in PortfolioState. No manual sync boilerplate at call sites.
-
-Corporate actions
------------------
-yfinance auto_adjust=True back-adjusts all historical prices for splits and
-dividends. The backtest operates on this adjusted series chronologically, so a
-pre-split purchase books proportionally more shares at the lower adjusted price,
-exactly replicating the post-split share count. No separate split ledger needed.
-
-CRITICAL FIX #3 (ghost synthesis determinism):
-The previous implementation recomputed the RNG seed inside compute_book_cvar on
-every call. Because rng.normal(size=len(rets)) draws `len(rets)` numbers from the
-RNG stream, and len(rets) differs between backtest (fixed historical window) and
-live (growing window), the synthesised ghost returns were non-deterministic across
-runs even though the seed itself was the same. The equity curve therefore diverged
-between backtest and live marking.
-
-Fix: module-level _GHOST_RNG_CACHE maps symbol → (seed, np.random.Generator).
-The Generator is created once per symbol per process.  Ghost returns are always
-drawn from index 0 of a freshly-seeded Generator (i.e. same seed → same sequence
-regardless of T), then the first T elements are taken.  This guarantees bitwise
-reproducibility between backtest and live marking on identical input data.
-
 BUG FIXES (murder board):
-- FIX-MB-SLIP: Double-slippage on buys eliminated. compute_one_way_slip_rate
-  already returns the one-way rate (ROUND_TRIP / 2). execute_rebalance was
-  applying it both as a price markup AND a separate cash deduction, over-costing
-  every buy by 2x. Now the one-way rate is used only to compute the effective buy
-  price for share sizing; the actual cash deduction uses the same one-way slip_rate
-  applied to the delta notional once — consistent with the User Guide definition
-  that ROUND_TRIP_SLIPPAGE_BPS covers the combined buy+sell cost.
-- FIX-MB-VOL: compute_book_cvar wrote last_known_volatility under three keys
-  (sym, to_bare(sym), to_ns(sym)) for every active symbol, silently overwriting
-  frozen vol for absent symbols that share a bare name. Now writes only under the
-  canonical key present in state.shares, and only when the symbol is active.
-- FIX-MB-OSQP: OSQP solver cache is invalidated on any solve() exception so the
-  next call gets a fresh setup instead of re-using a potentially broken solver.
-- FIX-MB-SECTOR: max_possible_weight computation now correctly caps known-sector
-  groups at MAX_SECTOR_WEIGHT while leaving unknown-sector (sentinel -1) stocks
-  uncapped, preventing budget upper-bound inflation.
-- FIX-MB-SETTER: SLIPPAGE_BPS setter chains the original exception via
-  `raise ValueError(...) from exc` to preserve the original exception type.
-- FIX-MB2-GHOSTPV: compute_book_cvar previously used fill_value=0.0 when
-  reindexing hist_log_rets onto held_syms. This silently zeroed the return
-  series of any active held symbol that was absent from hist_log_rets (e.g. a
-  symbol added intraday), understating CVaR. Now reindex uses fill_value=np.nan
-  and ghost synthesis covers both true off-universe ghosts AND active symbols
-  with missing history, before a final fillna(0.0) cleans up any residual NaN.
+- FIX-MB-SLIP: Double-slippage on buys eliminated.
+- FIX-MB-VOL: compute_book_cvar writes last_known_volatility only under the
+  canonical key present in state.shares.
+- FIX-MB-OSQP: OSQP solver cache is invalidated on any solve() exception.
+- FIX-MB-SECTOR: max_possible_weight correctly caps known-sector groups.
+- FIX-MB-SETTER: SLIPPAGE_BPS setter chains original exception.
+- FIX-MB2-GHOSTPV: compute_book_cvar reindexes with fill_value=np.nan.
+- FIX-MB-ME-02: compute_one_way_slip_rate now accepts an optional trade_notional
+  parameter and uses it as the impact numerator when provided. The portfolio_value
+  parameter is kept for backward compatibility but impact is computed against
+  trade_notional when available, preventing overestimation for small trades and
+  underestimation for large rebalances.
+- FIX-MB-ME-03: PortfolioState.update_exposure re-evaluates the breach condition
+  after cooldown expiry so that a sustained CVaR breach spanning the entire
+  cooldown period re-arms the override on the step cooldown reaches zero, rather
+  than allowing one unprotected rebalance.
+- FIX-MB-ME-01: execute_rebalance two-phase PV accounting is documented with
+  inline comments explaining why force-close proceeds flow through pv_exec
+  rather than actual_notional.
 """
 
 from __future__ import annotations
@@ -90,19 +58,16 @@ def _ghost_seed_for(sym: str) -> int:
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
 
 def to_ns(sym: str) -> str:
-    """Return ticker with .NS suffix; pass-through for indices (^) and already-suffixed."""
     if sym.startswith("^") or sym.endswith(".NS"):
         return sym
     return sym + ".NS"
 
 
 def to_bare(sym: str) -> str:
-    """Strip .NS suffix."""
     return sym[:-3] if sym.endswith(".NS") else sym
 
 
 def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
-    """Mark absent symbols with a linear haircut that reaches zero at the absence threshold."""
     px = float(last_known_price)
     if not np.isfinite(px) or px <= 0:
         return 0.0
@@ -165,10 +130,6 @@ class SolverDiagnostics:
 # ─── Matrix Building Helper ───────────────────────────────────────────────────
 
 class _ConstraintBuilder:
-    """
-    Encapsulates OSQP sparse matrix construction to improve auditability.
-    Replaces repetitive and error-prone individual block appends.
-    """
     def __init__(self, n_vars: int):
         self.n_vars = n_vars
         self.A_parts: list = []
@@ -191,8 +152,6 @@ class _ConstraintBuilder:
 
 @dataclass
 class UltimateConfig:
-    """Runtime configuration for portfolio construction, risk, and execution."""
-
     # Portfolio construction
     INITIAL_CAPITAL:          float = 1_000_000.0
     MAX_POSITIONS:            int   = 10
@@ -210,7 +169,6 @@ class UltimateConfig:
     CVAR_MIN_HISTORY:            int   = 20
     CVAR_HARD_BREACH_MULTIPLIER: float = 1.5
 
-    # Drift tolerance: minimum weight change
     DRIFT_TOLERANCE:             float = 0.02
 
     # Exposure management
@@ -282,12 +240,10 @@ class UltimateConfig:
 
     @property
     def SLIPPAGE_BPS(self) -> float:
-        """Backward-compatible alias for ROUND_TRIP_SLIPPAGE_BPS."""
         return self.ROUND_TRIP_SLIPPAGE_BPS
 
     @SLIPPAGE_BPS.setter
     def SLIPPAGE_BPS(self, value: float) -> None:
-        # FIX-MB-SETTER: chain the original exception so callers see the root cause.
         try:
             self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
         except (TypeError, ValueError) as exc:
@@ -344,15 +300,20 @@ class PortfolioState:
         normalised_cvar = realized_cvar / max(float(gross_exposure), 0.05)
         breach = normalised_cvar > cfg.MAX_PORTFOLIO_RISK_PCT
 
-        cooled_down_this_step = False
+        # FIX-MB-ME-03: Decrement cooldown, but evaluate the breach condition
+        # AFTER clearing override_active so that a sustained breach spanning the
+        # entire cooldown period re-arms the override immediately on the step
+        # cooldown reaches zero, rather than allowing one unprotected rebalance.
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
-            cooled_down_this_step = self.override_cooldown == 0
 
+        # Clear override once cooldown has fully expired
         if self.override_cooldown == 0 and self.override_active:
             self.override_active = False
 
-        if breach and not self.override_active and self.override_cooldown == 0 and not cooled_down_this_step:
+        # Re-check breach after override is cleared.  If cooldown just expired
+        # AND we are still in breach, re-arm immediately (no free step).
+        if breach and not self.override_active and self.override_cooldown == 0:
             override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, self.exposure_multiplier * 0.5)
             self.exposure_multiplier = min(new_mult, override_mult)
             self.override_active     = True
@@ -490,7 +451,6 @@ class PortfolioState:
 
 
 def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
-    """Activate exposure override immediately after hard risk events."""
     state.override_active = True
     state.override_cooldown = max(state.override_cooldown, 4)
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
@@ -500,20 +460,33 @@ def compute_one_way_slip_rate(
     cfg: UltimateConfig,
     portfolio_value: float,
     adv_notional: Optional[float],
+    trade_notional: Optional[float] = None,
 ) -> float:
     """
     Compute per-name one-way slippage rate.
 
-    ROUND_TRIP_SLIPPAGE_BPS is the combined buy+sell cost in basis points.
-    One-way cost = half of round-trip, consistent with the User Guide definition.
-    The rate returned here is used ONCE per trade side — callers must not apply
-    it twice (i.e. do not both mark up the buy price AND deduct from cash).
+    FIX-MB-ME-02: Market impact is now scaled against trade_notional (the delta
+    notional being traded) rather than portfolio_value. Using portfolio_value as
+    the impact numerator caused systematic overestimation for small trades and
+    underestimation for large rebalances, because a 1-share trade in a large
+    portfolio received the same impact rate as a full-position rebalance.
+
+    When trade_notional is not provided (backward-compatible callers), falls back
+    to portfolio_value to preserve existing behaviour.
+
+    One-way cost = half of round-trip (ROUND_TRIP_SLIPPAGE_BPS / 2).
+    The rate returned here is applied ONCE per trade side.
     """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
         return base_rate
 
-    impact_rate = (cfg.IMPACT_COEFF * portfolio_value) / float(adv_notional)
+    # FIX-MB-ME-02: prefer trade_notional for impact scaling; fall back to
+    # portfolio_value when trade_notional is unavailable (legacy call sites).
+    numerator = trade_notional if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0) \
+        else portfolio_value
+
+    impact_rate = (cfg.IMPACT_COEFF * numerator) / float(adv_notional)
     return max(base_rate, min(0.05, impact_rate))
 
 
@@ -533,11 +506,22 @@ def execute_rebalance(
     conviction_scores: Optional[np.ndarray] = None,
     force_rebalance_trades: bool = False,
 ) -> float:
-    """Execute a portfolio rebalance, updating state in-place."""
+    """Execute a portfolio rebalance, updating state in-place.
+
+    FIX-MB-ME-01: Two-phase PV accounting explanation:
+    Phase 1 — pv_exec is built from cash + retained positions + ghost positions.
+              Force-close candidates are EXCLUDED here (sym not in symbols_to_force_close).
+    Phase 2 — Force-close positions are sold: proceeds (n_shares * close_price)
+              are added to pv_exec, and the sell trade is logged.
+    Settlement — state.cash = pv_exec - actual_notional - total_slippage.
+              actual_notional covers only retained (new_shares) positions, not
+              force-closed ones. The force-close proceeds were added to pv_exec
+              in Phase 2, so cash correctly reflects their liquidation without
+              needing to subtract them via actual_notional.
+    """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     local_prices = np.array(prices, dtype=float, copy=True)
 
-    # FIX B1: Snapshot T-1 prices BEFORE the loop overwrites last_known_prices.
     t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
 
     for sym, i in active_idx.items():
@@ -563,6 +547,7 @@ def execute_rebalance(
                 )
                 symbols_to_force_close.append(sym)
 
+    # Phase 1: build pv_exec excluding force-close candidates (see docstring)
     pv_t1 = state.cash
     pv_exec = state.cash
 
@@ -634,7 +619,7 @@ def execute_rebalance(
                     if px_exec > 0 and n_shares > 0:
                         if sym in symbols_to_force_close:
                             pv_exec += n_shares * px_exec
-                        slip = n_shares * px_exec * exit_slip_rate
+                        slip            = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:
                             tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
@@ -658,28 +643,27 @@ def execute_rebalance(
         if not np.isfinite(w):
             w = 0.0
         price = max(float(local_prices[i]), 1e-6)
-        slip_rate = compute_one_way_slip_rate(
-            cfg=cfg,
-            portfolio_value=pv_exec,
-            adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
-        )
-
-        target_notional = w * pv_exec
         old_s = state.shares.get(sym, 0)
         current_notional = old_s * price
+
+        # FIX-MB-ME-02: compute trade notional for impact calculation
         if w <= 0.001:
             s = 0
-        elif target_notional > current_notional:
-            buy_notional = max(0.0, target_notional - current_notional)
-            # FIX-MB-SLIP: Use effective_buy_price for share count sizing only.
-            # The slip_rate is the one-way cost (half of round-trip). It is applied
-            # once here to compute how many shares we can afford at the effective
-            # (slip-inclusive) buy price. The actual cash deduction happens below
-            # in the slip = abs(delta) * price * slip_rate line — NOT doubled.
+            trade_not = old_s * price  # selling
+        elif w * pv_exec > current_notional:
+            buy_notional = max(0.0, w * pv_exec - current_notional)
+            slip_rate = compute_one_way_slip_rate(
+                cfg=cfg,
+                portfolio_value=pv_exec,
+                adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+                trade_notional=buy_notional,
+            )
             effective_buy_price = price * (1.0 + slip_rate)
             s = old_s + int(np.floor(buy_notional / max(effective_buy_price, 1e-9)))
+            trade_not = buy_notional
         else:
-            s = int(np.floor(target_notional / price))
+            s = int(np.floor(w * pv_exec / price))
+            trade_not = abs(s - old_s) * price
 
         if adv_shares is not None and i < len(adv_shares):
             adv_notional = float(adv_shares[i])
@@ -731,14 +715,15 @@ def execute_rebalance(
                 price = data["price"]
                 i     = data["i"]
                 w_i   = data["w"]
+                cash_entitlement = (w_i / total_eligible_w) * residual_cash
                 slip_rate = compute_one_way_slip_rate(
                     cfg=cfg,
                     portfolio_value=pv_exec,
                     adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+                    trade_notional=cash_entitlement,
                 )
                 effective_buy_price = price * (1.0 + slip_rate)
 
-                cash_entitlement = (w_i / total_eligible_w) * residual_cash
                 extra = int(cash_entitlement // max(effective_buy_price, 1e-9))
 
                 if extra <= 0:
@@ -783,17 +768,18 @@ def execute_rebalance(
 
         if s > 0 or old_s > 0:
             delta = s - old_s
+            trade_not = abs(delta) * price
 
             slip_rate = compute_one_way_slip_rate(
                 cfg=cfg,
                 portfolio_value=pv_exec,
                 adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
+                trade_notional=trade_not,
             )
 
-            # FIX-MB-SLIP: slip cost is the one-way cost on the traded notional.
-            # This is deducted from cash once. We do NOT also mark up the price
-            # in the cash accounting — effective_buy_price was used only for
-            # share-count sizing above, not for the cash deduction below.
+            # FIX-MB-SLIP: slip cost is the one-way cost on the traded notional,
+            # deducted from cash once. effective_buy_price was used only for
+            # share-count sizing above, not for this cash deduction.
             slip = abs(delta) * price * slip_rate
             total_slippage += slip
             actual_notional += s * price
@@ -830,6 +816,7 @@ def execute_rebalance(
                 cfg.MAX_ABSENT_PERIODS,
             )
 
+    # Phase 2: force-close positions — proceeds added to pv_exec (see docstring)
     for sym in symbols_to_force_close:
         close_price = float(state.last_known_prices.get(sym, 0.0))
         n_shares    = state.shares.get(sym, 0)
@@ -837,6 +824,8 @@ def execute_rebalance(
             if close_price > 0:
                 slip            = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
+                # Add proceeds to pv_exec; not subtracted via actual_notional
+                # because force-closed positions are not in new_shares.
                 pv_exec        += n_shares * close_price
                 if trade_log is not None:
                     tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
@@ -891,15 +880,10 @@ def compute_book_cvar(
     held_syms = list(mtm_weights.keys())
     T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
 
-    # FIX-MB2-GHOSTPV: Reindex with fill_value=np.nan (not 0.0) so that any
-    # held symbol absent from hist_log_rets — whether it is a ghost off-universe
-    # position OR an active symbol whose history is missing — receives synthetic
-    # returns via ghost synthesis below, not a silent zero-return series.
-    # Zero-filling active missing columns understates CVaR and misrepresents risk.
+    # FIX-MB2-GHOSTPV: fill_value=np.nan so absent symbols get ghost synthesis
+    # rather than silent zero-fill which understates CVaR.
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
     rets = rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-T_cvar:]
-    # We do NOT fillna(0.0) here; that happens after ghost synthesis so NaN
-    # columns are properly synthesised rather than treated as flat zero.
 
     vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
     if not hist_log_rets.empty:
@@ -909,18 +893,13 @@ def compute_book_cvar(
             .std()
             .dropna()
         )
-        # FIX-MB-VOL: Only update last_known_volatility for symbols that are
-        # currently active (present in hist_log_rets columns = active universe).
-        # Writing the vol under bare AND .NS keys for every active symbol was
-        # overwriting frozen vol for absent ghost symbols that share a bare name,
-        # destroying the time-warp fix. Now we write only under the canonical key
-        # that matches how the symbol appears in state.shares.
+        # FIX-MB-VOL: write only under the canonical key as it appears in
+        # state.shares; do not write aliased bare/.NS keys to avoid overwriting
+        # frozen vol for absent ghost symbols.
         for sym_key, vol in rolling_vol.items():
             vol_value = float(max(vol, 1e-4))
-            # Only write the key exactly as it appears — no additional aliases.
             state.last_known_volatility[str(sym_key)] = vol_value
 
-    # ghost_mask covers both off-universe ghosts AND active symbols with no history.
     ghost_mask = np.array([
         (s not in active_idx) or (s in rets.columns and rets[s].isna().all())
         for s in held_syms
@@ -949,8 +928,6 @@ def compute_book_cvar(
             synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
             rets.loc[:, sym] = synth_rets
 
-    # All ghost columns have been synthesised; any remaining NaN (e.g. active
-    # symbol with partial history not fully forward-filled) becomes 0.0.
     rets = rets.fillna(0.0)
 
     if len(rets) < 5:
@@ -1152,11 +1129,8 @@ class InstitutionalRiskEngine:
         l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
         u_gamma = min(1.0, gamma)
 
-        # FIX-MB-SECTOR: Compute max_possible_weight correctly.
-        # Known-sector groups are capped at MAX_SECTOR_WEIGHT.
-        # Unknown-sector stocks (sentinel -1) are governed only by ADV limits.
-        # Previously both groups were summed without the sector cap on known groups,
-        # inflating u_gamma when many "Unknown" sector stocks were present.
+        # FIX-MB-SECTOR: known-sector groups capped at MAX_SECTOR_WEIGHT;
+        # unknown-sector (sentinel -1) stocks governed only by ADV limits.
         max_possible_weight = 0.0
         if sector_labels is not None:
             labels = np.asarray(sector_labels, dtype=int)
@@ -1164,7 +1138,6 @@ class InstitutionalRiskEngine:
                 mask    = labels == sec_id
                 sec_adv_sum = float(np.sum(adv_limit[mask]))
                 if sec_id == -1:
-                    # Unknown sector: no sector cap, only ADV limit governs.
                     max_possible_weight += sec_adv_sum
                 else:
                     if mask.sum() >= 2:
@@ -1298,9 +1271,8 @@ class InstitutionalRiskEngine:
                 Px=P_upper.data, Ax=A.data,
             )
 
-        # FIX-MB-OSQP: Wrap solve() in try/except. On any exception, invalidate
-        # the cached solver so the next call gets a fresh setup instead of
-        # attempting to reuse a solver in an undefined internal state.
+        # FIX-MB-OSQP: invalidate solver cache on any exception so the next
+        # call gets a fresh setup rather than reusing a broken solver state.
         try:
             res = self._solver.solve()
         except Exception as exc:
@@ -1318,7 +1290,6 @@ class InstitutionalRiskEngine:
             ) from exc
 
         if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
-            # Invalidate cache on failed solve as well.
             self._solver        = None
             self._solver_shape  = None
             self._solver_nnz    = None

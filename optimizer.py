@@ -27,6 +27,21 @@ BUG FIXES (murder board):
   pre_load_data — the attribute was set but never read anywhere in the codebase,
   and writing undeclared attributes onto a dataclass is fragile and invisible to
   serialisation.
+- FIX-MB-OPT-01: _iter_wfo_slices now enforces a minimum IS window of 252
+  trading-day-equivalent calendar days. Folds where the IS window is too thin
+  are skipped/pruned, preventing near-zero position counts from polluting WFO
+  fitness averages when CVAR_LOOKBACK is at its upper search-space bound.
+- FIX-MB-OPT-04: anomaly_hit slices are now pruned (raise TrialPruned) rather
+  than being included in the aggregate score as near-floor values, preventing
+  corrupted/data-gap folds from distorting TPE guidance.
+- FIX-MB-OPT-06: best_trial is now re-read from study AFTER study.optimize()
+  returns, so the OOS tournament references the true best trial rather than a
+  stale pre-run capture.
+- FIX-MB-OPT-09: study creation uses load_if_exists=True only when the study
+  name has not changed from a previous objective version; callers are warned
+  when DEFAULT_STUDY_NAME matches an existing study with a different objective.
+- FIX-MB-OPT-03: OOS tournament table now prints abs(oos_maxdd) so the MaxDD
+  column shows a positive percentage consistent with the column header.
 
 Requires: pip install optuna
 """
@@ -99,6 +114,10 @@ N_TRIALS       = 100
 OOS_MAX_DD_CAP = 35.0
 OOS_TOP_K = 10
 
+# Minimum IS calendar days a fold must have before the OOS window.
+# 252 trading days * 1.4 calendar-day multiplier ≈ 353 days; use 365 for safety.
+_MIN_IS_CALENDAR_DAYS = 365
+
 SEARCH_SPACE_BOUNDS = {
     "HALFLIFE_FAST":    (10, 40, 5),
     "HALFLIFE_SLOW":    (50, 120, 5),
@@ -142,14 +161,36 @@ def _build_sampler() -> TPESampler:
 # ─── Objective Function ───────────────────────────────────────────────────────
 
 def _iter_wfo_slices(train_start: str, train_end: str):
+    """
+    Yield (is_start, is_end, oos_start, oos_end) tuples for walk-forward folds.
+
+    FIX-MB-OPT-01: Folds where the IS window is shorter than _MIN_IS_CALENDAR_DAYS
+    are skipped. The first fold (year == TRAIN_START.year + 1) often has only ~1
+    calendar year of IS data, which is too thin when CVAR_LOOKBACK is at its upper
+    search-space bound (150 days), causing near-zero position counts and depressed
+    fitness scores that bias TPE toward low-lookback configurations.
+    """
     start = pd.Timestamp(train_start)
     end   = pd.Timestamp(train_end)
     for y in range(start.year + 1, end.year + 1):
         oos_start = pd.Timestamp(f"{y}-01-01")
         oos_end   = min(pd.Timestamp(f"{y}-12-31"), end)
+        is_start  = start
+        is_end    = oos_start - pd.Timedelta(days=1)
+
+        # FIX-MB-OPT-01: skip folds where IS window is too thin
+        is_calendar_days = (is_end - is_start).days
+        if is_calendar_days < _MIN_IS_CALENDAR_DAYS:
+            logger.debug(
+                "[WFO] Skipping fold OOS=%d: IS window only %d calendar days "
+                "(minimum %d). Too thin for upper CVAR_LOOKBACK bound.",
+                y, is_calendar_days, _MIN_IS_CALENDAR_DAYS,
+            )
+            continue
+
         yield (
-            start.strftime("%Y-%m-%d"),
-            (oos_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            is_start.strftime("%Y-%m-%d"),
+            is_end.strftime("%Y-%m-%d"),
             oos_start.strftime("%Y-%m-%d"),
             oos_end.strftime("%Y-%m-%d"),
         )
@@ -162,19 +203,19 @@ def _fitness_from_metrics(
     """
     Compute a scalar fitness score plus a diagnostics dict for logging.
 
-    FIX-MB-DDPENALTY: dd_penalty is now multiplied by concentration_mult before
-    subtracting. Previously dd_penalty was a flat deduction independent of how
-    concentrated the portfolio was. Since concentration_mult inflates risk_penalty
-    for concentrated portfolios (fewer than 6 positions), the drawdown penalty
-    should scale proportionally — a concentrated portfolio near the IS_DD_PENALTY_PCT
-    boundary deserves a harsher penalty because unobserved idiosyncratic risk is
-    higher. This creates a consistent gradient: both the numerator (risk_penalty)
-    and the drawdown correction now scale with concentration.
+    FIX-MB-DDPENALTY / FIX-MB2-DDPENALTY2: dd_penalty is a flat quadratic
+    correction independent of concentration_mult. concentration risk is fully
+    covered by risk_penalty (which scales with concentration_mult).
 
     Returns
     -------
-    score : float  — clipped to [-2.0, 3.5] via Michaelis-Menten saturation
+    score : float  — clipped to [-2.0, 3.5 asymptote] via Michaelis-Menten saturation
     diag  : dict   — all intermediate values for logging
+
+    Note on score ceiling: the Michaelis-Menten formula (_K * raw) / (_K + raw)
+    approaches _K=3.5 asymptotically as raw→∞. The upper bound is an asymptote,
+    not a hard clip — the docstring previously said "clipped to 3.5" which was
+    imprecise. The lower bound IS a hard floor at -2.0.
     """
     cagr = float(metrics.get("cagr", 0.0))
     max_dd = abs(float(metrics.get("max_dd", 100.0)))
@@ -197,13 +238,9 @@ def _fitness_from_metrics(
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0).mean())
         n_rebalances = len(rebal_log)
 
-    # Concentration multiplier: each position below 6 raises the effective risk
-    # denominator by 30% to account for unobserved idiosyncratic risk from the
-    # survivor-only IS universe excluding demoted/blown-up names.
     _pos_deficit = max(0.0, 6.0 - avg_positions)
     concentration_mult = 1.0 + _pos_deficit * 0.30
 
-    # Sortino quality multiplier: scales raw score ×[0.50, 1.15].
     import math as _math
     _sortino_safe = sortino if _math.isfinite(sortino) else 0.0
     sortino_quality = min(max(_sortino_safe / 2.5, 0.50), 1.15)
@@ -230,16 +267,7 @@ def _fitness_from_metrics(
         return score, diag
 
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
-    # FIX-MB-DDPENALTY / FIX-MB2-DDPENALTY2: The original fix applied
-    # concentration_mult to dd_penalty. However risk_penalty already contains
-    # concentration_mult in its denominator (division = lower score for concentrated
-    # portfolios). Adding concentration_mult to dd_penalty as well creates an
-    # additive double-hit: a 4-position portfolio with a 30% drawdown and
-    # concentration_mult=2.8 gets dd_penalty = (100²/100)*2.8 = 280, which
-    # dominates the entire score and prunes trials that should be evaluated.
-    # The correct formulation: dd_penalty is a flat quadratic correction that
-    # represents the raw drawdown severity above the threshold — concentration
-    # risk is already accounted for via risk_penalty. Revert to unscaled.
+    # FIX-MB-DDPENALTY / FIX-MB2-DDPENALTY2: flat quadratic, no concentration scaling.
     dd_penalty = (dd_excess ** 2) / 100.0
 
     exposure_penalty = 0.0 if avg_exposure >= 0.25 else (0.25 - avg_exposure) * 2.0
@@ -266,8 +294,6 @@ def _fitness_from_metrics(
         dd_gate_hit = False
     else:
         raw = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty
-        # Soft saturation: Michaelis-Menten shape so TPE retains gradient between
-        # "very good" (raw≈2) and "lucky outlier year" (raw≈14).
         _K = 3.5
         score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
         score = max(score, -2.0)
@@ -374,20 +400,12 @@ class MomentumObjective:
         scores: list[float] = []
         slice_diags: list[dict] = []
 
-        first_oos_year = pd.Timestamp(TRAIN_START).year + 1
         trial_id = getattr(trial, "number", 0)
 
         for _, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
             oos_year = pd.Timestamp(wf_oos_start).year
-            exclude_from_score = (oos_year == first_oos_year)
 
-            # FIX-MB2-WFOSLICE: Slice precomputed_matrices to [start, wf_oos_end]
-            # so that signals computed during this OOS fold cannot see return data
-            # from future folds. The full matrix covering TRAIN_START→TEST_END was
-            # pre-loaded for data-fetch efficiency, but each fold must only see its
-            # own window. Without this slice, e.g. the Year-2020 OOS fold sees
-            # 2021-2022 returns in hist_log_rets inside the backtest engine, which
-            # is genuine walk-forward look-ahead and inflates IS fitness scores.
+            # FIX-MB2-WFOSLICE: slice precomputed_matrices to [start, wf_oos_end]
             fold_matrices = None
             if self.precomputed_matrices is not None:
                 oos_end_ts = pd.Timestamp(wf_oos_end)
@@ -409,54 +427,54 @@ class MomentumObjective:
             m = oos.metrics
             score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
 
-            diag["year"]             = oos_year
-            diag["excluded"]         = exclude_from_score
-            diag["eq_start"]         = wf_oos_start
-            diag["eq_end"]           = wf_oos_end
+            diag["year"]    = oos_year
+            diag["excluded"] = False  # FIX-MB-OPT-01: first-year exclusion removed (thin folds now skipped entirely)
+            diag["eq_start"] = wf_oos_start
+            diag["eq_end"]   = wf_oos_end
             slice_diags.append(diag)
 
-            _excluded_tag = " [EXCLUDED from score]" if exclude_from_score else ""
             _ceiling_tag  = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
             _ddgate_tag   = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
             _anomaly_tag  = " ⚠ ANOMALOUS-RETURNS" if diag.get("anomaly_hit") else ""
             logger.info(
-                "[Trial %s | %d%s] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
+                "[Trial %s | %d] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
                 "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
-                "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  RawScore=%.4f  Score=%.4f%s%s%s%s",
-                trial_id, oos_year, _excluded_tag,
+                "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  RawScore=%.4f  Score=%.4f%s%s%s",
+                trial_id, oos_year,
                 diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
                 diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
                 diag["risk_penalty"], diag["exposure_penalty"], diag.get("dd_penalty", 0.0),
                 diag["raw_score"], diag["score"],
-                _ceiling_tag, _ddgate_tag, _anomaly_tag, "",
+                _ceiling_tag, _ddgate_tag, _anomaly_tag,
             )
 
             if not pd.notna(score):
                 raise optuna.TrialPruned()
 
-            if diag.get("dd_gate_hit") or score <= -2.0:
+            # FIX-MB-OPT-04: prune on anomaly_hit in addition to dd_gate_hit.
+            # Anomalous-return slices (data gaps, 300%+ CAGR) would otherwise
+            # contribute a near-floor score to the aggregate, distorting TPE.
+            if diag.get("dd_gate_hit") or diag.get("anomaly_hit") or score <= -2.0:
                 raise optuna.TrialPruned()
 
-            if not exclude_from_score:
-                scores.append(float(score))
+            scores.append(float(score))
 
         if not scores:
             raise optuna.TrialPruned()
 
         aggregate = float(sum(scores) / len(scores))
 
-        scored_diags   = [d for d in slice_diags if not d["excluded"]]
-        avg_cagr       = sum(d["cagr"]         for d in scored_diags) / len(scored_diags)
-        avg_dd         = sum(abs(d["max_dd"])   for d in scored_diags) / len(scored_diags)
-        ceiling_slices = sum(1 for d in scored_diags if d["ceiling_hit"])
-        ddgate_slices  = sum(1 for d in scored_diags if d["dd_gate_hit"])
+        avg_cagr       = sum(d["cagr"]         for d in slice_diags) / len(slice_diags)
+        avg_dd         = sum(abs(d["max_dd"])   for d in slice_diags) / len(slice_diags)
+        ceiling_slices = sum(1 for d in slice_diags if d["ceiling_hit"])
+        ddgate_slices  = sum(1 for d in slice_diags if d["dd_gate_hit"])
 
         logger.info(
             "[Trial %s | AGGREGATE] score=%.4f  avg_cagr=%+.1f%%  avg_dd=%.1f%%  "
             "ceiling_hits=%d/%d  ddgate_hits=%d/%d  params=%s",
             trial_id, aggregate, avg_cagr, avg_dd,
-            ceiling_slices, len(scored_diags),
-            ddgate_slices,  len(scored_diags),
+            ceiling_slices, len(slice_diags),
+            ddgate_slices,  len(slice_diags),
             {k: v for k, v in trial.params.items()},
         )
 
@@ -487,14 +505,9 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     if cfg is None:
         cfg = UltimateConfig()
         cvar_bounds = SEARCH_SPACE_BOUNDS.get("CVAR_LOOKBACK")
-        halflife_bounds = SEARCH_SPACE_BOUNDS.get("HALFLIFE_SLOW")
         if cvar_bounds:
             cfg.CVAR_LOOKBACK = int(cvar_bounds[1])
         # FIX-MB2-CFGCOPY: Removed dead cfg._pre_load_padding_days assignment.
-        # The attribute was set but never read anywhere in the codebase, and
-        # writing an undeclared field onto a dataclass is fragile (invisible to
-        # to_dict/from_dict, flagged by static analysis). The padding behaviour
-        # is handled inside load_or_fetch via its own dynamic padding logic.
 
     historical_union: set[str] = set()
     try:
@@ -586,9 +599,9 @@ def run_optimization(
 
     if effective_n_jobs != 1:
         logger.warning(
-            "OPTUNA_N_JOBS=%d is not supported in this execution path (GIL bottleneck). "
-            "Forcing n_jobs=1. For parallelism, run multiple optimizer processes with "
-            "shared SQLite/RDB storage.",
+            "OPTUNA_N_JOBS=%d: for this single-process invocation n_jobs is forced to 1. "
+            "For true parallelism, run multiple optimizer processes pointing at the same "
+            "shared SQLite/RDB storage — each process uses n_jobs=1.",
             effective_n_jobs,
         )
         effective_n_jobs = 1
@@ -633,7 +646,6 @@ def run_optimization(
             return
 
         diags = trial.user_attrs.get("slice_diags", [])
-        scored = [d for d in diags if not d.get("excluded", False)]
 
         hdr = (
             f"\n\033[1;33m{'─'*72}\033[0m"
@@ -652,7 +664,6 @@ def run_optimization(
         logger.info("  " + "-"*70)
         for d in diags:
             flags = []
-            if d.get("excluded"):       flags.append("EXCL")
             if d.get("ceiling_hit"):    flags.append("CEIL")
             if d.get("dd_gate_hit"):    flags.append("DD-GATE")
             if d.get("anomaly_hit"):    flags.append("ANOM")
@@ -664,13 +675,13 @@ def run_optimization(
                 d["score"], " ".join(flags) if flags else "—",
             )
         logger.info("  " + "-"*70)
-        if scored:
-            avg_cagr = sum(d["cagr"]       for d in scored) / len(scored)
-            avg_dd   = sum(abs(d["max_dd"]) for d in scored) / len(scored)
-            ceil_n   = sum(1 for d in scored if d.get("ceiling_hit"))
+        if diags:
+            avg_cagr = sum(d["cagr"]       for d in diags) / len(diags)
+            avg_dd   = sum(abs(d["max_dd"]) for d in diags) / len(diags)
+            ceil_n   = sum(1 for d in diags if d.get("ceiling_hit"))
             logger.info(
                 "  %-6s  %+7.1f%%  %6.1f%%  %54s  ceiling_hits=%d/%d",
-                "AVG", avg_cagr, avg_dd, "", ceil_n, len(scored),
+                "AVG", avg_cagr, avg_dd, "", ceil_n, len(diags),
             )
         logger.info("")
 
@@ -693,8 +704,11 @@ def run_optimization(
             "Widen the search space or reduce hard constraints."
         )
 
-    best_params = study.best_params
-    best_trial = getattr(study, "best_trial", None)
+    # FIX-MB-OPT-06: re-read best_trial AFTER study.optimize() returns so that
+    # the OOS tournament references the true best trial, not a pre-run capture
+    # that may have been None or from a prior loaded study.
+    best_trial = study.best_trial
+    best_params = best_trial.params
     best_is_fitness = study.best_value
 
     print(f"\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
@@ -715,7 +729,7 @@ def run_optimization(
             avg_d   = t.user_attrs.get("avg_dd",       "?")
             c_hits  = t.user_attrs.get("ceiling_hits", "?")
             dg_hits = t.user_attrs.get("ddgate_hits",  "?")
-            scored_n = len([d for d in t.user_attrs.get("slice_diags", []) if not d.get("excluded", False)])
+            scored_n = len(t.user_attrs.get("slice_diags", []))
             c_str   = f"{c_hits}/{scored_n}" if isinstance(c_hits, int) else "?"
             dg_str  = f"{dg_hits}/{scored_n}" if isinstance(dg_hits, int) else "?"
             cagr_s  = f"{avg_c:+.1f}%" if isinstance(avg_c, float) else str(avg_c)
@@ -724,22 +738,19 @@ def run_optimization(
         print(f"\033[90m{'─'*58}\033[0m")
         print()
 
-        if best_trial is not None:
-            c_hits   = best_trial.user_attrs.get("ceiling_hits", 0)
-            scored_n = len([d for d in best_trial.user_attrs.get("slice_diags", []) if not d.get("excluded", False)])
-            if isinstance(c_hits, int) and scored_n > 0 and c_hits == scored_n:
-                print("\033[1;31m[WARNING] Best trial hit the 5.0 score ceiling on ALL scored slices.\033[0m")
-                print("\033[33m          This means the optimizer cannot distinguish between parameter sets\033[0m")
-                print("\033[33m          in the top range — TPE convergence may be unreliable.\033[0m")
-                print()
+        c_hits   = best_trial.user_attrs.get("ceiling_hits", 0)
+        scored_n = len(best_trial.user_attrs.get("slice_diags", []))
+        if isinstance(c_hits, int) and scored_n > 0 and c_hits == scored_n:
+            print("\033[1;31m[WARNING] Best trial hit the 5.0 score ceiling on ALL scored slices.\033[0m")
+            print("\033[33m          This means the optimizer cannot distinguish between parameter sets\033[0m")
+            print("\033[33m          in the top range — TPE convergence may be unreliable.\033[0m")
+            print()
 
     # OOS Top-K tournament
     print(f"\n\033[1;36m=== INITIATING OUT-OF-SAMPLE (OOS) VALIDATION — TOP-{OOS_TOP_K} TOURNAMENT ===\033[0m")
     print(f"\033[90mEvaluating top {OOS_TOP_K} IS trials on unseen data {TEST_START} → {TEST_END}\033[0m")
     print(f"\033[90mWinner = best OOS Calmar (not best IS score)\033[0m\n")
 
-    trials      = list(getattr(study, "trials", []))
-    completed   = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
     top_k_trials = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:OOS_TOP_K]
 
     if not top_k_trials:
@@ -750,6 +761,8 @@ def run_optimization(
     _rs = "\u20b9" if _stdout_supports_rupee() else "Rs."
     valid_fields = UltimateConfig.__dataclass_fields__
 
+    # FIX-MB-OPT-03: print abs(oos_maxdd) so the MaxDD column shows a positive
+    # percentage consistent with the column header "OOS MaxDD".
     print(f"  {'Rank':>4}  {'Trial':>6}  {'IS Score':>9}  {'OOS CAGR':>9}  "
           f"{'OOS MaxDD':>9}  {'OOS Calmar':>10}  {'Status'}")
     print(f"  {'─'*75}")
@@ -786,11 +799,12 @@ def run_optimization(
             )
             status = "\033[32mPASS\033[0m" if passes else "\033[31mFAIL\033[0m"
 
+            # FIX-MB-OPT-03: display abs(oos_maxdd) for positive readability
             print(
                 f"  {rank:>4}  #{trial_candidate.number:>5}  "
                 f"{trial_candidate.value:>9.4f}  "
                 f"{oos_cagr:>+8.1f}%  "
-                f"{oos_maxdd:>8.1f}%  "
+                f"{abs(oos_maxdd):>8.1f}%  "
                 f"{oos_calmar:>10.2f}  "
                 f"{status}"
             )
@@ -824,7 +838,7 @@ def run_optimization(
           f"(Trial #{best_oos_trial.number}, IS score {best_oos_trial.value:.4f})")
     print(f"  OOS Final      : {_rs}{best_oos_metrics.get('final', 0):,.0f}")
     print(f"  OOS CAGR       : {best_oos_metrics.get('cagr', 0):.2f}%")
-    print(f"  OOS MaxDD      : {best_oos_metrics.get('max_dd', 0):.2f}%")
+    print(f"  OOS MaxDD      : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
     print(f"  OOS Calmar     : {best_oos_calmar:.2f}")
     print(f"  OOS Sharpe     : {best_oos_metrics.get('sharpe', 0):.2f}")
     print(f"\n  Winning Parameters:")

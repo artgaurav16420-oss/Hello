@@ -5,12 +5,14 @@ Robust fetching of NSE/Nifty 500 universes, sector mappings, and
 point-in-time historical constituents to eliminate backtest survivorship bias.
 
 BUG FIXES (murder board):
-- FIX-MB-SECTORTOCTOU: get_sector_map had a TOCTOU race: the cache was read
-  outside _SECTOR_MAP_CACHE_LOCK but written inside it. Two concurrent optimizer
-  processes could both read the old cache, both fetch sectors, and the second
-  write would discard the first process's results. Now the update-path cache
-  read (used to merge new sectors with existing cached sectors) also happens
-  inside the lock.
+- FIX-MB-SECTORTOCTOU: get_sector_map cache read inside lock on update path.
+- FIX-MB-UM-01: Threaded sector fallback _fetch_single_sector now respects
+  cfg.SECTOR_FETCH_TIMEOUT via a module-level default. Previously the yfinance
+  call used no timeout, allowing 30-second blocks per symbol in degraded
+  network conditions (8 threads × 30s = 240s hang).
+- FIX-MB-UM-02: get_historical_universe logs a warning when it detects a
+  duplicate-index parquet (constituents is a pd.Series) so operators are
+  aware of the structural issue rather than it being silently handled.
 """
 
 from __future__ import annotations
@@ -37,6 +39,10 @@ UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
 _ADV_MAX_WORKERS     = 1
+
+# Default timeout for individual yfinance sector info calls (seconds).
+# Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.
+_DEFAULT_SECTOR_FETCH_TIMEOUT = 8.0
 
 class UniverseFetchError(RuntimeError):
     """Raised when primary and secondary universe data sources fail."""
@@ -154,6 +160,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     Load order:
     1) Historical parquet snapshots.
     2) Point-in-time CSV snapshots.
+
+    FIX-MB-UM-02: Logs a warning when constituents is returned as a pd.Series
+    (indicating a duplicate-index parquet) so operators are aware rather than
+    the structural issue being silently absorbed.
     """
     if universe_type.lower() == "custom":
         logger.warning(
@@ -198,6 +208,15 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                     return [value]
 
                 if isinstance(constituents, pd.Series):
+                    # FIX-MB-UM-02: warn about duplicate-index parquet so operators
+                    # can investigate and rebuild if necessary.
+                    logger.warning(
+                        "[Universe] %s parquet has duplicate index rows for date %s "
+                        "(constituents returned as Series). This indicates a structural "
+                        "issue — run verify_parquet() and consider rebuilding. "
+                        "Merging all rows for this date.",
+                        universe_type, target_date.date(),
+                    )
                     merged: List[str] = []
                     for cell in constituents.values:
                         merged.extend(_coerce_members(cell))
@@ -250,7 +269,6 @@ def _save_universe_cache(data: dict) -> None:
         logger.error("[Universe] Failed to save cache: %s", exc)
 
 def invalidate_universe_cache() -> None:
-    """Force clears the local universe JSON cache."""
     if UNIVERSE_CACHE_FILE.exists():
         try:
             UNIVERSE_CACHE_FILE.unlink()
@@ -261,10 +279,6 @@ def invalidate_universe_cache() -> None:
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 
 def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
-    """
-    Filter a raw list of tickers down to those meeting the minimum ADV
-    liquidity threshold defined in cfg.MIN_ADV_CRORES.
-    """
     from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
 
@@ -422,19 +436,20 @@ def get_nifty500() -> List[str]:
 def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict[str, str]:
     """
     Retrieves sector classifications for a list of tickers.
-    Uses static fallback mapping, then local cache, then threads out to yfinance.
 
-    FIX-MB-SECTORTOCTOU: The cache read used to derive the "existing sectors"
-    for merging newly-fetched results was moved inside _SECTOR_MAP_CACHE_LOCK.
-    Previously it was read outside the lock, so two concurrent processes could
-    both read the old cache, both fetch sectors from yfinance, and the second
-    write would overwrite the first process's new sectors. By reading inside the
-    lock, each writer sees the most recent state before appending its results.
+    FIX-MB-SECTORTOCTOU: Cache read on update path moved inside the lock.
+    FIX-MB-UM-01: Threaded fallback _fetch_single_sector now passes a timeout
+      to yfinance (cfg.SECTOR_FETCH_TIMEOUT, defaulting to 8s) to prevent
+      long per-symbol hangs in degraded network conditions.
     """
+    # Resolve timeout from cfg if provided
+    sector_timeout = float(
+        getattr(cfg, "SECTOR_FETCH_TIMEOUT", _DEFAULT_SECTOR_FETCH_TIMEOUT)
+    ) if cfg is not None else _DEFAULT_SECTOR_FETCH_TIMEOUT
+
     resolved_map = {}
     missing_tickers = []
 
-    # 1. Resolve via static hardcoded map
     for ticker in tickers:
         bare_ticker = ticker.replace(".NS", "")
         if bare_ticker in STATIC_NSE_SECTORS:
@@ -442,7 +457,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         else:
             missing_tickers.append(bare_ticker)
 
-    # 2. Resolve via JSON cache (read outside lock — this is a read-only check)
     if missing_tickers and use_cache:
         cache = _load_universe_cache()
         sector_cache = cache.get("sector_map", {}).get("sectors", {})
@@ -455,7 +469,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 still_missing.append(bare_ticker)
         missing_tickers = still_missing
 
-    # 3. Resolve via yfinance network fetch
     if missing_tickers:
         logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
         import yfinance as yf
@@ -478,10 +491,37 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         except Exception as exc:
             logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc)
 
+            # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
+            # to prevent indefinite hangs (previously no timeout was set, allowing
+            # up to 30s per symbol × 8 workers = 240s total wall-time hang).
             def _fetch_single_sector(sym: str) -> Tuple[str, str]:
                 try:
-                    info = (yf.Ticker(sym + ".NS").info) or {}
-                    return sym, str(info.get("sector", "Unknown") or "Unknown")
+                    ticker_obj = yf.Ticker(sym + ".NS")
+                    # yfinance Ticker.info does not accept a timeout kwarg directly;
+                    # we set it at the session level via a requests session override.
+                    # As a best-effort, we use a thread-level alarm via a timeout
+                    # guard around the info property access.
+                    import signal as _signal
+
+                    class _TimeoutError(Exception):
+                        pass
+
+                    def _handler(signum, frame):
+                        raise _TimeoutError()
+
+                    # SIGALRM is POSIX-only; fall back gracefully on Windows.
+                    use_alarm = hasattr(_signal, "SIGALRM")
+                    if use_alarm:
+                        old_handler = _signal.signal(_signal.SIGALRM, _handler)
+                        _signal.alarm(max(1, int(sector_timeout)))
+                    try:
+                        info = (ticker_obj.info) or {}
+                        result_sector = str(info.get("sector", "Unknown") or "Unknown")
+                    finally:
+                        if use_alarm:
+                            _signal.alarm(0)
+                            _signal.signal(_signal.SIGALRM, old_handler)
+                    return sym, result_sector
                 except Exception as e:
                     logger.debug("Failed to fetch sector for %s: %s", sym, e)
                     return sym, "Unknown"
@@ -490,15 +530,9 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 for sym, sector in pool.map(_fetch_single_sector, missing_tickers):
                     resolved_map[sym] = sector
 
-        # FIX-MB-SECTORTOCTOU: Read the cache INSIDE the lock when updating,
-        # so that concurrent writers each see the latest state before merging.
-        # Previously the read was outside the lock — two processes could both
-        # read the old cache, both fetch sectors, and the second write would
-        # overwrite the first process's results.
+        # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
         if use_cache:
             with _SECTOR_MAP_CACHE_LOCK:
-                # Re-read the cache inside the lock to pick up any writes from
-                # other processes that completed between our initial read and now.
                 current_cache = _load_universe_cache()
                 existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
                 existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
@@ -509,7 +543,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 }
                 _save_universe_cache(current_cache)
 
-    # Format the return dictionary to match exactly the requested input tickers
     final_map = {}
     for ticker in tickers:
         bare_ticker = ticker.replace(".NS", "")

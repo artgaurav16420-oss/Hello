@@ -4,19 +4,17 @@ data_cache.py — Persistent Atomic Downloader v11.49
 Robustly manages downloading, parsing, and persisting yfinance data.
 
 BUG FIXES (murder board):
-- FIX-MB-GROWWADJ: GrowwProvider._build_adj_close_from_batches previously used
-  .bfill() on the adjustment ratio before applying it to Groww prices. bfill()
-  can apply a future adjustment ratio to past prices when NSE and yfinance
-  holiday calendars diverge — look-ahead contamination. Now only .ffill() is
-  applied (forward-fill only), and the ratio is computed from a single yfinance
-  call with auto_adjust=False, actions=True so adj and raw come from the same
-  cache state, eliminating divergence from separate calls.
-- FIX-MB-GROWW429: GrowwProvider._fetch_candles_chunk returned [] on a 429
-  response with a 5-second sleep, but the outer _fetch_full_history loop then
-  immediately made the next chunk request with only the 0.2s inter-chunk sleep,
-  creating a rapid retry storm after a rate-limit event. Now the 429 handler
-  returns a sentinel that causes the outer loop to apply exponential backoff
-  before the next chunk request for the same symbol.
+- FIX-MB-GROWWADJ: GrowwProvider._build_adj_close_from_batches uses only ffill
+  (no bfill) when aligning the adjustment ratio, preventing look-ahead
+  contamination across holiday gaps.
+- FIX-MB-GROWW429: GrowwProvider._fetch_candles_chunk returns _RATE_LIMITED
+  sentinel on HTTP 429, enabling exponential backoff in the outer loop.
+- FIX-MB-DC-02: _fetch_full_history now caps consecutive rate-limit retries at
+  _MAX_RATE_LIMIT_RETRIES (5). After the cap is hit, a warning is logged and the
+  history fetch aborts for that symbol rather than blocking indefinitely.
+- FIX-MB-DC-01: _recover_from_stale_cache now updates the manifest entry for
+  successfully recovered symbols so that subsequent load_or_fetch calls do not
+  repeatedly trigger download attempts for stale-but-available parquets.
 """
 
 from __future__ import annotations
@@ -41,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()
+
+# Maximum consecutive 429 retries per symbol before aborting
+_MAX_RATE_LIMIT_RETRIES = 5
 
 
 def _load_local_env_file(env_path: Path = Path('.env')) -> None:
@@ -89,15 +90,10 @@ class GrowwProvider(DataProvider):
     """
     Fetches daily OHLCV candles from the Groww API for NSE equity tickers.
 
-    FIX-MB-GROWWADJ: Adj Close adjustment ratio is now computed from a single
-    yfinance call (auto_adjust=False, actions=True) so raw close and corporate
-    actions come from the same snapshot. Only forward-fill (ffill) is applied
-    when aligning the ratio to Groww dates — bfill was removed because it could
-    propagate a future split ratio backward across a holiday gap (look-ahead).
-
-    FIX-MB-GROWW429: The 429 handler now returns the _RATE_LIMITED sentinel
-    instead of [] so _fetch_full_history can distinguish rate-limit hits from
-    normal empty responses and apply exponential backoff before the next chunk.
+    FIX-MB-GROWWADJ: Only ffill applied when aligning adj ratio — no bfill.
+    FIX-MB-GROWW429: 429 returns _RATE_LIMITED sentinel for exponential backoff.
+    FIX-MB-DC-02: Exponential backoff capped at _MAX_RATE_LIMIT_RETRIES to
+      prevent indefinite blocking when a token is revoked or account suspended.
     """
 
     _GROWW_SLEEP_SECS = 0.2
@@ -155,9 +151,6 @@ class GrowwProvider(DataProvider):
                 logger.debug("[Groww] Symbol %s not found (404), skipping.", groww_symbol)
                 return []
             if resp.status_code == 429:
-                # FIX-MB-GROWW429: Return sentinel instead of [] so the outer
-                # loop can distinguish a rate-limit hit from an empty response
-                # and apply exponential backoff before the next chunk request.
                 logger.warning("[Groww] Rate limited for %s.", groww_symbol)
                 return _RATE_LIMITED
             resp.raise_for_status()
@@ -176,8 +169,9 @@ class GrowwProvider(DataProvider):
         """
         Fetch complete daily OHLCV history for groww_symbol over [start, end].
 
-        FIX-MB-GROWW429: Applies exponential backoff when _RATE_LIMITED sentinel
-        is returned, preventing a rapid retry storm after a 429 response.
+        FIX-MB-DC-02: Caps consecutive rate-limit retries at _MAX_RATE_LIMIT_RETRIES.
+        When the cap is reached, logs a warning and aborts the fetch for this symbol
+        rather than blocking indefinitely (e.g. when a token is revoked).
         """
         start_ts = pd.Timestamp(start)
         end_ts   = pd.Timestamp(end)
@@ -196,14 +190,24 @@ class GrowwProvider(DataProvider):
 
             if result is _RATE_LIMITED:
                 consecutive_rate_limits += 1
-                # Exponential backoff: 5s, 10s, 20s, ... capped at 60s
+
+                # FIX-MB-DC-02: abort after too many consecutive 429s to prevent
+                # infinite blocking (e.g. revoked token, suspended account).
+                if consecutive_rate_limits > _MAX_RATE_LIMIT_RETRIES:
+                    logger.warning(
+                        "[Groww] %s: hit rate-limit %d times consecutively "
+                        "(max %d). Aborting fetch — token may be revoked or "
+                        "account suspended. Falling back to yfinance.",
+                        groww_symbol, consecutive_rate_limits, _MAX_RATE_LIMIT_RETRIES,
+                    )
+                    return None
+
                 backoff = min(5.0 * (2 ** (consecutive_rate_limits - 1)), 60.0)
                 logger.warning(
                     "[Groww] Rate limit hit #%d for %s — backing off %.0fs.",
                     consecutive_rate_limits, groww_symbol, backoff,
                 )
                 time.sleep(backoff)
-                # Retry the same chunk (do not advance cursor)
                 continue
 
             consecutive_rate_limits = 0
@@ -274,31 +278,14 @@ class GrowwProvider(DataProvider):
         yf_raw: pd.DataFrame,
     ) -> pd.Series:
         """
-        Back-adjust the raw Groww Close series using split/dividend metadata
-        from yfinance (auto_adjust=False, actions=True).
+        Back-adjust raw Groww Close using split/dividend metadata from a single
+        yfinance call (auto_adjust=False, actions=True).
 
-        FIX-MB-GROWWADJ: The previous implementation took two separate yfinance
-        downloads (one with auto_adjust=True, one with auto_adjust=False) and
-        computed the ratio between them. This introduced two problems:
-        1. The two downloads could use different internal caches, causing
-           mismatched adj/raw prices on split days and a ratio that is not 1.0
-           on non-event days.
-        2. After aligning the ratio to Groww dates, bfill() was applied, which
-           could propagate a future split ratio backward across an NSE/yfinance
-           holiday calendar gap — look-ahead contamination.
-
-        Fix: the caller now provides a single yf_raw download (auto_adjust=False,
-        actions=True). We derive Adj Close directly from Close + Stock Splits +
-        Dividends in the same payload, matching yfinance's own adjustment logic.
-        If derivation fails, we fall back to yfinance's pre-computed Adj Close
-        column from the same payload (no separate download needed).
-        Only ffill (forward-fill) is applied when aligning to Groww dates —
-        never bfill.
+        FIX-MB-GROWWADJ: Only ffill is applied when aligning ratio to Groww
+        dates. bfill was removed because it propagates a future split ratio
+        backward across holiday gaps (look-ahead contamination).
         """
         try:
-            # Prefer yfinance's own Adj Close from the raw (unadjusted) payload.
-            # Both Close and Adj Close come from the same download call, so their
-            # ratio is internally consistent.
             adj_yf     = self._extract_batch_series(yf_raw, "Adj Close", ns_ticker)
             raw_yf_cls = self._extract_batch_series(yf_raw, "Close",     ns_ticker)
 
@@ -313,9 +300,7 @@ class GrowwProvider(DataProvider):
             if ratio.empty:
                 return raw_close
 
-            # FIX-MB-GROWWADJ: Only forward-fill (ffill) — never bfill.
-            # bfill would carry a future split ratio backward across a holiday
-            # gap, contaminating historical prices with look-ahead information.
+            # FIX-MB-GROWWADJ: ffill only — never bfill.
             ratio_aligned = ratio.reindex(raw_close.index).ffill().fillna(1.0)
             adj_groww = raw_close * ratio_aligned
             return adj_groww
@@ -357,10 +342,8 @@ class GrowwProvider(DataProvider):
         yf_start = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
         yf_end   = (pd.Timestamp(end) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
 
-        # FIX-MB-GROWWADJ: Single yfinance call with auto_adjust=False, actions=True.
-        # This gives us both raw Close AND Adj Close AND corporate actions (Dividends,
-        # Stock Splits) from the same internal cache state, eliminating the
-        # divergence that occurred when two separate calls hit different snapshots.
+        # Single yfinance call: auto_adjust=False, actions=True — both raw Close
+        # and Adj Close come from the same snapshot, eliminating ratio divergence.
         yf_raw = pd.DataFrame()
         if valid_groww_tickers:
             try:
@@ -389,7 +372,6 @@ class GrowwProvider(DataProvider):
             if raw_df is None or raw_df.empty:
                 continue
 
-            # Build Adj Close using the single yf_raw payload (no separate adj call)
             adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_raw)
             raw_df["Adj Close"] = adj_close
 
@@ -935,6 +917,16 @@ def _recover_from_stale_cache(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
 ) -> None:
+    """
+    Load stale-but-present parquets as a fallback when all providers fail.
+
+    FIX-MB-DC-01: Update the manifest entry for each successfully recovered
+    symbol so that subsequent load_or_fetch calls see a valid (if stale) entry
+    and do not repeatedly trigger download attempts. The last_date is preserved
+    from the parquet itself rather than being set to today, so the entry
+    accurately reflects that the data is stale and will be refreshed when the
+    provider recovers.
+    """
     recovered = 0
     for ticker in chunk:
         parquet_path = CACHE_DIR / f"{ticker}.parquet"
@@ -946,9 +938,23 @@ def _recover_from_stale_cache(
                 continue
             market_data[ticker] = fallback_df
             recovered += 1
+
+            # FIX-MB-DC-01: update manifest with the actual last_date from the
+            # parquet so subsequent calls don't re-trigger downloads on every run.
+            existing = entries.get(ticker, {})
+            entries[ticker] = {
+                "fetched_at":   existing.get("fetched_at", datetime.now().isoformat()),
+                "rows":         len(fallback_df),
+                "last_date":    fallback_df.index[-1].strftime("%Y-%m-%d"),
+                "suspended":    existing.get("suspended", False),
+                "max_gap_days": existing.get("max_gap_days", 0),
+                "stale_recovery": True,
+            }
+
             logger.warning(
-                "[Cache] Using stale cached parquet for %s after all providers failed.",
-                ticker,
+                "[Cache] Using stale cached parquet for %s after all providers failed "
+                "(last_date=%s).",
+                ticker, entries[ticker]["last_date"],
             )
         except Exception as exc:
             logger.warning(
@@ -971,5 +977,6 @@ def get_cache_summary() -> dict:
         "total_symbols":     len(entries),
         "schema_version":    manifest.get("schema_version", 1),
         "suspended_symbols": sum(1 for v in entries.values() if v.get("suspended")),
+        "stale_recovered":   sum(1 for v in entries.values() if v.get("stale_recovery")),
         "groww_enabled":     bool(groww_token),
     }

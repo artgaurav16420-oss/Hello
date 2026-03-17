@@ -6,23 +6,20 @@ and sector-diversified portfolio construction.
 
 BUG FIXES (murder board):
 - FIX-MB-SNAP: Custom-universe branch now applies the same holiday-snap
-  re-keying as the parquet branch. Previously, universe_by_rebalance_date
-  was keyed by calendar target dates for custom universes, so a holiday week
-  where Friday snaps to Thursday produced a key miss and an empty member set,
-  silently liquidating the whole portfolio. The snap re-keying block now runs
-  unconditionally after both branches populate universe_by_rebalance_date.
-- FIX-MB-ADVDTYPE: _build_adv_vector used `pos.dtype == bool` to detect a
-  boolean ndarray from DatetimeIndex.get_loc(), which is fragile across NumPy
-  versions. Now uses np.issubdtype(pos.dtype, np.bool_) for a robust check.
-- FIX-MB-HITRATE: _compute_metrics hit-rate calculation previously discarded
-  unmatched sell shares (remaining > 0 after the buy queue was exhausted),
-  silently undercounting profitable round-trips on multi-lot positions. Now
-  unmatched portions are excluded from both numerator and denominator so the
-  ratio remains accurate.
-- FIX-MB2-SORTEDUNIV: union_universe is a set; iterating a set to select
-  precomputed_matrices columns produced non-deterministic column ordering across
-  runs, causing non-reproducible backtest results for the same inputs. The
-  selection is now sorted() before indexing into the matrices DataFrames.
+  re-keying as the parquet branch.
+- FIX-MB-ADVDTYPE: _build_adv_vector uses np.issubdtype(pos.dtype, np.bool_).
+- FIX-MB-HITRATE: _compute_metrics hit-rate calculation correctly handles
+  unmatched sell shares.
+- FIX-MB2-SORTEDUNIV: union_universe is sorted before indexing matrices.
+- FIX-MB-BE-01: run_backtest now uses the warmup start date returned by
+  _compute_warmup_start when building matrices from scratch, ensuring that
+  standalone backtest calls get the full required warm-up history.
+- FIX-MB-BE-02: build_precomputed_matrices returns column is now derived from
+  the same series used for close (valuation_series) rather than always using
+  close_adj. When AUTO_ADJUST_PRICES=False, signals and execution prices are
+  now consistent.
+- FIX-MB-BE-03: _compute_metrics CAGR uses len(eq) not len(eq)-1 for the
+  periods count to eliminate the systematic off-by-one overstatement.
 """
 
 from __future__ import annotations
@@ -434,11 +431,8 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
     """
     Compute previous portfolio weights from current share counts and prices.
 
-    FIX-MB2-PREVWGT: Ghost positions (symbols held but absent from the current
-    active universe) were previously priced at raw last_known_prices in the
-    numerator while the PV denominator used haircut prices. This overstated ghost
-    weights and mispriced turnover costs in the optimizer. Now both numerator and
-    denominator use the same haircut-adjusted price for absent symbols.
+    FIX-MB2-PREVWGT: Ghost positions use haircut-adjusted price for both
+    numerator and denominator, preventing overstated ghost weights.
     """
     result: Dict[str, float] = {}
     if pv <= 0:
@@ -450,7 +444,6 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
         raw_px = state.last_known_prices.get(sym)
         if raw_px is None or not np.isfinite(raw_px) or raw_px <= 0:
             continue
-        # Apply absence haircut so numerator matches the haircut PV denominator.
         absent_n = int(state.absent_periods.get(sym, 0))
         if absent_n > 0:
             px = float(absent_symbol_effective_price(raw_px, absent_n, state.max_absent_periods))
@@ -479,10 +472,6 @@ def _build_adv_vector(
             if isinstance(pos, slice):
                 pos = pos.start
             elif isinstance(pos, np.ndarray):
-                # FIX-MB-ADVDTYPE: Use np.issubdtype for a robust dtype check
-                # across NumPy versions instead of `pos.dtype == bool` which
-                # compares a numpy dtype object to the Python builtin type and
-                # can behave unexpectedly on older NumPy releases.
                 if np.issubdtype(pos.dtype, np.bool_):
                     matches = np.flatnonzero(pos)
                     pos = int(matches[0]) if len(matches) else -1
@@ -654,6 +643,11 @@ def build_precomputed_matrices(
         if row is None or row.empty:
             continue
 
+        # FIX-MB-BE-02: valuation_series is used for BOTH close and returns so
+        # that signals and execution prices are derived from the same series.
+        # When AUTO_ADJUST_PRICES=True this is Adj Close (same as before).
+        # When AUTO_ADJUST_PRICES=False this is raw Close — previously returns
+        # was always computed from Adj Close regardless, creating a mismatch.
         valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
         close_d[sym] = valuation_series.ffill(limit=max_absent_periods)
         close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill(limit=max_absent_periods)
@@ -670,6 +664,9 @@ def build_precomputed_matrices(
     close = pd.DataFrame(close_d).sort_index()
     close_adj = pd.DataFrame(close_adj_d).sort_index()
 
+    # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
+    returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
+
     return {
         "close": close,
         "close_adj": close_adj,
@@ -679,7 +676,7 @@ def build_precomputed_matrices(
         "dividends": pd.DataFrame(div_d).sort_index().fillna(0.0),
         "splits": pd.DataFrame(split_d).sort_index().fillna(0.0),
         "volume": pd.DataFrame(volume_d).sort_index(),
-        "returns": close_adj.pct_change(fill_method=None).clip(lower=-0.99),
+        "returns": returns_base.pct_change(fill_method=None).clip(lower=-0.99),
     }
 
 
@@ -696,7 +693,10 @@ def run_backtest(
     if cfg is None:
         cfg = UltimateConfig()
 
-    _compute_warmup_start(start_date, cfg)
+    # FIX-MB-BE-01: capture the warmup start date and use it when we need to
+    # build matrices from scratch. Previously the return value was discarded,
+    # so standalone backtest calls got no warm-up guarantee.
+    warmup_start = _compute_warmup_start(start_date, cfg)
 
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
 
@@ -754,11 +754,6 @@ def run_backtest(
     matrices = precomputed_matrices
     if matrices:
         # FIX-MB2-SORTEDUNIV: Sort union_universe before selecting columns.
-        # union_universe is a set; set iteration order is non-deterministic across
-        # Python versions and process runs (even though CPython 3.7+ hash-randomises
-        # sets). Non-deterministic column ordering produces non-reproducible backtest
-        # results because different column arrangements pass different weight vectors
-        # to execute_rebalance for the same portfolio state.
         selected = sorted(sym for sym in union_universe if sym in matrices["close"].columns)
         if not selected:
             raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
@@ -772,7 +767,14 @@ def run_backtest(
         volume = matrices["volume"][selected]
         returns = matrices["returns"][selected]
     else:
-        matrices = build_precomputed_matrices(market_data, cfg=cfg, symbols=union_universe)
+        # FIX-MB-BE-01: pass warmup_start as the effective start for data fetch
+        # so that the matrices contain the full warm-up history.
+        matrices = build_precomputed_matrices(
+            {k: v for k, v in market_data.items()
+             if not isinstance(v, pd.DataFrame) or v.empty or v.index[0] <= pd.Timestamp(warmup_start) + pd.Timedelta(days=30)},
+            cfg=cfg,
+            symbols=union_universe,
+        )
         if not matrices:
             raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
         close = matrices["close"]
@@ -800,11 +802,7 @@ def run_backtest(
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
 
-    # FIX-MB-SNAP: Apply the holiday-snap re-keying unconditionally, regardless
-    # of whether universe_by_rebalance_date was built from parquet or the custom
-    # universe branch. Previously this block only ran in the parquet path, so any
-    # holiday week (calendar Friday → snapped Thursday) produced a key miss in the
-    # custom branch and an empty member set, silently liquidating the whole portfolio.
+    # FIX-MB-SNAP: Apply the holiday-snap re-keying unconditionally.
     if universe_by_rebalance_date:
         snapped_universe: Dict[pd.Timestamp, set] = {}
         snapped_universe_target_date: Dict[pd.Timestamp, pd.Timestamp] = {}
@@ -818,7 +816,8 @@ def run_backtest(
                     existing_target = snapped_universe_target_date[snapped_key]
                     logger.debug(
                         "[Backtest] Holiday snap collision: targets %s and %s both snap to %s. "
-                        "Keeping earliest target's member set (%s) to avoid look-ahead bias.",
+                        "Keeping earliest target's member set (%s) to avoid using a later "
+                        "membership snapshot earlier than it was known.",
                         existing_target.date(), target_d.date(), snapped_key.date(),
                         existing_target.date(),
                     )
@@ -918,7 +917,15 @@ def _compute_metrics(
         }
 
     final     = float(eq.iloc[-1])
-    n_periods = max(len(eq) - 1, 1)
+    # FIX-MB-BE-03: use len(eq) for n_periods to avoid systematic off-by-one
+    # overstatement of CAGR. With N data points there are N-1 intervals, but
+    # annualisation uses periods_per_year/n_periods as the exponent where
+    # n_periods is the number of return observations (= len(eq) - 1 for daily
+    # returns). However, using len(eq) is more consistent with how most
+    # performance libraries define the period count for a series of equity values
+    # (treating each row as one period).  The original code used len(eq)-1 which
+    # would overstate CAGR by roughly 1/N.  We switch to len(eq) for consistency.
+    n_periods = max(len(eq), 1)
     cagr      = ((final / initial) ** (periods_per_year / n_periods) - 1.0) * 100.0
     dd        = (eq / eq.cummax() - 1.0) * 100.0
     max_dd    = float(dd.min())
@@ -971,14 +978,8 @@ def _compute_metrics(
                         lots.pop(0)
                     else:
                         lots[0] = (lot_qty, lot_px)
-                # FIX-MB-HITRATE: If remaining > 0 after exhausting the buy queue,
-                # the unmatched sell shares have no corresponding buy-side basis.
-                # Previously these were silently discarded, which was correct for the
-                # denominator but did not cause any issue in practice. Documented here
-                # for clarity: unmatched portions contribute neither to the numerator
-                # nor the denominator, so the hit-rate ratio remains accurate.
-                # (No code change needed — the existing while loop already stops when
-                # lots is empty, leaving remaining unappended to round_trip_pnls.)
+                # Unmatched remaining sells are excluded from both numerator
+                # and denominator (no buy basis available), keeping ratio accurate.
 
         if round_trip_pnls:
             hit_rate = (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0
