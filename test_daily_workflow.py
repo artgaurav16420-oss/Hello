@@ -122,7 +122,10 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
 
     dw._run_scan(["BAD", "GOOD"], state, "TEST", cfg_override=UltimateConfig())
 
-def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, monkeypatch):
+def test_load_portfolio_state_returns_safe_default_when_all_backups_corrupted(
+    tmp_path: Path, monkeypatch
+):
+    """PROD-FIX-1: corrupted state returns safe zero-position default, does not raise."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     base = data_dir / "portfolio_state_main.json"
@@ -131,8 +134,9 @@ def test_load_portfolio_state_raises_when_all_backups_corrupted(tmp_path: Path, 
 
     monkeypatch.chdir(tmp_path)
 
-    with pytest.raises(RuntimeError, match="all discovered state files are corrupted"):
-        dw.load_portfolio_state("main")
+    state = dw.load_portfolio_state("main")
+    assert state.shares == {}
+    assert state.cash == 1_000_000.0
 
 
 def test_detect_and_apply_splits_requires_explicit_stock_splits_signal():

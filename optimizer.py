@@ -50,6 +50,10 @@ BUG FIXES (murder board):
   or anomaly) per trial instead of pruning immediately. Only trials with
   more than one bad fold are pruned, allowing strategies that dip into one
   recessionary year to still be evaluated on their healthy-year aggregate.
+- FIX-OOS-CUTOFF: TEST_END is now a fixed date (default "2024-12-31") rather
+  than today(). Using today() silently expanded the OOS window on every run,
+  making results incomparable across runs and progressively more in-sample.
+  Override via OPTIMIZER_OOS_CUTOFF env var for exploratory runs.
 
 Requires: pip install optuna
 """
@@ -77,10 +81,24 @@ def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            # BUG-FIX-DOTENV: strip inline comments before removing quotes.
+            # Previously "API_KEY=abc123 # comment" left " # comment" in the value
+            # because strip(chr(34)) only removes surrounding quote chars.
+            # Quoted values (double or single) preserve literal # characters.
+            if value and value[0] in ('"', "'"):
+                # Quoted: remove surrounding matching quotes only.
+                q = value[0]
+                if value.endswith(q) and len(value) >= 2:
+                    value = value[1:-1]
+            else:
+                # Unquoted: strip trailing inline comment.
+                for _sep in (" #", "\t#"):
+                    if _sep in value:
+                        value = value[:value.index(_sep)].rstrip()
+                        break
             if key:
                 os.environ.setdefault(key, value)
-
 
 _load_dotenv_if_present()
 
@@ -116,7 +134,14 @@ logging.getLogger("data_cache").setLevel(logging.ERROR)
 TRAIN_START = "2018-01-01"
 TRAIN_END   = "2022-12-31"
 TEST_START  = "2023-01-01"
-TEST_END    = pd.Timestamp.today().strftime("%Y-%m-%d")
+# FIX-OOS-CUTOFF: TEST_END is now a fixed date, not today().
+# Using today() means every optimizer run silently expands the OOS window:
+# a run on Monday and a run on Friday test against different periods, making
+# "OOS" results incomparable and increasingly in-sample over time.
+# Set this once, leave it until you have 6+ months of live performance data,
+# then advance it deliberately to a new fixed date. The env-var override
+# allows CI / exploratory runs to use a different cutoff without code changes.
+TEST_END = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2024-12-31")
 
 N_TRIALS       = 100
 OOS_MAX_DD_CAP = 35.0
@@ -596,15 +621,81 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     }
 
 
+def _validate_optimal_config(params: dict) -> list[str]:
+    """
+    PROD-FIX-2: Validate cross-field constraints before persisting optimal config.
+
+    Returns a list of violation messages (empty = valid).  Callers should refuse
+    to persist configs that contain violations, since load_optimized_config applies
+    them at startup and a bad value could put the live system in an unsafe state
+    (e.g. CVAR_DAILY_LIMIT below the regulatory floor, MAX_POSITIONS=1 creating
+    a fully-concentrated portfolio, HALFLIFE_FAST > HALFLIFE_SLOW inverting the
+    signal).
+    """
+    violations: list[str] = []
+
+    cvar = params.get("CVAR_DAILY_LIMIT")
+    if cvar is not None:
+        if not isinstance(cvar, (int, float)) or cvar <= 0.0:
+            violations.append(f"CVAR_DAILY_LIMIT must be > 0; got {cvar!r}")
+        elif cvar > 0.50:
+            violations.append(f"CVAR_DAILY_LIMIT={cvar:.3f} exceeds 50% — implausibly loose risk limit")
+
+    max_pos = params.get("MAX_POSITIONS")
+    if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 2):
+        violations.append(f"MAX_POSITIONS must be an integer >= 2; got {max_pos!r}")
+
+    hf = params.get("HALFLIFE_FAST")
+    hs = params.get("HALFLIFE_SLOW")
+    if hf is not None and hs is not None:
+        if hf > hs:
+            violations.append(
+                f"HALFLIFE_FAST ({hf}) > HALFLIFE_SLOW ({hs}) — would invert momentum signal"
+            )
+
+    exp_floor = params.get("MIN_EXPOSURE_FLOOR")
+    if exp_floor is not None:
+        if not isinstance(exp_floor, (int, float)) or not (0.0 <= exp_floor <= 1.0):
+            violations.append(f"MIN_EXPOSURE_FLOOR={exp_floor!r} must be in [0, 1]")
+
+    max_w = params.get("MAX_SINGLE_NAME_WEIGHT")
+    if max_w is not None:
+        if not isinstance(max_w, (int, float)) or not (0.01 <= max_w <= 1.0):
+            violations.append(f"MAX_SINGLE_NAME_WEIGHT={max_w!r} must be in [0.01, 1.0]")
+
+    risk_av = params.get("RISK_AVERSION")
+    if risk_av is not None and (not isinstance(risk_av, (int, float)) or risk_av <= 0):
+        violations.append(f"RISK_AVERSION must be > 0; got {risk_av!r}")
+
+    return violations
+
+
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
+    # PROD-FIX-2: Validate before writing.  A bad config persisted here will be
+    # applied at next startup via load_optimized_config; blocking unsafe values
+    # here is the last line of defence before they reach a live rebalance.
+    violations = _validate_optimal_config(best_params)
+    if violations:
+        msg = "; ".join(violations)
+        raise ValueError(
+            f"save_optimal_config: refusing to persist invalid config ({msg}).  "
+            f"Params: {best_params}"
+        )
+
     output_dir = os.path.dirname(filepath)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    # PROD-FIX-L03: resolve output path before splitting to avoid ambiguity when
+    # filepath has no directory component (os.path.dirname returns '' which the
+    # NamedTemporaryFile dir kwarg may resolve to a different location than CWD).
+    resolved = os.path.abspath(filepath)
+    resolved_dir = os.path.dirname(resolved)
+
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
-        dir=output_dir or os.path.dirname(os.path.abspath(filepath)) or ".",
+        dir=resolved_dir or ".",
         delete=False,
     ) as tmp_file:
         json.dump(best_params, tmp_file, indent=4)
@@ -666,6 +757,21 @@ def run_optimization(
     os.makedirs("data", exist_ok=True)
     effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME
     logger.info("Using Optuna study: %s", effective_study_name)
+
+    # FIX-MB-OPT-09 WARNING: warn when a custom --study-name is passed that does
+    # not embed OBJECTIVE_VERSION, because old trials from a different objective
+    # version will silently contaminate the new optimization run via Optuna's
+    # warm-starting logic.  The default name (DEFAULT_STUDY_NAME) always includes
+    # OBJECTIVE_VERSION so this guard only fires for explicit --study-name overrides.
+    if effective_study_name != DEFAULT_STUDY_NAME and OBJECTIVE_VERSION not in effective_study_name:
+        logger.warning(
+            "[Optimizer] Study name '%s' does not contain the current objective "
+            "version string '%s'.  If this study was created with a different "
+            "objective function, previously completed trials will bias TPE guidance "
+            "toward parameters calibrated for the old objective.  Rename the study "
+            "or use the default name to start a clean optimization track.",
+            effective_study_name, OBJECTIVE_VERSION,
+        )
 
     study = optuna.create_study(
         study_name=effective_study_name,

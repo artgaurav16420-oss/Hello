@@ -35,6 +35,13 @@ BUG FIXES (murder board):
   thin-history names.
 - FIX-MB-L-02: compute_regime_score breadth fallback now explicitly assigns
   breadth_component = 0.5 and logs at DEBUG, replacing a silent `pass`.
+- BUG-FIX-HISTORY-GATE: generate_signals history gate now counts valid rows
+  only in the tail(HISTORY_GATE) window, not across the entire history.
+  A gapped stock (old data + listing gap + few new bars) could pass the
+  total-count gate while having insufficient recent history for the EWM.
+- BUG-FIX-BROAD-EXCEPT: compute_single_adv now catches specific exception
+  types (KeyError, TypeError, ValueError, AttributeError, IndexError) instead
+  of bare Exception, so genuine bugs surface rather than returning 0.0.
 """
 
 from __future__ import annotations
@@ -194,7 +201,11 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
             .iloc[-1]
         )
         return adv_val if np.isfinite(adv_val) else 0.0
-    except Exception as exc:
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+        # BUG-FIX-BROAD-EXCEPT: catch only expected data-shape errors.
+        # A bare `except Exception` would silently swallow unexpected bugs
+        # (e.g. a Pandas API change) and return 0.0 for all symbols,
+        # destroying the portfolio without any visible crash.
         logger.debug("[Signals] ADV calculation failed: %s", exc)
         return 0.0
 
@@ -290,7 +301,15 @@ def generate_signals(
     history_pass = np.zeros(len(active_symbols), dtype=bool)
     liquidity_pass = np.zeros(len(active_symbols), dtype=bool)
     for i, sym in enumerate(active_symbols):
-        history_pass[i]   = int(log_rets[sym].notna().sum()) >= cfg.HISTORY_GATE
+        # BUG-FIX-HISTORY-GATE: count valid rows only in the most recent
+        # HISTORY_GATE-length tail, not across the entire history.
+        # Counting the total collapses the distinction between a stock with
+        # 200 old bars + a 100-bar listing gap + 10 new bars (total=210, gate
+        # passes) and one with 90 uninterrupted recent bars (also passes).
+        # The EWM halflife decay means old bars beyond the gap contribute
+        # negligibly to momentum, so the gate must verify that recent,
+        # contiguous history is sufficient.
+        history_pass[i]   = int(log_rets[sym].tail(cfg.HISTORY_GATE).notna().sum()) >= cfg.HISTORY_GATE
         liquidity_pass[i] = bool(np.isfinite(adv_arr[i]) and adv_arr[i] > 0)
     gate_pass_mask = history_pass & liquidity_pass
 
@@ -370,8 +389,20 @@ def generate_signals(
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
         dispersion_floor = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
-        dispersion = max(std_cross, dispersion_floor)
-        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion
+        # FIX-DISPERSION-SCALE: The previous implementation multiplied base_bonus
+        # by max(std_cross, floor), which both inverted the intended direction
+        # (high-dispersion markets — where signals are already well-separated —
+        # got a LARGER continuity bonus) and produced a unit-mismatch (multiplying
+        # a dimensionless config param by a raw-return std made the bonus ~500x too
+        # small in typical markets).
+        #
+        # Correct model: the bonus should be FULL in normal/high-dispersion markets
+        # and REDUCED in range-bound low-dispersion markets (where a small score
+        # lead is likely noise and a tiebreaker would be unreliable).
+        # dispersion_scale = 1.0 when std_cross >= floor (full bonus);
+        # dispersion_scale < 1.0 when std_cross < floor (reduced bonus).
+        dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
 
         activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
         stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)

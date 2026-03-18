@@ -17,6 +17,9 @@ BUG FIXES (murder board):
   ADV=0 fallback. Missing symbols (delisted / no history / provider gap) are
   treated as ADV=0 and logged at DEBUG rather than failing the entire chunk.
   UniverseFetchError is only raised when a chunk returns zero symbols total.
+- BUG-FIX-SESSION-LEAK: _fetch_single_sector now uses `with requests.Session()`
+  context manager, ensuring urllib3 connection pools and sockets are released
+  immediately rather than being abandoned to the GC in TIME_WAIT state.
 """
 
 from __future__ import annotations
@@ -554,32 +557,37 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             # to prevent indefinite hangs (previously no timeout was set, allowing
             # up to 30s per symbol × 8 workers = 240s total wall-time hang).
             def _fetch_single_sector(sym: str) -> Tuple[str, str]:
+                # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
+                # (SIGALRM) inside this worker function.  Python's signal module
+                # strictly requires that signals are set and handled only in the
+                # main thread.  Calling signal.signal() or signal.alarm() from a
+                # ThreadPoolExecutor worker raises ValueError instantly, crashing
+                # the entire fallback sector fetch.
+                #
+                # Fix: attach a requests.Session with a socket-level timeout to
+                # the yfinance Ticker object.  The timeout is enforced by the
+                # urllib3 socket layer and works correctly in any thread.
                 try:
-                    ticker_obj = yf.Ticker(sym + ".NS")
-                    # yfinance Ticker.info does not accept a timeout kwarg directly;
-                    # we set it at the session level via a requests session override.
-                    # As a best-effort, we use a thread-level alarm via a timeout
-                    # guard around the info property access.
-                    import signal as _signal
-
-                    class _TimeoutError(Exception):
-                        pass
-
-                    def _handler(signum, frame):
-                        raise _TimeoutError()
-
-                    # SIGALRM is POSIX-only; fall back gracefully on Windows.
-                    use_alarm = hasattr(_signal, "SIGALRM")
-                    if use_alarm:
-                        old_handler = _signal.signal(_signal.SIGALRM, _handler)
-                        _signal.alarm(max(1, int(sector_timeout)))
-                    try:
+                    # requests is already imported at module level;
+                    # use it directly rather than re-importing inside the worker.
+                    _timeout = max(1.0, float(sector_timeout))
+                    # BUG-FIX-SESSION-LEAK: use context manager so the
+                    # urllib3 connection pool and underlying sockets are
+                    # released immediately when the function returns.
+                    # Without this, 100 missing tickers = 100 Sessions =
+                    # ~200 sockets abandoned to the GC in TIME_WAIT state.
+                    with requests.Session() as _session:
+                        # Wrap Session.request so every call carries the timeout,
+                        # regardless of which yfinance code path invokes it.
+                        _orig_request = _session.request
+                        _session.request = lambda method, url, **kwargs: _orig_request(
+                            method, url,
+                            timeout=kwargs.pop("timeout", _timeout),
+                            **kwargs,
+                        )
+                        ticker_obj = yf.Ticker(sym + ".NS", session=_session)
                         info = (ticker_obj.info) or {}
                         result_sector = str(info.get("sector", "Unknown") or "Unknown")
-                    finally:
-                        if use_alarm:
-                            _signal.alarm(0)
-                            _signal.signal(_signal.SIGALRM, old_handler)
                     return sym, result_sector
                 except Exception as e:
                     logger.debug("Failed to fetch sector for %s: %s", sym, e)

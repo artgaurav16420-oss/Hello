@@ -32,6 +32,9 @@ BUG FIXES (murder board):
   years to at least 1/252 to prevent near-zero values from inflating
   annualised turnover by orders of magnitude in short test series.
 - FIX-MB-M-04: Holiday-snap collision logging elevated from DEBUG to WARNING.
+- BUG-FIX-FRAC-SLIP: Fractional share liquidations on stock splits now deduct
+  one-way slippage from the cash credit, matching the treatment of all other
+  sell-side transactions.
 """
 
 from __future__ import annotations
@@ -140,7 +143,13 @@ class BacktestEngine:
                     fractional_shares = max(0.0, theoretical_new - new_shares)
                     price_now = float(close_t[sym]) if sym in close_t.index and pd.notna(close_t[sym]) else 0.0
                     if price_now > 0 and fractional_shares > 0:
-                        self.state.cash = round(self.state.cash + fractional_shares * price_now, 10)
+                        # BUG-FIX-FRAC-SLIP: deduct one-way slippage on the
+                        # fractional-share liquidation.  Previously the cash
+                        # credit was at the raw price with zero transaction cost,
+                        # slightly overstating CAGR in split-heavy environments.
+                        _frac_slip_rate = (self.engine.cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
+                        _frac_proceeds = fractional_shares * price_now * (1.0 - _frac_slip_rate)
+                        self.state.cash = round(self.state.cash + _frac_proceeds, 10)
 
                     self.state.shares[sym] = new_shares
                     old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
@@ -382,7 +391,7 @@ class BacktestEngine:
                 _exhaust_decay = True
                 activate_override_on_stress(self.state, cfg)
             else:
-                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg)
+                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg, current_prices=valuation_prices, pv=pv)
                 sel_idx_set = set(sel_idx)
                 sym_to_pos  = {s: i for i, s in enumerate(active_symbols)}
                 n_gated = sum(

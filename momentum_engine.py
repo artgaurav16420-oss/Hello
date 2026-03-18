@@ -32,6 +32,15 @@ BUG FIXES (murder board):
   state.cash by up to 2x the force-closed notional.
 - FIX-MB-M-05: override_cooldown re-arm now uses max(current, 4) so any
   longer externally-set cooldown is preserved rather than silently shortened.
+- PROD-FIX-EXEC-1: execute_rebalance buy path now sizes shares at raw price;
+  slippage is charged as a separate cash deduction in the accounting loop.
+  Previously effective_buy_price (raw*(1+slip)) was used for share-count
+  sizing, causing a clean 2% intended weight move to be reduced to 1.5% in
+  shares and then incorrectly blocked by the drift gate.
+- PROD-FIX-EXEC-2: drift gate now compares the intended weight change
+  (|target_weight - current_weight|) rather than the slippage-adjusted share
+  delta, so the gate correctly reflects manager intent independent of the
+  execution slippage model.
 """
 
 from __future__ import annotations
@@ -680,20 +689,24 @@ def execute_rebalance(
         old_s = state.shares.get(sym, 0)
         current_notional = old_s * price
 
-        # FIX-MB-ME-02: compute trade notional for impact calculation
-        if w <= 0.001:
-            s = 0
-            trade_not = old_s * price  # selling
-        elif w * pv_exec > current_notional:
+        # FIX-MB-ME-02: compute trade notional for impact calculation.
+        # Share count is sized at raw price; slippage is a separate cash cost
+        # charged in the accounting loop below via the slip_rate on the actual
+        # traded notional.  Using effective_buy_price (raw * (1+slip)) for share
+        # count caused a systematic under-allocation: a 2% intended weight move
+        # was reduced to 1.5% in shares and then blocked by the drift gate, even
+        # though the manager clearly intended to trade.
+        # FIX-MAGIC-THRESHOLD: removed the hard 0.001 (0.1%) weight floor.
+        # The previous guard forced any target weight below 0.1% to zero shares,
+        # which incorrectly liquidates valid optimizer positions in broad-market
+        # configurations (e.g. MAX_POSITIONS=100+ where average weight is <0.5%).
+        # The natural floor is already enforced by integer share flooring:
+        # floor(w * pv_exec / price) = 0 whenever the notional is less than one
+        # share's price — no explicit threshold needed.
+        if w * pv_exec > current_notional:
             buy_notional = max(0.0, w * pv_exec - current_notional)
-            slip_rate = compute_one_way_slip_rate(
-                cfg=cfg,
-                portfolio_value=pv_exec,
-                adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
-                trade_notional=buy_notional,
-            )
-            effective_buy_price = price * (1.0 + slip_rate)
-            s = old_s + int(np.floor(buy_notional / max(effective_buy_price, 1e-9)))
+            # Size at raw price; slip is charged in the accounting loop.
+            s = old_s + int(np.floor(buy_notional / max(price, 1e-9)))
             trade_not = buy_notional
         else:
             s = int(np.floor(w * pv_exec / price))
@@ -713,22 +726,67 @@ def execute_rebalance(
 
     if not force_rebalance_trades:
         drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
+        # Collect gated symbols so we can purge them from valid_targets below.
+        drift_gated_syms: set = set()
         for i, sym in enumerate(active_symbols):
             old_s = state.shares.get(sym, 0)
             s = desired_shares.get(sym, 0)
             price = max(float(local_prices[i]), 1e-6)
 
             if old_s > 0 and s > 0 and s != old_s:
-                weight_change = abs((s - old_s) * price) / max(pv_exec, 1.0)
-                if weight_change < drift_threshold:
+                # FIX: compare the INTENDED weight change (target_weight vs
+                # current weight at raw price) not the slippage-adjusted share
+                # delta.  Using slippage-adjusted shares means a clean 2% intended
+                # move that slippage reduces to 1.5% in shares gets incorrectly
+                # blocked.  The drift gate should ask "does the manager intend to
+                # move by more than the threshold?" which is a function of the
+                # target weight, not of execution slippage.
+                w_target  = float(target_weights[i]) if np.isfinite(target_weights[i]) else 0.0
+                w_current = (old_s * price) / max(pv_exec, 1.0)
+                intended_change = abs(w_target - w_current)
+                if intended_change < drift_threshold:
                     desired_shares[sym] = old_s
+                    drift_gated_syms.add(sym)
+
+        # FIX-DRIFT-GATE-RESIDUAL: Remove gated symbols from valid_targets so
+        # the residual cash allocator cannot issue tiny top-up trades that the
+        # drift gate explicitly blocked.  Without this purge a gated symbol with
+        # weight 1.5% (gated; target was 2%) still appears in eligible and
+        # receives a cash_entitlement, producing a small slippage-incurring buy
+        # that negates the gate's purpose.
+        if drift_gated_syms:
+            valid_targets = [vt for vt in valid_targets if vt[1] not in drift_gated_syms]
 
     base_notional = sum(
         desired_shares.get(sym, 0) * max(float(local_prices[i]), 1e-6)
         for i, sym in enumerate(active_symbols)
     )
 
-    residual_cash = max(0.0, pv_exec - base_notional)
+    # FIX-SLIP-RESERVE: pre-estimate the slippage cost of base trades and
+    # subtract it from the residual budget before the allocation loop starts.
+    # Without this reserve, the residual loop spends cash that is already
+    # committed to paying the broker for base-trade slippage.  The final
+    # settlement (state.cash = pv_exec - actual_notional - total_slippage)
+    # then goes slightly negative, silently absorbed by the max(0.0,...) floor
+    # as phantom margin money.  At the default 0.1% slip the leakage is small
+    # (~0.08% of portfolio per rebalance) but compounds over many rebalances
+    # and grows proportionally with illiquidity-driven impact costs.
+    _base_slip_reserve = 0.0
+    for _i, _sym in enumerate(active_symbols):
+        _old_s = state.shares.get(_sym, 0)
+        _s = desired_shares.get(_sym, 0)
+        if _s > 0 or _old_s > 0:
+            _px = max(float(local_prices[_i]), 1e-6)
+            _delta_not = abs(_s - _old_s) * _px
+            _sr = compute_one_way_slip_rate(
+                cfg=cfg,
+                portfolio_value=pv_exec,
+                adv_notional=float(adv_shares[_i]) if adv_shares is not None and _i < len(adv_shares) else None,
+                trade_notional=_delta_not,
+            )
+            _base_slip_reserve += _delta_not * _sr
+
+    residual_cash = max(0.0, pv_exec - base_notional - _base_slip_reserve)
 
     if valid_targets and residual_cash > 0:
         eligible = {
@@ -780,15 +838,31 @@ def execute_rebalance(
 
                 if actual_extra > 0:
                     desired_shares[sym] += actual_extra
-                    # FIX-NEW-ME-01: deduct the RAW (unslipped) cost from
-                    # residual_cash here.  The final accounting loop below
-                    # charges slippage via total_slippage and subtracts
-                    # actual_notional (also at raw price) from pv_exec to
-                    # arrive at state.cash.  Using effective_buy_price here
-                    # would embed slippage in residual_cash AND charge it again
-                    # in the accounting loop — a double-deduction that drives
-                    # state.cash negative after large residual allocations.
-                    residual_cash       -= actual_extra * price
+                    # FIX-RESIDUAL-BUDGET: deduct the EFFECTIVE (slipped) cost
+                    # from the residual_cash spending budget.
+                    #
+                    # The previous FIX-NEW-ME-01 comment claimed raw deduction
+                    # was necessary to avoid double-charging slippage.  That
+                    # reasoning was wrong: residual_cash is a LOCAL loop budget
+                    # only — it is never used in the final cash settlement.  The
+                    # final accounting always computes:
+                    #   state.cash = pv_exec - actual_notional - total_slippage
+                    # where actual_notional = sum(shares * raw_price) and
+                    # total_slippage = sum(|delta| * raw_price * slip_rate).
+                    # Neither term reads residual_cash, so there is no
+                    # double-deduction regardless of what we subtract here.
+                    #
+                    # What raw deduction DID cause: when slip_rate is large
+                    # (e.g. 5% market-impact cap on an illiquid small-cap),
+                    # the loop could authorise more shares than the portfolio
+                    # can actually afford.  The final settlement would then
+                    # drive state.cash negative, silently covered by the
+                    # max(0.0, ...) floor — phantom margin money.
+                    #
+                    # Correct fix: deduct effective_buy_price so the budget
+                    # reflects the true all-in cost of each purchase, keeping
+                    # total authorised spending within the available residual.
+                    residual_cash       -= actual_extra * effective_buy_price
                     shares_bought_this_pass += actual_extra
 
                 if actual_extra >= cap_limit or effective_buy_price > residual_cash:
@@ -859,11 +933,27 @@ def execute_rebalance(
             )
 
     # Phase 2: force-close positions — proceeds added to pv_exec (see docstring)
+    #
+    # FIX-PHOENIX: force-close must use absent_symbol_effective_price, NOT raw
+    # last_known_prices.  At MAX_ABSENT_PERIODS the haircut multiplier is 0.0,
+    # so close_price_effective == 0.0 — the position is written off entirely.
+    # Using raw last_known_prices here previously injected phantom cash equal to
+    # the full pre-halt notional, erasing the bankruptcy loss that had been
+    # accruing via the haircut in record_eod and Phase 1 of prior rebalances.
     for sym in symbols_to_force_close:
-        close_price = float(state.last_known_prices.get(sym, 0.0))
+        # count was already incremented to MAX_ABSENT_PERIODS above
+        absent_count = state.absent_periods.get(sym, cfg.MAX_ABSENT_PERIODS)
+        close_price_effective = absent_symbol_effective_price(
+            state.last_known_prices.get(sym, 0.0),
+            absent_count,
+            cfg.MAX_ABSENT_PERIODS,
+        )
+        close_price = close_price_effective  # 0.0 at MAX_ABSENT_PERIODS
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
+                # Slippage is zero when close_price == 0 (fully written off),
+                # so this branch only runs for partial haircut force-closes.
                 slip            = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
                 # Add proceeds to pv_exec; not subtracted via actual_notional
@@ -1006,13 +1096,34 @@ def compute_decay_targets(
     state:          PortfolioState,
     sel_idx:        List[int],
     active_symbols: List[str],
-    cfg:            UltimateConfig
+    cfg:            UltimateConfig,
+    current_prices: np.ndarray,
+    pv:             float,
 ) -> np.ndarray:
+    """Compute decayed target weights for the gate-passing symbols.
+
+    FIX-DECAY-STALEW: use true mark-to-market weights derived from current
+    prices and portfolio value rather than stale state.weights (which reflect
+    the weight AT LAST EXECUTION, not today's MTM).  If a position rallied
+    from 10% to 35% of the portfolio since the last rebalance, state.weights
+    still says 10%.  Using it produces a decay target of 0.085 (8.5%) which
+    would force-sell 75% of the position in one step — the exact opposite of
+    the gentle 15% haircut the decay mechanism is designed to apply.
+
+    Parameters current_prices and pv are mandatory: MTM weights are computed
+    from state.shares * current_prices / pv.  Both call sites (daily_workflow
+    and backtest_engine) have these values available immediately before calling
+    this function, so no backward-compatibility shim is needed.
+    """
     targets = np.zeros(len(active_symbols))
     sel_set = set(sel_idx)
+
     for i, sym in enumerate(active_symbols):
         if i in sel_set:
-            w_pre = min(state.weights.get(sym, 0.0), cfg.MAX_SINGLE_NAME_WEIGHT)
+            shares = state.shares.get(sym, 0)
+            price  = max(float(current_prices[i]), 1e-6)
+            mtm_w  = (shares * price) / max(pv, 1.0)
+            w_pre      = min(mtm_w, cfg.MAX_SINGLE_NAME_WEIGHT)
             targets[i] = w_pre * cfg.DECAY_FACTOR
         else:
             targets[i] = 0.0
@@ -1126,7 +1237,27 @@ class InstitutionalRiskEngine:
             )
 
         clean_rets = raw_rets.iloc[:, kept_indices].ffill()
-        clean_rets = clean_rets.fillna(0.0)
+        # FIX-ZERO-FILL: replace zeros with the cross-sectional row mean so that
+        # pre-IPO NaN cells (after ffill exhausts real data) are treated as
+        # 'market-average return that day' rather than 'risk-free zero return'.
+        # Filling with 0.0 causes the LedoitWolf covariance estimator to see the
+        # stock as uncorrelated with all other assets during the pre-IPO period,
+        # slightly underestimating its covariance and making it appear as a
+        # partial hedge — a mild but systematic bias toward newer listings.
+        # Cross-sectional mean fill is standard practice: it assumes the stock
+        # would have moved with the market-average on days it didn't exist,
+        # producing a more conservative (realistic) covariance estimate.
+        # The history gate already ensures at most ~30% of any column is NaN,
+        # so row means are anchored by the majority of real observations.
+        _row_means = clean_rets.mean(axis=1)
+        # FIX-SYSTEMIC-NAN: chain a final .fillna(0.0) to handle systemic
+        # market-closure days where every stock has NaN (e.g. a total provider
+        # gap or unexpected exchange suspension).  On such days _row_means is
+        # NaN, so .fillna(_row_means) leaves those cells as NaN, which would
+        # crash LedoitWolf with 'Input contains NaN'.  Filling with 0.0 treats
+        # a total market closure as a flat day — the most conservative
+        # assumption and consistent with the price ffill applied upstream.
+        clean_rets = clean_rets.apply(lambda col: col.fillna(_row_means)).fillna(0.0)
 
         col_stds = clean_rets.std()
         valid_vol_mask = col_stds >= 1e-10
@@ -1205,10 +1336,16 @@ class InstitutionalRiskEngine:
                 if sec_id == -1:
                     max_possible_weight += sec_adv_sum
                 else:
-                    if mask.sum() >= 2:
-                        max_possible_weight += min(sec_adv_sum, self.cfg.MAX_SECTOR_WEIGHT)
-                    else:
-                        max_possible_weight += sec_adv_sum
+                    # FIX-BUDGET-MISMATCH: always apply MAX_SECTOR_WEIGHT cap here,
+                    # matching the constraint builder which now adds a sector
+                    # constraint for ALL sector sizes including single-stock sectors
+                    # (FIX-SECTOR-SINGLE).  The previous 'mask.sum() >= 2' guard
+                    # left single-stock sectors uncapped in the budget, inflating
+                    # max_possible_weight and therefore l_gamma above the actual
+                    # feasible maximum enforced by the OSQP constraint matrix —
+                    # causing guaranteed primal infeasibility when
+                    # MAX_SECTOR_WEIGHT < MAX_SINGLE_NAME_WEIGHT.
+                    max_possible_weight += min(sec_adv_sum, self.cfg.MAX_SECTOR_WEIGHT)
         else:
             max_possible_weight = float(np.sum(adv_limit))
 
@@ -1281,8 +1418,15 @@ class InstitutionalRiskEngine:
                 if sec_id == -1:
                     continue
                 mask = labels == sec_id
-                if mask.sum() < 2:
-                    continue
+                # FIX-SECTOR-SINGLE: removed the 'mask.sum() < 2' guard that
+                # skipped sector constraints for single-stock sectors.
+                # When MAX_SECTOR_WEIGHT < MAX_SINGLE_NAME_WEIGHT (e.g. a user
+                # enforcing tighter sector diversification than per-name limits),
+                # a lone stock in its sector could reach MAX_SINGLE_NAME_WEIGHT
+                # unchecked, silently violating the sector cap.
+                # A single-row sector constraint (w_i <= MAX_SECTOR_WEIGHT) is
+                # perfectly valid in OSQP — it simply tightens the effective per-
+                # stock bound to min(adv_limit, MAX_SECTOR_WEIGHT) as intended.
                 sec_row = sp.lil_matrix((1, n_vars))
                 sec_row[0, np.where(mask)[0]] = 1.0
                 builder.add_constraint(sec_row.tocsc(), [0.0], [self.cfg.MAX_SECTOR_WEIGHT])

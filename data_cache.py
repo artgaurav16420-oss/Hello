@@ -15,6 +15,20 @@ BUG FIXES (murder board):
 - FIX-MB-DC-01: _recover_from_stale_cache now updates the manifest entry for
   successfully recovered symbols so that subsequent load_or_fetch calls do not
   repeatedly trigger download attempts for stale-but-available parquets.
+- BUG-FIX-FALLBACK: _process_chunk now returns the set of validated-and-saved
+  tickers. The fallback chain uses this ground-truth set instead of raw column
+  presence, so NaN-only provider responses no longer block SecondaryProvider.
+- BUG-FIX-DOTENV-DC: _load_local_env_file now strips inline comments before
+  removing quotes, matching the fix applied to optimizer.py.
+- BUG-FIX-MANIFEST-IO: _save_manifest moved outside the for-chunk loop;
+  one write per load_or_fetch call instead of one per chunk.
+- BUG-FIX-FILLNA: GrowwProvider._build_adj_close_from_batches replaces
+  fillna(1.0) on leading NaN ratio with bfill, preventing a price
+  discontinuity at the oldest known adjustment boundary.
+- BUG-FIX-STALE-RETRY: _recover_from_stale_cache now writes retry_after=tomorrow
+  to the manifest entry, and the staleness check honours this cooldown.  Previously
+  every run re-downloaded stale symbols, failed all providers, and recovered from
+  the stale cache again — an infinite hammer-and-recover loop.
 """
 
 from __future__ import annotations
@@ -54,7 +68,18 @@ def _load_local_env_file(env_path: Path = Path('.env')) -> None:
                 continue
             key, value = line.split('=', 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            # BUG-FIX-DOTENV-DC: strip inline comments before removing quotes.
+            # "FALLBACK_API_KEY=mykey # comment" left " # comment" in the value.
+            if value and value[0] in ('"', "'"):
+                q = value[0]
+                if value.endswith(q) and len(value) >= 2:
+                    value = value[1:-1]
+            else:
+                for _sep in (' #', '\t#'):
+                    if _sep in value:
+                        value = value[:value.index(_sep)].rstrip()
+                        break
             if key and key not in os.environ:
                 os.environ[key] = value
     except Exception as exc:
@@ -300,8 +325,45 @@ class GrowwProvider(DataProvider):
             if ratio.empty:
                 return raw_close
 
-            # FIX-MB-GROWWADJ: ffill only — never bfill.
-            ratio_aligned = ratio.reindex(raw_close.index).ffill().fillna(1.0)
+            # FIX-MB-GROWWADJ: ffill only (no future look-ahead) for dates
+            # AFTER the first known ratio bar.
+            # BUG-FIX-FILLNA: replace fillna(1.0) with bfill limited to the
+            # leading-NaN region only (dates BEFORE the first known ratio bar).
+            # fillna(1.0) caused a price discontinuity: if YFinance ratio data
+            # starts in 2018 but Groww data goes back to 2015, and a 10:1 split
+            # happened in 2016, the post-2018 ratio is ~0.1.  fillna(1.0) gave
+            # pre-2018 bars ratio=1.0, making those prices 10x higher than
+            # post-2018 prices — a phantom discontinuity in the adjusted series.
+            # Correct fix: extend the EARLIEST known ratio backward (bfill only
+            # on the leading NaN region), which preserves proportionality across
+            # the entire series.  This is safe because no future information is
+            # used — we are filling BACKWARD from the oldest known data point.
+            ratio_reindexed = ratio.reindex(raw_close.index)
+            # FIX-BFILL-SCOPE: limit bfill strictly to the leading-NaN region
+            # (dates before the first known ratio bar).  The previous
+            # ratio_reindexed.ffill().bfill() applied bfill unconditionally
+            # across the entire series, which would fill trailing NaN dates
+            # (Groww bars after the last YF ratio bar) backward from a future
+            # ratio — minor look-ahead contamination.  The correct approach:
+            # 1. ffill() propagates each known ratio forward across internal
+            #    gaps (holidays); ratio is stable between corporate actions.
+            # 2. For the leading NaN region (before the first known ratio bar),
+            #    extend the oldest known ratio backward — this is safe because
+            #    we use the earliest available data point, not a future one.
+            _first_valid_idx = ratio_reindexed.first_valid_index()
+            if _first_valid_idx is None:
+                # ratio is completely empty for this date range — return raw
+                return raw_close
+            ratio_aligned = ratio_reindexed.ffill()
+            _leading_mask = ratio_aligned.index < _first_valid_idx
+            if _leading_mask.any():
+                ratio_aligned[_leading_mask] = ratio_aligned[~_leading_mask].iloc[0]
+            if ratio_aligned.isna().any():
+                # trailing NaN after last YF bar — fill with last known ratio
+                ratio_aligned = ratio_aligned.ffill()
+            if ratio_aligned.isna().any():
+                # ratio is completely empty for this date range — return raw
+                return raw_close
             adj_groww = raw_close * ratio_aligned
             return adj_groww
 
@@ -487,7 +549,17 @@ class SecondaryProvider(DataProvider):
         if not ticker_frames:
             return None
 
-        if len(ticker_frames) == 1:
+        # BUG-FIX-MULTIINDEX: The previous bypass returned a flat DataFrame
+        # when exactly one ticker succeeded from a multi-symbol chunk.
+        # _extract_ticker_frame received is_single_request=False (because the
+        # original chunk had >1 symbol), expected a MultiIndex, found none,
+        # and returned None — silently discarding the only recovered data.
+        #
+        # Fix: use pd.concat when the chunk requested multiple tickers,
+        # ensuring a MultiIndex even if only one ticker succeeded.  When the
+        # chunk is genuinely single-ticker (len(tickers)==1), return flat so
+        # the caller's is_single_request=True path works correctly.
+        if len(tickers) == 1:
             only = next(iter(ticker_frames.values()))
             return _normalize_history_index(only)
 
@@ -797,8 +869,14 @@ def load_or_fetch(
 
         is_stale     = entry.get("last_date", "") < latest_bday
         missing_file = not parquet_path.exists()
+        # BUG-FIX-STALE-RETRY: honour retry_after cooldown set by
+        # _recover_from_stale_cache.  Without this, a symbol whose providers
+        # all failed would be re-downloaded (and fail again) on every single
+        # run, causing infinite hammer-and-recover cycles.
+        retry_after  = entry.get("retry_after", "")
+        in_cooldown  = bool(retry_after) and latest_bday < retry_after
 
-        if force_refresh or is_stale or missing_file:
+        if force_refresh or (is_stale and not in_cooldown) or missing_file:
             tickers_to_download.append(ticker)
         else:
             try:
@@ -831,12 +909,14 @@ def load_or_fetch(
                     raw_data = None
 
                 if raw_data is not None and not raw_data.empty:
-                    served = set()
-                    if isinstance(raw_data.columns, pd.MultiIndex):
-                        served = set(raw_data.columns.get_level_values(1)) | set(raw_data.columns.get_level_values(0))
-                    missing_from_provider = [t for t in chunk if t not in served]
-
-                    _process_chunk(chunk, raw_data, entries, market_data, cfg)
+                    # BUG-FIX-FALLBACK: use validated-and-saved tickers from
+                    # _process_chunk, not raw column presence.  A provider that
+                    # returns a column full of NaN values causes that ticker to
+                    # appear in raw column names but fail _is_valid_dataframe
+                    # and never be saved.  Using column names would mark it as
+                    # "served" and block the SecondaryProvider fallback.
+                    saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
+                    missing_from_provider = [t for t in chunk if t not in saved]
 
                     if not missing_from_provider:
                         break
@@ -848,7 +928,12 @@ def load_or_fetch(
             if raw_data is None or (hasattr(raw_data, "empty") and raw_data.empty):
                 _recover_from_stale_cache(chunk, entries, market_data)
 
-            _save_manifest(manifest)
+        # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
+        # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
+        # full JSON serialisations and atomic renames. One write is sufficient
+        # because the manifest is only read at startup and the per-chunk
+        # entries have already been mutated in-place in `manifest`.
+        _save_manifest(manifest)
 
     padded_start_ts = pd.Timestamp(padded_start)
     for t, df in market_data.items():
@@ -866,8 +951,18 @@ def _process_chunk(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
     cfg,
-) -> None:
+) -> set:
+    """Process a downloaded chunk and return the set of successfully saved tickers.
+
+    BUG-FIX-FALLBACK: Previously returned None, so the caller inferred served
+    tickers from raw column names — which includes NaN-only columns that pass
+    the column-presence check but fail _is_valid_dataframe.  Those tickers were
+    added to `served`, blocking the SecondaryProvider fallback even though no
+    valid data was actually saved.  Returning the validated set here lets the
+    caller use ground-truth instead of inferred membership.
+    """
     manifest_entries = entries
+    saved_tickers: set = set()
 
     for ticker in chunk:
         try:
@@ -918,9 +1013,12 @@ def _process_chunk(
                 "max_gap_days":  max_gap_days,
             }
             market_data[ticker] = df
+            saved_tickers.add(ticker)
 
         except Exception as exc:
             logger.error("[Cache] Failed processing downloaded dataframe for %s: %s", ticker, exc)
+
+    return saved_tickers
 
 
 def _recover_from_stale_cache(
@@ -953,6 +1051,16 @@ def _recover_from_stale_cache(
             # FIX-MB-DC-01: update manifest with the actual last_date from the
             # parquet so subsequent calls don't re-trigger downloads on every run.
             existing = entries.get(ticker, {})
+            # BUG-FIX-STALE-RETRY: set retry_after to tomorrow so the
+            # staleness check does not re-trigger a download on every run.
+            # Previously last_date was preserved as the parquet's actual last
+            # date, which is always < latest_bday, so is_stale was always True
+            # and every subsequent run would hammer all providers, fail, and
+            # fall back to the stale cache again — infinite retry loop.
+            # retry_after acts as a cooldown: we do not attempt a re-download
+            # until at least the next business day.  last_date is preserved
+            # accurately so callers know the true data freshness.
+            _tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
             entries[ticker] = {
                 "fetched_at":   existing.get("fetched_at", datetime.now().isoformat()),
                 "rows":         len(fallback_df),
@@ -960,6 +1068,7 @@ def _recover_from_stale_cache(
                 "suspended":    existing.get("suspended", False),
                 "max_gap_days": existing.get("max_gap_days", 0),
                 "stale_recovery": True,
+                "retry_after":  _tomorrow,
             }
 
             logger.warning(

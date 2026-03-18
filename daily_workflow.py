@@ -38,6 +38,25 @@ BUG FIXES (murder board):
   days execute_rebalance owns absent_periods accounting; the post-scan loop
   was incrementing it a second time, halving the effective MAX_ABSENT_PERIODS
   grace period and causing premature force-close of suspended stocks.
+- PROD-FIX-1: load_portfolio_state now logs CRITICAL and returns a safe
+  zero-position PortfolioState() when all state files are corrupted, rather
+  than raising RuntimeError and blocking restart.
+- PROD-FIX-3: _run_scan circuit breaker tracks consecutive empty-universe
+  scans and raises RuntimeError after EMPTY_UNIVERSE_HALT_AFTER (default 3)
+  consecutive failures, preventing silent full-cash drift during outages.
+- PROD-FIX-5: ScanContext injects a per-scan correlation_id into every log
+  record. DeadLetterTracker accumulates stale-price symbols and emits a
+  single structured report at flush() time. configure_logging() replaces
+  basicConfig with JsonFormatter for machine-parseable structured output.
+- FIX-WRITE-VERIFY: save_portfolio_state reads back and JSON-parses the
+  written file immediately after os.replace(), catching filesystem-level
+  corruption while backups and in-memory state are still intact.
+- FIX-STALE-PRICE: _run_scan suppresses the rebalance (not force-liquidations)
+  when any held symbol has price data older than 2 trading days, preventing
+  incorrect position sizing against stale prices during provider outages.
+- FIX-CB-PERSIST: _CONSECUTIVE_EMPTY_SCANS is now persisted to
+  data/circuit_breaker.json on every change and loaded at startup, so the
+  circuit breaker threshold survives process restarts during outages.
 """
 from __future__ import annotations
 import importlib.util
@@ -52,6 +71,7 @@ import copy
 import json
 import logging
 import os
+import pathlib
 import shutil
 import sys
 import time
@@ -87,11 +107,48 @@ from universe_manager import (
 from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
+from log_config import ScanContext, DeadLetterTracker, current_correlation_id
 
 __version__ = "11.48"
 
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
+
+# PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
+# empty universe (provider outage / all symbols filtered).  Reset to zero on
+# any scan that yields at least one symbol.  When it hits
+# _EMPTY_UNIVERSE_HALT_AFTER the scan raises RuntimeError so the caller
+# (cron job / supervisor) knows to page an operator rather than silently
+# running indefinitely with no positions.
+_EMPTY_UNIVERSE_HALT_AFTER: int = int(os.environ.get("EMPTY_UNIVERSE_HALT_AFTER", "3"))
+_CIRCUIT_BREAKER_FILE = "data/circuit_breaker.json"
+
+
+def _load_circuit_breaker_count() -> int:
+    """Read the persisted empty-universe counter from disk. Returns 0 if absent."""
+    try:
+        p = pathlib.Path(_CIRCUIT_BREAKER_FILE)
+        if p.exists():
+            return int(json.loads(p.read_text(encoding="utf-8")).get("consecutive_empty", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _save_circuit_breaker_count(n: int) -> None:
+    """Persist the empty-universe counter so restarts do not reset it."""
+    try:
+        os.makedirs("data", exist_ok=True)
+        tmp = _CIRCUIT_BREAKER_FILE + ".tmp"
+        pathlib.Path(tmp).write_text(
+            json.dumps({"consecutive_empty": n}), encoding="utf-8"
+        )
+        os.replace(tmp, _CIRCUIT_BREAKER_FILE)
+    except Exception as _exc:
+        logger.warning("Could not persist circuit breaker count: %s", _exc)
+
+
+_CONSECUTIVE_EMPTY_SCANS: int = _load_circuit_breaker_count()
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -476,6 +533,27 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
         os.replace(tmp_file, state_file)
 
+        # Read-back verification: confirm the file we just wrote contains valid
+        # JSON before releasing control. Filesystem-level corruption (rare on
+        # NFS / cloud storage) can produce a silently corrupted file that only
+        # fails on the next startup — at which point the backup chain is the
+        # only recovery path. Catching it here while the previous state is still
+        # in memory allows us to log a clear error and leave the backups intact.
+        with open(state_file, "r", encoding="utf-8") as _vf:
+            _raw = _vf.read()
+        try:
+            json.loads(_raw)
+        except json.JSONDecodeError as _jexc:
+            logger.critical(
+                "State file write-back verification FAILED for '%s': %s. "
+                "The file on disk may be corrupted. Backups are intact. "
+                "Do not restart the process until the issue is resolved.",
+                name, _jexc,
+            )
+            # Do not raise — the in-memory state is still correct and the next
+            # scan will attempt another save. Raising here would crash the
+            # process and leave an operator with no running system.
+
         # FIX-MB-FDLEAK: Wrap the directory fsync in try/finally to guarantee
         # the file descriptor is closed even when os.fsync() raises (e.g. on
         # a remounted read-only filesystem). Without finally, a raised exception
@@ -556,10 +634,20 @@ def load_portfolio_state(name: str) -> PortfolioState:
                 corrupted_paths.append(path)
 
     if corrupted_paths:
-        raise RuntimeError(
-            "Portfolio state recovery failed: all discovered state files are corrupted "
-            f"for '{name}' ({', '.join(corrupted_paths)})."
+        # PROD-FIX-1: Do NOT raise here. Refusing to start when all state files
+        # are corrupted (e.g. crash mid-write during a CVaR breach) forces manual
+        # intervention before the system can run again. Instead, log at CRITICAL
+        # and return a safe zero-position, full-cash state so the operator can
+        # inspect while the system stays live. The next save_portfolio_state call
+        # will overwrite the corrupted files with the fresh default state.
+        logger.critical(
+            "PORTFOLIO STATE RECOVERY FAILED for '%s': all %d discovered state "
+            "file(s) are corrupted. Starting from a ZERO-POSITION, FULL-CASH "
+            "state. Verify the live position manually before any rebalance "
+            "executes. Corrupted files: %s",
+            name, len(corrupted_paths), corrupted_paths,
         )
+        return PortfolioState()
 
     return PortfolioState()
 
@@ -571,8 +659,15 @@ def _run_scan(
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
 ) -> tuple:
+    global _CONSECUTIVE_EMPTY_SCANS  # PROD-FIX-3: circuit breaker counter
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
+
+    # PROD-FIX-5: wrap the scan in a ScanContext so every log record emitted
+    # during this run carries a correlation_id field for log aggregator queries.
+    _scan_ctx = ScanContext(label=label)
+    _scan_ctx.__enter__()
+    _dead_letter = DeadLetterTracker(threshold=10)
 
     cfg    = cfg_override if cfg_override else load_optimized_config()
     engine = InstitutionalRiskEngine(cfg)
@@ -630,11 +725,33 @@ def _run_scan(
             close_d[to_bare(ns)] = market_data[ns][col].ffill()
 
     if not close_d:
-        logger.warning("[Scan] No data available for any universe symbol.")
+        # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
+        _CONSECUTIVE_EMPTY_SCANS += 1
+        _save_circuit_breaker_count(_CONSECUTIVE_EMPTY_SCANS)  # persist across restarts
+        logger.warning(
+            "[Scan] No data available for any universe symbol "
+            "(consecutive empty scans: %d / halt threshold: %d).",
+            _CONSECUTIVE_EMPTY_SCANS, _EMPTY_UNIVERSE_HALT_AFTER,
+        )
+        if _CONSECUTIVE_EMPTY_SCANS >= _EMPTY_UNIVERSE_HALT_AFTER:
+            raise RuntimeError(
+                f"[Scan] CIRCUIT BREAKER TRIPPED: {_CONSECUTIVE_EMPTY_SCANS} consecutive "
+                f"scans returned an empty universe (threshold={_EMPTY_UNIVERSE_HALT_AFTER}). "
+                "Possible data provider outage or misconfigured universe.  "
+                "Halting to prevent unintended full-cash drift.  "
+                "Set EMPTY_UNIVERSE_HALT_AFTER env var to adjust threshold."
+            )
         for held_sym in list(state.shares.keys()):
             if held_sym not in close_d:
                 state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+        # PROD-FIX-5: flush dead-letter and close scan context on early exit
+        _dead_letter.flush()
+        _scan_ctx.__exit__(None, None, None)
         return state, market_data
+
+    # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
+    _CONSECUTIVE_EMPTY_SCANS = 0
+    _save_circuit_breaker_count(0)  # persist reset so restarts start clean
 
     _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
 
@@ -652,6 +769,12 @@ def _run_scan(
         if not np.isfinite(prices[_i]) or prices[_i] <= 0:
             _lkp = state.last_known_prices.get(_sym, 0.0)
             prices[_i] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
+            # PROD-FIX-5: accumulate stale-price symbols for dead-letter report
+            _dead_letter.add(
+                _sym,
+                reason="stale_price" if (np.isfinite(_lkp) and _lkp > 0) else "no_price",
+                detail=f"last_known={_lkp:.4f}" if np.isfinite(_lkp) else "no_last_known",
+            )
 
     mtm_notional = 0.0
     for sym in state.shares:
@@ -669,11 +792,12 @@ def _run_scan(
                 mtm_notional += state.shares[_absent_sym] * _mtm_px
                 logger.warning(
                     "[Scan] Held symbol '%s' absent from current market data "
-                    "(possibly delisted/suspended). Applying absence haircut %.1f%% "
-                    "to last-known price ₹%.2f for PV calculation (mark ₹%.2f). "
-                    "Position will be force-closed after %d consecutive absent periods.",
+                    "(possibly delisted/suspended). Absent %d/%d periods; "
+                    "last-known ₹%.2f haircut to ₹%.2f for PV. "
+                    "Force-close triggers at %d consecutive absent periods.",
                     _absent_sym,
-                    (1.0 - (_mtm_px / _fallback_px if _fallback_px > 0 else 0.0)) * 100.0,
+                    _absent_n,
+                    cfg.MAX_ABSENT_PERIODS,
                     _fallback_px,
                     _mtm_px,
                     cfg.MAX_ABSENT_PERIODS,
@@ -811,7 +935,7 @@ def _run_scan(
             )
             _exhaust_decay = True
         else:
-            weights = compute_decay_targets(state, sel_idx, active, cfg)
+            weights = compute_decay_targets(state, sel_idx, active, cfg, current_prices=prices, pv=pv)
 
     # FIX-MB-RESIDUALCASH: The residual-cash allocation is handled entirely inside
     # execute_rebalance via its multi-pass proportional allocation loop, which
@@ -821,6 +945,91 @@ def _run_scan(
     # oversizing here causes state.cash to go negative after slippage deduction.
     # The execute_rebalance call below receives the target weights and handles
     # residual distribution correctly with no pre-call adjustment needed.
+
+    # Fix 2: Per-symbol price staleness gate.
+    # If any HELD position's last price bar is older than 2 trading days,
+    # something is wrong with the data feed for that symbol. Running a
+    # rebalance with a stale price for a held name can produce badly wrong
+    # weight calculations — better to skip and wait for fresh data.
+    # Exception: _force_full_cash (CVaR hard breach) always executes because
+    # liquidating to cash is safe regardless of price staleness.
+    _stale_held: list = []
+    _MAX_STALE_TRADING_DAYS = 2
+    if rebalance_allowed and not _force_full_cash and not close.empty:
+        _last_bar_date = close.index[-1]
+        # Count trading days between last bar and today using the close index
+        # (business-day calendar of actual market data in the matrix).
+        _trading_days_since_last = int(
+            (close.index <= today).sum() - len(close.index[close.index <= _last_bar_date])
+        )
+        # Simpler: how many bars ago is the last row relative to today?
+        _days_stale = (today - _last_bar_date).days
+        for _hsym in state.shares:
+            if _hsym not in active_idx:
+                continue  # absent symbols handled by absent_periods
+            _sym_series = close.get(_hsym)
+            if _sym_series is None:
+                continue
+            _last_valid = _sym_series.last_valid_index()
+            if _last_valid is None:
+                _stale_held.append(_hsym)
+                continue
+            # BUG-FIX-MONDAY: count bars in the close index that fall
+            # strictly after _last_valid and up to today.  This is NSE-calendar
+            # aware and never falsely fires on Monday (Friday close = 0 bars
+            # elapsed over the weekend, 1 bar elapsed by Monday close).
+            _bars_elapsed = int((close.index > _last_valid).sum())
+            if _bars_elapsed > _MAX_STALE_TRADING_DAYS:
+                _stale_held.append(_hsym)
+        if _stale_held:
+            logger.warning(
+                "[Scan] STALENESS GATE: skipping rebalance because %d held symbol(s) "
+                "have prices older than %d trading days: %s. "
+                "Wait for fresh market data before rebalancing.",
+                len(_stale_held), _MAX_STALE_TRADING_DAYS, _stale_held,
+            )
+            rebalance_allowed = False
+
+    # FIX-STALE-PRICE: Before executing a rebalance, check whether any held
+    # position has a price that is older than _STALE_PRICE_DAYS trading days.
+    # A rebalance using a 3-day-old price is likely worse than no rebalance,
+    # because the optimizer will size incorrectly relative to the current
+    # portfolio value. Force-liquidations (CVaR breach) are exempt — it is
+    # always safer to exit a position than to hold it with a stale price.
+    _STALE_PRICE_DAYS = 2  # trading days
+    _stale_held: list = []
+    if optimization_succeeded and not _force_full_cash:
+        for _chk_sym in state.shares:
+            if _chk_sym not in active_idx:
+                continue  # absent symbols handled by execute_rebalance itself
+            _chk_col = to_ns(_chk_sym)
+            _chk_df  = market_data.get(_chk_col) if market_data else None
+            if _chk_df is not None and not _chk_df.empty:
+                _last_ts = _chk_df.index[-1]
+                # Normalise timezone before comparison
+                if hasattr(_last_ts, "tzinfo") and _last_ts.tzinfo is not None:
+                    _last_ts = _last_ts.tz_convert("UTC").tz_localize(None)
+                _last_ts = pd.Timestamp(_last_ts)
+                # BUG-FIX-MONDAY: use the close index (actual NSE trading
+                # calendar) as the business-day ruler rather than raw calendar
+                # days.  A Friday close evaluated on Monday gives 0 bars elapsed
+                # (the weekend produced no trading bars), correctly passing the
+                # gate.  Calendar-day arithmetic (today - last_ts).days would
+                # yield 3, suppressing every Monday rebalance as a false alarm.
+                _trading_bars_elapsed = int((close.index > _last_ts).sum())
+                if _trading_bars_elapsed > _STALE_PRICE_DAYS:
+                    _stale_held.append((_chk_sym, _trading_bars_elapsed))
+        if _stale_held:
+            logger.warning(
+                "[Scan] REBALANCE SUPPRESSED: %d held symbol(s) have prices "
+                "older than %d trading bar(s) in the NSE close index: %s. "
+                "Skipping rebalance to avoid sizing on stale data. "
+                "Will retry on next scan once provider returns fresh data.",
+                len(_stale_held),
+                _STALE_PRICE_DAYS,
+                [(s, f"{d}d") for s, d in _stale_held],
+            )
+            optimization_succeeded = False
 
     if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
         _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
@@ -912,6 +1121,9 @@ def _run_scan(
             )
         print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
 
+    # PROD-FIX-5: flush dead-letter tracker and close scan context
+    _dead_letter.flush()
+    _scan_ctx.__exit__(None, None, None)
     return state, market_data
 
 
@@ -1353,14 +1565,14 @@ if __name__ == "__main__":
 
     os.makedirs("logs", exist_ok=True)
 
-    logging.basicConfig(
+    # PROD-FIX-5: use structured JSON logging in production.
+    # Pass json_stdout=False to keep human-readable output in dev.
+    _use_json = os.environ.get("LOG_JSON", "1").strip().lower() not in ("0", "false", "no")
+    from log_config import configure_logging
+    configure_logging(
         level=logging.INFO,
-        format=f"{C.GRY}[%(asctime)s]{C.RST} %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("logs/ultimate.log", encoding="utf-8", mode="a")
-        ]
+        json_stdout=_use_json,
+        log_file="logs/ultimate.log",
     )
 
     logger.info("Ultimate Momentum v%s started", __version__)
