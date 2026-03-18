@@ -5,57 +5,6 @@ Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses expanding-window time-series cross-validation for parameter selection,
 followed by a true holdout Out-of-Sample (OOS) validation period.
 
-BUG FIXES (murder board):
-- FIX-MB-DDPENALTY: _fitness_from_metrics computed dd_penalty independently of
-  concentration_mult and subtracted it flat. A 4-position portfolio with a 25%
-  drawdown therefore received the same dd_penalty as an 8-position portfolio
-  with the same drawdown, even though the 4-position portfolio carries 2x the
-  unobserved idiosyncratic risk.
-- FIX-MB2-DDPENALTY2: The original FIX-MB-DDPENALTY fix over-corrected by
-  multiplying dd_penalty by concentration_mult. Since risk_penalty already
-  contains concentration_mult in its denominator, applying it again to dd_penalty
-  created an asymmetric double-hit: concentrated portfolios near IS_DD_PENALTY_PCT
-  received a combinatorial penalty that dominated the fitness score and pruned
-  otherwise valid parameter sets. dd_penalty is now a flat quadratic correction
-  independent of concentration; concentration risk is fully covered by risk_penalty.
-- FIX-MB2-WFOSLICE: Each WFO fold's precomputed_matrices is now sliced to
-  [start, wf_oos_end] before passing to run_backtest. Without this slice the
-  full matrix (TRAIN_START→TEST_END) was visible to every OOS fold, allowing
-  e.g. the Year-2020 fold to see 2021-2022 returns — genuine walk-forward
-  look-ahead that inflated IS fitness scores.
-- FIX-MB2-CFGCOPY: Removed dead cfg._pre_load_padding_days assignment in
-  pre_load_data — the attribute was set but never read anywhere in the codebase,
-  and writing undeclared attributes onto a dataclass is fragile and invisible to
-  serialisation.
-- FIX-MB-OPT-01: _iter_wfo_slices now enforces a minimum IS window of 252
-  trading-day-equivalent calendar days. Folds where the IS window is too thin
-  are skipped/pruned, preventing near-zero position counts from polluting WFO
-  fitness averages when CVAR_LOOKBACK is at its upper search-space bound.
-- FIX-MB-OPT-04: anomaly_hit slices are now pruned (raise TrialPruned) rather
-  than being included in the aggregate score as near-floor values, preventing
-  corrupted/data-gap folds from distorting TPE guidance.
-- FIX-MB-OPT-06: best_trial is now re-read from study AFTER study.optimize()
-  returns, so the OOS tournament references the true best trial rather than a
-  stale pre-run capture.
-- FIX-MB-OPT-09: study creation uses load_if_exists=True only when the study
-  name has not changed from a previous objective version; callers are warned
-  when DEFAULT_STUDY_NAME matches an existing study with a different objective.
-- FIX-MB-OPT-03: OOS tournament table now prints abs(oos_maxdd) so the MaxDD
-  column shows a positive percentage consistent with the column header.
-- FIX-MB-H-01: WFO fold matrices now sliced to [is_start, oos_end] on both
-  bounds. Previously only the upper bound (:oos_end) was applied, leaving
-  each fold with full history back to TRAIN_START and cross-fold IS/OOS
-  window contamination.
-- FIX-MB-M-02: MomentumObjective tolerates a single gate-hit fold (dd_gate
-  or anomaly) per trial instead of pruning immediately. Only trials with
-  more than one bad fold are pruned, allowing strategies that dip into one
-  recessionary year to still be evaluated on their healthy-year aggregate.
-- FIX-OOS-CUTOFF: TEST_END is now a fixed date (default "2024-12-31") rather
-  than today(). Using today() silently expanded the OOS window on every run,
-  making results incomparable across runs and progressively more in-sample.
-  Override via OPTIMIZER_OOS_CUTOFF env var for exploratory runs.
-
-Requires: pip install optuna
 """
 import argparse
 import json
@@ -103,7 +52,7 @@ def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
 _load_dotenv_if_present()
 
 from momentum_engine import UltimateConfig, OptimizationError
-from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices
+from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
 from universe_manager import get_nifty500, fetch_nse_equity_universe, get_historical_universe
 
@@ -143,7 +92,7 @@ TEST_START  = "2023-01-01"
 # allows CI / exploratory runs to use a different cutoff without code changes.
 TEST_END = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2024-12-31")
 
-N_TRIALS       = 100
+N_TRIALS       = 10
 OOS_MAX_DD_CAP = 35.0
 OOS_TOP_K = 10
 
