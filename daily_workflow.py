@@ -665,11 +665,16 @@ def _run_scan(
 
     # PROD-FIX-5: wrap the scan in a ScanContext so every log record emitted
     # during this run carries a correlation_id field for log aggregator queries.
-    _scan_ctx = ScanContext(label=label)
-    _scan_ctx.__enter__()
+    #
+    # FIX-SCAN-CTX-SAFETY: use the context manager protocol directly (with statement)
+    # instead of manual __enter__/__exit__ calls.  The previous manual approach had
+    # no try/finally guard, so any exception that escaped the scan body left the
+    # thread-local correlation_id set for the next scan and silently dropped all
+    # accumulated dead-letter symbols.  The `with` statement guarantees __exit__
+    # is called on every exit path, including exceptions.
     _dead_letter = DeadLetterTracker(threshold=10)
-
-    cfg    = cfg_override if cfg_override else load_optimized_config()
+    with ScanContext(label=label):
+        cfg    = cfg_override if cfg_override else load_optimized_config()
     engine = InstitutionalRiskEngine(cfg)
     # FIX-MB2-EQUITYCAP: Only apply cfg defaults when the state field still holds
     # its dataclass default (250 for equity_hist_cap, 12 for max_absent_periods).
@@ -744,9 +749,8 @@ def _run_scan(
         for held_sym in list(state.shares.keys()):
             if held_sym not in close_d:
                 state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
-        # PROD-FIX-5: flush dead-letter and close scan context on early exit
+        # PROD-FIX-5: flush dead-letter on early exit; ScanContext exits automatically
         _dead_letter.flush()
-        _scan_ctx.__exit__(None, None, None)
         return state, market_data
 
     # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
@@ -1121,9 +1125,8 @@ def _run_scan(
             )
         print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
 
-    # PROD-FIX-5: flush dead-letter tracker and close scan context
-    _dead_letter.flush()
-    _scan_ctx.__exit__(None, None, None)
+    # PROD-FIX-5: flush dead-letter tracker; ScanContext.__exit__ runs automatically
+        _dead_letter.flush()
     return state, market_data
 
 

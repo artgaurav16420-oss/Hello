@@ -419,7 +419,7 @@ class BacktestEngine:
                 _exhaust_decay = True
                 activate_override_on_stress(self.state, cfg)
             else:
-                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg)
+                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg, current_prices=valuation_prices, pv=pv)
                 sel_idx_set = set(sel_idx)
                 sym_to_pos  = {s: i for i, s in enumerate(active_symbols)}
                 n_gated = sum(

@@ -396,8 +396,12 @@ def generate_signals(
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
         dispersion_floor = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
-        dispersion = max(std_cross, dispersion_floor)
-        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion
+        # FIX-DISPERSION-SCALE: scale bonus DOWN in low-dispersion markets.
+        # Previous code multiplied by max(std_cross, floor) which both inverted
+        # the direction (high-dispersion got bigger bonus) and produced a unit
+        # mismatch (raw-return std multiplied onto a dimensionless config param).
+        dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
 
         activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
         stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)

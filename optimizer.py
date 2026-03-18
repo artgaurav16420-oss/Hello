@@ -90,9 +90,9 @@ TEST_START  = "2023-01-01"
 # Set this once, leave it until you have 6+ months of live performance data,
 # then advance it deliberately to a new fixed date. The env-var override
 # allows CI / exploratory runs to use a different cutoff without code changes.
-TEST_END = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2024-12-31")
+TEST_END = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
 
-N_TRIALS       = 10
+N_TRIALS       = 200
 OOS_MAX_DD_CAP = 35.0
 OOS_TOP_K = 10
 
@@ -101,7 +101,7 @@ OOS_TOP_K = 10
 _MIN_IS_CALENDAR_DAYS = 365
 
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (10, 40, 5),
+    "HALFLIFE_FAST":    (10, 40, 2),
     "HALFLIFE_SLOW":    (50, 120, 5),
     "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
     "RISK_AVERSION":    (10.0, 20.0, 0.5),
@@ -717,6 +717,18 @@ def run_optimization(
     os.makedirs("data", exist_ok=True)
     effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME
     logger.info("Using Optuna study: %s", effective_study_name)
+
+    # FIX-MB-OPT-09 WARNING: warn when a custom --study-name is passed that does
+    # not embed OBJECTIVE_VERSION, because old trials from a different objective
+    # version will silently contaminate the new optimization run.
+    if effective_study_name != DEFAULT_STUDY_NAME and OBJECTIVE_VERSION not in effective_study_name:
+        logger.warning(
+            "[Optimizer] Study name '%s' does not contain the current objective "
+            "version string '%s'.  If this study was created with a different "
+            "objective function, previously completed trials will bias TPE guidance "            "toward parameters calibrated for the old objective.  Rename the study "
+            "or use the default name to start a clean optimization track.",
+            effective_study_name, OBJECTIVE_VERSION,
+        )
 
     study = optuna.create_study(
         study_name=effective_study_name,
