@@ -351,16 +351,23 @@ def generate_signals(
     _full_daily_vols = None
     _baseline_daily_vol = 0.01
 
-    if len(log_rets) >= cfg.KNIFE_WINDOW:
-        recent_simple = np.expm1(log_rets.iloc[-cfg.KNIFE_WINDOW:])
+    # FIX-LAG-KNIFE: use signal_log_rets (lag-truncated) for the knife gate so
+    # that when SIGNAL_LAG_DAYS > 0 the gate cannot see price data that is in
+    # the future relative to the signal date.  Using raw log_rets here gave the
+    # gate KNIFE_WINDOW bars of look-ahead (e.g. 20 days into the future when
+    # SIGNAL_LAG_DAYS=21), allowing the strategy to avoid stocks that were
+    # crashing AFTER the signal date — a form of clairvoyance that inflates
+    # Sortino ratios for any trial using the lag parameter.
+    if len(signal_log_rets) >= cfg.KNIFE_WINDOW:
+        recent_simple = np.expm1(signal_log_rets.iloc[-cfg.KNIFE_WINDOW:])
         recent_cumulative_returns = (
             (1.0 + recent_simple)
             .prod(skipna=True, min_count=1)
             - 1.0
         ).values
 
-        recent_lookback = min(len(log_rets), 126)
-        _signal_date_vols = log_rets.iloc[-recent_lookback:].std()
+        recent_lookback = min(len(signal_log_rets), 126)
+        _signal_date_vols = signal_log_rets.iloc[-recent_lookback:].std()
         _full_daily_vols = _signal_date_vols.values
 
         for i, cumulative_ret in enumerate(recent_cumulative_returns):
@@ -389,20 +396,8 @@ def generate_signals(
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
         dispersion_floor = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
-        # FIX-DISPERSION-SCALE: The previous implementation multiplied base_bonus
-        # by max(std_cross, floor), which both inverted the intended direction
-        # (high-dispersion markets — where signals are already well-separated —
-        # got a LARGER continuity bonus) and produced a unit-mismatch (multiplying
-        # a dimensionless config param by a raw-return std made the bonus ~500x too
-        # small in typical markets).
-        #
-        # Correct model: the bonus should be FULL in normal/high-dispersion markets
-        # and REDUCED in range-bound low-dispersion markets (where a small score
-        # lead is likely noise and a tiebreaker would be unreliable).
-        # dispersion_scale = 1.0 when std_cross >= floor (full bonus);
-        # dispersion_scale < 1.0 when std_cross < floor (reduced bonus).
-        dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
-        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
+        dispersion = max(std_cross, dispersion_floor)
+        base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion
 
         activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
         stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)
@@ -427,11 +422,11 @@ def generate_signals(
         for i, sym in enumerate(active_symbols):
             prev_w = float(prev_weights.get(sym, 0.0))
             if valid_mask[i] and prev_w > 0.001 and not knife_pre_bonus_suppress[i]:
-                recent_rets = log_rets[sym].tail(activity_window)
+                recent_rets = signal_log_rets[sym].tail(activity_window)  # FIX-LAG-CONT
                 nonzero_days = int((recent_rets.abs() > flat_ret_eps).sum()) if len(recent_rets) else 0
                 has_recent_activity = nonzero_days >= min_nonzero_days
 
-                stale_rets = log_rets[sym].tail(stale_sessions)
+                stale_rets = signal_log_rets[sym].tail(stale_sessions)  # FIX-LAG-CONT
                 is_stale = (
                     len(stale_rets) == stale_sessions
                     and stale_rets.notna().all()
@@ -463,6 +458,17 @@ def generate_signals(
                 liquidity_denied,
             )
 
+    # FIX-NAN-ARGSORT: replace any residual NaN in adj_scores with -inf before
+    # sorting.  NumPy places NaN at the END of an argsort result (highest indices),
+    # so NaN values would occupy top-N slots and be silently dropped by the
+    # adj_scores[idx] > -np.inf guard — each NaN steals a slot from a legitimate
+    # high-momentum candidate.  Converting NaN -> -inf ensures they sort to the
+    # same position as explicitly-gated symbols and are correctly excluded.
+    # NaN can arise when the most recent bars of signal_log_rets are all NaN
+    # (e.g., a stock with valid early history that recently went ex-data),
+    # causing ewm().mean().iloc[-1] to return NaN even though the history gate
+    # counted enough valid bars across the full tail window.
+    adj_scores = np.where(np.isnan(adj_scores), -np.inf, adj_scores)
     sorted_indices = np.argsort(adj_scores)
     top_n_indices = sorted_indices[-cfg.MAX_POSITIONS:]
 

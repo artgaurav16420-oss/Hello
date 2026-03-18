@@ -598,8 +598,19 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     symbols_to_fetch = list(dict.fromkeys(preload_universe + ["^NSEI", "^CRSLDX"]))
 
-    logger.info(f"Fetching {len(symbols_to_fetch)} symbols from {TRAIN_START} to {TEST_END}...")
-    kwargs = dict(tickers=symbols_to_fetch, required_start=TRAIN_START, required_end=TEST_END)
+    # FIX-WARMUP-FETCH: pre_load_data must fetch from the computed warmup start,
+    # not from TRAIN_START.  _compute_warmup_start requests data hundreds of
+    # calendar days before TRAIN_START so that slow EMAs (HALFLIFE_SLOW up to 120)
+    # and Ledoit-Wolf covariance matrices are fully initialised for the first WFO
+    # fold.  Without this, the first fold's fitness score is subtly biased by
+    # cold-start EMA values — overweighting strategies that happen to look good
+    # on thin early history.
+    _pre_load_cfg = cfg if cfg is not None else UltimateConfig()
+    _actual_warmup_start = _compute_warmup_start(TRAIN_START, _pre_load_cfg)
+    logger.info(
+        f"Fetching {len(symbols_to_fetch)} symbols from {_actual_warmup_start} "        f"(warmup) to {TEST_END}..."
+    )
+    kwargs = dict(tickers=symbols_to_fetch, required_start=_actual_warmup_start, required_end=TEST_END)
     if cfg is not None:
         kwargs["cfg"] = cfg
     try:
@@ -758,21 +769,6 @@ def run_optimization(
     effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME
     logger.info("Using Optuna study: %s", effective_study_name)
 
-    # FIX-MB-OPT-09 WARNING: warn when a custom --study-name is passed that does
-    # not embed OBJECTIVE_VERSION, because old trials from a different objective
-    # version will silently contaminate the new optimization run via Optuna's
-    # warm-starting logic.  The default name (DEFAULT_STUDY_NAME) always includes
-    # OBJECTIVE_VERSION so this guard only fires for explicit --study-name overrides.
-    if effective_study_name != DEFAULT_STUDY_NAME and OBJECTIVE_VERSION not in effective_study_name:
-        logger.warning(
-            "[Optimizer] Study name '%s' does not contain the current objective "
-            "version string '%s'.  If this study was created with a different "
-            "objective function, previously completed trials will bias TPE guidance "
-            "toward parameters calibrated for the old objective.  Rename the study "
-            "or use the default name to start a clean optimization track.",
-            effective_study_name, OBJECTIVE_VERSION,
-        )
-
     study = optuna.create_study(
         study_name=effective_study_name,
         direction="maximize",
@@ -904,7 +900,7 @@ def run_optimization(
         c_hits   = best_trial.user_attrs.get("ceiling_hits", 0)
         scored_n = len(best_trial.user_attrs.get("slice_diags", []))
         if isinstance(c_hits, int) and scored_n > 0 and c_hits == scored_n:
-            print("\033[1;31m[WARNING] Best trial hit the 5.0 score ceiling on ALL scored slices.\033[0m")
+            print("\033[1;31m[WARNING] Best trial hit the 3.5 score ceiling on ALL scored slices.\033[0m")
             print("\033[33m          This means the optimizer cannot distinguish between parameter sets\033[0m")
             print("\033[33m          in the top range — TPE convergence may be unreliable.\033[0m")
             print()

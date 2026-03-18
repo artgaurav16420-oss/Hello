@@ -240,6 +240,34 @@ class BacktestEngine:
 
         adv_vector = _build_adv_vector(active_symbols, close, volume, date, cfg=cfg)
 
+        # FIX-ADV-GLITCH: A one-day data gap (missing volume for a liquid stock)
+        # causes _build_adv_vector to return ADV=0, which the OSQP constraint
+        # translates to adv_limit=1e-9 — forcing a complete liquidation of an
+        # otherwise healthy position.  For symbols currently held in the
+        # portfolio, substitute a trailing ADV from the available history rather
+        # than defaulting to zero.  Truly illiquid / delisted stocks are handled
+        # by the absent_periods mechanism, not the ADV gate.
+        _adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
+        for _adv_i, _adv_sym in enumerate(active_symbols):
+            if adv_vector[_adv_i] == 0.0 and self.state.shares.get(_adv_sym, 0) > 0:
+                if _adv_sym in close.columns and _adv_sym in volume.columns:
+                    try:
+                        _c = close.loc[:signal_date, _adv_sym].dropna()
+                        _v = volume.loc[:signal_date, _adv_sym].dropna()
+                        _not = (_c * _v).clip(lower=0).dropna()
+                        _trail = _not.tail(_adv_lookback * 5)  # 5x window for robustness
+                        if not _trail.empty:
+                            _fallback_adv = float(_trail.mean())
+                            if _fallback_adv > 0:
+                                adv_vector[_adv_i] = _fallback_adv
+                                logger.debug(
+                                    "[Backtest] ADV glitch: using trailing fallback "
+                                    "ADV=%.0f for held position %s on %s.",
+                                    _fallback_adv, _adv_sym, date,
+                                )
+                    except Exception:
+                        pass  # leave at 0; absent_periods will handle it
+
         valuation_close = close.loc[signal_date]
 
         valuation_prices = np.array([
@@ -391,7 +419,7 @@ class BacktestEngine:
                 _exhaust_decay = True
                 activate_override_on_stress(self.state, cfg)
             else:
-                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg, current_prices=valuation_prices, pv=pv)
+                target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg)
                 sel_idx_set = set(sel_idx)
                 sym_to_pos  = {s: i for i, s in enumerate(active_symbols)}
                 n_gated = sum(
@@ -536,7 +564,12 @@ def _build_adv_vector(
                 else:
                     val = float(lookback.mean())
                     adv.append(val if np.isfinite(val) else 0.0)
-            except Exception:
+            except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+                # Specific exceptions only — mirrors BUG-FIX-BROAD-EXCEPT in
+                # signals.py.  A bare 'except Exception' would silently swallow
+                # unexpected bugs (e.g. a pandas API change) and return ADV=0
+                # for all symbols, triggering the liquidity gate and forcing a
+                # total portfolio liquidation without a visible error trace.
                 adv.append(0.0)
         else:
             adv.append(0.0)
