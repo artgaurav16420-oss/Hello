@@ -101,12 +101,12 @@ OOS_TOP_K = 10
 _MIN_IS_CALENDAR_DAYS = 365
 
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (10, 40, 2),
-    "HALFLIFE_SLOW":    (50, 120, 5),
-    "CONTINUITY_BONUS": (0.05, 0.30, 0.01),
+    "HALFLIFE_FAST":    (10, 30, 2),
+    "HALFLIFE_SLOW":    (40, 100, 5),
+    "CONTINUITY_BONUS": (0.06, 0.30, 0.03),
     "RISK_AVERSION":    (10.0, 20.0, 0.5),
     "CVAR_DAILY_LIMIT": (0.040, 0.070, 0.005),
-    "CVAR_LOOKBACK":    (60, 150, 5),
+    "CVAR_LOOKBACK":    (50, 120, 10),
 }
 
 N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "1"))
@@ -134,11 +134,10 @@ def _stdout_supports_rupee(stdout=None) -> bool:
         return False
     return True
 
-
 def _build_sampler() -> TPESampler:
     if OPTUNA_SEED in (None, ""):
-        return TPESampler()
-    return TPESampler(seed=int(OPTUNA_SEED))
+        return TPESampler(n_ei_candidates=24, multivariate=True)
+    return TPESampler(seed=int(OPTUNA_SEED), n_ei_candidates=24, multivariate=True)
 
 # ─── Objective Function ───────────────────────────────────────────────────────
 
@@ -239,7 +238,7 @@ def _fitness_from_metrics(
     risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
 
     IS_DD_GATE        = 40.0
-    IS_DD_PENALTY_PCT = 20.0
+    IS_DD_PENALTY_PCT = 15.0
 
     if max_dd > IS_DD_GATE:
         raw = -(max_dd / 5.0)
