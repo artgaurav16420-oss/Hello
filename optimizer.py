@@ -94,6 +94,7 @@ TEST_END = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
 
 N_TRIALS       = 200
 OOS_MAX_DD_CAP = 35.0
+OOS_SOFT_MAX_DD_CAP = 38.0
 OOS_TOP_K = 10
 
 # Minimum IS calendar days a fold must have before the OOS window.
@@ -101,12 +102,12 @@ OOS_TOP_K = 10
 _MIN_IS_CALENDAR_DAYS = 365
 
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (10, 30, 2),
-    "HALFLIFE_SLOW":    (40, 100, 5),
-    "CONTINUITY_BONUS": (0.06, 0.30, 0.03),
-    "RISK_AVERSION":    (10.0, 20.0, 0.5),
-    "CVAR_DAILY_LIMIT": (0.040, 0.070, 0.005),
-    "CVAR_LOOKBACK":    (50, 120, 10),
+    "HALFLIFE_FAST":    (15, 30, 2),
+    "HALFLIFE_SLOW":    (60, 100, 5),
+    "CONTINUITY_BONUS": (0.06, 0.20, 0.03),
+    "RISK_AVERSION":    (12.0, 20.0, 0.5),
+    "CVAR_DAILY_LIMIT": (0.040, 0.060, 0.005),
+    "CVAR_LOOKBACK":    (60, 120, 10),
 }
 
 N_JOBS = int(os.getenv("OPTUNA_N_JOBS", "1"))
@@ -211,6 +212,7 @@ def _fitness_from_metrics(
     avg_exposure = 1.0
     avg_positions = 0.0
     n_rebalances = 0
+    forced_cash_penalty = 0.0
 
     if rebal_log is not None and not rebal_log.empty:
         fallback_series = pd.Series([0.0])
@@ -218,6 +220,17 @@ def _fitness_from_metrics(
         avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", fallback_series), errors="coerce").fillna(0.0).mean())
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0).mean())
         n_rebalances = len(rebal_log)
+
+        forced_cash_flags = rebal_log.get("forced_to_cash")
+        if forced_cash_flags is not None:
+            forced_cash_count = int(pd.Series(forced_cash_flags).fillna(False).astype(bool).sum())
+        else:
+            n_positions = pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0)
+            apply_decay = pd.Series(rebal_log.get("apply_decay", False)).fillna(False).astype(bool)
+            forced_cash_count = int(((n_positions <= 0) & apply_decay).sum())
+
+        forced_cash_fraction = forced_cash_count / max(n_rebalances, 1)
+        forced_cash_penalty = forced_cash_fraction * 1.5
 
     _pos_deficit = max(0.0, 6.0 - avg_positions)
     concentration_mult = 1.0 + _pos_deficit * 0.30
@@ -237,8 +250,8 @@ def _fitness_from_metrics(
 
     risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
 
-    IS_DD_GATE        = 40.0
-    IS_DD_PENALTY_PCT = 15.0
+    IS_DD_GATE        = 35.0
+    IS_DD_PENALTY_PCT = 12.0
 
     if max_dd > IS_DD_GATE:
         raw = -(max_dd / 5.0)
@@ -251,6 +264,7 @@ def _fitness_from_metrics(
             "n_rebalances": n_rebalances, "concentration_mult": round(concentration_mult, 4),
             "sortino_quality": round(sortino_quality, 4), "risk_penalty": round(risk_penalty, 4),
             "exposure_penalty": 0.0, "dd_penalty": 0.0,
+            "forced_cash_penalty": round(forced_cash_penalty, 4),
             "raw_score": round(raw, 6), "score": round(score, 6),
             "ceiling_hit": False, "dd_gate_hit": True, "anomaly_hit": False,
         }
@@ -283,7 +297,7 @@ def _fitness_from_metrics(
         ceiling_hit = False
         dd_gate_hit = False
     else:
-        raw = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty
+        raw = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty - forced_cash_penalty
         _K = 3.5
         score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
         score = max(score, -2.0)
@@ -305,6 +319,7 @@ def _fitness_from_metrics(
         "risk_penalty":        round(risk_penalty, 4),
         "exposure_penalty":    round(exposure_penalty, 4),
         "dd_penalty":          round(dd_penalty, 4),
+        "forced_cash_penalty": round(forced_cash_penalty, 4),
         "raw_score":           round(raw, 6) if not (abs(cagr) < 1e-12 and max_dd == 0.0) else 0.0,
         "score":               round(score, 6),
         "ceiling_hit":         ceiling_hit,
@@ -438,36 +453,42 @@ class MomentumObjective:
             slice_diags.append(diag)
 
             _ceiling_tag  = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
-            _ddgate_tag   = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
+            _ddgate_tag   = " ⚠ DD-GATE (>35%)" if diag["dd_gate_hit"] else ""
             _anomaly_tag  = " ⚠ ANOMALOUS-RETURNS" if diag.get("anomaly_hit") else ""
+            _cashpen_tag  = (
+                f" ⚠ FORCED-CASH={diag.get('forced_cash_penalty', 0.0):.2f}"
+                if diag.get("forced_cash_penalty", 0.0) > 0.1 else ""
+            )
             logger.info(
                 "[Trial %s | %d] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
                 "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
-                "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  RawScore=%.4f  Score=%.4f%s%s%s",
+                "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  ForcedCashPen=%.4f  "
+                "RawScore=%.4f  Score=%.4f%s%s%s%s",
                 trial_id, oos_year,
                 diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
                 diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
                 diag["risk_penalty"], diag["exposure_penalty"], diag.get("dd_penalty", 0.0),
+                diag.get("forced_cash_penalty", 0.0),
                 diag["raw_score"], diag["score"],
-                _ceiling_tag, _ddgate_tag, _anomaly_tag,
+                _ceiling_tag, _ddgate_tag, _anomaly_tag, _cashpen_tag,
             )
 
             if not pd.notna(score):
                 raise optuna.TrialPruned()
 
-            # FIX-MB-M-02: count gate hits; prune only when MORE THAN ONE fold
-            # triggers dd_gate_hit or anomaly_hit.  A single bad fold is
-            # tolerated as market noise; only pervasively bad strategies prune.
-            # NaN-score and score <= -2.0 remain immediate hard prunes.
+            # Count gate hits; include the first gate-hit fold score in the
+            # aggregate so fragile strategies are penalised rather than silently
+            # averaging only their good years. Prune when MORE THAN ONE fold
+            # triggers a gate.
             is_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit") or score <= -2.0
             if is_gate_hit:
                 n_gate_hits += 1
+                scores.append(float(score))
                 if n_gate_hits > 1:
                     raise optuna.TrialPruned()
-                # Single gate hit: log and skip this fold's score from aggregate.
                 logger.debug(
-                    "[Trial %s | %d] Single gate-hit fold tolerated "
-                    "(dd_gate=%s anomaly=%s score=%.4f); excluding from aggregate.",
+                    "[Trial %s | %d] Single gate-hit fold included in aggregate "
+                    "(dd_gate=%s anomaly=%s score=%.4f).",
                     trial_id, oos_year,
                     diag.get("dd_gate_hit"), diag.get("anomaly_hit"), score,
                 )
@@ -764,22 +785,23 @@ def run_optimization(
             logger.info("    %-28s %s", k, v)
 
         logger.info("")
-        logger.info("  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %s",
-                    "Year", "CAGR%", "DD%", "Turn", "AvgPos", "AvgExp", "Score", "Flags")
-        logger.info("  " + "-"*70)
+        logger.info("  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %-10s  %s",
+                    "Year", "CAGR%", "DD%", "Turn", "AvgPos", "AvgExp", "ForcedCash", "Score", "Flags")
+        logger.info("  " + "-"*82)
         for d in diags:
             flags = []
             if d.get("ceiling_hit"):    flags.append("CEIL")
             if d.get("dd_gate_hit"):    flags.append("DD-GATE")
             if d.get("anomaly_hit"):    flags.append("ANOM")
             logger.info(
-                "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %s",
+                "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %9.4f  %s",
                 d["year"],
                 d["cagr"], abs(d["max_dd"]), d["turnover"],
                 d["avg_positions"], d["avg_exposure"],
+                d.get("forced_cash_penalty", 0.0),
                 d["score"], " ".join(flags) if flags else "—",
             )
-        logger.info("  " + "-"*70)
+        logger.info("  " + "-"*82)
         if diags:
             avg_cagr = sum(d["cagr"]       for d in diags) / len(diags)
             avg_dd   = sum(abs(d["max_dd"]) for d in diags) / len(diags)
@@ -868,7 +890,9 @@ def run_optimization(
     # OOS Top-K tournament
     print(f"\n\033[1;36m=== INITIATING OUT-OF-SAMPLE (OOS) VALIDATION — TOP-{OOS_TOP_K} TOURNAMENT ===\033[0m")
     print(f"\033[90mEvaluating top {OOS_TOP_K} IS trials on unseen data {TEST_START} → {TEST_END}\033[0m")
-    print(f"\033[90mWinner = best OOS Calmar (not best IS score)\033[0m\n")
+    print(f"\033[90mWinner = best OOS Calmar (not best IS score)\033[0m")
+    print(f"\033[90mHard pass = Calmar > 0.5 and MaxDD <= {OOS_MAX_DD_CAP:.1f}% | "
+          f"Soft pass = Calmar > 0.5 and MaxDD <= {OOS_SOFT_MAX_DD_CAP:.1f}%\033[0m\n")
 
     top_k_trials = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:OOS_TOP_K]
 
@@ -884,7 +908,7 @@ def run_optimization(
     # percentage consistent with the column header "OOS MaxDD".
     print(f"  {'Rank':>4}  {'Trial':>6}  {'IS Score':>9}  {'OOS CAGR':>9}  "
           f"{'OOS MaxDD':>9}  {'OOS Calmar':>10}  {'Status'}")
-    print(f"  {'─'*75}")
+    print(f"  {'─'*79}")
 
     oos_results_list = []
 
@@ -916,7 +940,16 @@ def run_optimization(
                 oos_calmar > 0.5
                 and abs(oos_maxdd) <= OOS_MAX_DD_CAP
             )
-            status = "\033[32mPASS\033[0m" if passes else "\033[31mFAIL\033[0m"
+            soft_pass = (
+                oos_calmar > 0.5
+                and abs(oos_maxdd) <= OOS_SOFT_MAX_DD_CAP
+            )
+            if passes:
+                status = "\033[32mPASS\033[0m"
+            elif soft_pass:
+                status = "\033[33mNEAR\033[0m"
+            else:
+                status = "\033[31mFAIL\033[0m"
 
             # FIX-MB-OPT-03: display abs(oos_maxdd) for positive readability
             print(
@@ -938,7 +971,7 @@ def run_optimization(
                 f"{'ERROR':>9}  {'—':>9}  {'—':>10}  \033[31mERROR: {exc}\033[0m"
             )
 
-    print(f"  {'─'*75}\n")
+    print(f"  {'─'*79}\n")
 
     if not oos_results_list:
         raise RuntimeError(
