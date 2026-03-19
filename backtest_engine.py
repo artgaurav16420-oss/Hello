@@ -459,6 +459,12 @@ class BacktestEngine:
                 "override_active":    self.state.override_active,
                 "n_positions":        len(self.state.shares),
                 "apply_decay":        apply_decay,
+                "forced_to_cash":     bool(_force_full_cash or _exhaust_decay),
+                "force_cash_reason":  (
+                    "book_cvar_breach" if _force_full_cash else
+                    "max_decay_rounds" if _exhaust_decay else
+                    ""
+                ),
             })
 
 

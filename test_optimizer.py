@@ -113,8 +113,15 @@ def test_objective_propagates_unexpected_errors(monkeypatch):
 
 def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch):
     class _Result:
-        metrics = {"cagr": 10.0, "max_dd": 30.0, "turnover": 0.0}
-        rebal_log = None
+        metrics = {"cagr": 10.0, "max_dd": 20.0, "turnover": 0.0}
+        rebal_log = pd.DataFrame(
+            {
+                "realised_cvar": [0.01, 0.01, 0.01],
+                "exposure_multiplier": [1.0, 1.0, 1.0],
+                "n_positions": [8, 8, 8],
+                "apply_decay": [False, False, False],
+            }
+        )
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
@@ -122,14 +129,51 @@ def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch
     trial = optuna.trial.FixedTrial(
         {
             "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
+            "HALFLIFE_SLOW": 65,
             "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
+            "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
     )
 
     assert isinstance(objective(trial), numbers.Real)
+
+
+def test_fitness_penalizes_explicit_forced_cash_events():
+    metrics = {"cagr": 12.0, "max_dd": 10.0, "turnover": 0.0}
+    base_rebal = pd.DataFrame(
+        {
+            "realised_cvar": [0.01, 0.01, 0.01, 0.01],
+            "exposure_multiplier": [1.0, 1.0, 1.0, 1.0],
+            "n_positions": [8, 8, 8, 8],
+            "apply_decay": [False, False, False, False],
+        }
+    )
+    forced_rebal = base_rebal.assign(forced_to_cash=[False, True, False, True], n_positions=[8, 0, 8, 0])
+
+    base_score, base_diag = optimizer._fitness_from_metrics(metrics, base_rebal)
+    forced_score, forced_diag = optimizer._fitness_from_metrics(metrics, forced_rebal)
+
+    assert forced_diag["forced_cash_penalty"] > 0.0
+    assert forced_score < base_score
+    assert base_diag["forced_cash_penalty"] == 0.0
+
+
+def test_fitness_falls_back_to_decay_and_zero_positions_when_forced_cash_flag_missing():
+    metrics = {"cagr": 12.0, "max_dd": 10.0, "turnover": 0.0}
+    rebal_log = pd.DataFrame(
+        {
+            "realised_cvar": [0.01, 0.01, 0.01, 0.01],
+            "exposure_multiplier": [1.0, 1.0, 1.0, 1.0],
+            "n_positions": [8, 0, 8, 0],
+            "apply_decay": [False, True, False, True],
+        }
+    )
+
+    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+
+    assert score < 0.75
+    assert diag["forced_cash_penalty"] == pytest.approx(0.75)
 
 
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
@@ -180,8 +224,8 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
 
     result = optimizer.pre_load_data("  NSE_TOTAL ")
 
-    assert result == {"ok": True}
-    assert captured["required_start"] == "2020-01-01"
+    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
     assert captured["required_end"] == "2020-12-31"
     assert captured["tickers"].count("ABC") == 1
     assert "^NSEI" in captured["tickers"]
@@ -216,8 +260,8 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
 
     result = optimizer.pre_load_data("nifty500")
 
-    assert result == {"ok": True}
-    assert captured["required_start"] == "2020-01-01"
+    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
     assert captured["required_end"] == "2020-03-31"
     assert "LIVEONLY" in captured["tickers"]
     assert "OLD1" in captured["tickers"]
@@ -347,15 +391,27 @@ def test_run_optimization_forces_single_job(monkeypatch):
     captured = {}
 
     class _Study:
-        best_trials = [object()]
         best_params = {
             "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
+            "HALFLIFE_SLOW": 65,
             "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
+            "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
         best_value = 1.23
+        best_trial = optuna.trial.create_trial(
+            params=best_params,
+            distributions={
+                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
+                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
+                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
+                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
+                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
+            },
+            value=1.23,
+            user_attrs={},
+        )
+        best_trials = [best_trial]
 
         def optimize(self, objective, **kwargs):
             captured.update(kwargs)
@@ -385,15 +441,27 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
     class _Study:
-        best_trials = [object()]
         best_params = {
             "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
+            "HALFLIFE_SLOW": 65,
             "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
+            "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
         best_value = 1.23
+        best_trial = optuna.trial.create_trial(
+            params=best_params,
+            distributions={
+                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
+                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
+                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
+                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
+                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
+            },
+            value=1.23,
+            user_attrs={},
+        )
+        best_trials = [best_trial]
 
         def optimize(self, objective, **kwargs):
             pass
@@ -438,15 +506,27 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
     captured = {}
 
     class _Study:
-        best_trials = [object()]
         best_params = {
             "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
+            "HALFLIFE_SLOW": 65,
             "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
+            "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
         best_value = 1.23
+        best_trial = optuna.trial.create_trial(
+            params=best_params,
+            distributions={
+                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
+                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
+                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
+                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
+                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
+            },
+            value=1.23,
+            user_attrs={},
+        )
+        best_trials = [best_trial]
 
         def optimize(self, objective, **kwargs):
             captured.update(kwargs)
