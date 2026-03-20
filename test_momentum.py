@@ -1252,7 +1252,7 @@ def test_gated_position_force_closed_on_first_decay_bar():
     assert b_sells, "A SELL trade for B must be recorded."
 
 
-def test_decay_liquidation_restores_force_close_proceeds(monkeypatch):
+def test_decay_liquidation_restores_force_close_proceeds():
     cfg = UltimateConfig(MAX_ABSENT_PERIODS=3, CVAR_DAILY_LIMIT=0.01, ROUND_TRIP_SLIPPAGE_BPS=10.0)
     state = PortfolioState(cash=0.0)
     state.shares = {"LIVE": 1, "GHOST": 2}
@@ -1260,15 +1260,11 @@ def test_decay_liquidation_restores_force_close_proceeds(monkeypatch):
     state.last_known_prices = {"LIVE": 100.0, "GHOST": 50.0}
     state.absent_periods = {"GHOST": cfg.MAX_ABSENT_PERIODS - 1}
 
-    original_absent_price = absent_symbol_effective_price
-
-    monkeypatch.setattr(
-        "momentum_engine.absent_symbol_effective_price",
-        lambda last_known_price, absent_periods, max_absent_periods: (
-            25.0 if absent_periods >= max_absent_periods else
-            original_absent_price(last_known_price, absent_periods, max_absent_periods)
-        ),
-    )
+    assert absent_symbol_effective_price(
+        50.0,
+        cfg.MAX_ABSENT_PERIODS,
+        cfg.MAX_ABSENT_PERIODS,
+    ) == 0.0
 
     total_slip = execute_rebalance(
         state=state,
@@ -1280,7 +1276,7 @@ def test_decay_liquidation_restores_force_close_proceeds(monkeypatch):
         scenario_losses=np.array([[1.0], [1.0], [1.0]]),
     )
 
-    expected_gross = 100.0 + (2 * 25.0)
+    expected_gross = 100.0 + (2 * 50.0)
     expected_cash = expected_gross - total_slip
     assert state.shares == {}
     assert state.cash == pytest.approx(expected_cash)
