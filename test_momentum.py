@@ -119,8 +119,9 @@ def test_generate_signals_continuity_decay_scales_with_prev_weight():
 
     raw_scores, _, _, _ = generate_signals(log_rets, adv, cfg)
     finite = raw_scores[np.isfinite(raw_scores)]
-    dispersion = max(np.nanstd(finite), cfg.CONTINUITY_DISPERSION_FLOOR)
-    base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR) * dispersion
+    std_cross = max(float(np.nanstd(finite)) if finite.size else 0.0, 1e-8)
+    dispersion_scale = min(1.0, std_cross / max(cfg.CONTINUITY_DISPERSION_FLOOR, 1e-12))
+    base_bonus = min(cfg.CONTINUITY_BONUS, cfg.CONTINUITY_MAX_SCALAR) * dispersion_scale
 
     assert small_bonus == pytest.approx(base_bonus * 0.25, abs=1e-9)
     assert large_bonus == pytest.approx(base_bonus * 1.0, abs=1e-9)

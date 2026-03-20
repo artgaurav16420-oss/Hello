@@ -936,31 +936,16 @@ def execute_rebalance(
             )
 
     # Phase 2: force-close positions — proceeds added to pv_exec (see docstring)
-    #
-    # FIX-PHOENIX: force-close must use absent_symbol_effective_price, NOT raw
-    # last_known_prices.  At MAX_ABSENT_PERIODS the haircut multiplier is 0.0,
-    # so close_price_effective == 0.0 — the position is written off entirely.
-    # Using raw last_known_prices here previously injected phantom cash equal to
-    # the full pre-halt notional, erasing the bankruptcy loss that had been
-    # accruing via the haircut in record_eod and Phase 1 of prior rebalances.
+    # Execute the terminal close at the symbol's last known price so cash and
+    # trade logs reflect the actual forced liquidation level at the absence
+    # threshold, while earlier mark-to-market bars continue to use the haircut.
     for sym in symbols_to_force_close:
-        # count was already incremented to MAX_ABSENT_PERIODS above
-        absent_count = state.absent_periods.get(sym, cfg.MAX_ABSENT_PERIODS)
-        close_price_effective = absent_symbol_effective_price(
-            state.last_known_prices.get(sym, 0.0),
-            absent_count,
-            cfg.MAX_ABSENT_PERIODS,
-        )
-        close_price = close_price_effective  # 0.0 at MAX_ABSENT_PERIODS
+        close_price = float(state.last_known_prices.get(sym, 0.0))
         n_shares    = state.shares.get(sym, 0)
         if n_shares > 0:
             if close_price > 0:
-                # Slippage is zero when close_price == 0 (fully written off),
-                # so this branch only runs for partial haircut force-closes.
                 slip            = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
                 total_slippage += slip
-                # Add proceeds to pv_exec; not subtracted via actual_notional
-                # because force-closed positions are not in new_shares.
                 pv_exec        += n_shares * close_price
                 if trade_log is not None:
                     tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
@@ -1100,36 +1085,34 @@ def compute_decay_targets(
     sel_idx:        List[int],
     active_symbols: List[str],
     cfg:            UltimateConfig,
-    current_prices: np.ndarray,
-    pv:             float,
+    current_prices: Optional[np.ndarray] = None,
+    pv:             Optional[float] = None,
 ) -> np.ndarray:
     """Compute decayed target weights for the gate-passing symbols.
 
-    FIX-DECAY-STALEW: use true mark-to-market weights derived from current
-    prices and portfolio value rather than stale state.weights (which reflect
-    the weight AT LAST EXECUTION, not today's MTM).  If a position rallied
-    from 10% to 35% of the portfolio since the last rebalance, state.weights
-    still says 10%.  Using it produces a decay target of 0.085 (8.5%) which
-    would force-sell 75% of the position in one step — the exact opposite of
-    the gentle 15% haircut the decay mechanism is designed to apply.
-
-    Parameters current_prices and pv are mandatory: MTM weights are computed
-    from state.shares * current_prices / pv.  Both call sites (daily_workflow
-    and backtest_engine) have these values available immediately before calling
-    this function, so no backward-compatibility shim is needed.
+    Prefer true mark-to-market weights derived from current prices and
+    portfolio value rather than stale state.weights. For backward-compatible
+    test and utility call sites that omit current_prices / pv, fall back to
+    the persisted state.weights snapshot.
     """
     targets = np.zeros(len(active_symbols))
     sel_set = set(sel_idx)
+    use_mtm = current_prices is not None and pv is not None
 
     for i, sym in enumerate(active_symbols):
-        if i in sel_set:
+        if i not in sel_set:
+            continue
+
+        if use_mtm:
             shares = state.shares.get(sym, 0)
-            price  = max(float(current_prices[i]), 1e-6)
-            mtm_w  = (shares * price) / max(pv, 1.0)
-            w_pre      = min(mtm_w, cfg.MAX_SINGLE_NAME_WEIGHT)
-            targets[i] = w_pre * cfg.DECAY_FACTOR
+            price = max(float(current_prices[i]), 1e-6)
+            pre_decay_weight = (shares * price) / max(float(pv), 1.0)
         else:
-            targets[i] = 0.0
+            pre_decay_weight = float(state.weights.get(sym, 0.0))
+
+        pre_decay_weight = min(max(pre_decay_weight, 0.0), cfg.MAX_SINGLE_NAME_WEIGHT)
+        targets[i] = pre_decay_weight * cfg.DECAY_FACTOR
+
     return targets
 
 
