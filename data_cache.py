@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
-_MAX_RATE_LIMIT_RETRIES = 10
+_MAX_RATE_LIMIT_RETRIES = 5
 
 
 def _load_local_env_file(env_path: Path = Path('.env')) -> None:
@@ -218,7 +218,7 @@ class GrowwProvider(DataProvider):
 
                 # FIX-MB-DC-02: abort after too many consecutive 429s to prevent
                 # infinite blocking (e.g. revoked token, suspended account).
-                if consecutive_rate_limits > _MAX_RATE_LIMIT_RETRIES:
+                if consecutive_rate_limits >= _MAX_RATE_LIMIT_RETRIES:
                     logger.warning(
                         "[Groww] %s: hit rate-limit %d times consecutively "
                         "(max %d). Aborting fetch — token may be revoked or "
@@ -936,7 +936,7 @@ def load_or_fetch(
         _save_manifest(manifest)
 
     padded_start_ts = pd.Timestamp(padded_start)
-    for t, df in market_data.items():
+    for t, df in list(market_data.items()):
         if df.empty:
             continue
         effective_start = min(df.index[0], padded_start_ts)

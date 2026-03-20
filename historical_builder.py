@@ -755,7 +755,15 @@ def build_historical_csv(universe_type: str, output_path: str) -> Path:
         "Run build_historical_fallback.py first (or historical_builder.main())."
     )
 
-    # Legacy network-first fallback kept below for manual use.
+def _build_historical_csv_network_fallback(universe_type: str, output_path: str) -> Path:
+    """
+    Legacy network-first PIT builder kept for manual/offline-recovery workflows.
+
+    This path is intentionally not called by build_historical_csv(), which now
+    enforces the deterministic local-archive-first pipeline used by production
+    and tests.
+    """
+    output = Path(output_path)
 
     # ── Primary: Wayback Machine ──────────────────────────────────────────────
     print(f"\n[HistoricalBuilder] Building PIT CSV for {universe_type} via Wayback Machine...")
