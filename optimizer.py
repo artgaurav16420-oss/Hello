@@ -1,12 +1,16 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.52
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.53
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses expanding-window time-series cross-validation for parameter selection,
 followed by a true holdout Out-of-Sample (OOS) validation period.
 
-CHANGES vs v11_51:
-- OBJECTIVE_VERSION = fitness_v11_52: clean study, no old trial contamination.
+CHANGES vs v11_52:
+- OBJECTIVE_VERSION = fitness_v11_53: resets the study for the revised
+  walk-forward/pruning regime.
+- TRAIN_START moved 2018-01-01 -> 2019-01-01: drops the fragile 2019 OOS fold
+  that only had the minimum 365-day IS history and gives 2020+ folds a fuller
+  training window.
 - IS_DD_GATE kept at 40%: lowering to 35% caused every 2020 COVID fold to
   score -2.0, making positive aggregate scores mathematically impossible.
   IS_DD_GATE and OOS_MAX_DD_CAP serve different purposes and need not match.
@@ -16,8 +20,12 @@ CHANGES vs v11_51:
   continuous pressure across moderate-drawdown parameter sets.
 - Gate-hit fold scores INCLUDED in aggregate: previously one bad fold was
   silently excluded via `continue`, inflating aggregate for fragile strategies.
-  Now the bad score enters the average. The >1 gate-hit prune still eliminates
-  strategies failing in multiple years.
+  Now the bad score enters the average. Structural gate hits are allowed in up
+  to two folds before pruning so the unavoidable 2020 COVID regime does not
+  prevent trial completion.
+- Floor-clamped scores no longer consume the structural gate-hit budget. Only
+  DD-gate/anomaly diagnostics count toward pruning; harsh negative scores still
+  enter the aggregate and teach TPE to avoid those regions.
 - forced_cash_penalty: penalises forced CVaR liquidations. Reads forced_to_cash
   column from rebal_log (backtest_engine v11.52). Falls back to inference.
 - OOS_MAX_DD_CAP raised 35% -> 38%: 2023-2025 is harder than training.
@@ -93,7 +101,7 @@ logging.getLogger("data_cache").setLevel(logging.ERROR)
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
-TRAIN_START = "2018-01-01"
+TRAIN_START = "2019-01-01"
 TRAIN_END   = "2022-12-31"
 TEST_START  = "2023-01-01"
 TEST_END    = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
@@ -128,8 +136,8 @@ N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
-# Bumped to v11_52: guarantees a clean study, no contamination from v11_51 trials.
-OBJECTIVE_VERSION  = "fitness_v11_52"
+# Bumped to v11_53: guarantees a clean study after the revised fold/prune logic.
+OBJECTIVE_VERSION  = "fitness_v11_53"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 MAX_REASONABLE_CAGR_PCT       = 300.0
@@ -494,18 +502,22 @@ class MomentumObjective:
             if not pd.notna(score):
                 raise optuna.TrialPruned()
 
-            # Gate-hit fold score is appended BEFORE the >1 prune check.
+            # Structural gate-hit fold scores are appended BEFORE the >2 prune
+            # check. This lets bad-but-non-structural floor-clamped scores stay
+            # in the aggregate without burning the gate-hit budget, while still
+            # pruning strategies that trip genuine DD/anomaly gates in 3+ folds.
             # The bad score enters the aggregate — fragile strategies that fail
             # in one year receive a lower aggregate than strategies that pass
-            # all folds. The >1 prune eliminates strategies failing in 2+ years.
-            is_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit") or score <= -2.0
+            # all folds. The >2 prune eliminates strategies failing structurally
+            # in 3+ years.
+            is_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit")
             if is_gate_hit:
                 n_gate_hits += 1
                 scores.append(float(score))   # include — do NOT skip
-                if n_gate_hits > 1:
+                if n_gate_hits > 2:
                     raise optuna.TrialPruned()
                 logger.debug(
-                    "[Trial %s | %d] Single gate-hit fold included in aggregate "
+                    "[Trial %s | %d] Structural gate-hit fold included in aggregate "
                     "(dd_gate=%s anomaly=%s score=%.4f).",
                     trial_id, oos_year,
                     diag.get("dd_gate_hit"), diag.get("anomaly_hit"), score,

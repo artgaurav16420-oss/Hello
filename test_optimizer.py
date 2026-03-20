@@ -333,6 +333,17 @@ def test_iter_wfo_slices_keeps_first_full_calendar_year():
     ]
 
 
+def test_default_train_start_drops_2019_oos_fold():
+    slices = list(optimizer._iter_wfo_slices(optimizer.TRAIN_START, optimizer.TRAIN_END))
+
+    assert optimizer.TRAIN_START == "2019-01-01"
+    assert [oos_start for _, _, oos_start, _ in slices] == [
+        "2020-01-01",
+        "2021-01-01",
+        "2022-01-01",
+    ]
+
+
 def test_normalize_universe_type_falls_back_to_nifty500():
     assert optimizer._normalize_universe_type("  typo  ") == "nifty500"
 
@@ -968,6 +979,110 @@ def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch):
             "RISK_AVERSION": 5.0,
             "CVAR_DAILY_LIMIT": 0.04,
             "CVAR_LOOKBACK": 150,
+        }
+    )
+
+    with pytest.raises(optuna.TrialPruned):
+        objective(trial)
+
+
+def _objective_diag(*, score, dd_gate_hit=False, anomaly_hit=False):
+    return (
+        score,
+        {
+            "cagr": 0.0,
+            "max_dd": 0.0,
+            "turnover": 0.0,
+            "avg_exposure": 1.0,
+            "avg_positions": 10.0,
+            "avg_cvar_pct": 1.0,
+            "risk_penalty": 0.0,
+            "exposure_penalty": 0.0,
+            "dd_penalty": 0.0,
+            "forced_cash_penalty": 0.0,
+            "raw_score": score,
+            "score": score,
+            "dd_gate_hit": dd_gate_hit,
+            "anomaly_hit": anomaly_hit,
+            "ceiling_hit": False,
+        },
+    )
+
+
+def test_objective_does_not_count_floor_score_as_gate_hit(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 0.0, "max_dd": 0.0, "turnover": 0.0}
+        rebal_log = pd.DataFrame()
+
+    monkeypatch.setattr(
+        optimizer,
+        "_iter_wfo_slices",
+        lambda *_args: [
+            ("2019-01-01", "2019-12-31", "2020-01-01", "2020-12-31"),
+            ("2019-01-01", "2020-12-31", "2021-01-01", "2021-12-31"),
+            ("2019-01-01", "2021-12-31", "2022-01-01", "2022-12-31"),
+        ],
+    )
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    fold_diags = iter(
+        [
+            _objective_diag(score=-2.0),
+            _objective_diag(score=-2.0, dd_gate_hit=True),
+            _objective_diag(score=0.5),
+        ]
+    )
+    monkeypatch.setattr(optimizer, "_fitness_from_metrics", lambda *_args: next(fold_diags))
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 65,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 12.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+    )
+
+    score = objective(trial)
+
+    assert score == pytest.approx((-2.0 - 2.0 + 0.5) / 3)
+
+
+def test_objective_prunes_after_third_structural_gate_hit(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 0.0, "max_dd": 0.0, "turnover": 0.0}
+        rebal_log = pd.DataFrame()
+
+    monkeypatch.setattr(
+        optimizer,
+        "_iter_wfo_slices",
+        lambda *_args: [
+            ("2019-01-01", "2019-12-31", "2020-01-01", "2020-12-31"),
+            ("2019-01-01", "2020-12-31", "2021-01-01", "2021-12-31"),
+            ("2019-01-01", "2021-12-31", "2022-01-01", "2022-12-31"),
+        ],
+    )
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    fold_diags = iter(
+        [
+            _objective_diag(score=-2.0, dd_gate_hit=True),
+            _objective_diag(score=-2.0, anomaly_hit=True),
+            _objective_diag(score=-1.5, dd_gate_hit=True),
+        ]
+    )
+    monkeypatch.setattr(optimizer, "_fitness_from_metrics", lambda *_args: next(fold_diags))
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = optuna.trial.FixedTrial(
+        {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 65,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 12.0,
+            "CVAR_DAILY_LIMIT": 0.04,
         }
     )
 
