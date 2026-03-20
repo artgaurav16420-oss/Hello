@@ -18,8 +18,9 @@ BUG FIXES (murder board):
   the same series used for close (valuation_series) rather than always using
   close_adj. When AUTO_ADJUST_PRICES=False, signals and execution prices are
   now consistent.
-- FIX-MB-BE-03: _compute_metrics CAGR uses len(eq) not len(eq)-1 for the
-  periods count to eliminate the systematic off-by-one overstatement.
+- FIX-MB-BE-03: _compute_metrics CAGR now uses elapsed calendar time instead
+  of a bar-count proxy, eliminating the prior off-by-one overstatement and
+  making annualisation consistent across irregular trading calendars.
 - FIX-MB-C-02: run_backtest now slices precomputed_matrices to [warmup_start,
   end_date] on the time axis before handing them to BacktestEngine.run.
   Previously any caller that pre-built a full TRAIN_START→TEST_END matrix
@@ -441,6 +442,7 @@ class BacktestEngine:
 
             execute_rebalance(
                 self.state, target_weights, exec_prices, active_symbols, cfg,
+                adv_shares     = adv_vector,
                 date_context   = date,
                 trade_log      = self.trades,
                 apply_decay    = apply_decay and not _exhaust_decay,
@@ -612,15 +614,15 @@ def _execution_prices(
 ) -> np.ndarray:
     exec_px = close_prices.copy()
 
+    if open_px is not None and date in open_px.index:
+        opens = open_px.loc[date].reindex(symbols).values.astype(float)
+        exec_px = np.where(np.isfinite(opens) & (opens > 0), opens, exec_px)
+
     if high_px is not None and low_px is not None and date in high_px.index and date in low_px.index:
         highs = high_px.loc[date].reindex(symbols).values.astype(float)
         lows  = low_px.loc[date].reindex(symbols).values.astype(float)
         vwap  = (highs + lows + close_prices) / 3.0
         exec_px = np.where(np.isfinite(vwap) & (vwap > 0), vwap, exec_px)
-
-    if open_px is not None and date in open_px.index:
-        opens = open_px.loc[date].reindex(symbols).values.astype(float)
-        exec_px = np.where(np.isfinite(opens) & (opens > 0), opens, exec_px)
 
     return exec_px
 
@@ -818,7 +820,11 @@ def run_backtest(
                 row = market_data.get(sym)
             if row is not None and not row.empty and "Volume" in row.columns:
                 import numpy as _np
-                vol_dict[sym] = row["Volume"].replace(0, _np.nan).notna().cumsum()
+                valid_volume = row["Volume"].replace(0, _np.nan).notna().astype(float)
+                vol_dict[sym] = valid_volume.rolling(
+                    history_gate,
+                    min_periods=history_gate,
+                ).sum()
 
         if vol_dict:
             cum_vol_df = pd.DataFrame(vol_dict).sort_index()

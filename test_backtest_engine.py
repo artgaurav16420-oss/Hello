@@ -50,6 +50,46 @@ def test_rebalance_values_portfolio_from_previous_close(monkeypatch):
     assert captured["pv"] == 200.0
 
 
+def test_run_rebalance_passes_adv_vector_to_execute_rebalance(monkeypatch):
+    cfg = UltimateConfig(CVAR_MIN_HISTORY=9999)
+    engine = InstitutionalRiskEngine(cfg)
+    bt = be.BacktestEngine(engine, initial_cash=100.0)
+
+    dates = pd.DatetimeIndex([pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
+    close = pd.DataFrame({"AAA": [10.0, 11.0]}, index=dates)
+    volume = pd.DataFrame({"AAA": [1_000_000, 1_000_000]}, index=dates)
+    returns = close.pct_change(fill_method=None).fillna(0.0)
+    captured = {}
+
+    monkeypatch.setattr(be, "generate_signals", lambda *_args, **_kwargs: (np.array([0.01]), np.array([0.01]), [0], {}))
+    monkeypatch.setattr(be, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(be, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(be, "_build_adv_vector", lambda *_args, **_kwargs: np.array([12345.0]))
+    monkeypatch.setattr(engine, "optimize", lambda **_kwargs: np.array([1.0]))
+
+    def _fake_execute_rebalance(*_args, **kwargs):
+        captured["adv_shares"] = kwargs.get("adv_shares")
+        return 0.0
+
+    monkeypatch.setattr(be, "execute_rebalance", _fake_execute_rebalance)
+
+    bt._run_rebalance(
+        pd.Timestamp("2020-01-02"),
+        close,
+        volume,
+        returns,
+        ["AAA"],
+        close.loc[pd.Timestamp("2020-01-02")].values.astype(float),
+        idx_df=None,
+        sector_map=None,
+        open_px=close,
+        high_px=close,
+        low_px=close,
+    )
+
+    assert np.array_equal(captured["adv_shares"], np.array([12345.0]))
+
+
 def test_run_skips_corporate_actions_when_auto_adjust_prices_enabled(monkeypatch):
     cfg = UltimateConfig(AUTO_ADJUST_PRICES=True, DIVIDEND_SWEEP=True, CVAR_MIN_HISTORY=9999)
     engine = InstitutionalRiskEngine(cfg)
@@ -124,6 +164,63 @@ def test_run_backtest_uses_adjusted_close_for_valuation_when_auto_adjust_enabled
         )
 
     assert list(captured["close"]["AAA"]) == [100.0, 100.0]
+
+
+def test_execution_prices_prefers_vwap_when_intraday_range_available():
+    date = pd.Timestamp("2020-01-02")
+    symbols = ["AAA"]
+    close_prices = np.array([12.0])
+    open_px = pd.DataFrame({"AAA": [10.0]}, index=[date])
+    high_px = pd.DataFrame({"AAA": [15.0]}, index=[date])
+    low_px = pd.DataFrame({"AAA": [9.0]}, index=[date])
+
+    exec_px = be._execution_prices(symbols, date, close_prices, open_px, high_px, low_px)
+
+    assert exec_px[0] == 12.0
+
+
+def test_run_backtest_custom_universe_requires_recent_contiguous_volume():
+    cfg = UltimateConfig(HISTORY_GATE=3, REBALANCE_FREQ="D")
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2020-01-01"),
+        pd.Timestamp("2020-01-02"),
+        pd.Timestamp("2020-01-03"),
+        pd.Timestamp("2020-01-10"),
+        pd.Timestamp("2020-01-13"),
+    ])
+    market_data = {
+        "AAA.NS": pd.DataFrame(
+            {
+                "Close": [10.0, 10.0, 10.0, 10.0, 10.0],
+                "Adj Close": [10.0, 10.0, 10.0, 10.0, 10.0],
+                "Open": [10.0, 10.0, 10.0, 10.0, 10.0],
+                "High": [10.0, 10.0, 10.0, 10.0, 10.0],
+                "Low": [10.0, 10.0, 10.0, 10.0, 10.0],
+                "Volume": [100.0, 100.0, 100.0, 0.0, 100.0],
+                "Dividends": [0.0] * 5,
+                "Stock Splits": [0.0] * 5,
+            },
+            index=idx,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [1.0] * 5}, index=idx),
+    }
+    captured = {}
+
+    def _fake_run(self, close, volume, returns, rebalance_dates, start_date, **kwargs):
+        captured["universe_by_rebalance_date"] = kwargs["universe_by_rebalance_date"]
+        return pd.DataFrame({"equity": pd.Series(dtype=float)})
+
+    import unittest.mock as mock
+    with mock.patch.object(be.BacktestEngine, "run", _fake_run):
+        be.run_backtest(
+            market_data=market_data,
+            start_date="2020-01-10",
+            end_date="2020-01-13",
+            cfg=cfg,
+            universe=["AAA"],
+        )
+
+    assert captured["universe_by_rebalance_date"][pd.Timestamp("2020-01-13")] == set()
 
 
 def test_backtest_run_handles_empty_close_dataframe():
