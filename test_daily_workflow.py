@@ -9,6 +9,7 @@ import pytest
 
 import daily_workflow as dw
 from momentum_engine import PortfolioState, UltimateConfig, execute_rebalance
+from log_config import current_correlation_id
 
 
 def test_prompt_menu_choice_retries_until_valid(monkeypatch):
@@ -71,6 +72,53 @@ def test_run_scan_returns_early_when_universe_has_no_data(monkeypatch):
     assert returned_state is state
     assert "^NSEI" in market_data
     assert captured["cfg"] is cfg
+
+
+def test_run_scan_keeps_context_active_and_flushes_dead_letter_without_trades(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "ABC.NS": pd.DataFrame({"Close": [float("nan")] * 6, "Dividends": [0.0] * 6}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100.0] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0] * 6}, index=idx),
+    }
+    captured = {"engine_corr": None, "flush_corr": None, "flush_calls": 0}
+
+    class _FakeDeadLetterTracker:
+        def __init__(self, threshold=10):
+            self.entries = []
+
+        def add(self, symbol, reason, detail=""):
+            self.entries.append((symbol, reason, detail))
+
+        def flush(self, logger_name="dead_letter"):
+            captured["flush_calls"] += 1
+            captured["flush_corr"] = current_correlation_id()
+
+    class _Engine:
+        def __init__(self, _cfg):
+            captured["engine_corr"] = current_correlation_id()
+
+    monkeypatch.setattr(dw, "DeadLetterTracker", _FakeDeadLetterTracker)
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 99.0},
+        last_rebalance_date=datetime.today().strftime("%Y-%m-%d"),
+    )
+    cfg = UltimateConfig(REBALANCE_FREQ="W-FRI")
+
+    out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
+
+    assert out_state is state
+    assert captured["engine_corr"] is not None
+    assert captured["flush_calls"] == 1
+    assert captured["flush_corr"] == captured["engine_corr"]
 
 
 
@@ -190,6 +238,7 @@ def test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event():
     assert adjusted == ["ABC"]
     assert state.shares["ABC"] == 20
     assert state.entry_prices["ABC"] == 500.0
+    assert state.cash == pytest.approx(0.0)
 
 
 def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
@@ -326,3 +375,28 @@ def test_detect_and_apply_splits_handles_tz_aware_split_index():
 
     assert adjusted == ["ABC"]
     assert state.shares["ABC"] == 20
+
+
+def test_detect_and_apply_splits_fractional_cash_applies_one_way_slippage():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=False, ROUND_TRIP_SLIPPAGE_BPS=10.0)
+    state = PortfolioState(
+        shares={"ABC": 3},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 100.0},
+        cash=0.0,
+    )
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [200.0],
+                "Dividends": [0.0],
+                "Stock Splits": [0.5],
+            }
+        )
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == ["ABC"]
+    assert state.shares["ABC"] == 1
+    assert state.cash == pytest.approx(99.95)

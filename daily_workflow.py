@@ -469,7 +469,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         new_entry = old_entry / split_ratio
 
         fractional_new_shares = max(0.0, theoretical_new_shares - new_shares)
-        fractional_value = fractional_new_shares * current_price
+        one_way_slip = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000.0
+        fractional_value = fractional_new_shares * current_price * max(0.0, 1.0 - one_way_slip)
         state.cash = round(state.cash + fractional_value, 10)
 
         logger.warning(
@@ -673,461 +674,466 @@ def _run_scan(
     # accumulated dead-letter symbols.  The `with` statement guarantees __exit__
     # is called on every exit path, including exceptions.
     _dead_letter = DeadLetterTracker(threshold=10)
-    with ScanContext(label=label):
-        cfg    = cfg_override if cfg_override else load_optimized_config()
-    engine = InstitutionalRiskEngine(cfg)
-    # FIX-MB2-EQUITYCAP: Only apply cfg defaults when the state field still holds
-    # its dataclass default (250 for equity_hist_cap, 12 for max_absent_periods).
-    # A user who persisted a custom value (e.g. equity_hist_cap=1000) must not have
-    # it silently reset to cfg.EQUITY_HIST_CAP=500 on every scan call.
-    if state.equity_hist_cap == 250:
-        state.equity_hist_cap = cfg.EQUITY_HIST_CAP
-    if state.max_absent_periods == 12:
-        state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
-    today = pd.Timestamp(datetime.today().date())
-    next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
-    rebalance_allowed = next_due is None or today >= next_due
-    if not rebalance_allowed:
-        logger.info(
-            "[Scan] Cadence gate active: last rebalance %s, next due %s (%s). Scan will mark-to-market only.",
-            state.last_rebalance_date,
-            next_due.strftime("%Y-%m-%d"),
-            cfg.REBALANCE_FREQ,
-        )
+    def _scan_body(cfg: UltimateConfig) -> tuple:
+        global _CONSECUTIVE_EMPTY_SCANS
+        engine = InstitutionalRiskEngine(cfg)
+        # FIX-MB2-EQUITYCAP: Only apply cfg defaults when the state field still holds
+        # its dataclass default (250 for equity_hist_cap, 12 for max_absent_periods).
+        # A user who persisted a custom value (e.g. equity_hist_cap=1000) must not have
+        # it silently reset to cfg.EQUITY_HIST_CAP=500 on every scan call.
+        if state.equity_hist_cap == 250:
+            state.equity_hist_cap = cfg.EQUITY_HIST_CAP
+        if state.max_absent_periods == 12:
+            state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
-    end_date   = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
-
-    held_syms  = {to_ns(s) for s in state.shares.keys()}
-    all_syms   = list({to_ns(t) for t in universe} | held_syms | {"^NSEI", "^CRSLDX"})
-    _print_stage_status(
-        "Download",
-        0.35,
-        f"Fetching/caching OHLCV data ({start_date} → {end_date}) for {len(all_syms):,} instruments...",
-    )
-    market_data = load_or_fetch(all_syms, start_date, end_date, cfg=cfg)
-    _print_stage_status("Download", 1.0, f"Data ready. Starting iteration and signal analysis for {label}.")
-    _print_stage_status("Analysis", 0.10, "Normalizing market snapshots and benchmark regime inputs...")
-
-    idx_df = market_data.get("^CRSLDX")
-    if idx_df is None or idx_df.empty:
-        idx_df = market_data.get("^NSEI")
-
-    idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
-
-    split_syms = detect_and_apply_splits(state, market_data, cfg)
-    if split_syms:
-        logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
-
-    use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
-
-    close_d: Dict[str, pd.Series] = {}
-    for sym in universe:
-        ns = to_ns(sym)
-        if ns in market_data:
-            col = "Adj Close" if use_adj and "Adj Close" in market_data[ns].columns else "Close"
-            close_d[to_bare(ns)] = market_data[ns][col].ffill()
-
-    if not close_d:
-        # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
-        _CONSECUTIVE_EMPTY_SCANS += 1
-        _save_circuit_breaker_count(_CONSECUTIVE_EMPTY_SCANS)  # persist across restarts
-        logger.warning(
-            "[Scan] No data available for any universe symbol "
-            "(consecutive empty scans: %d / halt threshold: %d).",
-            _CONSECUTIVE_EMPTY_SCANS, _EMPTY_UNIVERSE_HALT_AFTER,
-        )
-        if _CONSECUTIVE_EMPTY_SCANS >= _EMPTY_UNIVERSE_HALT_AFTER:
-            raise RuntimeError(
-                f"[Scan] CIRCUIT BREAKER TRIPPED: {_CONSECUTIVE_EMPTY_SCANS} consecutive "
-                f"scans returned an empty universe (threshold={_EMPTY_UNIVERSE_HALT_AFTER}). "
-                "Possible data provider outage or misconfigured universe.  "
-                "Halting to prevent unintended full-cash drift.  "
-                "Set EMPTY_UNIVERSE_HALT_AFTER env var to adjust threshold."
-            )
-        for held_sym in list(state.shares.keys()):
-            if held_sym not in close_d:
-                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
-        # PROD-FIX-5: flush dead-letter on early exit; ScanContext exits automatically
-        _dead_letter.flush()
-        return state, market_data
-
-    # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
-    _CONSECUTIVE_EMPTY_SCANS = 0
-    _save_circuit_breaker_count(0)  # persist reset so restarts start clean
-
-    _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
-
-    close    = pd.DataFrame(close_d).sort_index()
-    active   = list(close.columns)
-    prices   = close.iloc[-1].values.astype(float)
-    active_idx = {sym: i for i, sym in enumerate(active)}
-
-    # FIX-NEW-DW-02: replace NaN or non-positive prices with last_known_prices
-    # before any downstream computation (compute_book_cvar, execute_rebalance,
-    # record_eod).  compute_book_cvar does not guard against NaN in its prices
-    # argument — a NaN propagates into notional → pv → weights → CVaR, producing
-    # an incorrect (often zero) CVaR that suppresses the risk gate.
-    for _sym, _i in active_idx.items():
-        if not np.isfinite(prices[_i]) or prices[_i] <= 0:
-            _lkp = state.last_known_prices.get(_sym, 0.0)
-            prices[_i] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
-            # PROD-FIX-5: accumulate stale-price symbols for dead-letter report
-            _dead_letter.add(
-                _sym,
-                reason="stale_price" if (np.isfinite(_lkp) and _lkp > 0) else "no_price",
-                detail=f"last_known={_lkp:.4f}" if np.isfinite(_lkp) else "no_last_known",
+        today = pd.Timestamp(datetime.today().date())
+        next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
+        rebalance_allowed = next_due is None or today >= next_due
+        if not rebalance_allowed:
+            logger.info(
+                "[Scan] Cadence gate active: last rebalance %s, next due %s (%s). Scan will mark-to-market only.",
+                state.last_rebalance_date,
+                next_due.strftime("%Y-%m-%d"),
+                cfg.REBALANCE_FREQ,
             )
 
-    mtm_notional = 0.0
-    for sym in state.shares:
-        if sym in active_idx:
-            px = prices[active_idx[sym]]
-            if np.isnan(px) or px <= 0:
-                px = float(state.last_known_prices.get(sym, 0.0))
-            mtm_notional += state.shares.get(sym, 0) * px
-    for _absent_sym in state.shares:
-        if _absent_sym not in active_idx:
-            _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
-            if _fallback_px > 0:
-                _absent_n = int(state.absent_periods.get(_absent_sym, 0))
-                _mtm_px = absent_symbol_effective_price(_fallback_px, _absent_n, cfg.MAX_ABSENT_PERIODS)
-                mtm_notional += state.shares[_absent_sym] * _mtm_px
-                logger.warning(
-                    "[Scan] Held symbol '%s' absent from current market data "
-                    "(possibly delisted/suspended). Absent %d/%d periods; "
-                    "last-known ₹%.2f haircut to ₹%.2f for PV. "
-                    "Force-close triggers at %d consecutive absent periods.",
-                    _absent_sym,
-                    _absent_n,
-                    cfg.MAX_ABSENT_PERIODS,
-                    _fallback_px,
-                    _mtm_px,
-                    cfg.MAX_ABSENT_PERIODS,
+        end_date   = datetime.today().strftime("%Y-%m-%d")
+        start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+
+        held_syms  = {to_ns(s) for s in state.shares.keys()}
+        all_syms   = list({to_ns(t) for t in universe} | held_syms | {"^NSEI", "^CRSLDX"})
+        _print_stage_status(
+            "Download",
+            0.35,
+            f"Fetching/caching OHLCV data ({start_date} → {end_date}) for {len(all_syms):,} instruments...",
+        )
+        market_data = load_or_fetch(all_syms, start_date, end_date, cfg=cfg)
+        _print_stage_status("Download", 1.0, f"Data ready. Starting iteration and signal analysis for {label}.")
+        _print_stage_status("Analysis", 0.10, "Normalizing market snapshots and benchmark regime inputs...")
+
+        idx_df = market_data.get("^CRSLDX")
+        if idx_df is None or idx_df.empty:
+            idx_df = market_data.get("^NSEI")
+
+        idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
+
+        split_syms = detect_and_apply_splits(state, market_data, cfg)
+        if split_syms:
+            logger.warning("[Scan] Applied split adjustments for: %s", split_syms)
+
+        use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
+
+        close_d: Dict[str, pd.Series] = {}
+        for sym in universe:
+            ns = to_ns(sym)
+            if ns in market_data:
+                col = "Adj Close" if use_adj and "Adj Close" in market_data[ns].columns else "Close"
+                close_d[to_bare(ns)] = market_data[ns][col].ffill()
+
+        if not close_d:
+            # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
+            _CONSECUTIVE_EMPTY_SCANS += 1
+            _save_circuit_breaker_count(_CONSECUTIVE_EMPTY_SCANS)  # persist across restarts
+            logger.warning(
+                "[Scan] No data available for any universe symbol "
+                "(consecutive empty scans: %d / halt threshold: %d).",
+                _CONSECUTIVE_EMPTY_SCANS, _EMPTY_UNIVERSE_HALT_AFTER,
+            )
+            if _CONSECUTIVE_EMPTY_SCANS >= _EMPTY_UNIVERSE_HALT_AFTER:
+                raise RuntimeError(
+                    f"[Scan] CIRCUIT BREAKER TRIPPED: {_CONSECUTIVE_EMPTY_SCANS} consecutive "
+                    f"scans returned an empty universe (threshold={_EMPTY_UNIVERSE_HALT_AFTER}). "
+                    "Possible data provider outage or misconfigured universe.  "
+                    "Halting to prevent unintended full-cash drift.  "
+                    "Set EMPTY_UNIVERSE_HALT_AFTER env var to adjust threshold."
                 )
-    pv = mtm_notional + state.cash
-    initial_cash = state.cash
-    initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
-
-    close_hist    = close.iloc[:-1]
-    regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
-    log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
-    adv_arr       = compute_adv(market_data, active, cfg=cfg)
-    prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
-    _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
-
-    state.update_exposure(
-        regime_score,
-        state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY),
-        cfg,
-        gross_exposure=initial_gross_exposure,
-    )
-
-    weights              = np.zeros(len(active))
-    apply_decay          = False
-    optimization_succeeded = False
-    total_slippage       = 0.0
-    trade_log: List[Trade] = []
-    sel_idx: List[int]   = []
-    _force_full_cash     = False
-    _soft_cvar_breach    = False
-    rebalanced_this_scan = False
-
-    # ── Book CVaR screen ──────────────────────────────────────────────────────
-    if state.shares:
-        book_cvar = compute_book_cvar(state, prices, active, log_rets, cfg)
-        hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
-        hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
-
-        if book_cvar > hard_breach_threshold:
-            logger.warning(
-                "[Scan] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) — "
-                "skipping optimization, forcing immediate liquidation.",
-                book_cvar * 100, hard_breach_threshold * 100, hard_multiplier,
-            )
-            state.consecutive_failures += 1
-            apply_decay      = True
-            _force_full_cash = True
-            activate_override_on_stress(state, cfg)
-        elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
-            _soft_cvar_breach = True
-            logger.info(
-                "[Scan] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) — "
-                "running optimizer with CVaR constraint active.",
-                book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100,
-            )
-
-    if rebalance_allowed and not _force_full_cash:
-        try:
-            raw_daily, adj_scores, sel_idx, gate_counts = generate_signals(
-                log_rets, adv_arr, cfg, prev_weights=state.weights
-            )
-            # FIX-MB-GATENAMES: Keys renamed to "history_failed" / "adv_failed" /
-            # "knife_failed". Log message now clearly states "removed by" each gate
-            # so operators can distinguish a data-provider outage (many history
-            # failures) from a volatility spike (many knife-gate removals).
-            logger.info(
-                "[Scan] Universe funnel: %d total → %d removed by history gate → "
-                "%d removed by ADV gate → %d removed by knife gate → %d selected.",
-                gate_counts.get("total", 0),
-                gate_counts.get("history_failed", 0),
-                gate_counts.get("adv_failed", 0),
-                gate_counts.get("knife_failed", 0),
-                gate_counts.get("selected", 0),
-            )
-            if not sel_idx:
-                raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
-            sel_syms      = [active[i] for i in sel_idx]
-            sector_map    = get_sector_map(sel_syms, cfg=cfg)
-            known_sectors  = sorted(s for s in set(sector_map.values()) if s != "Unknown")
-            sec_idx        = {s: i for i, s in enumerate(known_sectors)}
-            sector_labels  = np.array(
-                [sec_idx.get(sector_map[sym], -1) for sym in sel_syms], dtype=int
-            )
-
-            weights_sel = engine.optimize(
-                expected_returns    = raw_daily[sel_idx],
-                historical_returns  = log_rets[[active[i] for i in sel_idx]],
-                execution_date      = pd.Timestamp(end_date),
-                adv_shares          = adv_arr[sel_idx],
-                prices              = prices[sel_idx],
-                portfolio_value     = pv,
-                prev_w              = prev_w_arr[sel_idx],
-                exposure_multiplier = state.exposure_multiplier,
-                sector_labels       = sector_labels,
-            )
-            weights[sel_idx]               = weights_sel
-            state.consecutive_failures     = 0
-            state.decay_rounds             = 0
-            optimization_succeeded         = True
-
-        except (OptimizationError, ValueError) as exc:
-            is_data_error = isinstance(exc, ValueError) or (
-                isinstance(exc, OptimizationError) and exc.error_type == OptimizationErrorType.DATA
-            )
-            if not is_data_error:
+            for held_sym in list(state.shares.keys()):
+                if held_sym not in close_d:
+                    state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+            return state, market_data
+    
+        # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
+        _CONSECUTIVE_EMPTY_SCANS = 0
+        _save_circuit_breaker_count(0)  # persist reset so restarts start clean
+    
+        _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
+    
+        close    = pd.DataFrame(close_d).sort_index()
+        active   = list(close.columns)
+        prices   = close.iloc[-1].values.astype(float)
+        active_idx = {sym: i for i, sym in enumerate(active)}
+    
+        # FIX-NEW-DW-02: replace NaN or non-positive prices with last_known_prices
+        # before any downstream computation (compute_book_cvar, execute_rebalance,
+        # record_eod).  compute_book_cvar does not guard against NaN in its prices
+        # argument — a NaN propagates into notional → pv → weights → CVaR, producing
+        # an incorrect (often zero) CVaR that suppresses the risk gate.
+        for _sym, _i in active_idx.items():
+            if not np.isfinite(prices[_i]) or prices[_i] <= 0:
+                _lkp = state.last_known_prices.get(_sym, 0.0)
+                prices[_i] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
+                # PROD-FIX-5: accumulate stale-price symbols for dead-letter report
+                _dead_letter.add(
+                    _sym,
+                    reason="stale_price" if (np.isfinite(_lkp) and _lkp > 0) else "no_price",
+                    detail=f"last_known={_lkp:.4f}" if np.isfinite(_lkp) else "no_last_known",
+                )
+    
+        mtm_notional = 0.0
+        for sym in state.shares:
+            if sym in active_idx:
+                px = prices[active_idx[sym]]
+                if np.isnan(px) or px <= 0:
+                    px = float(state.last_known_prices.get(sym, 0.0))
+                mtm_notional += state.shares.get(sym, 0) * px
+        for _absent_sym in state.shares:
+            if _absent_sym not in active_idx:
+                _fallback_px = state.last_known_prices.get(_absent_sym, 0.0)
+                if _fallback_px > 0:
+                    _absent_n = int(state.absent_periods.get(_absent_sym, 0))
+                    _mtm_px = absent_symbol_effective_price(_fallback_px, _absent_n, cfg.MAX_ABSENT_PERIODS)
+                    mtm_notional += state.shares[_absent_sym] * _mtm_px
+                    logger.warning(
+                        "[Scan] Held symbol '%s' absent from current market data "
+                        "(possibly delisted/suspended). Absent %d/%d periods; "
+                        "last-known ₹%.2f haircut to ₹%.2f for PV. "
+                        "Force-close triggers at %d consecutive absent periods.",
+                        _absent_sym,
+                        _absent_n,
+                        cfg.MAX_ABSENT_PERIODS,
+                        _fallback_px,
+                        _mtm_px,
+                        cfg.MAX_ABSENT_PERIODS,
+                    )
+        pv = mtm_notional + state.cash
+        initial_cash = state.cash
+        initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
+    
+        close_hist    = close.iloc[:-1]
+        regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
+        log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
+        adv_arr       = compute_adv(market_data, active, cfg=cfg)
+        prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
+        _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
+    
+        state.update_exposure(
+            regime_score,
+            state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY),
+            cfg,
+            gross_exposure=initial_gross_exposure,
+        )
+    
+        weights              = np.zeros(len(active))
+        apply_decay          = False
+        optimization_succeeded = False
+        total_slippage       = 0.0
+        trade_log: List[Trade] = []
+        sel_idx: List[int]   = []
+        _force_full_cash     = False
+        _soft_cvar_breach    = False
+        rebalanced_this_scan = False
+    
+        # ── Book CVaR screen ──────────────────────────────────────────────────────
+        if state.shares:
+            book_cvar = compute_book_cvar(state, prices, active, log_rets, cfg)
+            hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+            hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
+    
+            if book_cvar > hard_breach_threshold:
+                logger.warning(
+                    "[Scan] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) — "
+                    "skipping optimization, forcing immediate liquidation.",
+                    book_cvar * 100, hard_breach_threshold * 100, hard_multiplier,
+                )
                 state.consecutive_failures += 1
-                logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
-                if _soft_cvar_breach:
-                    logger.warning(
-                        "Solver failure during active soft CVaR breach — "
-                        "bypassing 3-failure wait, triggering immediate decay."
-                    )
-                    apply_decay = True
-                elif state.consecutive_failures >= 3:
-                    logger.warning(
-                        "3 consecutive solver failures — triggering gate-filtered "
-                        "pro-rata liquidation (%.0f%% of gate-passing positions).",
-                        cfg.DECAY_FACTOR * 100,
-                    )
-                    apply_decay = True
+                apply_decay      = True
+                _force_full_cash = True
+                activate_override_on_stress(state, cfg)
+            elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+                _soft_cvar_breach = True
+                logger.info(
+                    "[Scan] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) — "
+                    "running optimizer with CVaR constraint active.",
+                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100,
+                )
+    
+        if rebalance_allowed and not _force_full_cash:
+            try:
+                raw_daily, adj_scores, sel_idx, gate_counts = generate_signals(
+                    log_rets, adv_arr, cfg, prev_weights=state.weights
+                )
+                # FIX-MB-GATENAMES: Keys renamed to "history_failed" / "adv_failed" /
+                # "knife_failed". Log message now clearly states "removed by" each gate
+                # so operators can distinguish a data-provider outage (many history
+                # failures) from a volatility spike (many knife-gate removals).
+                logger.info(
+                    "[Scan] Universe funnel: %d total → %d removed by history gate → "
+                    "%d removed by ADV gate → %d removed by knife gate → %d selected.",
+                    gate_counts.get("total", 0),
+                    gate_counts.get("history_failed", 0),
+                    gate_counts.get("adv_failed", 0),
+                    gate_counts.get("knife_failed", 0),
+                    gate_counts.get("selected", 0),
+                )
+                if not sel_idx:
+                    raise OptimizationError("No valid universe candidates.", OptimizationErrorType.DATA)
+                sel_syms      = [active[i] for i in sel_idx]
+                sector_map    = get_sector_map(sel_syms, cfg=cfg)
+                known_sectors  = sorted(s for s in set(sector_map.values()) if s != "Unknown")
+                sec_idx        = {s: i for i, s in enumerate(known_sectors)}
+                sector_labels  = np.array(
+                    [sec_idx.get(sector_map[sym], -1) for sym in sel_syms], dtype=int
+                )
+    
+                weights_sel = engine.optimize(
+                    expected_returns    = raw_daily[sel_idx],
+                    historical_returns  = log_rets[[active[i] for i in sel_idx]],
+                    execution_date      = pd.Timestamp(end_date),
+                    adv_shares          = adv_arr[sel_idx],
+                    prices              = prices[sel_idx],
+                    portfolio_value     = pv,
+                    prev_w              = prev_w_arr[sel_idx],
+                    exposure_multiplier = state.exposure_multiplier,
+                    sector_labels       = sector_labels,
+                )
+                weights[sel_idx]               = weights_sel
+                state.consecutive_failures     = 0
+                state.decay_rounds             = 0
+                optimization_succeeded         = True
+    
+            except (OptimizationError, ValueError) as exc:
+                is_data_error = isinstance(exc, ValueError) or (
+                    isinstance(exc, OptimizationError) and exc.error_type == OptimizationErrorType.DATA
+                )
+                if not is_data_error:
+                    state.consecutive_failures += 1
+                    logger.error("Solver failure #%d: %s. Freezing state.", state.consecutive_failures, exc)
+                    if _soft_cvar_breach:
+                        logger.warning(
+                            "Solver failure during active soft CVaR breach — "
+                            "bypassing 3-failure wait, triggering immediate decay."
+                        )
+                        apply_decay = True
+                    elif state.consecutive_failures >= 3:
+                        logger.warning(
+                            "3 consecutive solver failures — triggering gate-filtered "
+                            "pro-rata liquidation (%.0f%% of gate-passing positions).",
+                            cfg.DECAY_FACTOR * 100,
+                        )
+                        apply_decay = True
+                else:
+                    logger.warning("Data error (empty universe / thin history): %s. Resetting counters and freezing state.", exc)
+                    state.consecutive_failures = 0
+                    state.decay_rounds = 0
+    
+        # ── Gate-filtered decay target computation ────────────────────────────────
+        _exhaust_decay = False
+        if apply_decay and not optimization_succeeded:
+            if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+                weights = np.zeros(len(active), dtype=float)
+                logger.warning(
+                    "[Scan] %s — forcing full liquidation to cash.",
+                    "Book CVaR breach" if _force_full_cash else
+                    f"MAX_DECAY_ROUNDS={cfg.MAX_DECAY_ROUNDS} exhausted",
+                )
+                _exhaust_decay = True
             else:
-                logger.warning("Data error (empty universe / thin history): %s. Resetting counters and freezing state.", exc)
-                state.consecutive_failures = 0
+                weights = compute_decay_targets(state, sel_idx, active, cfg, current_prices=prices, pv=pv)
+    
+        # FIX-MB-RESIDUALCASH: The residual-cash allocation is handled entirely inside
+        # execute_rebalance via its multi-pass proportional allocation loop, which
+        # operates on the actual post-sell cash balance. We must NOT attempt to size
+        # additional buys here against pv_exec (computed before sells execute) because
+        # after sells complete the available cash is lower than pv_exec implies, and
+        # oversizing here causes state.cash to go negative after slippage deduction.
+        # The execute_rebalance call below receives the target weights and handles
+        # residual distribution correctly with no pre-call adjustment needed.
+    
+        # Fix 2: Per-symbol price staleness gate.
+        # If any HELD position's last price bar is older than 2 trading days,
+        # something is wrong with the data feed for that symbol. Running a
+        # rebalance with a stale price for a held name can produce badly wrong
+        # weight calculations — better to skip and wait for fresh data.
+        # Exception: _force_full_cash (CVaR hard breach) always executes because
+        # liquidating to cash is safe regardless of price staleness.
+        _cadence_stale_held: list = []
+        _MAX_STALE_TRADING_DAYS = 2
+        if rebalance_allowed and not _force_full_cash and not close.empty:
+            _last_bar_date = close.index[-1]
+            # Count trading days between last bar and today using the close index
+            # (business-day calendar of actual market data in the matrix).
+            _trading_days_since_last = int(
+                (close.index <= today).sum() - len(close.index[close.index <= _last_bar_date])
+            )
+            # Simpler: how many bars ago is the last row relative to today?
+            _days_stale = (today - _last_bar_date).days
+            for _hsym in state.shares:
+                if _hsym not in active_idx:
+                    continue  # absent symbols handled by absent_periods
+                _sym_series = close.get(_hsym)
+                if _sym_series is None:
+                    continue
+                _last_valid = _sym_series.last_valid_index()
+                if _last_valid is None:
+                    _cadence_stale_held.append(_hsym)
+                    continue
+                # BUG-FIX-MONDAY: count bars in the close index that fall
+                # strictly after _last_valid and up to today.  This is NSE-calendar
+                # aware and never falsely fires on Monday (Friday close = 0 bars
+                # elapsed over the weekend, 1 bar elapsed by Monday close).
+                _bars_elapsed = int((close.index > _last_valid).sum())
+                if _bars_elapsed > _MAX_STALE_TRADING_DAYS:
+                    _cadence_stale_held.append(_hsym)
+            if _cadence_stale_held:
+                logger.warning(
+                    "[Scan] STALENESS GATE: skipping rebalance because %d held symbol(s) "
+                    "have prices older than %d trading days: %s. "
+                    "Wait for fresh market data before rebalancing.",
+                    len(_cadence_stale_held), _MAX_STALE_TRADING_DAYS, _cadence_stale_held,
+                )
+                rebalance_allowed = False
+    
+        # FIX-STALE-PRICE: Before executing a rebalance, check whether any held
+        # position has a price that is older than _STALE_PRICE_DAYS trading days.
+        # A rebalance using a 3-day-old price is likely worse than no rebalance,
+        # because the optimizer will size incorrectly relative to the current
+        # portfolio value. Force-liquidations (CVaR breach) are exempt — it is
+        # always safer to exit a position than to hold it with a stale price.
+        _STALE_PRICE_DAYS = 2  # trading days
+        _rebalance_stale_held: list = []
+        if optimization_succeeded and not _force_full_cash:
+            for _chk_sym in state.shares:
+                if _chk_sym not in active_idx:
+                    continue  # absent symbols handled by execute_rebalance itself
+                _chk_col = to_ns(_chk_sym)
+                _chk_df  = market_data.get(_chk_col) if market_data else None
+                if _chk_df is not None and not _chk_df.empty:
+                    _last_ts = _chk_df.index[-1]
+                    # Normalise timezone before comparison
+                    if hasattr(_last_ts, "tzinfo") and _last_ts.tzinfo is not None:
+                        _last_ts = _last_ts.tz_convert("UTC").tz_localize(None)
+                    _last_ts = pd.Timestamp(_last_ts)
+                    # BUG-FIX-MONDAY: use the close index (actual NSE trading
+                    # calendar) as the business-day ruler rather than raw calendar
+                    # days.  A Friday close evaluated on Monday gives 0 bars elapsed
+                    # (the weekend produced no trading bars), correctly passing the
+                    # gate.  Calendar-day arithmetic (today - last_ts).days would
+                    # yield 3, suppressing every Monday rebalance as a false alarm.
+                    _trading_bars_elapsed = int((close.index > _last_ts).sum())
+                    if _trading_bars_elapsed > _STALE_PRICE_DAYS:
+                        _rebalance_stale_held.append((_chk_sym, _trading_bars_elapsed))
+            if _rebalance_stale_held:
+                logger.warning(
+                    "[Scan] REBALANCE SUPPRESSED: %d held symbol(s) have prices "
+                    "older than %d trading bar(s) in the NSE close index: %s. "
+                    "Skipping rebalance to avoid sizing on stale data. "
+                    "Will retry on next scan once provider returns fresh data.",
+                    len(_rebalance_stale_held),
+                    _STALE_PRICE_DAYS,
+                    [(s, f"{d}d") for s, d in _rebalance_stale_held],
+                )
+                optimization_succeeded = False
+    
+        if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
+            _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
+            _scenario_losses = -(
+                log_rets.iloc[-_T_cvar:]
+                .reindex(columns=active, fill_value=0.0)
+                .values
+            )
+            total_slippage = execute_rebalance(
+                state, weights, prices, active, cfg,
+                adv_shares=adv_arr,
+                date_context=today, trade_log=trade_log,
+                apply_decay    = apply_decay and not _exhaust_decay,
+                scenario_losses = None if _exhaust_decay else _scenario_losses,
+                force_rebalance_trades = _soft_cvar_breach,
+            )
+            state.last_rebalance_date = today.strftime("%Y-%m-%d")
+            rebalanced_this_scan = True
+            if _exhaust_decay:
                 state.decay_rounds = 0
-
-    # ── Gate-filtered decay target computation ────────────────────────────────
-    _exhaust_decay = False
-    if apply_decay and not optimization_succeeded:
-        if _force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
-            weights = np.zeros(len(active), dtype=float)
-            logger.warning(
-                "[Scan] %s — forcing full liquidation to cash.",
-                "Book CVaR breach" if _force_full_cash else
-                f"MAX_DECAY_ROUNDS={cfg.MAX_DECAY_ROUNDS} exhausted",
-            )
-            _exhaust_decay = True
-        else:
-            weights = compute_decay_targets(state, sel_idx, active, cfg, current_prices=prices, pv=pv)
-
-    # FIX-MB-RESIDUALCASH: The residual-cash allocation is handled entirely inside
-    # execute_rebalance via its multi-pass proportional allocation loop, which
-    # operates on the actual post-sell cash balance. We must NOT attempt to size
-    # additional buys here against pv_exec (computed before sells execute) because
-    # after sells complete the available cash is lower than pv_exec implies, and
-    # oversizing here causes state.cash to go negative after slippage deduction.
-    # The execute_rebalance call below receives the target weights and handles
-    # residual distribution correctly with no pre-call adjustment needed.
-
-    # Fix 2: Per-symbol price staleness gate.
-    # If any HELD position's last price bar is older than 2 trading days,
-    # something is wrong with the data feed for that symbol. Running a
-    # rebalance with a stale price for a held name can produce badly wrong
-    # weight calculations — better to skip and wait for fresh data.
-    # Exception: _force_full_cash (CVaR hard breach) always executes because
-    # liquidating to cash is safe regardless of price staleness.
-    _stale_held: list = []
-    _MAX_STALE_TRADING_DAYS = 2
-    if rebalance_allowed and not _force_full_cash and not close.empty:
-        _last_bar_date = close.index[-1]
-        # Count trading days between last bar and today using the close index
-        # (business-day calendar of actual market data in the matrix).
-        _trading_days_since_last = int(
-            (close.index <= today).sum() - len(close.index[close.index <= _last_bar_date])
+                state.consecutive_failures = 0
+    
+        _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
+    
+        price_dict = {sym: prices[active_idx[sym]] for sym in active}
+        state.record_eod(price_dict)
+    
+        # FIX-MB-H-04: execute_rebalance already increments absent_periods for
+        # every held symbol not found in active_idx (and clears it for symbols
+        # that ARE present).  Running the same loop here after a rebalance causes
+        # a double-increment, halving the effective MAX_ABSENT_PERIODS grace period.
+        #
+        # Rule: absent_periods accounting belongs exclusively to execute_rebalance
+        # on rebalance days.  This post-scan loop only runs on mark-to-market-only
+        # days (cadence gate blocked the rebalance) so that absent positions are
+        # still tracked even when no rebalance fires.
+        if not rebalanced_this_scan:
+            for held_sym in list(state.shares.keys()):
+                if held_sym not in active_idx:
+                    state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+                else:
+                    state.absent_periods.pop(held_sym, None)
+    
+        final_pv = state.equity_hist[-1] if state.equity_hist else pv
+    
+        logger.info(
+            "%s%s%s | Regime: %.2f | CVaR: %.2f%% | Failures: %d | "
+            "Equity: %s₹%s%s | Slippage: %s₹%s%s",
+            C.BLU, label, C.RST,
+            regime_score,
+            state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY) * 100,
+            state.consecutive_failures,
+            C.GRN, f"{final_pv:,.0f}", C.RST,
+            C.RED, f"{total_slippage:,.0f}", C.RST,
         )
-        # Simpler: how many bars ago is the last row relative to today?
-        _days_stale = (today - _last_bar_date).days
-        for _hsym in state.shares:
-            if _hsym not in active_idx:
-                continue  # absent symbols handled by absent_periods
-            _sym_series = close.get(_hsym)
-            if _sym_series is None:
-                continue
-            _last_valid = _sym_series.last_valid_index()
-            if _last_valid is None:
-                _stale_held.append(_hsym)
-                continue
-            # BUG-FIX-MONDAY: count bars in the close index that fall
-            # strictly after _last_valid and up to today.  This is NSE-calendar
-            # aware and never falsely fires on Monday (Friday close = 0 bars
-            # elapsed over the weekend, 1 bar elapsed by Monday close).
-            _bars_elapsed = int((close.index > _last_valid).sum())
-            if _bars_elapsed > _MAX_STALE_TRADING_DAYS:
-                _stale_held.append(_hsym)
-        if _stale_held:
-            logger.warning(
-                "[Scan] STALENESS GATE: skipping rebalance because %d held symbol(s) "
-                "have prices older than %d trading days: %s. "
-                "Wait for fresh market data before rebalancing.",
-                len(_stale_held), _MAX_STALE_TRADING_DAYS, _stale_held,
-            )
-            rebalance_allowed = False
-
-    # FIX-STALE-PRICE: Before executing a rebalance, check whether any held
-    # position has a price that is older than _STALE_PRICE_DAYS trading days.
-    # A rebalance using a 3-day-old price is likely worse than no rebalance,
-    # because the optimizer will size incorrectly relative to the current
-    # portfolio value. Force-liquidations (CVaR breach) are exempt — it is
-    # always safer to exit a position than to hold it with a stale price.
-    _STALE_PRICE_DAYS = 2  # trading days
-    _stale_held: list = []
-    if optimization_succeeded and not _force_full_cash:
-        for _chk_sym in state.shares:
-            if _chk_sym not in active_idx:
-                continue  # absent symbols handled by execute_rebalance itself
-            _chk_col = to_ns(_chk_sym)
-            _chk_df  = market_data.get(_chk_col) if market_data else None
-            if _chk_df is not None and not _chk_df.empty:
-                _last_ts = _chk_df.index[-1]
-                # Normalise timezone before comparison
-                if hasattr(_last_ts, "tzinfo") and _last_ts.tzinfo is not None:
-                    _last_ts = _last_ts.tz_convert("UTC").tz_localize(None)
-                _last_ts = pd.Timestamp(_last_ts)
-                # BUG-FIX-MONDAY: use the close index (actual NSE trading
-                # calendar) as the business-day ruler rather than raw calendar
-                # days.  A Friday close evaluated on Monday gives 0 bars elapsed
-                # (the weekend produced no trading bars), correctly passing the
-                # gate.  Calendar-day arithmetic (today - last_ts).days would
-                # yield 3, suppressing every Monday rebalance as a false alarm.
-                _trading_bars_elapsed = int((close.index > _last_ts).sum())
-                if _trading_bars_elapsed > _STALE_PRICE_DAYS:
-                    _stale_held.append((_chk_sym, _trading_bars_elapsed))
-        if _stale_held:
-            logger.warning(
-                "[Scan] REBALANCE SUPPRESSED: %d held symbol(s) have prices "
-                "older than %d trading bar(s) in the NSE close index: %s. "
-                "Skipping rebalance to avoid sizing on stale data. "
-                "Will retry on next scan once provider returns fresh data.",
-                len(_stale_held),
-                _STALE_PRICE_DAYS,
-                [(s, f"{d}d") for s, d in _stale_held],
-            )
-            optimization_succeeded = False
-
-    if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
-        _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
-        _scenario_losses = -(
-            log_rets.iloc[-_T_cvar:]
-            .reindex(columns=active, fill_value=0.0)
-            .values
-        )
-        total_slippage = execute_rebalance(
-            state, weights, prices, active, cfg,
-            adv_shares=adv_arr,
-            date_context=today, trade_log=trade_log,
-            apply_decay    = apply_decay and not _exhaust_decay,
-            scenario_losses = None if _exhaust_decay else _scenario_losses,
-            force_rebalance_trades = _soft_cvar_breach,
-        )
-        state.last_rebalance_date = today.strftime("%Y-%m-%d")
-        rebalanced_this_scan = True
-        if _exhaust_decay:
-            state.decay_rounds = 0
-            state.consecutive_failures = 0
-
-    _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
-
-    price_dict = {sym: prices[active_idx[sym]] for sym in active}
-    state.record_eod(price_dict)
-
-    # FIX-MB-H-04: execute_rebalance already increments absent_periods for
-    # every held symbol not found in active_idx (and clears it for symbols
-    # that ARE present).  Running the same loop here after a rebalance causes
-    # a double-increment, halving the effective MAX_ABSENT_PERIODS grace period.
-    #
-    # Rule: absent_periods accounting belongs exclusively to execute_rebalance
-    # on rebalance days.  This post-scan loop only runs on mark-to-market-only
-    # days (cadence gate blocked the rebalance) so that absent positions are
-    # still tracked even when no rebalance fires.
-    if not rebalanced_this_scan:
-        for held_sym in list(state.shares.keys()):
-            if held_sym not in active_idx:
-                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
-            else:
-                state.absent_periods.pop(held_sym, None)
-
-    final_pv = state.equity_hist[-1] if state.equity_hist else pv
-
-    logger.info(
-        "%s%s%s | Regime: %.2f | CVaR: %.2f%% | Failures: %d | "
-        "Equity: %s₹%s%s | Slippage: %s₹%s%s",
-        C.BLU, label, C.RST,
-        regime_score,
-        state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY) * 100,
-        state.consecutive_failures,
-        C.GRN, f"{final_pv:,.0f}", C.RST,
-        C.RED, f"{total_slippage:,.0f}", C.RST,
-    )
-
-    elapsed = time.perf_counter() - scan_started_at
-    _print_stage_status("Analysis", 1.0, f"{label} completed in {elapsed:.1f}s.")
-
-    if trade_log:
-        final_mtm = sum(state.shares.get(sym, 0) * prices[active_idx[sym]] for sym in state.shares if sym in active_idx)
-        final_gross_exposure = final_mtm / final_pv if final_pv > 0 else 0.0
-        net_cash_delta = state.cash - initial_cash
-
-        print(f"\n  {C.B_CYN}=== PHASE A: TRADE INTENT SUMMARY ==={C.RST}")
-        print(f"  {C.GRY}{'─' * 66}{C.RST}")
-        print(f"  {C.BLD}Gross Exp Before:{C.RST} {initial_gross_exposure:>7.1%}")
-        print(f"  {C.BLD}Gross Exp After: {C.RST} {final_gross_exposure:>7.1%}")
-        cash_color = C.B_GRN if net_cash_delta >= 0 else C.B_RED
-        print(f"  {C.BLD}Net Cash Delta:  {C.RST} {cash_color}₹{net_cash_delta:+,.0f}{C.RST}")
-        print(f"  {C.BLD}Total Slippage:  {C.RST} {C.RED}₹{total_slippage:,.0f}{C.RST}")
-
-        largest_trade = max(trade_log, key=lambda t: abs(t.delta_shares) * t.exec_price, default=None)
-        if largest_trade:
-            notional = abs(largest_trade.delta_shares) * largest_trade.exec_price
-            print(f"  {C.BLD}Largest Change:  {C.RST} {largest_trade.direction} {largest_trade.symbol} (₹{notional:,.0f})")
-
-        print(f"\n  {C.B_CYN}=== PHASE B: EXECUTION ACTION SHEET ==={C.RST}")
-        print(f"  {C.GRY}{'─' * 66}{C.RST}")
-
-        sorted_trades = sorted(trade_log, key=lambda t: state.weights.get(t.symbol, 0.0), reverse=True)
-
-        for t in sorted_trades:
-            action_color = C.B_GRN if t.direction == "BUY" else C.B_RED
-            target_weight = state.weights.get(t.symbol, 0.0)
-            print(
-                f"  {action_color}{t.direction:<4}{C.RST} | {C.BLD}{t.symbol:<12}{C.RST} | "
-                f"{abs(t.delta_shares):>6,d} shares @ ≈ ₹{t.exec_price:>9,.2f} | Tgt: {C.CYN}{target_weight:>5.1%}{C.RST}"
-            )
-        print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
-
-    # PROD-FIX-5: flush dead-letter tracker; ScanContext.__exit__ runs automatically
-        _dead_letter.flush()
-    return state, market_data
+    
+        elapsed = time.perf_counter() - scan_started_at
+        _print_stage_status("Analysis", 1.0, f"{label} completed in {elapsed:.1f}s.")
+    
+        if trade_log:
+            final_mtm = sum(state.shares.get(sym, 0) * prices[active_idx[sym]] for sym in state.shares if sym in active_idx)
+            final_gross_exposure = final_mtm / final_pv if final_pv > 0 else 0.0
+            net_cash_delta = state.cash - initial_cash
+    
+            print(f"\n  {C.B_CYN}=== PHASE A: TRADE INTENT SUMMARY ==={C.RST}")
+            print(f"  {C.GRY}{'─' * 66}{C.RST}")
+            print(f"  {C.BLD}Gross Exp Before:{C.RST} {initial_gross_exposure:>7.1%}")
+            print(f"  {C.BLD}Gross Exp After: {C.RST} {final_gross_exposure:>7.1%}")
+            cash_color = C.B_GRN if net_cash_delta >= 0 else C.B_RED
+            print(f"  {C.BLD}Net Cash Delta:  {C.RST} {cash_color}₹{net_cash_delta:+,.0f}{C.RST}")
+            print(f"  {C.BLD}Total Slippage:  {C.RST} {C.RED}₹{total_slippage:,.0f}{C.RST}")
+    
+            largest_trade = max(trade_log, key=lambda t: abs(t.delta_shares) * t.exec_price, default=None)
+            if largest_trade:
+                notional = abs(largest_trade.delta_shares) * largest_trade.exec_price
+                print(f"  {C.BLD}Largest Change:  {C.RST} {largest_trade.direction} {largest_trade.symbol} (₹{notional:,.0f})")
+    
+            print(f"\n  {C.B_CYN}=== PHASE B: EXECUTION ACTION SHEET ==={C.RST}")
+            print(f"  {C.GRY}{'─' * 66}{C.RST}")
+    
+            sorted_trades = sorted(trade_log, key=lambda t: state.weights.get(t.symbol, 0.0), reverse=True)
+    
+            for t in sorted_trades:
+                action_color = C.B_GRN if t.direction == "BUY" else C.B_RED
+                target_weight = state.weights.get(t.symbol, 0.0)
+                print(
+                    f"  {action_color}{t.direction:<4}{C.RST} | {C.BLD}{t.symbol:<12}{C.RST} | "
+                    f"{abs(t.delta_shares):>6,d} shares @ ≈ ₹{t.exec_price:>9,.2f} | Tgt: {C.CYN}{target_weight:>5.1%}{C.RST}"
+                )
+            print(f"  {C.GRY}{'─' * 66}{C.RST}\n")
+    
+        return state, market_data
+    
+    with ScanContext(label=label):
+        cfg = cfg_override if cfg_override else load_optimized_config()
+        try:
+            return _scan_body(cfg)
+        finally:
+            # PROD-FIX-5: flush the tracker while the scan correlation_id is still active.
+            _dead_letter.flush()
 
 
 # ─── Status display ───────────────────────────────────────────────────────────
