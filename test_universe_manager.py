@@ -11,10 +11,14 @@ def reset_universe_warning_state():
     um._MISSING_PARQUET_WARNED.clear()
     um._NO_RECORD_WARNED.clear()
     um._HISTORICAL_UNIVERSE_DF_CACHE.clear()
+    um._UNIVERSE_LOOKUP_CACHE.clear()
+    um._HISTORICAL_UNIVERSE_DATES_CACHE.clear()
     yield
     um._MISSING_PARQUET_WARNED.clear()
     um._NO_RECORD_WARNED.clear()
     um._HISTORICAL_UNIVERSE_DF_CACHE.clear()
+    um._UNIVERSE_LOOKUP_CACHE.clear()
+    um._HISTORICAL_UNIVERSE_DATES_CACHE.clear()
 
 
 def test_get_historical_universe_uses_csv_without_survivorship_warning(tmp_path, monkeypatch, caplog):
