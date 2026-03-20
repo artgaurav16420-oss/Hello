@@ -210,7 +210,7 @@ def _fitness_from_metrics(
     Uses forced_to_cash column (backtest_engine v11.52) or infers from logs.
 
     Score ceiling: Michaelis-Menten (_K * raw) / (_K + raw) -> asymptote _K=3.5.
-    A "ceiling hit" is tracked when the bounded score reaches >=99% of _K.
+    A "ceiling hit" is tracked when the bounded score reaches >=90% of _K.
     Score floor  : hard -2.0
     """
     cagr         = float(metrics.get("cagr",    0.0))
@@ -324,7 +324,7 @@ def _fitness_from_metrics(
         _K    = 3.5
         score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
         score = max(score, -2.0)
-        ceiling_hit = raw > 0.0 and score >= (_K * 0.99)
+        ceiling_hit = raw > 0.0 and score >= (_K * 0.90)
         dd_gate_hit = False
 
     diag = {

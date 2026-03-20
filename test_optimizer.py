@@ -176,6 +176,25 @@ def test_fitness_falls_back_to_decay_and_zero_positions_when_forced_cash_flag_mi
     assert diag["forced_cash_penalty"] == pytest.approx(0.75)
 
 
+def test_fitness_marks_reachable_score_plateaus_as_ceiling_hits():
+    metrics = {"cagr": 32.0, "max_dd": 0.01, "turnover": 0.0, "sortino": 10.0}
+    rebal_log = pd.DataFrame(
+        {
+            "realised_cvar": [0.0, 0.0, 0.0, 0.0],
+            "exposure_multiplier": [1.0, 1.0, 1.0, 1.0],
+            "n_positions": [8, 8, 8, 8],
+            "apply_decay": [False, False, False, False],
+        }
+    )
+
+    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+
+    assert score >= 3.15
+    assert score < 3.5
+    assert diag["anomaly_hit"] is False
+    assert diag["ceiling_hit"] is True
+
+
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
@@ -208,9 +227,6 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
     monkeypatch.setattr(optimizer, "TEST_END", "2020-12-31")
     monkeypatch.setattr(optimizer, "fetch_nse_equity_universe", lambda: ["ABC", "^NSEI", "ABC"])
-    # apply_halt_simulation is a no-op for this test — it would crash because the
-    # fake load_or_fetch returns {"ok": True} (not real DataFrames).
-    monkeypatch.setattr(optimizer, "apply_halt_simulation", lambda md: md)
 
     captured = {}
 
@@ -236,7 +252,6 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
     monkeypatch.setattr(optimizer, "TEST_END", "2020-03-31")
     monkeypatch.setattr(optimizer, "get_nifty500", lambda: ["LIVEONLY"])
-    monkeypatch.setattr(optimizer, "apply_halt_simulation", lambda md: md)
 
     def _fake_hist(universe_type, date):
         assert universe_type == "nifty500"
@@ -269,6 +284,30 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     assert "OLD3" in captured["tickers"]
     assert "^NSEI" in captured["tickers"]
     assert "^CRSLDX" in captured["tickers"]
+
+
+def test_pre_load_data_skips_halt_simulation_when_disabled(monkeypatch):
+    monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-03-31")
+    monkeypatch.setattr(optimizer, "fetch_nse_equity_universe", lambda: ["ABC"])
+
+    cfg = optimizer.UltimateConfig()
+    cfg.SIMULATE_HALTS = False
+
+    monkeypatch.setattr(
+        optimizer,
+        "load_or_fetch",
+        lambda **kwargs: {"ok": True},
+    )
+
+    def _fail_if_called(_market_data):
+        raise AssertionError("apply_halt_simulation should not be called when disabled")
+
+    monkeypatch.setattr(optimizer, "apply_halt_simulation", _fail_if_called)
+
+    result = optimizer.pre_load_data("nse_total", cfg=cfg)
+
+    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
 
 
 def test_build_sampler_returns_tpe_sampler(monkeypatch):
