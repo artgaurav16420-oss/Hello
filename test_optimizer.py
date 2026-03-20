@@ -250,14 +250,14 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
 
 def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
-    monkeypatch.setattr(optimizer, "TEST_END", "2020-03-31")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-09-30")
     monkeypatch.setattr(optimizer, "get_nifty500", lambda: ["LIVEONLY"])
 
     def _fake_hist(universe_type, date):
         assert universe_type == "nifty500"
-        if pd.Timestamp(date) == pd.Timestamp("2020-01-31"):
+        if pd.Timestamp(date) == pd.Timestamp("2020-03-31"):
             return ["OLD1", "OLD2"]
-        if pd.Timestamp(date) == pd.Timestamp("2020-02-29"):
+        if pd.Timestamp(date) == pd.Timestamp("2020-06-30"):
             return ["OLD2", "OLD3"]
         return []
 
@@ -277,7 +277,7 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
 
     assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    assert captured["required_end"] == "2020-03-31"
+    assert captured["required_end"] == "2020-09-30"
     assert "LIVEONLY" in captured["tickers"]
     assert "OLD1" in captured["tickers"]
     assert "OLD2" in captured["tickers"]
@@ -350,7 +350,7 @@ def test_normalize_universe_type_falls_back_to_nifty500():
 
 def test_pre_load_data_uses_normalized_fallback_universe_for_history(monkeypatch):
     monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
-    monkeypatch.setattr(optimizer, "TEST_END", "2020-01-31")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-03-31")
     monkeypatch.setattr(optimizer, "get_nifty500", lambda: ["LIVEONLY"])
 
     historical_calls = []
