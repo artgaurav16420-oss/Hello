@@ -116,9 +116,9 @@ _MIN_IS_CALENDAR_DAYS = 365
 #   RISK_AVERSION  floor 10->12: removes aggressive configurations
 #   CVAR_DAILY_LIMIT ceiling 0.070->0.060: tighter risk limit
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (15, 30, 2),
+    "HALFLIFE_FAST":    (15, 29, 2),
     "HALFLIFE_SLOW":    (60, 100, 5),
-    "CONTINUITY_BONUS": (0.06, 0.20, 0.03),
+    "CONTINUITY_BONUS": (0.06, 0.18, 0.03),
     "RISK_AVERSION":    (12.0, 20.0, 0.5),
     "CVAR_DAILY_LIMIT": (0.040, 0.060, 0.005),
     "CVAR_LOOKBACK":    (60, 120, 10),
@@ -156,6 +156,15 @@ def _build_sampler() -> TPESampler:
     return TPESampler(seed=int(OPTUNA_SEED), n_ei_candidates=24, multivariate=True)
 
 
+def _normalize_universe_type(universe_type: str | None) -> str:
+    normalized_universe = (universe_type or "").strip().lower()
+    if normalized_universe in {"nifty500", "nse_total"}:
+        return normalized_universe
+
+    logger.warning("Unknown universe_type %r, falling back to nifty500", universe_type)
+    return "nifty500"
+
+
 # ─── Objective Function ───────────────────────────────────────────────────────
 
 def _iter_wfo_slices(train_start: str, train_end: str):
@@ -171,7 +180,7 @@ def _iter_wfo_slices(train_start: str, train_end: str):
         is_start  = start
         is_end    = oos_start - pd.Timedelta(days=1)
 
-        is_calendar_days = (is_end - is_start).days
+        is_calendar_days = (is_end - is_start).days + 1
         if is_calendar_days < _MIN_IS_CALENDAR_DAYS:
             logger.debug(
                 "[WFO] Skipping fold OOS=%d: IS window only %d calendar days (minimum %d).",
@@ -539,15 +548,12 @@ class MomentumObjective:
 
 def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
     logger.info("Initializing Data Pre-fetch phase...")
-    normalized_universe = (universe_type or "").strip().lower()
+    normalized_universe = _normalize_universe_type(universe_type)
 
     if normalized_universe == "nifty500":
         base_universe = get_nifty500()
-    elif normalized_universe == "nse_total":
-        base_universe = fetch_nse_equity_universe()
     else:
-        logger.warning("Unknown universe_type '%s', falling back to nifty500", universe_type)
-        base_universe = get_nifty500()
+        base_universe = fetch_nse_equity_universe()
 
     if cfg is None:
         cfg = UltimateConfig()
@@ -697,6 +703,7 @@ def run_optimization(
     in_memory:     bool      = False,
     study_name:    str | None = None,
 ):
+    universe_type = _normalize_universe_type(universe_type)
     if in_memory:
         effective_storage = ":memory:"
         effective_n_jobs  = 1

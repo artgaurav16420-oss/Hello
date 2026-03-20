@@ -321,6 +321,43 @@ def test_build_sampler_returns_tpe_sampler(monkeypatch):
     assert isinstance(sampler_seeded, optimizer.TPESampler)
 
 
+def test_iter_wfo_slices_keeps_first_full_calendar_year():
+    slices = list(optimizer._iter_wfo_slices("2018-01-01", "2022-12-31"))
+
+    assert slices[0] == ("2018-01-01", "2018-12-31", "2019-01-01", "2019-12-31")
+    assert [oos_start for _, _, oos_start, _ in slices] == [
+        "2019-01-01",
+        "2020-01-01",
+        "2021-01-01",
+        "2022-01-01",
+    ]
+
+
+def test_normalize_universe_type_falls_back_to_nifty500():
+    assert optimizer._normalize_universe_type("  typo  ") == "nifty500"
+
+
+def test_pre_load_data_uses_normalized_fallback_universe_for_history(monkeypatch):
+    monkeypatch.setattr(optimizer, "TRAIN_START", "2020-01-01")
+    monkeypatch.setattr(optimizer, "TEST_END", "2020-01-31")
+    monkeypatch.setattr(optimizer, "get_nifty500", lambda: ["LIVEONLY"])
+
+    historical_calls = []
+
+    def _fake_hist(universe_type, date):
+        historical_calls.append(universe_type)
+        return ["OLD1"]
+
+    monkeypatch.setattr(optimizer, "get_historical_universe", _fake_hist)
+    monkeypatch.setattr(optimizer, "load_or_fetch", lambda **kwargs: {"ok": True})
+
+    result = optimizer.pre_load_data(" typo ")
+
+    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert historical_calls
+    assert set(historical_calls) == {"nifty500"}
+
+
 
 
 def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
@@ -501,6 +538,7 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
             user_attrs={},
         )
         best_trials = [best_trial]
+        trials = [best_trial]
 
         def optimize(self, objective, **kwargs):
             pass
@@ -510,6 +548,62 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
     optimizer.run_optimization(universe_type="nse_total")
 
     assert captured["pre_load_universe"] == "nse_total"
+
+
+def test_run_optimization_normalizes_unknown_universe(monkeypatch):
+    monkeypatch.setattr(optimizer, "N_TRIALS", 1)
+    monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
+
+    captured = {}
+
+    def _fake_pre_load_data(universe_type):
+        captured["pre_load_universe"] = universe_type
+        return {}
+
+    monkeypatch.setattr(optimizer, "pre_load_data", _fake_pre_load_data)
+
+    class _Result:
+        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
+
+    def _fake_run_backtest(**kwargs):
+        captured["backtest_universe"] = kwargs["universe_type"]
+        return _Result()
+
+    monkeypatch.setattr(optimizer, "run_backtest", _fake_run_backtest)
+
+    class _Study:
+        best_params = {
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 65,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 12.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        }
+        best_value = 1.23
+        best_trial = optuna.trial.create_trial(
+            params=best_params,
+            distributions={
+                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 29, step=2),
+                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=5),
+                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.18, step=0.03),
+                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0, step=0.5),
+                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06, step=0.005),
+            },
+            value=1.23,
+            user_attrs={},
+        )
+        best_trials = [best_trial]
+        trials = [best_trial]
+
+        def optimize(self, objective, **kwargs):
+            pass
+
+    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: _Study())
+
+    optimizer.run_optimization(universe_type=" typo ")
+
+    assert captured["pre_load_universe"] == "nifty500"
+    assert captured["backtest_universe"] == "nifty500"
 
 
 def test_parse_args_accepts_universe_override():
