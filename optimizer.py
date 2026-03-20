@@ -473,7 +473,6 @@ class MomentumObjective:
             score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
 
             diag["year"]     = oos_year
-            diag["excluded"] = False
             diag["eq_start"] = wf_oos_start
             diag["eq_end"]   = wf_oos_end
             slice_diags.append(diag)
@@ -502,27 +501,20 @@ class MomentumObjective:
             if not pd.notna(score):
                 raise optuna.TrialPruned()
 
-            # Structural gate-hit fold scores are appended BEFORE the >2 prune
-            # check. This lets bad-but-non-structural floor-clamped scores stay
-            # in the aggregate without burning the gate-hit budget, while still
-            # pruning strategies that trip genuine DD/anomaly gates in 3+ folds.
-            # The bad score enters the aggregate — fragile strategies that fail
-            # in one year receive a lower aggregate than strategies that pass
-            # all folds. The >2 prune eliminates strategies failing structurally
-            # in 3+ years.
-            is_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit")
-            if is_gate_hit:
+            is_structural_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit")
+            diag["excluded"] = is_structural_gate_hit
+            if is_structural_gate_hit:
                 n_gate_hits += 1
-                scores.append(float(score))   # include — do NOT skip
-                if n_gate_hits > 2:
+                scores.append(float(score))
+                if n_gate_hits > 1:
                     raise optuna.TrialPruned()
                 logger.debug(
-                    "[Trial %s | %d] Structural gate-hit fold included in aggregate "
+                    "[Trial %s | %d] Single structural gate-hit fold included in aggregate "
                     "(dd_gate=%s anomaly=%s score=%.4f).",
                     trial_id, oos_year,
                     diag.get("dd_gate_hit"), diag.get("anomaly_hit"), score,
                 )
-                continue   # skip the duplicate append below
+                continue
 
             scores.append(float(score))
 
