@@ -768,7 +768,14 @@ def build_precomputed_matrices(
         return {}
 
     close = pd.DataFrame(close_d).sort_index()
-    close_adj = pd.DataFrame(close_adj_d).sort_index()
+    shared_index = close.index
+    close_adj = pd.DataFrame(close_adj_d).reindex(shared_index)
+    open_df = pd.DataFrame(open_d).reindex(shared_index)
+    high_df = pd.DataFrame(high_d).reindex(shared_index)
+    low_df = pd.DataFrame(low_d).reindex(shared_index)
+    dividends_df = pd.DataFrame(div_d).reindex(shared_index).fillna(0.0)
+    splits_df = pd.DataFrame(split_d).reindex(shared_index).fillna(0.0)
+    volume_df = pd.DataFrame(volume_d).reindex(shared_index)
 
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
@@ -776,12 +783,12 @@ def build_precomputed_matrices(
     return {
         "close": close,
         "close_adj": close_adj,
-        "open": pd.DataFrame(open_d).sort_index(),
-        "high": pd.DataFrame(high_d).sort_index(),
-        "low": pd.DataFrame(low_d).sort_index(),
-        "dividends": pd.DataFrame(div_d).sort_index().fillna(0.0),
-        "splits": pd.DataFrame(split_d).sort_index().fillna(0.0),
-        "volume": pd.DataFrame(volume_d).sort_index(),
+        "open": open_df,
+        "high": high_df,
+        "low": low_df,
+        "dividends": dividends_df,
+        "splits": splits_df,
+        "volume": volume_df,
         "returns": returns_base.pct_change(fill_method=None).clip(lower=-0.99),
     }
 

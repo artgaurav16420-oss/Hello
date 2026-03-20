@@ -563,10 +563,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     historical_union: set[str] = set()
     try:
-        rebalance_dates  = pd.date_range(TRAIN_START, TEST_END, freq=cfg.REBALANCE_FREQ)
-        month_end_dates  = pd.date_range(TRAIN_START, TEST_END, freq="ME")
-        all_target_dates = sorted(set(rebalance_dates).union(set(month_end_dates)))
-        for target_date in all_target_dates:
+        for target_date in pd.date_range(TRAIN_START, TEST_END, freq="QE"):
             historical_union.update(
                 get_historical_universe(normalized_universe, pd.Timestamp(target_date))
             )

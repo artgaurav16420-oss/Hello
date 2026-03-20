@@ -146,6 +146,35 @@ _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
 _SECTOR_MAP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
+_HISTORICAL_UNIVERSE_DATES_CACHE: Dict[Path, pd.DatetimeIndex] = {}
+_UNIVERSE_LOOKUP_CACHE: Dict[tuple[str, pd.Timestamp], List[str]] = {}
+
+
+def _clear_historical_universe_caches(hist_file: Path) -> None:
+    universe_type = hist_file.stem.removeprefix("historical_")
+    _HISTORICAL_UNIVERSE_DF_CACHE.pop(hist_file, None)
+    _HISTORICAL_UNIVERSE_DATES_CACHE.pop(hist_file, None)
+    stale_keys = [
+        key for key in _UNIVERSE_LOOKUP_CACHE
+        if key[0] == universe_type
+    ]
+    for key in stale_keys:
+        _UNIVERSE_LOOKUP_CACHE.pop(key, None)
+
+
+def _coerce_historical_members(value) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if hasattr(value, "tolist"):
+        converted = value.tolist()
+        return converted if isinstance(converted, list) else [converted]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _normalize_historical_members(values) -> List[str]:
+    return sorted({str(t).strip() for t in values if str(t).strip()})
 
 
 def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
@@ -179,6 +208,9 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     if cached is not None and cached[0] == mtime:
         return cached[1]
 
+    if cached is not None and cached[0] != mtime:
+        _clear_historical_universe_caches(hist_file)
+
     # FIX-NEW-UM-02: the parquet files written by historical_builder store list-
     # valued cells in the "tickers" column.  pyarrow preserves Python lists
     # natively via its list<string> type; fastparquet serialises them differently
@@ -195,6 +227,7 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
         )
         df = pd.read_parquet(hist_file)
     _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
+    _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = pd.DatetimeIndex(df.index.unique()).sort_values()
     return df
 
 
@@ -233,24 +266,23 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
             _MISSING_PARQUET_WARNED[universe_type] = True
     else:
         try:
+            lookup_date = pd.Timestamp(date).normalize()
             df = _load_historical_universe_df(hist_file)
+            available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
+            if available_dates is None:
+                available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
+                _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
 
-            available_dates = df.index.unique()
-            valid_dates = available_dates[available_dates <= date]
+            target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
 
-            if len(valid_dates) > 0:
-                target_date = valid_dates.max()
+            if target_pos >= 0:
+                target_date = pd.Timestamp(available_dates[target_pos])
+                cache_key = (universe_type, target_date)
+                cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
+                if cached_members is not None:
+                    return cached_members
+
                 constituents = df.loc[target_date, "tickers"]
-
-                def _coerce_members(value) -> List[str]:
-                    if isinstance(value, str):
-                        return [value]
-                    if hasattr(value, "tolist"):
-                        converted = value.tolist()
-                        return converted if isinstance(converted, list) else [converted]
-                    if isinstance(value, (list, tuple, set)):
-                        return list(value)
-                    return [value]
 
                 if isinstance(constituents, pd.Series):
                     # FIX-MB-UM-02: warn about duplicate-index parquet so operators
@@ -264,15 +296,18 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                     )
                     merged: List[str] = []
                     for cell in constituents.values:
-                        merged.extend(_coerce_members(cell))
-                    return sorted({str(t).strip() for t in merged if str(t).strip()})
+                        merged.extend(_coerce_historical_members(cell))
+                    result = _normalize_historical_members(merged)
+                else:
+                    result = _normalize_historical_members(_coerce_historical_members(constituents))
 
-                return sorted({str(t).strip() for t in _coerce_members(constituents) if str(t).strip()})
-            else:
-                logger.warning(
-                    "[Universe] No historical data prior to %s found in %s.",
-                    date.strftime("%Y-%m-%d"), hist_file
-                )
+                _UNIVERSE_LOOKUP_CACHE[cache_key] = result
+                return result
+
+            logger.warning(
+                "[Universe] No historical data prior to %s found in %s.",
+                lookup_date.strftime("%Y-%m-%d"), hist_file
+            )
         except Exception as exc:
             logger.error(
                 "[Universe] Historical load failed for %s on %s: %s",
