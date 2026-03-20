@@ -19,3 +19,19 @@ def test_load_env_file_fallback_sets_missing_keys_only(tmp_path, monkeypatch):
 
     assert os.getenv("GROWW_API_TOKEN") == "token_from_file"
     assert os.getenv("EXISTING_KEY") == "already_set"
+
+
+def test_load_env_file_fallback_strips_inline_comments_from_unquoted_values(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TOKEN=abc123 # prod token\nQUOTED='keep # inside quotes'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("TOKEN", raising=False)
+    monkeypatch.delenv("QUOTED", raising=False)
+
+    bhf._load_env_file_fallback(env_file)
+
+    assert os.getenv("TOKEN") == "abc123"
+    assert os.getenv("QUOTED") == "keep # inside quotes"

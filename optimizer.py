@@ -209,7 +209,8 @@ def _fitness_from_metrics(
     forced_cash_penalty: penalises repeated forced CVaR liquidations in IS.
     Uses forced_to_cash column (backtest_engine v11.52) or infers from logs.
 
-    Score ceiling: Michaelis-Menten (_K * raw) / (_K + raw) -> asymptote _K=3.5
+    Score ceiling: Michaelis-Menten (_K * raw) / (_K + raw) -> asymptote _K=3.5.
+    A "ceiling hit" is tracked when the bounded score reaches >=99% of _K.
     Score floor  : hard -2.0
     """
     cagr         = float(metrics.get("cagr",    0.0))
@@ -323,7 +324,7 @@ def _fitness_from_metrics(
         _K    = 3.5
         score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
         score = max(score, -2.0)
-        ceiling_hit = False
+        ceiling_hit = raw > 0.0 and score >= (_K * 0.99)
         dd_gate_hit = False
 
     diag = {
@@ -434,12 +435,12 @@ class MomentumObjective:
 
             fold_matrices = None
             if self.precomputed_matrices is not None:
-                is_start_ts = pd.Timestamp(wf_is_start)
+                warmup_start_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
                 oos_end_ts  = pd.Timestamp(wf_oos_end)
                 fold_matrices = {}
                 for key, df in self.precomputed_matrices.items():
                     if isinstance(df, pd.DataFrame) and not df.empty:
-                        fold_matrices[key] = df.loc[is_start_ts:oos_end_ts]
+                        fold_matrices[key] = df.loc[warmup_start_ts:oos_end_ts]
                     else:
                         fold_matrices[key] = df
 
@@ -595,7 +596,8 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         kwargs.pop("cfg", None)
         market_data = load_or_fetch(**kwargs)
 
-    market_data = apply_halt_simulation(market_data)
+    if getattr(cfg, "SIMULATE_HALTS", False):
+        market_data = apply_halt_simulation(market_data)
 
     precomputed_matrices = None
     if all(isinstance(v, pd.DataFrame) for v in market_data.values()):

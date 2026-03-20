@@ -148,6 +148,30 @@ _SECTOR_MAP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
 
 
+def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
+    if not fetched_at:
+        return False
+    try:
+        fetched_time = datetime.fromisoformat(fetched_at)
+    except (TypeError, ValueError):
+        return False
+    return datetime.now() - fetched_time < timedelta(hours=ttl_hours)
+
+
+def _normalize_sector_cache_entry(
+    entry,
+    *,
+    fallback_fetched_at: str | None = None,
+) -> tuple[str | None, str | None]:
+    if isinstance(entry, dict):
+        sector = str(entry.get("sector", "Unknown") or "Unknown")
+        fetched_at = entry.get("fetched_at") or fallback_fetched_at
+        return sector, fetched_at
+    if isinstance(entry, str):
+        return entry or "Unknown", fallback_fetched_at
+    return None, None
+
+
 def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     """Load historical universe parquet with mtime-based in-memory caching."""
     mtime = hist_file.stat().st_mtime
@@ -259,12 +283,13 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     if csv_members:
         return csv_members
 
-    logger.error(
-        "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
-        "Returning empty universe (survivorship bias risk if caller falls back).",
-        universe_type,
-    )
-    _NO_RECORD_WARNED[universe_type] = True
+    if not _NO_RECORD_WARNED.get(universe_type):
+        logger.error(
+            "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
+            "Returning empty universe (survivorship bias risk if caller falls back).",
+            universe_type,
+        )
+        _NO_RECORD_WARNED[universe_type] = True
     return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────
@@ -511,14 +536,21 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
 
     if missing_tickers and use_cache:
         cache = _load_universe_cache()
-        sector_cache = cache.get("sector_map", {}).get("sectors", {})
+        sector_map_cache = cache.get("sector_map", {})
+        sector_cache = sector_map_cache.get("sectors", {})
+        sector_cache_fetched_at = sector_map_cache.get("fetched_at")
 
         still_missing = []
         for bare_ticker in missing_tickers:
             if bare_ticker in sector_cache:
-                resolved_map[bare_ticker] = sector_cache[bare_ticker]
-            else:
-                still_missing.append(bare_ticker)
+                cached_sector, fetched_at = _normalize_sector_cache_entry(
+                    sector_cache[bare_ticker],
+                    fallback_fetched_at=sector_cache_fetched_at,
+                )
+                if cached_sector is not None and _is_cache_entry_fresh(fetched_at):
+                    resolved_map[bare_ticker] = cached_sector
+                    continue
+            still_missing.append(bare_ticker)
         missing_tickers = still_missing
 
     if missing_tickers:
@@ -602,10 +634,17 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             with _SECTOR_MAP_CACHE_LOCK:
                 current_cache = _load_universe_cache()
                 existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
-                existing_sector_cache.update({sym: resolved_map[sym] for sym in missing_tickers})
+                fetched_at = datetime.now().isoformat()
+                existing_sector_cache.update({
+                    sym: {
+                        "sector": resolved_map[sym],
+                        "fetched_at": fetched_at,
+                    }
+                    for sym in missing_tickers
+                })
 
                 current_cache["sector_map"] = {
-                    "fetched_at": datetime.now().isoformat(),
+                    "fetched_at": fetched_at,
                     "sectors": existing_sector_cache,
                 }
                 _save_universe_cache(current_cache)

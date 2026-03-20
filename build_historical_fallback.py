@@ -55,7 +55,16 @@ def _load_env_file_fallback(env_path: Path = Path('.env')) -> None:
                 continue
             key, value = line.split('=', 1)
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if value and value[0] in ('"', "'"):
+                q = value[0]
+                if value.endswith(q) and len(value) >= 2:
+                    value = value[1:-1]
+            else:
+                for _sep in (' #', '\t#'):
+                    if _sep in value:
+                        value = value[:value.index(_sep)].rstrip()
+                        break
             if key and key not in os.environ:
                 os.environ[key] = value
     except Exception as exc:
