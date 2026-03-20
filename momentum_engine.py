@@ -658,10 +658,13 @@ def execute_rebalance(
                             cfg.MAX_ABSENT_PERIODS,
                         )
                     if px_exec > 0 and n_shares > 0:
-                        # MB-C-03: do NOT add force-close proceeds to pv_exec here.
-                        # Phase 2 (below) unconditionally handles all symbols_to_force_close.
-                        # Adding them here as well would double-count their proceeds and
-                        # inflate state.cash by up to 2x the force-closed notional.
+                        # FIX-MB-C-03: full-liquidation returns before Phase 2,
+                        # so any force-close candidate excluded from Phase 1
+                        # must have its proceeds restored here exactly once.
+                        # Active/retained names are already included in pv_exec;
+                        # only symbols explicitly excluded from Phase 1 need this.
+                        if sym in symbols_to_force_close:
+                            pv_exec += n_shares * px_exec
                         slip            = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:

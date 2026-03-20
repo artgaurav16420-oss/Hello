@@ -730,10 +730,14 @@ def test_detect_and_apply_splits_fractional_cash():
     state.last_known_prices = {"A": 100.0}
 
     market_data = {"A": pd.DataFrame({"Close": [200.0], "Stock Splits": [0.5]})}
-    detect_and_apply_splits(state, market_data, UltimateConfig(AUTO_ADJUST_PRICES=False))
+    detect_and_apply_splits(
+        state,
+        market_data,
+        UltimateConfig(AUTO_ADJUST_PRICES=False, ROUND_TRIP_SLIPPAGE_BPS=10.0),
+    )
 
     assert state.shares["A"] == 50, "Shares should floor correctly on splits."
-    assert state.cash == 100.0, "Fractional value must be safely routed to Cash."
+    assert state.cash == pytest.approx(99.95), "Fractional value must deduct one-way slippage."
 
 def test_detect_and_apply_splits_runs_even_when_auto_adjust_enabled():
     state = PortfolioState(cash=0.0)
@@ -1245,6 +1249,40 @@ def test_gated_position_force_closed_on_first_decay_bar():
 
     b_sells = [t for t in trade_log if t.symbol == "B" and t.direction == "SELL"]
     assert b_sells, "A SELL trade for B must be recorded."
+
+
+def test_decay_liquidation_restores_force_close_proceeds(monkeypatch):
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=3, CVAR_DAILY_LIMIT=0.01, ROUND_TRIP_SLIPPAGE_BPS=10.0)
+    state = PortfolioState(cash=0.0)
+    state.shares = {"LIVE": 1, "GHOST": 2}
+    state.entry_prices = {"LIVE": 100.0, "GHOST": 50.0}
+    state.last_known_prices = {"LIVE": 100.0, "GHOST": 50.0}
+    state.absent_periods = {"GHOST": cfg.MAX_ABSENT_PERIODS - 1}
+
+    original_absent_price = absent_symbol_effective_price
+
+    monkeypatch.setattr(
+        "momentum_engine.absent_symbol_effective_price",
+        lambda last_known_price, absent_periods, max_absent_periods: (
+            25.0 if absent_periods >= max_absent_periods else
+            original_absent_price(last_known_price, absent_periods, max_absent_periods)
+        ),
+    )
+
+    total_slip = execute_rebalance(
+        state=state,
+        target_weights=np.array([1.0]),
+        prices=np.array([100.0]),
+        active_symbols=["LIVE"],
+        cfg=cfg,
+        apply_decay=True,
+        scenario_losses=np.array([[1.0], [1.0], [1.0]]),
+    )
+
+    expected_gross = 100.0 + (2 * 25.0)
+    expected_cash = expected_gross - total_slip
+    assert state.shares == {}
+    assert state.cash == pytest.approx(expected_cash)
 
 
 def test_decay_rounds_reset_on_solver_success():

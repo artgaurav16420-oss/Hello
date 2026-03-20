@@ -456,11 +456,6 @@ def generate_signals(
                 stale_denied,
                 liquidity_denied,
             )
-            logging.getLogger().debug(
-                "[Signals] Continuity denied for %d stale and %d illiquid symbols.",
-                stale_denied,
-                liquidity_denied,
-            )
 
     # FIX-NAN-ARGSORT: replace any residual NaN in adj_scores with -inf before
     # sorting.  NumPy places NaN at the END of an argsort result (highest indices),
