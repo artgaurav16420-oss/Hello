@@ -649,7 +649,9 @@ def execute_rebalance(
                 )
                 exit_slip_rate = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
                 for sym, n_shares in state.shares.items():
-                    if sym in active_idx:
+                    if sym in symbols_to_force_close:
+                        px_exec = float(state.last_known_prices.get(sym, 0.0))
+                    elif sym in active_idx:
                         px_exec = float(local_prices[active_idx[sym]])
                     else:
                         px_exec = absent_symbol_effective_price(
