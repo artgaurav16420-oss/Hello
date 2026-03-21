@@ -124,12 +124,12 @@ def compute_regime_score(
         vol_ewma = float(ewma_var.iloc[-1] ** 0.5 * np.sqrt(252)) if pd.notna(ewma_var.iloc[-1]) else 0.0
 
         vol_floor = float(getattr(cfg, "REGIME_VOL_FLOOR", 0.18)) if cfg else 0.18
-        vol_mult  = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
+        vol_mult = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
 
         lt_ewma_span = int(getattr(cfg, "REGIME_LT_VOL_EWMA_SPAN", 1260)) if cfg else 1260
         # FIX-MB-REGIMEWARMUP: min_periods=252 prevents cold-start false precision.
         # Returns NaN for the first ~252 days → falls back to vol_floor below.
-        lt_ewma_var  = all_returns.ewm(span=lt_ewma_span, adjust=False, min_periods=252).var()
+        lt_ewma_var = all_returns.ewm(span=lt_ewma_span, adjust=False, min_periods=252).var()
         if pd.notna(lt_ewma_var.iloc[-1]) and lt_ewma_var.iloc[-1] > 0:
             long_term_vol = float(lt_ewma_var.iloc[-1] ** 0.5 * np.sqrt(252))
         else:
@@ -140,7 +140,8 @@ def compute_regime_score(
         if vol_20d > dynamic_threshold:
             logger.debug(
                 "[Signals] Regime Volatility Spike detected (EWMA=%.2f > threshold=%.2f). Applying penalty.",
-                vol_20d, dynamic_threshold,
+                vol_20d,
+                dynamic_threshold,
             )
             base_score *= 0.85
         vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
@@ -149,9 +150,9 @@ def compute_regime_score(
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty:
         # FIX-NEW-SIG-02: exclude benchmark index columns (names starting with
-        # "^") before computing breadth.  When the active universe is empty or
+        # "^") before computing breadth. When the active universe is empty or
         # not yet passed, universe_close_hist may contain only index tickers such
-        # as ^NSEI / ^CRSLDX.  A rising index trivially beats its own SMA,
+        # as ^NSEI / ^CRSLDX. A rising index trivially beats its own SMA,
         # producing breadth_component=1.0 and inflating the composite regime
         # score — causing the engine to hold full exposure when there are in fact
         # no eligible equity positions to allocate to.
@@ -190,7 +191,23 @@ def compute_regime_score(
                     breadth_component = float((last[valid] > sma_vals[valid]).mean())
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
-    return round(float(np.clip(composite, 0.0, 1.0)), 10)
+    base_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
+
+    if universe_close_hist is not None and len(universe_close_hist) >= 50:
+        equity_cols = [c for c in universe_close_hist.columns if not str(c).startswith("^")]
+        if equity_cols:
+            breadth_hist = universe_close_hist.loc[:, equity_cols].tail(50)
+            sma_50 = breadth_hist.mean(skipna=True)
+            current_prices = universe_close_hist.loc[:, equity_cols].iloc[-1]
+            breadth_flags = (current_prices > sma_50) & current_prices.notna() & sma_50.notna()
+            breadth_pct = float(breadth_flags.mean())
+
+            if breadth_pct < 0.35:
+                return 0.0
+            if breadth_pct < 0.45:
+                return min(base_score, 0.5)
+
+    return base_score
 
 
 def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None) -> float:
