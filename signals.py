@@ -88,16 +88,30 @@ def compute_regime_score(
     close_series = idx_hist["Close"]
 
     sma_window = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
+    sma_fast_window = int(getattr(cfg, "REGIME_SMA_FAST_WINDOW", 50)) if cfg else 50
+    min_sma_periods = 20
+    min_fast_periods = max(10, min_sma_periods // 2)
+
     if len(close_series) >= sma_window:
-        sma200 = float(close_series.rolling(window=sma_window, min_periods=20).mean().iloc[-1])
+        sma200 = float(close_series.rolling(window=sma_window, min_periods=min_sma_periods).mean().iloc[-1])
     else:
-        sma200 = float(close_series.expanding(min_periods=20).mean().iloc[-1])
+        sma200 = float(close_series.expanding(min_periods=min_sma_periods).mean().iloc[-1])
+
+    if len(close_series) >= sma_fast_window:
+        sma_fast = float(
+            close_series.rolling(window=sma_fast_window, min_periods=min_fast_periods).mean().iloc[-1]
+        )
+    else:
+        sma_fast = float(close_series.expanding(min_periods=min_fast_periods).mean().iloc[-1])
+
     last_price = float(close_series.iloc[-1])
 
     if sma200 <= 0 or not np.isfinite(sma200):
         return 0.5
 
-    trend_deviation = (last_price / sma200) - 1.0
+    trend_dev_slow = (last_price / sma200) - 1.0
+    trend_dev_fast = (last_price / sma_fast) - 1.0 if sma_fast > 0 and np.isfinite(sma_fast) else trend_dev_slow
+    trend_deviation = 0.6 * trend_dev_fast + 0.4 * trend_dev_slow
     trend_steepness = float(getattr(cfg, "REGIME_SIGMOID_STEEPNESS", 10.0)) if cfg else 10.0
     base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
 

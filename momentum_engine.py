@@ -190,7 +190,7 @@ class UltimateConfig:
     DRIFT_TOLERANCE:             float = 0.02
 
     # Exposure management
-    DELEVERAGING_LIMIT:          float = 0.10
+    DELEVERAGING_LIMIT:          float = 0.20
     MIN_EXPOSURE_FLOOR:          float = 0.40
     CAPITAL_ELASTICITY:          float = 0.15
 
@@ -241,6 +241,7 @@ class UltimateConfig:
     REGIME_VOL_FLOOR:         float = 0.18
     REGIME_VOL_MULTIPLIER:    float = 1.5
     REGIME_SIGMOID_STEEPNESS: float = 10.0
+    REGIME_SMA_FAST_WINDOW:   int   = 50
     REGIME_SMA_WINDOW:        int   = 200
     REGIME_VOL_EWMA_SPAN:     int   = 20
     REGIME_LT_VOL_EWMA_SPAN:  int   = 1260
