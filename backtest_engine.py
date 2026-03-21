@@ -33,6 +33,9 @@ BUG FIXES (murder board):
   years to at least 1/252 to prevent near-zero values from inflating
   annualised turnover by orders of magnitude in short test series.
 - FIX-MB-M-04: Holiday-snap collision logging elevated from DEBUG to WARNING.
+- FIX-MB-M-05: turnover metric documentation now explicitly states that
+  1.0 turnover = one annualized full-portfolio round-trip, matching the
+  optimizer friction model.
 - BUG-FIX-FRAC-SLIP: Fractional share liquidations on stock splits now deduct
   one-way slippage from the cash credit, matching the treatment of all other
   sell-side transactions.
@@ -1140,6 +1143,8 @@ def _compute_metrics(
         total_sell_notional = sum(abs(t.delta_shares) * t.exec_price for t in sell_trades)
         avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
         if avg_equity > 0:
+            # Divide by 2.0 so 1.0 turnover means one full portfolio round-trip:
+            # e.g. buy Rs.100 and sell Rs.100 against Rs.100 average equity -> 1.0.
             turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
             if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
                 years = (eq.index[-1] - eq.index[0]).days / 365.25

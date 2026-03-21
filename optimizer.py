@@ -1,13 +1,15 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.53
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.54
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses expanding-window time-series cross-validation for parameter selection,
 followed by a true holdout Out-of-Sample (OOS) validation period.
 
-CHANGES vs v11_52:
-- OBJECTIVE_VERSION = fitness_v11_53: resets the study for the revised
-  walk-forward/pruning regime.
+CHANGES vs v11_53:
+- OBJECTIVE_VERSION = fitness_v11_54: resets the study for the revised
+  search bounds and turnover penalty.
+- N_TRIALS raised 150 -> 200: gives TPE a better chance to find robust
+  regions of the tighter search space.
 - TRAIN_START moved 2018-01-01 -> 2019-01-01: drops the fragile 2019 OOS fold
   that only had the minimum 365-day IS history and gives 2020+ folds a fuller
   training window.
@@ -30,8 +32,10 @@ CHANGES vs v11_52:
   column from rebal_log (backtest_engine v11.52). Falls back to inference.
 - OOS_MAX_DD_CAP raised 35% -> 38%: 2023-2025 is harder than training.
 - OOS_SOFT_MAX_DD_CAP = 42%: NEAR diagnostic tier (display only, not a pass).
-- SEARCH_SPACE_BOUNDS narrowed: removes aggressive short halflives and loose
-  CVaR limits that consistently overfitted to IS bull-market years.
+- SEARCH_SPACE_BOUNDS tightened again: higher floors on HALFLIFE_FAST,
+  CONTINUITY_BONUS, and RISK_AVERSION remove fragile high-churn settings.
+- turnover_drag now uses realistic 30 bps round-trip friction plus a
+  nonlinear churn penalty above 18x/year.
 """
 import argparse
 import json
@@ -72,7 +76,7 @@ def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
 
 _load_dotenv_if_present()
 
-from momentum_engine import UltimateConfig, OptimizationError
+from momentum_engine import UltimateConfig, OptimizationError, OptimizationErrorType
 from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
 from universe_manager import get_nifty500, fetch_nse_equity_universe, get_historical_universe
@@ -106,7 +110,7 @@ TRAIN_END   = "2023-12-31"
 TEST_START  = "2024-01-01"
 TEST_END    = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
 
-N_TRIALS = 150
+N_TRIALS = 200
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -118,16 +122,15 @@ OOS_TOP_K = 10
 
 _MIN_IS_CALENDAR_DAYS = 365
 
-# Narrowed vs v11_51:
-#   HALFLIFE_FAST  floor 10->15: removes noise-amplifying short signals
-#   HALFLIFE_SLOW  floor 40->60: biases toward slower, regime-robust signals
-#   RISK_AVERSION  floor 10->12: removes aggressive configurations
-#   CVAR_DAILY_LIMIT ceiling 0.070->0.060: tighter risk limit
+# Narrowed vs v11_53:
+#   HALFLIFE_FAST floor 15->19: removes short-horizon churny variants
+#   CONTINUITY_BONUS floor 0.06->0.12: requires stronger persistence reward
+#   RISK_AVERSION floor 12->14: removes aggressive leverage-seeking configs
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (15, 29, 2),
+    "HALFLIFE_FAST":    (19, 29, 2),
     "HALFLIFE_SLOW":    (60, 100, 5),
-    "CONTINUITY_BONUS": (0.06, 0.18, 0.03),
-    "RISK_AVERSION":    (12.0, 20.0, 0.5),
+    "CONTINUITY_BONUS": (0.12, 0.18, 0.03),
+    "RISK_AVERSION":    (14.0, 20.0, 0.5),
     "CVAR_DAILY_LIMIT": (0.055, 0.090, 0.005),
     "CVAR_LOOKBACK":    (60, 120, 10),
 }
@@ -136,8 +139,8 @@ N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
-# Bumped to v11_53: guarantees a clean study after the revised fold/prune logic.
-OBJECTIVE_VERSION  = "fitness_v11_53"
+# Bumped to v11_54: guarantees a clean study after bounds & penalty revisions.
+OBJECTIVE_VERSION  = "fitness_v11_54"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 MAX_REASONABLE_CAGR_PCT       = 300.0
@@ -236,8 +239,14 @@ def _fitness_from_metrics(
     sortino      = float(metrics.get("sortino",  0.0) or 0.0)
     final_equity = float(metrics.get("final", BASE_INITIAL_CAPITAL) or BASE_INITIAL_CAPITAL)
     final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
-    turnover_drag  = turnover * 0.05
-    cagr_net       = cagr - turnover_drag
+
+    # Base friction: 30 bps round-trip cost (15 bps per side for slippage/STT/fees).
+    base_friction_drag = turnover * 0.30
+    # Nonlinear churn penalty: heavily penalizes turnover beyond ~18 round-trips/year.
+    churn_penalty = (max(0.0, turnover - 18.0) ** 2) / 10.0
+
+    turnover_drag = base_friction_drag + churn_penalty
+    cagr_net = cagr - turnover_drag
 
     avg_cvar            = 0.0
     avg_exposure        = 1.0
@@ -550,6 +559,57 @@ class MomentumObjective:
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
+def _validate_regime_benchmark_data(market_data: dict, required_start: str, required_end: str) -> None:
+    """Fail fast when regime benchmark inputs are missing or unusable."""
+    required_start_ts = pd.Timestamp(required_start)
+    required_end_ts = pd.Timestamp(required_end)
+    benchmark_notes: list[str] = []
+
+    for ticker in ("^CRSLDX", "^NSEI"):
+        df = market_data.get(ticker)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            benchmark_notes.append(f"{ticker}: missing")
+            continue
+        if "Close" not in df.columns:
+            benchmark_notes.append(f"{ticker}: missing Close column")
+            continue
+
+        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if close.empty:
+            benchmark_notes.append(f"{ticker}: Close column has no finite values")
+            continue
+
+        coverage_start = pd.Timestamp(close.index.min())
+        coverage_end = pd.Timestamp(close.index.max())
+        if coverage_start > required_start_ts or coverage_end < required_end_ts:
+            benchmark_notes.append(
+                f"{ticker}: coverage {coverage_start.date()} -> {coverage_end.date()} does not span "
+                f"{required_start_ts.date()} -> {required_end_ts.date()}"
+            )
+            continue
+
+        if len(close.loc[required_start_ts:required_end_ts]) < 200:
+            benchmark_notes.append(
+                f"{ticker}: only {len(close.loc[required_start_ts:required_end_ts])} rows within required window"
+            )
+            continue
+
+        logger.info(
+            "Using %s for regime data validation (%s -> %s, %d rows in required window).",
+            ticker,
+            coverage_start.date(),
+            coverage_end.date(),
+            len(close.loc[required_start_ts:required_end_ts]),
+        )
+        return
+
+    raise OptimizationError(
+        "Regime benchmark validation failed. Neither ^CRSLDX nor ^NSEI has usable Close coverage for "
+        f"{required_start_ts.date()} -> {required_end_ts.date()}. Details: " + "; ".join(benchmark_notes),
+        OptimizationErrorType.DATA,
+    )
+
+
 def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
     logger.info("Initializing Data Pre-fetch phase...")
     normalized_universe = _normalize_universe_type(universe_type)
@@ -605,6 +665,8 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     if getattr(cfg, "SIMULATE_HALTS", False):
         market_data = apply_halt_simulation(market_data)
+
+    _validate_regime_benchmark_data(market_data, _actual_warmup_start, TEST_END)
 
     precomputed_matrices = None
     if all(isinstance(v, pd.DataFrame) for v in market_data.values()):
