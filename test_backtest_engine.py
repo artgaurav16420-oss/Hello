@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -249,6 +250,21 @@ def test_compute_metrics_handles_non_positive_initial_capital():
     assert metrics["cagr"] == 0.0
     assert metrics["calmar"] == 0.0
     assert metrics["final"] == 110.0
+
+
+def test_compute_metrics_turnover_uses_round_trip_units():
+    eq = pd.Series(
+        [100.0, 100.0],
+        index=pd.to_datetime(["2020-01-01", "2020-12-31"]),
+    )
+    trades = [
+        be.Trade("AAA", pd.Timestamp("2020-01-02"), 1, 100.0, 0.0, "BUY"),
+        be.Trade("AAA", pd.Timestamp("2020-12-30"), -1, 100.0, 0.0, "SELL"),
+    ]
+
+    metrics = be._compute_metrics(eq, trades=trades, initial=100.0)
+
+    assert metrics["turnover"] == pytest.approx(1.0, abs=0.01)
 
 
 def test_repair_suspension_gaps_only_fills_detected_gap_not_entire_history():

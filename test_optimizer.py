@@ -195,6 +195,31 @@ def test_fitness_marks_reachable_score_plateaus_as_ceiling_hits():
     assert diag["ceiling_hit"] is True
 
 
+def test_fitness_applies_nonlinear_turnover_drag_above_18x():
+    metrics = {"cagr": 25.0, "max_dd": 10.0, "turnover": 24.0, "sortino": 2.5}
+    rebal_log = pd.DataFrame(
+        {
+            "realised_cvar": [0.01, 0.01, 0.01, 0.01],
+            "exposure_multiplier": [1.0, 1.0, 1.0, 1.0],
+            "n_positions": [8, 8, 8, 8],
+            "apply_decay": [False, False, False, False],
+        }
+    )
+
+    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+
+    assert diag["cagr_net"] == pytest.approx(14.2)
+    assert score < 1.0
+
+
+def test_optimizer_defaults_reflect_v11_54_search_space():
+    assert optimizer.N_TRIALS == 200
+    assert optimizer.OBJECTIVE_VERSION == "fitness_v11_54"
+    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_FAST"] == (19, 29, 2)
+    assert optimizer.SEARCH_SPACE_BOUNDS["CONTINUITY_BONUS"] == (0.12, 0.18, 0.03)
+    assert optimizer.SEARCH_SPACE_BOUNDS["RISK_AVERSION"] == (14.0, 20.0, 0.5)
+
+
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
@@ -234,13 +259,15 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
         captured["tickers"] = tickers
         captured["required_start"] = required_start
         captured["required_end"] = required_end
-        return {"ok": True}
+        return {"ok": True, "^NSEI": pd.DataFrame({"Close": [100.0] * 800}, index=pd.date_range("2018-11-27", periods=800, freq="B"))}
 
     monkeypatch.setattr(optimizer, "load_or_fetch", _fake_load_or_fetch)
 
     result = optimizer.pre_load_data("  NSE_TOTAL ")
 
-    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert result["market_data"]["ok"] is True
+    assert "^NSEI" in result["market_data"]
+    assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
     assert captured["required_end"] == "2020-12-31"
     assert captured["tickers"].count("ABC") == 1
@@ -269,13 +296,15 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
         captured["tickers"] = tickers
         captured["required_start"] = required_start
         captured["required_end"] = required_end
-        return {"ok": True}
+        return {"ok": True, "^NSEI": pd.DataFrame({"Close": [100.0] * 800}, index=pd.date_range("2018-11-27", periods=800, freq="B"))}
 
     monkeypatch.setattr(optimizer, "load_or_fetch", _fake_load_or_fetch)
 
     result = optimizer.pre_load_data("nifty500")
 
-    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert result["market_data"]["ok"] is True
+    assert "^NSEI" in result["market_data"]
+    assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
     assert captured["required_end"] == "2020-09-30"
     assert "LIVEONLY" in captured["tickers"]
@@ -294,10 +323,12 @@ def test_pre_load_data_skips_halt_simulation_when_disabled(monkeypatch):
     cfg = optimizer.UltimateConfig()
     cfg.SIMULATE_HALTS = False
 
+    idx = pd.date_range("2018-11-27", "2020-03-31", freq="B")
+
     monkeypatch.setattr(
         optimizer,
         "load_or_fetch",
-        lambda **kwargs: {"ok": True},
+        lambda **kwargs: {"ABC": pd.DataFrame({"Close": [1.0] * len(idx)}, index=idx), "^NSEI": pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx)},
     )
 
     def _fail_if_called(_market_data):
@@ -307,7 +338,24 @@ def test_pre_load_data_skips_halt_simulation_when_disabled(monkeypatch):
 
     result = optimizer.pre_load_data("nse_total", cfg=cfg)
 
-    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert set(result["market_data"]) == {"ABC", "^NSEI"}
+    assert isinstance(result["precomputed_matrices"], dict)
+
+
+def test_validate_regime_benchmark_data_accepts_nsei_fallback():
+    idx = pd.date_range("2019-01-01", "2025-12-31", freq="B")
+    market_data = {
+        "^NSEI": pd.DataFrame({"Close": np.linspace(100.0, 200.0, len(idx))}, index=idx)
+    }
+
+    optimizer._validate_regime_benchmark_data(market_data, "2020-01-01", "2025-12-31")
+
+
+def test_validate_regime_benchmark_data_raises_when_benchmarks_missing():
+    with pytest.raises(optimizer.OptimizationError, match="Regime benchmark validation failed") as exc_info:
+        optimizer._validate_regime_benchmark_data({}, "2020-01-01", "2025-12-31")
+
+    assert exc_info.value.error_type == optimizer.OptimizationErrorType.DATA
 
 
 def test_build_sampler_returns_tpe_sampler(monkeypatch):
@@ -341,6 +389,7 @@ def test_default_train_start_drops_2019_oos_fold():
         "2020-01-01",
         "2021-01-01",
         "2022-01-01",
+        "2023-01-01",
     ]
 
 
@@ -360,11 +409,13 @@ def test_pre_load_data_uses_normalized_fallback_universe_for_history(monkeypatch
         return ["OLD1"]
 
     monkeypatch.setattr(optimizer, "get_historical_universe", _fake_hist)
-    monkeypatch.setattr(optimizer, "load_or_fetch", lambda **kwargs: {"ok": True})
+    monkeypatch.setattr(optimizer, "load_or_fetch", lambda **kwargs: {"ok": True, "^NSEI": pd.DataFrame({"Close": [100.0] * 800}, index=pd.date_range("2018-11-27", periods=800, freq="B"))})
 
     result = optimizer.pre_load_data(" typo ")
 
-    assert result == {"market_data": {"ok": True}, "precomputed_matrices": None}
+    assert result["market_data"]["ok"] is True
+    assert "^NSEI" in result["market_data"]
+    assert result["precomputed_matrices"] is None
     assert historical_calls
     assert set(historical_calls) == {"nifty500"}
 
