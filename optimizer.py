@@ -102,11 +102,11 @@ logging.getLogger("data_cache").setLevel(logging.ERROR)
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2019-01-01"
-TRAIN_END   = "2022-12-31"
-TEST_START  = "2023-01-01"
+TRAIN_END   = "2023-12-31"
+TEST_START  = "2024-01-01"
 TEST_END    = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
 
-N_TRIALS = 250
+N_TRIALS = 150
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -128,7 +128,7 @@ SEARCH_SPACE_BOUNDS = {
     "HALFLIFE_SLOW":    (60, 100, 5),
     "CONTINUITY_BONUS": (0.06, 0.18, 0.03),
     "RISK_AVERSION":    (12.0, 20.0, 0.5),
-    "CVAR_DAILY_LIMIT": (0.040, 0.060, 0.005),
+    "CVAR_DAILY_LIMIT": (0.055, 0.090, 0.005),
     "CVAR_LOOKBACK":    (60, 120, 10),
 }
 
@@ -506,7 +506,7 @@ class MomentumObjective:
             if is_structural_gate_hit:
                 n_gate_hits += 1
                 scores.append(float(score))
-                if n_gate_hits > 1:
+                if n_gate_hits > 2:
                     raise optuna.TrialPruned()
                 logger.debug(
                     "[Trial %s | %d] Single structural gate-hit fold included in aggregate "
