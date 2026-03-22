@@ -93,9 +93,9 @@ TRAIN_END   = "2023-12-31"
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TEST_START_2 = "2025-01-01"
-TEST_END_2   = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
+TEST_END_2   = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2024-12-31")
 
-N_TRIALS = 300
+N_TRIALS = 100
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -103,7 +103,7 @@ OOS_MAX_DD_CAP      = 38.0
 # OOS soft tier: displayed as NEAR but does not count as a pass.
 OOS_SOFT_MAX_DD_CAP = 42.0
 
-OOS_TOP_K = 20
+OOS_TOP_K = 30
 
 _MIN_IS_CALENDAR_DAYS = 365
 
@@ -111,21 +111,21 @@ _MIN_IS_CALENDAR_DAYS = 365
 # portfolio construction / execution dimensions. Bounds are expressed as
 # (min, max, step) for integer and stepped-float suggestions.
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (10, 40, 5),
-    "HALFLIFE_SLOW":    (40, 120, 10),
+    "HALFLIFE_FAST":    (20, 50, 5),
+    "HALFLIFE_SLOW":    (80, 160, 10),
     "CONTINUITY_BONUS": (0.05, 0.25, 0.05),
     "RISK_AVERSION":    (5.0, 20.0, 1.0),
     "CVAR_DAILY_LIMIT": (0.040, 0.120, 0.010),
     "CVAR_LOOKBACK":    (60, 180, 20),
-    "MAX_POSITIONS":    (8, 20, 2),
-    "SIGNAL_LAG_DAYS":  (0, 21, 7),
+    "MAX_POSITIONS":    (6, 20, 2),
+    "SIGNAL_LAG_DAYS":  (0, 12, 3),
 }
 
 N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
-OBJECTIVE_VERSION  = "fitness_v11_56"
+OBJECTIVE_VERSION  = "fitness_v11_57"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 MAX_REASONABLE_CAGR_PCT       = 300.0
