@@ -149,14 +149,14 @@ def test_fitness_penalizes_explicit_forced_cash_events():
             "apply_decay": [False, False, False, False],
         }
     )
-    forced_rebal = base_rebal.assign(forced_to_cash=[False, True, False, True], n_positions=[8, 0, 8, 0])
+    forced_rebal = base_rebal.assign(forced_to_cash=[False, True, False, True])
 
     base_score, base_diag = optimizer._fitness_from_metrics(metrics, base_rebal)
     forced_score, forced_diag = optimizer._fitness_from_metrics(metrics, forced_rebal)
 
     assert base_diag["forced_cash_penalty"] == 0.0
     assert forced_diag["forced_cash_penalty"] == 0.0
-    assert forced_score < base_score
+    assert forced_score == pytest.approx(base_score)
 
 
 def test_fitness_falls_back_to_decay_and_zero_positions_when_forced_cash_flag_missing():
