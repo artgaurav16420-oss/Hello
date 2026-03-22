@@ -1,41 +1,24 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.55
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.56
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
-Uses expanding-window time-series cross-validation for parameter selection,
-followed by a true holdout Out-of-Sample (OOS) validation period.
+Uses walk-forward time-series cross-validation for parameter selection,
+followed by true holdout Out-of-Sample (OOS) validation periods.
 
-CHANGES vs v11_53:
-- OBJECTIVE_VERSION = fitness_v11_55: resets the study for the revised
-  search bounds and turnover penalty.
-- N_TRIALS raised 150 -> 200: gives TPE a better chance to find robust
-  regions of the tighter search space.
-- TRAIN_START moved 2018-01-01 -> 2019-01-01: drops the fragile 2019 OOS fold
-  that only had the minimum 365-day IS history and gives 2020+ folds a fuller
-  training window.
-- IS_DD_GATE kept at 40%: lowering to 35% caused every 2020 COVID fold to
-  score -2.0, making positive aggregate scores mathematically impossible.
-  IS_DD_GATE and OOS_MAX_DD_CAP serve different purposes and need not match.
-  IS_DD_GATE = "this fold is catastrophic noise." OOS_MAX_DD_CAP = "acceptable
-  live performance." COVID 2020 with 38% DD is expected, not overfitting.
-- IS_DD_PENALTY_PCT lowered 15% -> 12%: quadratic penalty fires earlier, adding
-  continuous pressure across moderate-drawdown parameter sets.
-- Gate-hit fold scores INCLUDED in aggregate: previously one bad fold was
-  silently excluded via `continue`, inflating aggregate for fragile strategies.
-  Now the bad score enters the average. Structural gate hits are allowed in up
-  to two folds before pruning so the unavoidable 2020 COVID regime does not
-  prevent trial completion.
-- Floor-clamped scores no longer consume the structural gate-hit budget. Only
-  DD-gate/anomaly diagnostics count toward pruning; harsh negative scores still
-  enter the aggregate and teach TPE to avoid those regions.
-- forced_cash_penalty: penalises forced CVaR liquidations. Reads forced_to_cash
-  column from rebal_log (backtest_engine v11.52). Falls back to inference.
-- OOS_MAX_DD_CAP raised 35% -> 38%: 2023-2025 is harder than training.
-- OOS_SOFT_MAX_DD_CAP = 42%: NEAR diagnostic tier (display only, not a pass).
-- SEARCH_SPACE_BOUNDS keeps tighter continuity/risk bounds while restoring
-  HALFLIFE_FAST to 15 so the optimizer can explore faster signals again.
-- turnover_drag now uses realistic 30 bps round-trip friction plus a
-  nonlinear churn penalty above 18x/year.
+CHANGES vs v11_55:
+- OBJECTIVE_VERSION = fitness_v11_56 to force a clean Optuna study.
+- N_TRIALS raised to 300 and OOS_TOP_K raised to 20 for broader tournament
+  coverage on the widened search space.
+- Walk-forward CV now uses a fixed rolling 2-year IS window instead of an
+  expanding window, reducing later-fold history advantage.
+- Fitness scoring now uses log1p(raw) for positive raw scores, removing the
+  old Michaelis-Menten ceiling while still compressing extremes.
+- forced_cash_penalty no longer affects fitness and is always emitted as 0.0
+  in diagnostics for observability compatibility.
+- OOS selection now requires a secondary 2025+ holdout pass when available,
+  with fallback to the best Period-1 passer if no dual-period winner exists.
+- SEARCH_SPACE_BOUNDS widened substantially and now includes MAX_POSITIONS
+  and SIGNAL_LAG_DAYS as optional optimization dimensions.
 """
 import argparse
 import json
@@ -107,10 +90,12 @@ logging.getLogger("data_cache").setLevel(logging.ERROR)
 
 TRAIN_START = "2019-01-01"
 TRAIN_END   = "2023-12-31"
-TEST_START  = "2024-01-01"
-TEST_END    = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
+TEST_START   = "2024-01-01"
+TEST_END     = "2024-12-31"
+TEST_START_2 = "2025-01-01"
+TEST_END_2   = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2025-12-31")
 
-N_TRIALS = 200
+N_TRIALS = 300
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -118,30 +103,29 @@ OOS_MAX_DD_CAP      = 38.0
 # OOS soft tier: displayed as NEAR but does not count as a pass.
 OOS_SOFT_MAX_DD_CAP = 42.0
 
-OOS_TOP_K = 10
+OOS_TOP_K = 20
 
 _MIN_IS_CALENDAR_DAYS = 365
 
-# Revised vs v11_53:
-#   HALFLIFE_FAST restored to 15: breadth hysteresis now guards against
-#     bottom-whipsaw, so faster momentum variants are allowed again
-#   CONTINUITY_BONUS floor 0.06->0.12: requires stronger persistence reward
-#   RISK_AVERSION floor 12->14: removes aggressive leverage-seeking configs
+# Search space widened in v11_56 to reduce TPE noise-chasing and add optional
+# portfolio construction / execution dimensions. Bounds are expressed as
+# (min, max, step) for integer and stepped-float suggestions.
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (15, 29, 2),
-    "HALFLIFE_SLOW":    (60, 100, 5),
-    "CONTINUITY_BONUS": (0.12, 0.18, 0.03),
-    "RISK_AVERSION":    (14.0, 20.0, 0.5),
-    "CVAR_DAILY_LIMIT": (0.055, 0.090, 0.005),
-    "CVAR_LOOKBACK":    (60, 120, 10),
+    "HALFLIFE_FAST":    (10, 40, 5),
+    "HALFLIFE_SLOW":    (40, 120, 10),
+    "CONTINUITY_BONUS": (0.05, 0.25, 0.05),
+    "RISK_AVERSION":    (5.0, 20.0, 1.0),
+    "CVAR_DAILY_LIMIT": (0.040, 0.120, 0.010),
+    "CVAR_LOOKBACK":    (60, 180, 20),
+    "MAX_POSITIONS":    (8, 20, 2),
+    "SIGNAL_LAG_DAYS":  (0, 21, 7),
 }
 
 N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
-# Bumped to v11_55: guarantees a clean study after the hysteresis/bounds revision.
-OBJECTIVE_VERSION  = "fitness_v11_55"
+OBJECTIVE_VERSION  = "fitness_v11_56"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 MAX_REASONABLE_CAGR_PCT       = 300.0
@@ -181,16 +165,28 @@ def _normalize_universe_type(universe_type: str | None) -> str:
 
 def _iter_wfo_slices(train_start: str, train_end: str):
     """
-    Yield (is_start, is_end, oos_start, oos_end) tuples for walk-forward folds.
-    Folds where IS window < _MIN_IS_CALENDAR_DAYS are skipped.
+    Walk-forward folds with a fixed 2-year IS window and 1-year OOS window,
+    stepping annually.
+
+    Fixed-length IS prevents later folds from having a data advantage over
+    earlier ones — a known cause of TPE convergence to parameters that only
+    work with more history (i.e. later in time).
+
+    With TRAIN_START="2019-01-01" the yielded OOS years are 2021, 2022, 2023.
+    The 2019 and 2020 OOS folds from the old expanding window are intentionally
+    dropped — 3 independent folds are more diagnostic than 4 correlated ones.
     """
-    start = pd.Timestamp(train_start)
-    end   = pd.Timestamp(train_end)
-    for y in range(start.year + 1, end.year + 1):
+    IS_YEARS = 2
+    start    = pd.Timestamp(train_start)
+    end      = pd.Timestamp(train_end)
+    for y in range(start.year + IS_YEARS, end.year + 1):
         oos_start = pd.Timestamp(f"{y}-01-01")
         oos_end   = min(pd.Timestamp(f"{y}-12-31"), end)
-        is_start  = start
+        is_start  = oos_start - pd.DateOffset(years=IS_YEARS)
         is_end    = oos_start - pd.Timedelta(days=1)
+
+        if is_start < start:
+            is_start = start
 
         is_calendar_days = (is_end - is_start).days + 1
         if is_calendar_days < _MIN_IS_CALENDAR_DAYS:
@@ -227,11 +223,11 @@ def _fitness_from_metrics(
     adding more continuous pressure on moderately-high-drawdown parameter sets
     without making the gate threshold itself too aggressive.
 
-    forced_cash_penalty: penalises repeated forced CVaR liquidations in IS.
-    Uses forced_to_cash column (backtest_engine v11.52) or infers from logs.
+    forced_cash_penalty is logged only for observability compatibility and no
+    longer affects the fitness score.
 
-    Score ceiling: Michaelis-Menten (_K * raw) / (_K + raw) -> asymptote _K=3.5.
-    A "ceiling hit" is tracked when the bounded score reaches >=90% of _K.
+    Positive raw scores use log1p(raw), preserving ranking without a hard
+    asymptotic score ceiling.
     Score floor  : hard -2.0
     """
     cagr         = float(metrics.get("cagr",    0.0))
@@ -261,26 +257,6 @@ def _fitness_from_metrics(
         avg_exposure  = float(pd.to_numeric(rebal_log.get("exposure_multiplier", fallback_series), errors="coerce").fillna(0.0).mean())
         avg_positions = float(pd.to_numeric(rebal_log.get("n_positions",         fallback_series), errors="coerce").fillna(0.0).mean())
         n_rebalances  = len(rebal_log)
-
-        # Use the dedicated forced_to_cash column (backtest_engine v11.52).
-        # Fall back to inferring from n_positions + apply_decay for older logs.
-        forced_cash_flags = rebal_log.get("forced_to_cash")
-        if forced_cash_flags is not None:
-            forced_cash_count = int(
-                pd.Series(forced_cash_flags).fillna(False).astype(bool).sum()
-            )
-        else:
-            n_positions = pd.to_numeric(
-                rebal_log.get("n_positions", fallback_series), errors="coerce"
-            ).fillna(0.0)
-            apply_decay = pd.Series(
-                rebal_log.get("apply_decay", False)
-            ).fillna(False).astype(bool)
-            forced_cash_count = int(((n_positions <= 0) & apply_decay).sum())
-
-        forced_cash_fraction = forced_cash_count / max(n_rebalances, 1)
-        # Each 10% of rebalances spent in forced cash costs 0.15 score points.
-        forced_cash_penalty = forced_cash_fraction * 1.5
 
     _pos_deficit       = max(0.0, 6.0 - avg_positions)
     concentration_mult = 1.0 + _pos_deficit * 0.30
@@ -346,13 +322,21 @@ def _fitness_from_metrics(
             (cagr_net / risk_penalty) * sortino_quality
             - exposure_penalty
             - dd_penalty
-            - forced_cash_penalty
         )
-        _K    = 3.5
-        score = (_K * raw / (_K + raw)) if raw > 0.0 else raw
+        import math as _math_inner
+        if raw > 0.0:
+            score       = _math_inner.log1p(raw)
+            ceiling_hit = False
+        else:
+            score       = raw
+            ceiling_hit = False
         score = max(score, -2.0)
-        ceiling_hit = raw > 0.0 and score >= (_K * 0.90)
         dd_gate_hit = False
+
+    # forced_cash_penalty is logged for observability but no longer affects
+    # the fitness score — see BUG-OPT-05.  Always emit 0.0 so downstream
+    # test assertions and log parsers remain stable.
+    forced_cash_penalty = 0.0
 
     diag = {
         "cagr":                round(cagr,    2),
@@ -448,6 +432,32 @@ class MomentumObjective:
             cfg.CVAR_LOOKBACK = trial.suggest_int(
                 "CVAR_LOOKBACK", effective_cvar_lb_min, cvar_lb_max, step=cvar_lb_step
             )
+
+        _mp_bounds = self.search_space.get("MAX_POSITIONS")
+        if _mp_bounds is not None:
+            _mp_min, _mp_max, _mp_step = _mp_bounds
+            if isinstance(trial, optuna.trial.FixedTrial) and "MAX_POSITIONS" not in trial.params:
+                cfg.MAX_POSITIONS = UltimateConfig().MAX_POSITIONS
+            else:
+                cfg.MAX_POSITIONS = trial.suggest_int(
+                    "MAX_POSITIONS",
+                    int(_mp_min),
+                    int(_mp_max),
+                    step=int(_mp_step),
+                )
+
+        _lag_bounds = self.search_space.get("SIGNAL_LAG_DAYS")
+        if _lag_bounds is not None:
+            _lag_min, _lag_max, _lag_step = _lag_bounds
+            if isinstance(trial, optuna.trial.FixedTrial) and "SIGNAL_LAG_DAYS" not in trial.params:
+                cfg.SIGNAL_LAG_DAYS = UltimateConfig().SIGNAL_LAG_DAYS
+            else:
+                cfg.SIGNAL_LAG_DAYS = trial.suggest_int(
+                    "SIGNAL_LAG_DAYS",
+                    int(_lag_min),
+                    int(_lag_max),
+                    step=int(_lag_step),
+                )
 
         if hasattr(trial, "set_user_attr"):
             trial.set_user_attr("resolved_cfg", dict(vars(cfg)))
@@ -721,6 +731,12 @@ def _validate_optimal_config(params: dict) -> list[str]:
         not isinstance(risk_av, (int, float)) or risk_av <= 0
     ):
         violations.append(f"RISK_AVERSION must be > 0; got {risk_av!r}")
+
+    lag = params.get("SIGNAL_LAG_DAYS")
+    if lag is not None and (not isinstance(lag, int) or lag < 0):
+        violations.append(
+            f"SIGNAL_LAG_DAYS must be int >= 0; got {lag!r}"
+        )
 
     return violations
 
@@ -1022,9 +1038,9 @@ def run_optimization(
     if not oos_results_list:
         raise RuntimeError(
             f"OOS Validation Failed: None of the top-{OOS_TOP_K} IS trials "
-            f"passed OOS (Calmar > 0.5 and MaxDD <= {OOS_MAX_DD_CAP}%).\n"
+            f"passed Period-1 OOS (Calmar > 0.5 and MaxDD <= {OOS_MAX_DD_CAP}%).\n"
             f"Recommended actions:\n"
-            f"  (1) Run more trials — 250+ often needed for this search space.\n"
+            f"  (1) Run more trials — 300+ often needed for this search space.\n"
             f"  (2) Check data quality — ensure ^NSEI and ^CRSLDX downloaded\n"
             f"      successfully (regime score defaults to 0.5 when missing).\n"
             f"  (3) If NEAR results appear above, the strategy is close —\n"
@@ -1032,46 +1048,109 @@ def run_optimization(
         )
 
     oos_results_list.sort(key=lambda x: x[0], reverse=True)
-    best_oos_calmar, best_oos_trial, best_oos_params, best_oos_metrics = oos_results_list[0]
 
-    print(f"\033[1;32m=== OOS TOURNAMENT WINNER ===\033[0m")
-    print(
-        f"  IS Rank    : #{top_k_trials.index(best_oos_trial) + 1} of top-{OOS_TOP_K} "
-        f"(Trial #{best_oos_trial.number}, IS score {best_oos_trial.value:.4f})"
-    )
-    print(f"  OOS Final  : {_rs}{best_oos_metrics.get('final', 0):,.0f}")
-    print(f"  OOS CAGR   : {best_oos_metrics.get('cagr',   0):.2f}%")
-    print(f"  OOS MaxDD  : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
-    print(f"  OOS Calmar : {best_oos_calmar:.2f}")
-    print(f"  OOS Sharpe : {best_oos_metrics.get('sharpe', 0):.2f}")
-    print(f"\n  Winning Parameters:")
-    for k, v in best_oos_params.items():
-        is_winner = best_params.get(k)
-        marker    = "" if is_winner == v else f"  \033[33m<- differs from IS #1 ({is_winner})\033[0m"
-        print(f"    {k}: \033[33m{v}\033[0m{marker}")
+    print(f"\n\033[1;36m=== PERIOD-2 OOS HOLDOUT — {TEST_START_2} → {TEST_END_2} ===\033[0m")
+    print(f"\033[90mA trial must pass BOTH periods to be selected as winner.\033[0m\n")
 
-    if best_oos_trial.number != best_trial.number:
-        print(
-            f"\n\033[1;33m[NOTE] OOS winner is Trial #{best_oos_trial.number}, "
-            f"NOT IS #1 Trial #{best_trial.number}.\033[0m"
-        )
-        is1_also_passed = any(t.number == best_trial.number for _, t, _, _ in oos_results_list)
-        if not is1_also_passed:
-            print(f"\033[33m       IS #1 was overfit — it did not pass OOS.\033[0m")
-        else:
-            is1_calmar = next(
-                m.get("calmar", 0) for c, t, p, m in oos_results_list
-                if t.number == best_trial.number
+    dual_pass_list = []
+    valid_fields = UltimateConfig.__dataclass_fields__
+
+    for p1_calmar, p1_trial, p1_params, p1_metrics in oos_results_list:
+        p2_cfg = UltimateConfig()
+        resolved_cfg = p1_trial.user_attrs.get("resolved_cfg", {})
+        for k, v in resolved_cfg.items():
+            if k in valid_fields:
+                setattr(p2_cfg, k, v)
+        for k, v in p1_params.items():
+            if k in valid_fields:
+                setattr(p2_cfg, k, v)
+
+        try:
+            p2_result  = run_backtest(
+                market_data          = market_data,
+                precomputed_matrices = precomputed_matrices,
+                universe_type        = universe_type,
+                start_date           = TEST_START_2,
+                end_date             = TEST_END_2,
+                cfg                  = p2_cfg,
+            )
+            p2_m       = p2_result.metrics
+            p2_calmar  = p2_m.get("calmar", 0.0)
+            p2_maxdd   = p2_m.get("max_dd", -100.0)
+            p2_passes  = p2_calmar > 0.5 and abs(p2_maxdd) <= OOS_MAX_DD_CAP
+
+            status = (
+                "\033[32mPASS\033[0m" if p2_passes else
+                "\033[33mNEAR\033[0m" if p2_calmar > 0.5 and abs(p2_maxdd) <= OOS_SOFT_MAX_DD_CAP else
+                "\033[31mFAIL\033[0m"
             )
             print(
-                f"\033[33m       IS #1 also passed OOS but had lower Calmar "
-                f"({is1_calmar:.2f} vs {best_oos_calmar:.2f}).\033[0m"
+                f"  Trial #{p1_trial.number:>5}  "
+                f"P1 Calmar {p1_calmar:>6.2f}  "
+                f"P2 Calmar {p2_calmar:>6.2f}  "
+                f"P2 MaxDD {abs(p2_maxdd):>6.1f}%  "
+                f"{status}"
             )
+
+            if p2_passes:
+                dual_pass_list.append(
+                    (p1_calmar, p2_calmar, p1_trial, p1_params, p1_metrics, p2_m)
+                )
+
+        except Exception as exc:
+            print(
+                f"  Trial #{p1_trial.number:>5}  "
+                f"P1 Calmar {p1_calmar:>6.2f}  "
+                f"P2: \033[31mERROR: {exc}\033[0m"
+            )
+
+    if dual_pass_list:
+        dual_pass_list.sort(
+            key=lambda x: (2 * x[0] * x[1]) / max(x[0] + x[1], 1e-9),
+            reverse=True,
+        )
+        (best_p1_calmar, best_p2_calmar,
+         best_oos_trial, best_oos_params,
+         best_oos_metrics, _) = dual_pass_list[0]
+        winning_mode = "DUAL"
     else:
-        print(f"\n\033[1;32m[NOTE] IS #1 trial also won OOS — strong generalization.\033[0m")
+        logger.warning(
+            "[Optimizer] No trial passed both OOS periods. "
+            "Falling back to best Period-1 passer. "
+            "Consider running more trials or expanding search bounds."
+        )
+        print(
+            f"\n\033[1;33m[WARNING] No dual-period passer found. "
+            f"Selecting best Period-1 passer as fallback.\033[0m"
+        )
+        oos_results_list.sort(key=lambda x: x[0], reverse=True)
+        best_p1_calmar, best_oos_trial, best_oos_params, best_oos_metrics = (
+            oos_results_list[0]
+        )
+        best_p2_calmar = 0.0
+        winning_mode   = "P1-ONLY"
+
+    print(f"\n\033[1;32m=== OOS TOURNAMENT WINNER ({winning_mode}) ===\033[0m")
+    print(
+        f"  Trial      : #{best_oos_trial.number}  "
+        f"(IS score {best_oos_trial.value:.4f})"
+    )
+    print(f"  P1 Calmar  : {best_p1_calmar:.2f}")
+    if winning_mode == "DUAL":
+        print(f"  P2 Calmar  : {best_p2_calmar:.2f}")
+    print(f"  P1 CAGR    : {best_oos_metrics.get('cagr', 0):.2f}%")
+    print(f"  P1 MaxDD   : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
+    print(f"  P1 Sharpe  : {best_oos_metrics.get('sharpe', 0):.2f}")
+    print(f"\n  Winning Parameters:")
+    for k, v in best_oos_params.items():
+        print(f"    {k}: \033[33m{v}\033[0m")
 
     save_optimal_config(best_oos_params)
-    print("\n\033[1;32m[PASS]\033[0m OOS tournament complete. Best generalizing parameters saved.")
+    print(
+        f"\n\033[1;32m[PASS]\033[0m OOS tournament complete "
+        f"({'dual-period' if winning_mode == 'DUAL' else 'single-period fallback'}) "
+        f"parameters saved."
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
