@@ -218,6 +218,29 @@ def load_optimized_config() -> UltimateConfig:
                 cfg.CVAR_DAILY_LIMIT,
             )
             cfg.CVAR_DAILY_LIMIT = UltimateConfig().CVAR_DAILY_LIMIT
+        if (
+            "MAX_POSITIONS" in best_params
+            and (not isinstance(best_params["MAX_POSITIONS"], int)
+                 or best_params["MAX_POSITIONS"] < 2)
+        ):
+            logger.error(
+                "[Config] optimal_cfg.json has MAX_POSITIONS=%r outside [2, ∞). "
+                "Resetting to default.",
+                best_params.get("MAX_POSITIONS"),
+            )
+            cfg.MAX_POSITIONS = UltimateConfig().MAX_POSITIONS
+
+        if (
+            "SIGNAL_LAG_DAYS" in best_params
+            and (not isinstance(best_params["SIGNAL_LAG_DAYS"], int)
+                 or best_params["SIGNAL_LAG_DAYS"] < 0)
+        ):
+            logger.error(
+                "[Config] optimal_cfg.json has SIGNAL_LAG_DAYS=%r < 0. "
+                "Resetting to default.",
+                best_params.get("SIGNAL_LAG_DAYS"),
+            )
+            cfg.SIGNAL_LAG_DAYS = UltimateConfig().SIGNAL_LAG_DAYS
     return cfg
 
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
