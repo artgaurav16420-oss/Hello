@@ -191,7 +191,7 @@ class UltimateConfig:
 
     # Exposure management
     DELEVERAGING_LIMIT:          float = 0.20
-    MIN_EXPOSURE_FLOOR:          float = 0.40
+    MIN_EXPOSURE_FLOOR:          float = 0.05
     CAPITAL_ELASTICITY:          float = 0.15
 
     # Signal / optimizer
