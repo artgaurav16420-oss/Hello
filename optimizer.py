@@ -1,12 +1,12 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.54
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.55
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses expanding-window time-series cross-validation for parameter selection,
 followed by a true holdout Out-of-Sample (OOS) validation period.
 
 CHANGES vs v11_53:
-- OBJECTIVE_VERSION = fitness_v11_54: resets the study for the revised
+- OBJECTIVE_VERSION = fitness_v11_55: resets the study for the revised
   search bounds and turnover penalty.
 - N_TRIALS raised 150 -> 200: gives TPE a better chance to find robust
   regions of the tighter search space.
@@ -32,8 +32,8 @@ CHANGES vs v11_53:
   column from rebal_log (backtest_engine v11.52). Falls back to inference.
 - OOS_MAX_DD_CAP raised 35% -> 38%: 2023-2025 is harder than training.
 - OOS_SOFT_MAX_DD_CAP = 42%: NEAR diagnostic tier (display only, not a pass).
-- SEARCH_SPACE_BOUNDS tightened again: higher floors on HALFLIFE_FAST,
-  CONTINUITY_BONUS, and RISK_AVERSION remove fragile high-churn settings.
+- SEARCH_SPACE_BOUNDS keeps tighter continuity/risk bounds while restoring
+  HALFLIFE_FAST to 15 so the optimizer can explore faster signals again.
 - turnover_drag now uses realistic 30 bps round-trip friction plus a
   nonlinear churn penalty above 18x/year.
 """
@@ -122,12 +122,13 @@ OOS_TOP_K = 10
 
 _MIN_IS_CALENDAR_DAYS = 365
 
-# Narrowed vs v11_53:
-#   HALFLIFE_FAST floor 15->19: removes short-horizon churny variants
+# Revised vs v11_53:
+#   HALFLIFE_FAST restored to 15: breadth hysteresis now guards against
+#     bottom-whipsaw, so faster momentum variants are allowed again
 #   CONTINUITY_BONUS floor 0.06->0.12: requires stronger persistence reward
 #   RISK_AVERSION floor 12->14: removes aggressive leverage-seeking configs
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":    (19, 29, 2),
+    "HALFLIFE_FAST":    (15, 29, 2),
     "HALFLIFE_SLOW":    (60, 100, 5),
     "CONTINUITY_BONUS": (0.12, 0.18, 0.03),
     "RISK_AVERSION":    (14.0, 20.0, 0.5),
@@ -139,8 +140,8 @@ N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
 OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
 
-# Bumped to v11_54: guarantees a clean study after bounds & penalty revisions.
-OBJECTIVE_VERSION  = "fitness_v11_54"
+# Bumped to v11_55: guarantees a clean study after the hysteresis/bounds revision.
+OBJECTIVE_VERSION  = "fitness_v11_55"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 
 MAX_REASONABLE_CAGR_PCT       = 300.0
