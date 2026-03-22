@@ -193,18 +193,34 @@ def compute_regime_score(
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     base_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
 
-    if universe_close_hist is not None and len(universe_close_hist) >= 50:
+    if universe_close_hist is not None and len(universe_close_hist) >= 65:
         equity_cols = [c for c in universe_close_hist.columns if not str(c).startswith("^")]
         if equity_cols:
-            breadth_hist = universe_close_hist.loc[:, equity_cols].tail(50)
-            sma_50 = breadth_hist.mean(skipna=True)
-            current_prices = universe_close_hist.loc[:, equity_cols].iloc[-1]
-            breadth_flags = (current_prices > sma_50) & current_prices.notna() & sma_50.notna()
-            breadth_pct = float(breadth_flags.mean())
+            # Grab the last 65 days (50 for the SMA window + 15 days of rolling lookback)
+            _px_slice = universe_close_hist.loc[:, equity_cols].tail(65)
 
-            if breadth_pct < 0.35:
+            # Calculate the rolling 50-day SMA, then isolate the final 15 days
+            rolling_sma50 = _px_slice.rolling(window=50, min_periods=20).mean().tail(15)
+            recent_px = _px_slice.tail(15)
+
+            # Create a 15-day history of market breadth (% of stocks > their 50-SMA)
+            breadth_flags = (recent_px > rolling_sma50) & recent_px.notna() & rolling_sma50.notna()
+            breadth_history = breadth_flags.mean(axis=1)
+
+            current_breadth = float(breadth_history.iloc[-1])
+            min_recent_breadth = float(breadth_history.min())
+
+            # 1. Hard Crash Exit (Current breadth collapses)
+            if current_breadth < 0.35:
                 return 0.0
-            if breadth_pct < 0.45:
+
+            # 2. HYSTERESIS (The Schmitt Trigger)
+            # If the market crashed recently (<35%), demand a strong bounce (>50%) to allow re-entry.
+            if min_recent_breadth < 0.35 and current_breadth < 0.50:
+                return 0.0
+
+            # 3. Early Warning Trim (Market is weakening but hasn't crashed)
+            if current_breadth < 0.45:
                 return min(base_score, 0.5)
 
     return base_score
