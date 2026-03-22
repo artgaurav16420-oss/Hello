@@ -213,15 +213,16 @@ def test_fitness_applies_nonlinear_turnover_drag_above_18x():
     assert score < 1.5
 
 
-def test_optimizer_defaults_reflect_v11_56_search_space():
-    assert optimizer.N_TRIALS == 300
-    assert optimizer.OBJECTIVE_VERSION == "fitness_v11_56"
-    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_FAST"] == (10, 40, 5)
-    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_SLOW"] == (40, 120, 10)
+def test_optimizer_defaults_reflect_v11_58_search_space():
+    assert optimizer.N_TRIALS == 100
+    assert optimizer.OBJECTIVE_VERSION == "fitness_v11_58"
+    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_FAST"] == (20, 50, 5)
+    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_SLOW"] == (80, 160, 10)
     assert optimizer.SEARCH_SPACE_BOUNDS["CONTINUITY_BONUS"] == (0.05, 0.25, 0.05)
     assert optimizer.SEARCH_SPACE_BOUNDS["RISK_AVERSION"] == (5.0, 20.0, 1.0)
-    assert optimizer.SEARCH_SPACE_BOUNDS["MAX_POSITIONS"] == (8, 20, 2)
-    assert optimizer.SEARCH_SPACE_BOUNDS["SIGNAL_LAG_DAYS"] == (0, 21, 7)
+    assert optimizer.SEARCH_SPACE_BOUNDS["CVAR_DAILY_LIMIT"] == (0.040, 0.120, 0.010)
+    assert optimizer.SEARCH_SPACE_BOUNDS["MAX_POSITIONS"] == (6, 20, 2)
+    assert optimizer.SEARCH_SPACE_BOUNDS["MIN_EXPOSURE_FLOOR"] == (0.0, 0.20, 0.05)
 
 
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
@@ -453,6 +454,35 @@ def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
     assert "CVAR_LOOKBACK" in trial.suggested
     assert "MAX_POSITIONS" in trial.suggested
     assert "SIGNAL_LAG_DAYS" in trial.suggested
+
+
+def test_objective_suggests_min_exposure_floor_for_non_fixed_trials(monkeypatch):
+    class _Result:
+        metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}
+        rebal_log = None
+
+    class _DummyTrial:
+        params = {}
+
+        def __init__(self):
+            self.suggested = []
+
+        def suggest_int(self, name, low, high, step=1):
+            self.suggested.append(name)
+            return low
+
+        def suggest_float(self, name, low, high, step=None):
+            self.suggested.append(name)
+            return low
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
+    trial = _DummyTrial()
+
+    objective(trial)
+
+    assert "MIN_EXPOSURE_FLOOR" in trial.suggested
 
 
 def test_objective_uses_configurable_search_space(monkeypatch):
