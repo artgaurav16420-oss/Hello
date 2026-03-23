@@ -470,7 +470,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 if marker_date:
                     try:
                         split_start_date = pd.Timestamp(marker_date)
-                    except Exception:
+                    except (ValueError, TypeError):
                         split_start_date = None
 
             if split_start_date is not None:
