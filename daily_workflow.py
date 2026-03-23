@@ -455,7 +455,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             if state.last_rebalance_date:
                 try:
                     split_start_date = pd.Timestamp(state.last_rebalance_date)
-                except Exception:
+                except (ValueError, TypeError):
                     split_start_date = None
 
             # FIX-SPLIT-FIRST-RUN: on the first live scan we must not compound
