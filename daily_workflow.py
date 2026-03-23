@@ -485,11 +485,12 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
                 window = split_series.loc[split_series.index > split_start_date]
             else:
-                positive = split_series[split_series > 0]
-                if not positive.empty:
-                    window = positive.loc[positive.index == positive.index.max()]
-                else:
-                    window = positive
+                # When no trustworthy anchor exists at all, prefer compounding the
+                # explicit split signals present in the payload rather than silently
+                # dropping earlier split events inside the visible window. This keeps
+                # manual/fixture states without last_rebalance_date or a position
+                # marker internally consistent when multiple splits appear.
+                window = split_series[split_series > 0]
 
             if not window.empty:
                 positive = window[window > 0]
@@ -1039,7 +1040,7 @@ def _run_scan(
         # always safer to exit a position than to hold it with a stale price.
         _STALE_PRICE_DAYS = 2  # trading days
         _rebalance_stale_held: list = []
-        if optimization_succeeded and not _force_full_cash:
+        if (optimization_succeeded or apply_decay) and not _force_full_cash:
             for _chk_sym in state.shares:
                 if _chk_sym not in active_idx:
                     continue  # absent symbols handled by execute_rebalance itself

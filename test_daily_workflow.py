@@ -273,6 +273,32 @@ def test_detect_and_apply_splits_first_run_uses_position_marker_not_full_history
     assert state.shares["ABC"] == 20
     assert state.entry_prices["ABC"] == 500.0
 
+def test_detect_and_apply_splits_without_anchor_compounds_visible_split_events():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 1000.0},
+        last_known_prices={"ABC": 1000.0},
+        cash=0.0,
+    )
+    idx = pd.date_range("2024-01-01", periods=5)
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [1000.0, 500.0, 505.0, 252.5, 255.0],
+                "Dividends": [0.0] * 5,
+                "Stock Splits": [0.0, 2.0, 0.0, 2.0, 0.0],
+            },
+            index=idx,
+        )
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == ["ABC"]
+    assert state.shares["ABC"] == 40
+    assert state.entry_prices["ABC"] == 250.0
+
 
 def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
@@ -379,6 +405,7 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
         entry_prices={"ABC": 100.0},
         last_known_prices={"ABC": 100.0},
         last_rebalance_date="2024-01-01",
+        consecutive_failures=2,
     )
 
     out_state, _ = dw._run_scan(["ABC", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
