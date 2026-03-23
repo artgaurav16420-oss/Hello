@@ -195,11 +195,41 @@ class JsonFormatter(logging.Formatter):
         "thread", "threadName",
     })
 
+    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+        """
+        Produce a UTC ISO-8601 timestamp with microsecond precision.
+
+        FIX-BUG-15: two problems in the original implementation:
+
+        1. The datefmt ``"%Y-%m-%dT%H:%M:%S.%fZ"`` was passed to
+           ``logging.Formatter.formatTime``, which calls ``time.strftime()``.
+           ``time.strftime`` does not support ``%f`` (microseconds) — that
+           directive belongs to ``datetime.strftime``.  Every log line therefore
+           contained the literal string ``.%fZ`` instead of real microseconds,
+           making timestamps schema-invalid for any downstream parser.
+
+        2. ``logging.Formatter.converter`` defaults to ``time.localtime``, so
+           the timestamp was in local time (IST, UTC+5:30) while the hardcoded
+           ``Z`` suffix implied UTC — a silent timezone lie.
+
+        Fix: derive the timestamp directly from ``record.created`` (a Unix
+        epoch float) and ``record.msecs`` (milliseconds portion), both of which
+        are available on every ``LogRecord`` without calling ``time.strftime``.
+        The result is always UTC and always carries sub-millisecond precision.
+        """
+        import datetime as _dt
+        epoch_s  = record.created
+        # microseconds: msecs is the fractional-second portion in milliseconds;
+        # multiply by 1000 to get microseconds, then modulo to stay in [0, 999999].
+        us       = int(record.msecs * 1000) % 1_000_000
+        base     = _dt.datetime.fromtimestamp(epoch_s, tz=_dt.timezone.utc)
+        return base.strftime("%Y-%m-%dT%H:%M:%S") + f".{us:06d}Z"
+
     def format(self, record: logging.LogRecord) -> str:
         try:
-            # Base fields
+            # Base fields — ts is now a genuine UTC ISO-8601 string with μs.
             obj: Dict[str, Any] = {
-                "ts":             self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%fZ"),
+                "ts":             self.formatTime(record),
                 "level":          record.levelname,
                 "logger":         record.name,
                 "msg":            record.getMessage(),

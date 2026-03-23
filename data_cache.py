@@ -731,6 +731,12 @@ def _save_manifest(manifest_data: dict) -> None:
     try:
         with temp_file.open("w", encoding="utf-8") as file:
             json.dump(manifest_data, file, indent=2)
+            # FIX-BUG-12: flush userspace buffer then fsync to kernel before the
+            # atomic rename.  Without this a crash between write() and rename()
+            # can leave a zero-byte or partially-written manifest.  Matches the
+            # hardened pattern already used in save_portfolio_state().
+            file.flush()
+            os.fsync(file.fileno())
         temp_file.replace(MANIFEST_FILE)
     except Exception as exc:
         logger.error("[Cache] Failed to save manifest: %s", exc)
@@ -811,6 +817,18 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _latest_business_day() -> str:
+    """
+    Return the most recent Mon–Fri business day before today as 'YYYY-MM-DD'.
+
+    Note: uses pandas BDay (Mon–Fri only) rather than an NSE-specific holiday
+    calendar.  On the trading day immediately following an NSE market holiday
+    (e.g. Holi, Diwali) this will return the holiday date — a day with no NSE
+    data — causing the staleness check to mark every symbol as stale and trigger
+    spurious re-downloads.  The downloads themselves succeed (providers return
+    the data up to the last real trading day), so this is a performance/noise
+    issue rather than a correctness bug.  A future improvement would integrate
+    a pandas_market_calendars 'NSE' calendar here.
+    """
     today = pd.Timestamp.today().normalize()
     latest_bday_ts = today - pd.offsets.BDay(1)
     return latest_bday_ts.strftime("%Y-%m-%d")
@@ -925,7 +943,17 @@ def load_or_fetch(
                     raw_data = None
                     continue
 
-            if raw_data is None or (hasattr(raw_data, "empty") and raw_data.empty):
+            # FIX-BUG-8: guard recovery on whether `chunk` still has unresolved
+            # tickers, not on the state of `raw_data`.  The old check
+            #   `if raw_data is None or raw_data.empty`
+            # missed the case where the last provider returned a non-empty
+            # DataFrame but every ticker in it failed _is_valid_dataframe:
+            # raw_data was truthy so _recover_from_stale_cache was never called,
+            # silently dropping those tickers with no fallback and no WARNING.
+            # After the provider loop `chunk` always reflects the residual set of
+            # unresolved tickers (reassigned to missing_from_provider each pass),
+            # so a non-empty chunk is the correct and complete recovery signal.
+            if chunk:
                 _recover_from_stale_cache(chunk, entries, market_data)
 
         # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
@@ -935,12 +963,19 @@ def load_or_fetch(
         # entries have already been mutated in-place in `manifest`.
         _save_manifest(manifest)
 
-    padded_start_ts = pd.Timestamp(padded_start)
+    # FIX-BUG-10: only clip data at required_end, not at a computed start bound.
+    # The old logic computed effective_start = min(df.index[0], padded_start_ts):
+    # when cached data predates padded_start (df.index[0] < padded_start_ts),
+    # effective_start correctly equals df.index[0] and the slice is harmless.
+    # But when df.index[0] > padded_start_ts (the cache doesn't go back far enough),
+    # effective_start = padded_start_ts and df.loc[padded_start_ts:required_end]
+    # returns an *empty* leading slice because padded_start_ts predates the data —
+    # silently discarding all available history.  The intent is purely to drop
+    # future rows beyond required_end, so trim only the end.
     for t, df in list(market_data.items()):
         if df.empty:
             continue
-        effective_start = min(df.index[0], padded_start_ts)
-        market_data[t] = df.loc[effective_start:required_end]
+        market_data[t] = df.loc[:required_end]
 
     return market_data
 

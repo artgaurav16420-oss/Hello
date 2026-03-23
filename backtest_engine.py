@@ -688,7 +688,11 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             continue
 
         pre_gap_close = df["Close"].loc[:gap_start]
-        pre_gap_rets  = pre_gap_close.pct_change().dropna()
+        # FIX-BUG-5: pass fill_method=None to match all other pct_change call sites
+        # in the codebase and suppress the pandas 3.x DeprecationWarning for the
+        # default fill_method='pad'. For gap-filled synthetic series, ffill before
+        # computing returns could mask zero-return days near the gap boundary.
+        pre_gap_rets  = pre_gap_close.pct_change(fill_method=None).dropna()
         hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
         seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
@@ -829,8 +833,10 @@ def run_backtest(
             if row is None:
                 row = market_data.get(sym)
             if row is not None and not row.empty and "Volume" in row.columns:
-                import numpy as _np
-                valid_volume = row["Volume"].replace(0, _np.nan).notna().astype(float)
+                # FIX-BUG-3: use module-level np instead of importing inside the loop.
+                # `import numpy as _np` inside a 500+ iteration loop triggers a
+                # sys.modules dict lookup on every iteration; np is already available.
+                valid_volume = row["Volume"].replace(0, np.nan).notna().astype(float)
                 vol_dict[sym] = valid_volume.rolling(
                     history_gate,
                     min_periods=history_gate,

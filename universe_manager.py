@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -345,6 +346,12 @@ def _save_universe_cache(data: dict) -> None:
     try:
         with temp_file.open("w", encoding="utf-8") as file:
             json.dump(data, file, indent=2)
+            # FIX-BUG-12: flush userspace buffer then fsync to kernel before the
+            # atomic rename, matching the hardened pattern in save_portfolio_state
+            # and _save_manifest.  Without this, a crash between write() and rename()
+            # can leave a zero-byte or partially-written universe cache file.
+            file.flush()
+            os.fsync(file.fileno())
         temp_file.replace(UNIVERSE_CACHE_FILE)
     except Exception as exc:
         logger.error("[Universe] Failed to save cache: %s", exc)
@@ -562,8 +569,22 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     resolved_map = {}
     missing_tickers = []
 
+    def _bare(t: str) -> str:
+        """Strip any NSE/BSE exchange suffix to get the bare ticker symbol.
+
+        FIX-BUG-11: the original code only stripped '.NS'.  A ticker arriving
+        as 'RELIANCE.BO' or 'RELIANCE.BSE' would not match STATIC_NSE_SECTORS
+        and fall through to the expensive live-fetch path even though RELIANCE
+        is a well-known symbol.  Strip all three suffixes so BSE-suffixed inputs
+        resolve correctly from the static map and the persistent cache.
+        """
+        for sfx in (".NS", ".BO", ".BSE"):
+            if t.endswith(sfx):
+                return t[: -len(sfx)]
+        return t
+
     for ticker in tickers:
-        bare_ticker = ticker.replace(".NS", "")
+        bare_ticker = _bare(ticker)
         if bare_ticker in STATIC_NSE_SECTORS:
             resolved_map[bare_ticker] = STATIC_NSE_SECTORS[bare_ticker]
         else:
@@ -686,7 +707,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
 
     final_map = {}
     for ticker in tickers:
-        bare_ticker = ticker.replace(".NS", "")
+        bare_ticker = _bare(ticker)
         final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
 
     return final_map

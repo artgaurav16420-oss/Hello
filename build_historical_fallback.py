@@ -298,6 +298,35 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
     return snapshots, success
 
 
+def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
+    """
+    Write *df* to *path* as a Parquet file, pinning ``engine='pyarrow'``.
+
+    FIX-BUG-16: all four ``to_parquet`` calls in this module previously used
+    the default engine.  ``universe_manager._load_historical_universe_df``
+    reads with ``engine='pyarrow'`` (pinned in FIX-NEW-UM-02), and
+    ``historical_builder.build_parquet_from_csv`` also pins pyarrow on write
+    (FIX-NEW-HB-01).  If the system default engine is ``fastparquet``, Python
+    ``list`` values in the ``tickers`` column do not round-trip through a
+    pyarrow read, producing either a read error or stringified lists instead
+    of real Python lists, breaking ``_coerce_historical_members`` in
+    ``universe_manager``.  Pinning the same engine on both sides of the
+    parquet channel ensures deterministic list round-trips regardless of
+    which engines are installed.
+    """
+    try:
+        df.to_parquet(path, engine="pyarrow")
+    except Exception:
+        # pyarrow unavailable — fall back to default engine with a warning so
+        # operators know list round-trips may be unreliable.
+        logger.warning(
+            "[BHF] pyarrow not available; writing %s with default parquet engine. "
+            "List-valued 'tickers' column may not round-trip correctly on read.",
+            path,
+        )
+        df.to_parquet(path)
+
+
 def build_parquet_from_wayback(
     universe_type: str,
     snapshots: list[tuple[str, list[str]]],
@@ -315,7 +344,7 @@ def build_parquet_from_wayback(
     idx    = pd.DatetimeIndex(sorted(rows.keys()), name="date")
     series = pd.Series([rows[d] for d in idx], index=idx, name="tickers")
     out_df = pd.DataFrame({"tickers": series})
-    out_df.to_parquet(output_path)
+    _to_parquet_pyarrow(out_df, output_path)
 
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     csv_rows = []
@@ -442,7 +471,7 @@ def build_parquet(
         rows.append(eligible)
 
     out_df = pd.DataFrame({"tickers": rows}, index=pd.DatetimeIndex(snapshot_dates, name="date"))
-    out_df.to_parquet(output_path)
+    _to_parquet_pyarrow(out_df, output_path)
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(out_df))
     return output_path
 
@@ -517,7 +546,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    snapshot_df.to_parquet(output_path)
+    _to_parquet_pyarrow(snapshot_df, output_path)
 
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
@@ -641,7 +670,7 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
 
             idx = pd.DatetimeIndex(all_dates, name="date")
             out_df = pd.DataFrame({"tickers": merged_tickers}, index=idx)
-            out_df.to_parquet(parquet_path)
+            _to_parquet_pyarrow(out_df, parquet_path)
 
             csv_path = DATA_DIR / "historical_nifty500.csv"
             csv_rows = []
