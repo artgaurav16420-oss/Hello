@@ -1390,6 +1390,22 @@ def test_compute_book_cvar_missing_columns_handled_as_ghosts():
     result = compute_book_cvar(state, np.array([]), [], log_rets, cfg)
     assert result > 0.0, "Ghost position must have synthetic tail risk applied, yielding non-zero CVaR."
 
+def test_compute_book_cvar_supports_copy_on_write_for_ghost_positions():
+    cfg = UltimateConfig()
+    log_rets = _make_log_rets(60, 3)
+    state = PortfolioState(cash=0.0)
+    state.shares = {"OFFUNIVERSE": 100}
+    state.last_known_prices = {"OFFUNIVERSE": 10.0}
+
+    original = pd.options.mode.copy_on_write
+    pd.options.mode.copy_on_write = True
+    try:
+        result = compute_book_cvar(state, np.array([]), [], log_rets, cfg)
+    finally:
+        pd.options.mode.copy_on_write = original
+
+    assert result > 0.0
+
 
 def test_compute_book_cvar_high_loss_book():
     cfg = UltimateConfig(CVAR_LOOKBACK=50)

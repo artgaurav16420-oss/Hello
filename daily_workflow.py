@@ -451,31 +451,45 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         split_ratio = 0.0
         if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
             split_series = row["Stock Splits"].fillna(0.0)
-            last_scan_date = None
+            split_start_date = None
             if state.last_rebalance_date:
                 try:
-                    last_scan_date = pd.Timestamp(state.last_rebalance_date)
-                except Exception:
-                    last_scan_date = None
+                    split_start_date = pd.Timestamp(state.last_rebalance_date)
+                except (ValueError, TypeError):
+                    split_start_date = None
 
-            if last_scan_date is not None:
+            # FIX-SPLIT-FIRST-RUN: on the first live scan we must not compound
+            # every historical split in the provider payload onto today's share
+            # count.  Prefer the position's entry marker (stored in
+            # dividend_ledger when the position is opened) as the lower bound.
+            # If no trustworthy anchor exists, conservatively consider only the
+            # latest explicit split signal rather than replaying the full series.
+            if split_start_date is None:
+                marker = state.dividend_ledger.get(sym, "")
+                marker_date = marker.split(":", 1)[0] if marker else ""
+                if marker_date:
+                    try:
+                        split_start_date = pd.Timestamp(marker_date)
+                    except (ValueError, TypeError):
+                        split_start_date = None
+
+            if split_start_date is not None:
                 split_index_tz = getattr(split_series.index, "tz", None)
                 if split_index_tz is not None:
-                    if last_scan_date.tzinfo is None:
-                        last_scan_date = last_scan_date.tz_localize(split_index_tz)
+                    if split_start_date.tzinfo is None:
+                        split_start_date = split_start_date.tz_localize(split_index_tz)
                     else:
-                        last_scan_date = last_scan_date.tz_convert(split_index_tz)
-                elif last_scan_date.tzinfo is not None:
-                    last_scan_date = last_scan_date.tz_localize(None)
+                        split_start_date = split_start_date.tz_convert(split_index_tz)
+                elif split_start_date.tzinfo is not None:
+                    split_start_date = split_start_date.tz_localize(None)
 
-                window = split_series.loc[(split_series.index > last_scan_date) & (split_series.index <= split_series.index.max())]
+                window = split_series.loc[split_series.index > split_start_date]
             else:
-                # FIX-NEW-DW-04: on first run (no last_rebalance_date) the
-                # previous code used tail(1), which silently dropped any splits
-                # that occurred on earlier dates.  A symbol with two splits and
-                # no prior scan date would only have the most recent one applied.
-                # Use the full series so every positive split entry is compounded.
-                window = split_series
+                positive = split_series[split_series > 0]
+                if not positive.empty:
+                    window = positive.loc[positive.index == positive.index.max()]
+                else:
+                    window = positive
 
             if not window.empty:
                 positive = window[window > 0]
@@ -1057,6 +1071,7 @@ def _run_scan(
                     [(s, f"{d}d") for s, d in _rebalance_stale_held],
                 )
                 optimization_succeeded = False
+                apply_decay = False
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)

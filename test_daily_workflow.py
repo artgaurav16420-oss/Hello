@@ -8,7 +8,13 @@ import pandas as pd
 import pytest
 
 import daily_workflow as dw
-from momentum_engine import PortfolioState, UltimateConfig, execute_rebalance
+from momentum_engine import (
+    OptimizationError,
+    OptimizationErrorType,
+    PortfolioState,
+    UltimateConfig,
+    execute_rebalance,
+)
 from log_config import current_correlation_id
 
 
@@ -240,6 +246,33 @@ def test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event():
     assert state.entry_prices["ABC"] == 500.0
     assert state.cash == pytest.approx(0.0)
 
+def test_detect_and_apply_splits_first_run_uses_position_marker_not_full_history():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 1000.0},
+        last_known_prices={"ABC": 1000.0},
+        dividend_ledger={"ABC": "2024-01-03:0.00000000"},
+        cash=0.0,
+    )
+    idx = pd.date_range("2024-01-01", periods=5)
+    market_data = {
+        "ABC.NS": pd.DataFrame(
+            {
+                "Close": [1000.0, 500.0, 505.0, 252.5, 255.0],
+                "Dividends": [0.0] * 5,
+                "Stock Splits": [0.0, 2.0, 0.0, 2.0, 0.0],
+            },
+            index=idx,
+        )
+    }
+
+    adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
+
+    assert adjusted == ["ABC"]
+    assert state.shares["ABC"] == 20
+    assert state.entry_prices["ABC"] == 500.0
+
 
 def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
@@ -297,6 +330,61 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
     out_state, _ = dw._run_scan(["ABC"], state, "TEST", cfg_override=cfg)
 
     assert out_state.absent_periods["MISSING"] == 3
+
+
+def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    stale_idx = pd.date_range("2024-01-01", periods=3)
+    md = {
+        "ABC.NS": pd.DataFrame({"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)}, index=stale_idx),
+        "FRESH.NS": pd.DataFrame({"Close": [100.0] * len(idx), "Dividends": [0.0] * len(idx)}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: UltimateConfig().CVAR_DAILY_LIMIT + 0.01)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        import numpy as np
+        return np.array([0.01, 0.0]), np.array([1.0, 0.0]), [0], {
+            "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 1, "selected": 1
+        }
+
+    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **_kwargs):
+            raise OptimizationError("solver failed", OptimizationErrorType.NUMERICAL)
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+
+    called = {"n": 0}
+
+    def _boom(*_args, **_kwargs):
+        called["n"] += 1
+        raise AssertionError("execute_rebalance should not be called when held prices are stale")
+
+    monkeypatch.setattr(dw, "execute_rebalance", _boom)
+
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 100.0},
+        last_rebalance_date="2024-01-01",
+    )
+
+    out_state, _ = dw._run_scan(["ABC", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
+
+    assert called["n"] == 0
+    assert out_state.shares == {"ABC": 10}
 
 
 def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
