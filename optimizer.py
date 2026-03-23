@@ -93,7 +93,54 @@ TRAIN_END   = "2023-12-31"
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TEST_START_2 = "2025-01-01"
-TEST_END_2   = os.environ.get("OPTIMIZER_OOS_CUTOFF", "2024-12-31")
+
+
+def _resolve_period_2_end(
+    env_cutoff: str | None = None,
+    *,
+    today: pd.Timestamp | None = None,
+) -> str:
+    """
+    Resolve the Period-2 OOS end date.
+
+    Critical guardrail: the previous hard-coded default ("2024-12-31") sat
+    before TEST_START_2 ("2025-01-01"), which made the secondary holdout
+    window invalid by default and forced every optimization run into the
+    single-period fallback path. We now default to today's UTC date (clamped
+    to at least TEST_START_2), and we also clamp invalid env overrides that
+    point before the Period-2 start.
+    """
+    start_ts = pd.Timestamp(TEST_START_2)
+
+    if env_cutoff not in (None, ""):
+        try:
+            cutoff_ts = pd.Timestamp(env_cutoff)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid OPTIMIZER_OOS_CUTOFF %r; using %s instead.",
+                env_cutoff,
+                TEST_START_2,
+            )
+            return TEST_START_2
+
+        if cutoff_ts < start_ts:
+            logger.warning(
+                "OPTIMIZER_OOS_CUTOFF %s is before Period-2 start %s; clamping to %s.",
+                cutoff_ts.strftime("%Y-%m-%d"),
+                TEST_START_2,
+                TEST_START_2,
+            )
+            cutoff_ts = start_ts
+        return cutoff_ts.strftime("%Y-%m-%d")
+
+    today_ts = today if today is not None else pd.Timestamp.utcnow()
+    if getattr(today_ts, "tzinfo", None) is not None:
+        today_ts = today_ts.tz_convert(None)
+    today_ts = pd.Timestamp(today_ts).normalize()
+    return max(today_ts, start_ts).strftime("%Y-%m-%d")
+
+
+TEST_END_2 = _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
 
 N_TRIALS = 100
 

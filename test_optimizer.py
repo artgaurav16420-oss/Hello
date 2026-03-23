@@ -225,6 +225,20 @@ def test_optimizer_defaults_reflect_v11_58_search_space():
     assert optimizer.SEARCH_SPACE_BOUNDS["MIN_EXPOSURE_FLOOR"] == (0.0, 0.20, 0.05)
 
 
+def test_resolve_period_2_end_defaults_to_today_when_no_env_override():
+    resolved = optimizer._resolve_period_2_end(today=pd.Timestamp("2026-03-23"))
+
+    assert resolved == "2026-03-23"
+
+
+def test_resolve_period_2_end_clamps_env_cutoff_before_period_start(caplog):
+    with caplog.at_level("WARNING"):
+        resolved = optimizer._resolve_period_2_end("2024-12-31")
+
+    assert resolved == optimizer.TEST_START_2
+    assert "clamping" in caplog.text
+
+
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
