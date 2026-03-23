@@ -1013,7 +1013,7 @@ def compute_book_cvar(
     # FIX-MB2-GHOSTPV: fill_value=np.nan so absent symbols get ghost synthesis
     # rather than silent zero-fill which understates CVaR.
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
-    rets = rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-T_cvar:]
+    rets = rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-T_cvar:].copy()
 
     vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
     if not hist_log_rets.empty:
