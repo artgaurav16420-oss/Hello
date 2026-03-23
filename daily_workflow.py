@@ -490,6 +490,12 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 # dropping earlier split events inside the visible window. This keeps
                 # manual/fixture states without last_rebalance_date or a position
                 # marker internally consistent when multiple splits appear.
+                #
+                # Residual risk: a truly anchor-free restored/manual state can still
+                # over-apply older historical splits because there is no reliable way
+                # to distinguish "pre-position" events from "post-position" events.
+                # Normal live positions should carry either last_rebalance_date or a
+                # dividend_ledger marker and therefore avoid this fallback path.
                 window = split_series[split_series > 0]
 
             if not window.empty:
@@ -1040,7 +1046,7 @@ def _run_scan(
         # always safer to exit a position than to hold it with a stale price.
         _STALE_PRICE_DAYS = 2  # trading days
         _rebalance_stale_held: list = []
-        if (optimization_succeeded or apply_decay) and not _force_full_cash:
+        if rebalance_allowed and (optimization_succeeded or apply_decay) and not _force_full_cash:
             for _chk_sym in state.shares:
                 if _chk_sym not in active_idx:
                     continue  # absent symbols handled by execute_rebalance itself

@@ -414,6 +414,75 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
     assert out_state.shares == {"ABC": 10}
 
 
+def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(monkeypatch, caplog):
+    idx = pd.date_range("2024-01-01", periods=6)
+    stale_idx = pd.date_range("2024-01-01", periods=3)
+    md = {
+        "ABC.NS": pd.DataFrame(
+            {"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)},
+            index=stale_idx,
+        ),
+        "FRESH.NS": pd.DataFrame(
+            {"Close": [100.0] * len(idx), "Dividends": [0.0] * len(idx)},
+            index=idx,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0] * len(idx)}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        import numpy as np
+
+        return np.array([0.01, 0.0]), np.array([1.0, 0.0]), [0], {
+            "total": 2,
+            "history_failed": 0,
+            "adv_failed": 0,
+            "knife_failed": 1,
+            "selected": 1,
+        }
+
+    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **_kwargs):
+            import numpy as np
+
+            return np.array([1.0])
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+    monkeypatch.setattr(
+        dw,
+        "execute_rebalance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("execute_rebalance should not be called when cadence staleness gate fires")
+        ),
+    )
+
+    state = PortfolioState(
+        shares={"ABC": 10},
+        entry_prices={"ABC": 100.0},
+        last_known_prices={"ABC": 100.0},
+        last_rebalance_date="2024-01-01",
+    )
+
+    with caplog.at_level("WARNING"):
+        out_state, _ = dw._run_scan(["ABC", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
+
+    assert out_state.shares == {"ABC": 10}
+    assert sum("STALENESS GATE" in record.message for record in caplog.records) == 1
+    assert sum("REBALANCE SUPPRESSED" in record.message for record in caplog.records) == 0
+
+
 def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
     md = {
