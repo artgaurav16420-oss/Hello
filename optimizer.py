@@ -115,7 +115,7 @@ def _resolve_period_2_end(
     if env_cutoff not in (None, ""):
         try:
             cutoff_ts = pd.Timestamp(env_cutoff)
-        except Exception:
+        except (ValueError, TypeError):
             logger.warning(
                 "Invalid OPTIMIZER_OOS_CUTOFF %r; using %s instead.",
                 env_cutoff,
