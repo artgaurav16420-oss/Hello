@@ -288,7 +288,10 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    assert captured["required_end"] == "2020-12-31"
+    # FIX-BUG-13: required_end must be max(TEST_END, TEST_END_2) so Period-2 OOS
+    # backtests have price data available.  Previously asserted == TEST_END, which
+    # encoded the bug (P2 always running on an empty matrix).
+    assert captured["required_end"] == max(optimizer.TEST_END, optimizer.TEST_END_2)
     assert captured["tickers"].count("ABC") == 1
     assert "^NSEI" in captured["tickers"]
     assert "^CRSLDX" in captured["tickers"]
@@ -325,7 +328,8 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    assert captured["required_end"] == "2020-09-30"
+    # FIX-BUG-13: required_end must be max(TEST_END, TEST_END_2).
+    assert captured["required_end"] == max(optimizer.TEST_END, optimizer.TEST_END_2)
     assert "LIVEONLY" in captured["tickers"]
     assert "OLD1" in captured["tickers"]
     assert "OLD2" in captured["tickers"]

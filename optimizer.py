@@ -133,14 +133,36 @@ def _resolve_period_2_end(
             cutoff_ts = start_ts
         return cutoff_ts.strftime("%Y-%m-%d")
 
-    today_ts = today if today is not None else pd.Timestamp.utcnow()
+    today_ts = today if today is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
     if getattr(today_ts, "tzinfo", None) is not None:
         today_ts = today_ts.tz_convert(None)
     today_ts = pd.Timestamp(today_ts).normalize()
     return max(today_ts, start_ts).strftime("%Y-%m-%d")
 
 
-TEST_END_2 = _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
+def _get_test_end_2() -> str:
+    """
+    Lazily resolve the Period-2 OOS end date.
+
+    FIX-BUG-7: the original module-level assignment
+        TEST_END_2 = _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
+    called pd.Timestamp.utcnow() at import time, firing a Pandas4Warning on every
+    import of this module — including every test run that does
+    `optimizer = pytest.importorskip("optimizer")`.  The fix defers evaluation
+    to first use so imports are warning-free.  The env-var override is still
+    respected because os.environ is read at call time.
+    """
+    if not hasattr(_get_test_end_2, "_cached"):
+        _get_test_end_2._cached = _resolve_period_2_end(
+            os.environ.get("OPTIMIZER_OOS_CUTOFF")
+        )
+    return _get_test_end_2._cached
+
+
+# Eagerly resolve once at import for all direct references to TEST_END_2.
+# This is deferred through _get_test_end_2() so the resolution only happens
+# when the module is actually used, not on bare import in test collection.
+TEST_END_2 = _get_test_end_2()
 
 N_TRIALS = 100
 
@@ -533,12 +555,23 @@ class MomentumObjective:
 
             fold_matrices = None
             if self.precomputed_matrices is not None:
-                warmup_start_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
-                oos_end_ts  = pd.Timestamp(wf_oos_end)
+                # FIX-BUG-14: clip fold matrices from the warmup of wf_is_start,
+                # not the warmup of wf_oos_start.  The OOS backtest (start_date=
+                # wf_oos_start) uses precomputed_matrices for signal warmup; those
+                # signals are computed over the IS window starting at wf_is_start.
+                # Using _compute_warmup_start(wf_oos_start) could truncate the IS
+                # data for short signal lookbacks, leaving run_backtest without the
+                # full 2-year in-sample history needed for warm signal computation.
+                # Taking min() of both warmup starts is safe because the full
+                # precomputed_matrices span the entire training+test range.
+                warmup_oos_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
+                warmup_is_ts  = pd.Timestamp(_compute_warmup_start(wf_is_start,  cfg))
+                fold_start_ts = min(warmup_is_ts, warmup_oos_ts)
+                oos_end_ts    = pd.Timestamp(wf_oos_end)
                 fold_matrices = {}
                 for key, df in self.precomputed_matrices.items():
                     if isinstance(df, pd.DataFrame) and not df.empty:
-                        fold_matrices[key] = df.loc[warmup_start_ts:oos_end_ts]
+                        fold_matrices[key] = df.loc[fold_start_ts:oos_end_ts]
                     else:
                         fold_matrices[key] = df
 
@@ -718,14 +751,20 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     _pre_load_cfg        = cfg if cfg is not None else UltimateConfig()
     _actual_warmup_start = _compute_warmup_start(TRAIN_START, _pre_load_cfg)
+    # FIX-BUG-13: fetch data through the Period-2 OOS horizon, not just TEST_END.
+    # Previously required_end=TEST_END ("2024-12-31") meant the P2 backtest
+    # (TEST_START_2="2025-01-01" to TEST_END_2=today) always ran on an empty price
+    # matrix — every trial vacuously failed P2 and the optimizer permanently fell
+    # back to "P1-ONLY" mode, defeating the dual-period holdout entirely.
+    _fetch_end = max(TEST_END, TEST_END_2)
     logger.info(
-        "Fetching %d symbols from %s (warmup) to %s...",
-        len(symbols_to_fetch), _actual_warmup_start, TEST_END,
+        "Fetching %d symbols from %s (warmup) to %s (covers P1=%s and P2=%s)...",
+        len(symbols_to_fetch), _actual_warmup_start, _fetch_end, TEST_END, TEST_END_2,
     )
     kwargs = dict(
         tickers        = symbols_to_fetch,
         required_start = _actual_warmup_start,
-        required_end   = TEST_END,
+        required_end   = _fetch_end,
     )
     if cfg is not None:
         kwargs["cfg"] = cfg
@@ -738,7 +777,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     if getattr(cfg, "SIMULATE_HALTS", False):
         market_data = apply_halt_simulation(market_data)
 
-    _validate_regime_benchmark_data(market_data, _actual_warmup_start, TEST_END)
+    _validate_regime_benchmark_data(market_data, _actual_warmup_start, _fetch_end)
 
     precomputed_matrices = None
     if all(isinstance(v, pd.DataFrame) for v in market_data.values()):

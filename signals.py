@@ -356,7 +356,12 @@ def generate_signals(
         # The EWM halflife decay means old bars beyond the gap contribute
         # negligibly to momentum, so the gate must verify that recent,
         # contiguous history is sufficient.
-        history_pass[i]   = int(log_rets[sym].tail(cfg.HISTORY_GATE).notna().sum()) >= cfg.HISTORY_GATE
+        # FIX-BUG-6: use signal_log_rets (lag-truncated) not log_rets (full).
+        # When SIGNAL_LAG_DAYS > 0, log_rets is longer than signal_log_rets by
+        # signal_lag_days rows. A symbol could pass the gate based on the tail of
+        # log_rets that is excluded from signal computation, causing EWM to be
+        # evaluated on a series with fewer valid rows than HISTORY_GATE requires.
+        history_pass[i]   = int(signal_log_rets[sym].tail(cfg.HISTORY_GATE).notna().sum()) >= cfg.HISTORY_GATE
         liquidity_pass[i] = bool(np.isfinite(adv_arr[i]) and adv_arr[i] > 0)
     gate_pass_mask = history_pass & liquidity_pass
 

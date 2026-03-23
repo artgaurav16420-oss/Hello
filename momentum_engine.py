@@ -671,7 +671,7 @@ def execute_rebalance(
                         slip            = n_shares * px_exec * exit_slip_rate
                         total_slippage += slip
                         if trade_log is not None:
-                            tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                            tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
                             trade_log.append(
                                 Trade(sym, tdate, -n_shares, px_exec, slip, "SELL")
                             )
@@ -777,13 +777,20 @@ def execute_rebalance(
     # as phantom margin money.  At the default 0.1% slip the leakage is small
     # (~0.08% of portfolio per rebalance) but compounds over many rebalances
     # and grows proportionally with illiquidity-driven impact costs.
+    # FIX-BUG-1: only reserve slippage for net buys (new or increased positions).
+    # The old condition `if _s > 0 or _old_s > 0` also fired for full sells
+    # (_s=0, _old_s>0), double-counting their slippage — sell proceeds and
+    # sell-side slip are already settled in the final
+    # `state.cash = pv_exec - actual_notional - total_slippage` expression.
+    # Over-reservation shrinks residual_cash and under-allocates the residual
+    # buy pass after large portfolio rotations.
     _base_slip_reserve = 0.0
     for _i, _sym in enumerate(active_symbols):
         _old_s = state.shares.get(_sym, 0)
         _s = desired_shares.get(_sym, 0)
-        if _s > 0 or _old_s > 0:
+        if _s > _old_s:
             _px = max(float(local_prices[_i]), 1e-6)
-            _delta_not = abs(_s - _old_s) * _px
+            _delta_not = (_s - _old_s) * _px
             _sr = compute_one_way_slip_rate(
                 cfg=cfg,
                 portfolio_value=pv_exec,
@@ -914,7 +921,7 @@ def execute_rebalance(
                         new_entry_prices[sym] = price * (1.0 + slip_rate)
                         marker_date = (
                             pd.Timestamp(date_context).strftime("%Y-%m-%d")
-                            if date_context is not None else pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+                            if date_context is not None else pd.Timestamp.now("UTC").replace(tzinfo=None).strftime("%Y-%m-%d")
                         )
                         state.dividend_ledger[sym] = f"{marker_date}:0.00000000"
                     else:
@@ -922,7 +929,7 @@ def execute_rebalance(
                         new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + slip_rate) * delta) / s
 
             if delta != 0 and trade_log is not None:
-                tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
                 trade_log.append(
                     Trade(sym, tdate, delta, price, slip, "BUY" if delta > 0 else "SELL")
                 )
@@ -951,7 +958,7 @@ def execute_rebalance(
                 total_slippage += slip
                 pv_exec        += n_shares * close_price
                 if trade_log is not None:
-                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
                     trade_log.append(Trade(sym, tdate, -n_shares, close_price, slip, "SELL"))
             else:
                 logger.error(
@@ -960,7 +967,7 @@ def execute_rebalance(
                     sym, n_shares,
                 )
                 if trade_log is not None:
-                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.utcnow()
+                    tdate = pd.Timestamp(date_context) if date_context is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
                     trade_log.append(Trade(sym, tdate, -n_shares, 0.0, 0.0, "SELL"))
         state.absent_periods.pop(sym, None)
 
@@ -973,7 +980,10 @@ def execute_rebalance(
     state.entry_prices = new_entry_prices
     # FIX-MB-CASH-FLOOR: Validate cash doesn't go negative
     raw_cash = pv_exec - actual_notional - total_slippage
-    state.cash         = max(0.0, round(pv_exec - actual_notional - total_slippage, 10))
+    # FIX-BUG-4: use raw_cash in round() rather than re-evaluating the expression.
+    # The original code computed pv_exec - actual_notional - total_slippage twice —
+    # raw_cash was computed but then ignored in favour of a duplicate inline expression.
+    state.cash         = max(0.0, round(raw_cash, 10))
     if raw_cash < -1e-6:
         logger.warning(
             "execute_rebalance: Slippage overshoot; raw cash would be %.4f",
