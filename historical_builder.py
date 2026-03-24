@@ -282,7 +282,7 @@ _REBALANCE_DATE_PATTERN = [
 ]
 
 
-def _get_rebalance_dates(start_year: int = 2017, end_year: int | None = None) -> list[str]:
+def _get_rebalance_dates(start_year: int = 2015, end_year: int | None = None) -> list[str]:
     """
     Generate approximate semi-annual rebalance dates: last Friday of March and
     September for each year from start_year to end_year (inclusive).
@@ -359,7 +359,7 @@ def _approximate_nifty500_at_date(
 
 def _build_pit_csv_from_yfinance_approx(
     output_csv: Path,
-    start_year: int = 2017,
+    start_year: int = 2015,
     top_n: int = 500,
 ) -> bool:
     """
@@ -796,7 +796,7 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
 
     success = _build_pit_csv_from_yfinance_approx(
         output_csv=output,
-        start_year=2017,
+        start_year=2015,
         top_n=500,
     )
 
@@ -807,7 +807,7 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
             "Manual alternative:\n"
             "  1. Go to https://web.archive.org/web/*/https://www.niftyindices.com/"
             "IndexConstituent/ind_nifty500list.csv\n"
-            "  2. Download a snapshot for each year (2018–2026)\n"
+            "  2. Download a snapshot for each year (2015–2026)\n"
             "  3. Save each as 'data/nifty500_YYYY-MM-DD.csv'\n"
             "  4. Run: python historical_builder.py --from-manual-csvs data/"
         )
@@ -930,7 +930,7 @@ def main() -> None:
             # If user relies on the production fallback builder, invoke it directly.
             try:
                 import build_historical_fallback as bhf
-                bhf.run(universe_arg="nifty500", start_date="2018-01-01")
+                bhf.run(universe_arg="nifty500", start_date="2015-01-01")
                 if normalized_csv.exists():
                     build_parquet_from_csv(str(normalized_csv), str(parquet_out))
                     continue

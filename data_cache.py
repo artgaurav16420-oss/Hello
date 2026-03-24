@@ -1072,6 +1072,7 @@ def _recover_from_stale_cache(
     provider recovers.
     """
     recovered = 0
+    recovered_symbols: list[str] = []
     for ticker in chunk:
         parquet_path = CACHE_DIR / f"{ticker}.parquet"
         if not parquet_path.exists():
@@ -1082,6 +1083,7 @@ def _recover_from_stale_cache(
                 continue
             market_data[ticker] = fallback_df
             recovered += 1
+            recovered_symbols.append(ticker)
 
             # FIX-MB-DC-01: update manifest with the actual last_date from the
             # parquet so subsequent calls don't re-trigger downloads on every run.
@@ -1106,7 +1108,9 @@ def _recover_from_stale_cache(
                 "retry_after":  _tomorrow,
             }
 
-            logger.warning(
+            # Keep per-symbol details at debug level to avoid flooding stdout
+            # during large universe runs.
+            logger.debug(
                 "[Cache] Using stale cached parquet for %s after all providers failed "
                 "(last_date=%s).",
                 ticker, entries[ticker]["last_date"],
@@ -1117,6 +1121,16 @@ def _recover_from_stale_cache(
             )
 
     missing = len(chunk) - recovered
+    if recovered > 0:
+        sample = ", ".join(recovered_symbols[:5])
+        suffix = " ..." if recovered > 5 else ""
+        logger.warning(
+            "[Cache] Recovered %d symbol(s) from stale local cache after provider failures "
+            "(sample: %s%s).",
+            recovered,
+            sample,
+            suffix,
+        )
     if missing > 0:
         logger.error(
             "[Cache] Skipping %d symbols from chunk starting with %s after all providers failed.",
