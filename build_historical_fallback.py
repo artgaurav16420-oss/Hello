@@ -175,29 +175,58 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
 # ─── Wayback Machine PIT fetch ───────────────────────────────────────────────
 
 def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
-    params = {
-        "url":      nse_url,
-        "output":   "json",
-        "fl":       "timestamp,statuscode",
-        "filter":   "statuscode:200",
-        "collapse": "timestamp:6",
-        "from":     str(start_year),
-        "limit":    "500",
-    }
-    try:
-        resp = requests.get(
-            _WBM_CDX_URL, params=params,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        ts_list = [r[0] for r in rows[1:] if r[1] == "200"]
-        logger.info("[Wayback] CDX found %d monthly snapshots for %s", len(ts_list), nse_url)
-        return ts_list
-    except Exception as exc:
-        logger.warning("[Wayback] CDX query failed: %s", exc)
-        return []
+    """
+    Return one Wayback timestamp per month for the given Nifty500 CSV URL.
+
+    FIX-TRUE-PIT-01:
+    Some historical captures exist under HTTP vs HTTPS (or wildcard scheme),
+    so querying only one exact URL can massively undercount archival coverage.
+    We now query multiple URL patterns and then collapse to one snapshot per
+    month in Python (earliest snapshot in each month) for stable PIT anchors.
+    """
+    no_scheme = nse_url.split("://", 1)[1] if "://" in nse_url else nse_url
+    query_urls = [nse_url]
+    if nse_url.startswith("https://"):
+        query_urls.append(nse_url.replace("https://", "http://", 1))
+    query_urls.append(f"*://{no_scheme}")
+
+    collected: set[str] = set()
+    for query_url in query_urls:
+        params = {
+            "url": query_url,
+            "output": "json",
+            "fl": "timestamp,statuscode",
+            "filter": "statuscode:200",
+            "from": str(start_year),
+            "limit": "5000",
+        }
+        try:
+            resp = requests.get(
+                _WBM_CDX_URL, params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            for row in rows[1:]:
+                if len(row) >= 2 and row[1] == "200":
+                    ts = str(row[0]).strip()
+                    if len(ts) >= 8 and ts[:4].isdigit():
+                        collected.add(ts)
+        except Exception as exc:
+            logger.debug("[Wayback] CDX query failed for %s: %s", query_url, exc)
+
+    month_to_ts: dict[str, str] = {}
+    for ts in sorted(collected):
+        month_key = ts[:6]
+        month_to_ts.setdefault(month_key, ts)
+    ts_list = [month_to_ts[m] for m in sorted(month_to_ts)]
+    logger.info(
+        "[Wayback] CDX found %d monthly snapshots for %s",
+        len(ts_list),
+        nse_url,
+    )
+    return ts_list
 
 
 def _wbm_fetch_csv(timestamp: str, original_url: str) -> pd.DataFrame | None:
