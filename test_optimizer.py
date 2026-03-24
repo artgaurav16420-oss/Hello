@@ -374,6 +374,19 @@ def test_validate_regime_benchmark_data_accepts_nsei_fallback():
     optimizer._validate_regime_benchmark_data(market_data, "2020-01-01", "2025-12-31")
 
 
+def test_validate_regime_benchmark_data_allows_partial_coverage_with_warning(caplog):
+    idx = pd.date_range("2024-01-15", "2025-12-31", freq="B")
+    market_data = {
+        "^NSEI": pd.DataFrame({"Close": np.linspace(100.0, 200.0, len(idx))}, index=idx)
+    }
+
+    with caplog.at_level("WARNING"):
+        optimizer._validate_regime_benchmark_data(market_data, "2016-11-27", "2025-12-31")
+
+    assert "partial coverage" in caplog.text
+    assert "Proceeding with available history" in caplog.text
+
+
 def test_validate_regime_benchmark_data_raises_when_benchmarks_missing():
     with pytest.raises(optimizer.OptimizationError, match="Regime benchmark validation failed") as exc_info:
         optimizer._validate_regime_benchmark_data({}, "2020-01-01", "2025-12-31")

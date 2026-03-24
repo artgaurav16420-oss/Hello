@@ -38,6 +38,8 @@ import logging
 import os
 import random
 import time
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -56,6 +58,38 @@ _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
 _MAX_RATE_LIMIT_RETRIES = 5
+
+
+def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
+    """
+    Run yf.download while suppressing yfinance's noisy stdout/stderr prints.
+
+    yfinance writes per-symbol "possibly delisted" and "Failed downloads"
+    messages directly to stderr/stdout. When pulling large universes this can
+    flood logs and hide real errors. We capture those streams and keep only a
+    compact debug summary.
+    """
+    out_buf = StringIO()
+    err_buf = StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        data = yf.download(*args, **kwargs)
+
+    noisy_lines: list[str] = []
+    for text in (out_buf.getvalue(), err_buf.getvalue()):
+        if not text:
+            continue
+        noisy_lines.extend(
+            ln.strip() for ln in text.splitlines()
+            if ln.strip()
+        )
+
+    if noisy_lines:
+        logger.debug(
+            "[Cache] Suppressed %d yfinance warning line(s). First line: %s",
+            len(noisy_lines),
+            noisy_lines[0],
+        )
+    return data
 
 
 def _load_local_env_file(env_path: Path = Path('.env')) -> None:
@@ -409,7 +443,7 @@ class GrowwProvider(DataProvider):
         yf_raw = pd.DataFrame()
         if valid_groww_tickers:
             try:
-                yf_raw = yf.download(
+                yf_raw = _safe_yf_download(
                     valid_groww_tickers,
                     start=yf_start,
                     end=yf_end,
@@ -476,7 +510,7 @@ class YFinanceProvider(DataProvider):
 
     def _download_batch(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         try:
-            return yf.download(
+            return _safe_yf_download(
                 tickers,
                 start=start,
                 end=end,

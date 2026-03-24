@@ -665,10 +665,19 @@ class MomentumObjective:
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
 def _validate_regime_benchmark_data(market_data: dict, required_start: str, required_end: str) -> None:
-    """Fail fast when regime benchmark inputs are missing or unusable."""
+    """
+    Validate regime benchmark inputs.
+
+    Hard-fail only when no benchmark has any usable Close data at all.
+    Partial history (e.g. symbol history starts after required_start) is
+    accepted with a warning because the regime subsystem can safely default
+    to neutral when benchmark context is sparse.
+    """
     required_start_ts = pd.Timestamp(required_start)
     required_end_ts = pd.Timestamp(required_end)
     benchmark_notes: list[str] = []
+    partial_coverage_notes: list[str] = []
+    has_any_usable_close = False
 
     for ticker in ("^CRSLDX", "^NSEI"):
         df = market_data.get(ticker)
@@ -684,10 +693,11 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
             benchmark_notes.append(f"{ticker}: Close column has no finite values")
             continue
 
+        has_any_usable_close = True
         coverage_start = pd.Timestamp(close.index.min())
         coverage_end = pd.Timestamp(close.index.max())
         if coverage_start > required_start_ts or coverage_end < required_end_ts:
-            benchmark_notes.append(
+            partial_coverage_notes.append(
                 f"{ticker}: coverage {coverage_start.date()} -> {coverage_end.date()} does not span "
                 f"{required_start_ts.date()} -> {required_end_ts.date()}"
             )
@@ -708,9 +718,20 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
         )
         return
 
+    if has_any_usable_close:
+        warn_details = partial_coverage_notes + benchmark_notes
+        logger.warning(
+            "Regime benchmark has only partial coverage for %s -> %s. Proceeding with available history; "
+            "regime score may be neutral early in-sample. Details: %s",
+            required_start_ts.date(),
+            required_end_ts.date(),
+            "; ".join(warn_details) if warn_details else "n/a",
+        )
+        return
+
     raise OptimizationError(
-        "Regime benchmark validation failed. Neither ^CRSLDX nor ^NSEI has usable Close coverage for "
-        f"{required_start_ts.date()} -> {required_end_ts.date()}. Details: " + "; ".join(benchmark_notes),
+        "Regime benchmark validation failed. Neither ^CRSLDX nor ^NSEI has usable Close data. "
+        "Details: " + "; ".join(benchmark_notes),
         OptimizationErrorType.DATA,
     )
 
