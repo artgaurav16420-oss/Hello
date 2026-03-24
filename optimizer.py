@@ -164,7 +164,7 @@ def _get_test_end_2() -> str:
 # when the module is actually used, not on bare import in test collection.
 TEST_END_2 = "2025-12-31"
 
-N_TRIALS = 300
+N_TRIALS = 400
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -172,7 +172,7 @@ OOS_MAX_DD_CAP      = 38.0
 # OOS soft tier: displayed as NEAR but does not count as a pass.
 OOS_SOFT_MAX_DD_CAP = 42.0
 
-OOS_TOP_K = 30
+OOS_TOP_K = 10
 
 _MIN_IS_CALENDAR_DAYS = 365
 
@@ -957,6 +957,17 @@ def run_optimization(
         storage        = effective_storage,
         load_if_exists = True,
     )
+    my_starting_params = {
+        "HALFLIFE_FAST": 50,
+        "HALFLIFE_SLOW": 150,
+        "CONTINUITY_BONUS": 0.1,
+        "RISK_AVERSION": 11.0,
+        "CVAR_DAILY_LIMIT": 0.08,
+        "CVAR_LOOKBACK": 120,
+        "MAX_POSITIONS": 20,
+        "SIGNAL_LAG_DAYS": 12,
+        "MIN_EXPOSURE_FLOOR": 0.1
+    }
 
     objective = MomentumObjective(
         market_data,
