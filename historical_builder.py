@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import io
 import logging
-import time
 import os
+import time
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
@@ -764,6 +765,8 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
     and tests.
     """
     output = Path(output_path)
+    start_year = 2015
+    current_year = date.today().year
 
     # ── Primary: Wayback Machine ──────────────────────────────────────────────
     print(f"\n[HistoricalBuilder] Building PIT CSV for {universe_type} via Wayback Machine...")
@@ -773,7 +776,7 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
     success = _build_pit_csv_from_wayback(
         target_url=_NSE_NIFTY500_CSV_URL,
         output_csv=output,
-        start_year=2015,
+        start_year=start_year,
         sleep_seconds=1.2,
     )
 
@@ -796,7 +799,7 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
 
     success = _build_pit_csv_from_yfinance_approx(
         output_csv=output,
-        start_year=2015,
+        start_year=start_year,
         top_n=500,
     )
 
@@ -807,7 +810,7 @@ def _build_historical_csv_network_fallback(universe_type: str, output_path: str)
             "Manual alternative:\n"
             "  1. Go to https://web.archive.org/web/*/https://www.niftyindices.com/"
             "IndexConstituent/ind_nifty500list.csv\n"
-            "  2. Download a snapshot for each year (2015–2026)\n"
+            f"  2. Download a snapshot for each year ({start_year}-{current_year})\n"
             "  3. Save each as 'data/nifty500_YYYY-MM-DD.csv'\n"
             "  4. Run: python historical_builder.py --from-manual-csvs data/"
         )

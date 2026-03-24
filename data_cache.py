@@ -1072,7 +1072,7 @@ def _recover_from_stale_cache(
     provider recovers.
     """
     recovered = 0
-    recovered_symbols: list[str] = []
+    recovered_symbols: List[str] = []
     for ticker in chunk:
         parquet_path = CACHE_DIR / f"{ticker}.parquet"
         if not parquet_path.exists():

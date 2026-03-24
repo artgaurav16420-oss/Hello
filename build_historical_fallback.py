@@ -716,14 +716,14 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         first_non_empty = next(
             (
                 v for v in df_check["tickers"]
-                if isinstance(v, list) and len(v) > 0
+                if (len(v) if isinstance(v, list) else len(list(v))) > 0
             ),
             None,
         )
         if first_non_empty is None:
             n_syms = 0
         else:
-            n_syms = len(first_non_empty)
+            n_syms = len(first_non_empty) if isinstance(first_non_empty, list) else len(list(first_non_empty))
         print()
         print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-non-empty-snapshot")
 
