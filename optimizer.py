@@ -159,9 +159,7 @@ def _get_test_end_2() -> str:
     return _get_test_end_2._cached
 
 
-# Eagerly resolve once at import for all direct references to TEST_END_2.
-# This is deferred through _get_test_end_2() so the resolution only happens
-# when the module is actually used, not on bare import in test collection.
+# Fixed default Period-2 holdout window endpoint.
 TEST_END_2 = "2025-12-31"
 
 N_TRIALS = 400

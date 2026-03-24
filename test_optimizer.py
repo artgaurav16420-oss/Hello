@@ -214,14 +214,14 @@ def test_fitness_applies_nonlinear_turnover_drag_above_18x():
 
 
 def test_optimizer_defaults_reflect_v11_58_search_space():
-    assert optimizer.N_TRIALS == 100
+    assert optimizer.N_TRIALS == 400
     assert optimizer.OBJECTIVE_VERSION == "fitness_v11_58"
-    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_FAST"] == (20, 50, 5)
-    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_SLOW"] == (80, 160, 10)
+    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_FAST"] == (30, 70, 5)
+    assert optimizer.SEARCH_SPACE_BOUNDS["HALFLIFE_SLOW"] == (100, 180, 10)
     assert optimizer.SEARCH_SPACE_BOUNDS["CONTINUITY_BONUS"] == (0.05, 0.25, 0.05)
-    assert optimizer.SEARCH_SPACE_BOUNDS["RISK_AVERSION"] == (5.0, 20.0, 1.0)
+    assert optimizer.SEARCH_SPACE_BOUNDS["RISK_AVERSION"] == (8.0, 18.0, 1.0)
     assert optimizer.SEARCH_SPACE_BOUNDS["CVAR_DAILY_LIMIT"] == (0.040, 0.120, 0.010)
-    assert optimizer.SEARCH_SPACE_BOUNDS["MAX_POSITIONS"] == (6, 20, 2)
+    assert optimizer.SEARCH_SPACE_BOUNDS["MAX_POSITIONS"] == (10, 24, 2)
     assert optimizer.SEARCH_SPACE_BOUNDS["MIN_EXPOSURE_FLOOR"] == (0.0, 0.20, 0.05)
 
 
@@ -289,6 +289,7 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
     # FIX-BUG-13: required_end must be max(TEST_END, TEST_END_2) so Period-2 OOS
+    # backtests have price data available.
     # backtests have price data available.  Previously asserted == TEST_END, which
     # encoded the bug (P2 always running on an empty matrix).
     assert captured["required_end"] == max(optimizer.TEST_END, optimizer.TEST_END_2)
@@ -424,6 +425,8 @@ def test_default_train_start_drops_2019_oos_fold():
         "2021-01-01",
         "2022-01-01",
         "2023-01-01",
+        "2024-01-01",
+        "2025-01-01",
     ]
 
 
