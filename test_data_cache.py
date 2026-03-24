@@ -203,3 +203,34 @@ def test_ensure_price_columns_coerces_object_dividends_and_prices():
     assert out["Dividends"].dtype.kind in "fc"
     assert out["Dividends"].iloc[1] == 2.6
     assert out["Volume"].iloc[0] == 1000
+
+
+def test_recover_from_stale_cache_logs_summary_not_per_symbol(tmp_path, monkeypatch, caplog):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    monkeypatch.setattr(data_cache, "CACHE_DIR", cache_dir)
+
+    idx = pd.to_datetime(["2026-03-24"])
+    for ticker in ("AAA.NS", "BBB.NS"):
+        df = pd.DataFrame(
+            {
+                "Open": [100.0],
+                "High": [101.0],
+                "Low": [99.0],
+                "Close": [100.0],
+                "Adj Close": [100.0],
+                "Volume": [1000.0],
+            },
+            index=idx,
+        )
+        df.to_parquet(cache_dir / f"{ticker}.parquet")
+
+    entries: dict = {}
+    market_data: dict = {}
+    caplog.set_level("WARNING")
+
+    data_cache._recover_from_stale_cache(["AAA.NS", "BBB.NS"], entries, market_data)
+
+    assert "Recovered 2 symbol(s) from stale local cache" in caplog.text
+    assert "Using stale cached parquet for AAA.NS" not in caplog.text
+    assert set(market_data.keys()) == {"AAA.NS", "BBB.NS"}

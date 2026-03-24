@@ -437,7 +437,7 @@ def build_parquet(
     universe_type: str,
     valid_trading_days: pd.DataFrame,
     history_gate: int,
-    start_date: str = "2018-01-01",
+    start_date: str = "2015-01-01",
     snap_freq: str = "QS",
 ) -> Path:
     """
@@ -480,7 +480,7 @@ def build_csv_from_symbols(
     universe_type: str,
     valid_trading_days: pd.DataFrame,
     history_gate: int,
-    start_date: str = "2018-01-01",
+    start_date: str = "2015-01-01",
     snap_freq: str = "QS",
 ) -> Path:
     """Write the companion CSV incorporating strict volume existence gates."""
@@ -561,7 +561,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
-def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
+def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
     want_nifty500  = universe_arg in ("both", "nifty500")
     want_nse_total = universe_arg in ("both", "nse_total")
 
@@ -713,10 +713,19 @@ def run(universe_arg: str = "both", start_date: str = "2018-01-01") -> None:
 
         df_check = pd.read_parquet(parquet_path)
         n_snaps  = len(df_check)
-        first_row = df_check.iloc[0]["tickers"]
-        n_syms    = len(first_row) if isinstance(first_row, list) else len(list(first_row))
+        first_non_empty = next(
+            (
+                v for v in df_check["tickers"]
+                if (len(v) if isinstance(v, list) else len(list(v))) > 0
+            ),
+            None,
+        )
+        if first_non_empty is None:
+            n_syms = 0
+        else:
+            n_syms = len(first_non_empty) if isinstance(first_non_empty, list) else len(list(first_non_empty))
         print()
-        print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-snapshot")
+        print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-non-empty-snapshot")
 
         late_joiners = {"ZOMATO.NS", "NYKAA.NS", "PAYTM.NS", "IREDA.NS"}
         pre_2021 = df_check[df_check.index < pd.Timestamp("2021-07-01")]
@@ -793,8 +802,8 @@ def _parse_args(argv=None):
     )
     p.add_argument(
         "--start",
-        default="2018-01-01",
-        help="Earliest snapshot date (YYYY-MM-DD). Default: 2018-01-01.",
+        default="2015-01-01",
+        help="Earliest snapshot date (YYYY-MM-DD). Default: 2015-01-01.",
     )
     return p.parse_args(argv)
 

@@ -112,3 +112,39 @@ def test_main_downloads_archives_when_missing(tmp_path, monkeypatch):
     assert (tmp_path / "data" / "raw_nse_total_archives.csv").exists()
     assert (tmp_path / "data" / "historical_nifty500.parquet").exists()
     assert (tmp_path / "data" / "historical_nse_total.parquet").exists()
+
+
+def test_main_invokes_fallback_builder_from_2015_when_needed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    called: dict[str, str] = {}
+
+    def _fake_run(universe_arg="both", start_date=""):
+        called["universe_arg"] = universe_arg
+        called["start_date"] = start_date
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+        (data_dir / "historical_nifty500.csv").write_text(
+            "date,ticker\n2015-01-01,RELIANCE.NS\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(hb, "build_historical_csv", lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("missing")))
+    monkeypatch.setattr(hb, "build_parquet_from_csv", lambda *args, **kwargs: None)
+    def _fake_download_archive(universe_type: str, output_path):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            "date,ticker\n2015-01-01,RELIANCE\n",
+            encoding="utf-8",
+        )
+        return output_path
+
+    monkeypatch.setattr(hb, "_download_archive", _fake_download_archive)
+    monkeypatch.setattr(hb.pd, "read_csv", lambda *args, **kwargs: pd.DataFrame({"date": ["2015-01-01"], "ticker": ["RELIANCE"]}))
+    monkeypatch.setattr(hb, "verify_parquet", lambda *args, **kwargs: None)
+    monkeypatch.setattr("build_historical_fallback.run", _fake_run)
+
+    hb.main()
+
+    assert called["universe_arg"] == "nifty500"
+    assert called["start_date"] == "2015-01-01"

@@ -35,3 +35,8 @@ def test_load_env_file_fallback_strips_inline_comments_from_unquoted_values(tmp_
 
     assert os.getenv("TOKEN") == "abc123"
     assert os.getenv("QUOTED") == "keep # inside quotes"
+
+
+def test_parse_args_defaults_start_to_2015():
+    args = bhf._parse_args([])
+    assert args.start == "2015-01-01"
