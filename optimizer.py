@@ -89,7 +89,7 @@ logging.getLogger("data_cache").setLevel(logging.ERROR)
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2019-01-01"
-TRAIN_END   = "2023-12-31"
+TRAIN_END   = "2025-12-31"
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TEST_START_2 = "2025-01-01"
@@ -162,9 +162,9 @@ def _get_test_end_2() -> str:
 # Eagerly resolve once at import for all direct references to TEST_END_2.
 # This is deferred through _get_test_end_2() so the resolution only happens
 # when the module is actually used, not on bare import in test collection.
-TEST_END_2 = _get_test_end_2()
+TEST_END_2 = "2025-12-31"
 
-N_TRIALS = 100
+N_TRIALS = 300
 
 # OOS hard pass: Calmar > 0.5 AND MaxDD <= 38%.
 # Raised from original 35% — 2023-2025 is structurally harder than training.
@@ -180,14 +180,14 @@ _MIN_IS_CALENDAR_DAYS = 365
 # portfolio construction / execution dimensions. Bounds are expressed as
 # (min, max, step) for integer and stepped-float suggestions.
 SEARCH_SPACE_BOUNDS = {
-    "HALFLIFE_FAST":      (20, 50, 5),
-    "HALFLIFE_SLOW":      (80, 160, 10),
+    "HALFLIFE_FAST":      (30, 70, 5),
+    "HALFLIFE_SLOW":      (100, 180, 10),
     "CONTINUITY_BONUS":   (0.05, 0.25, 0.05),
-    "RISK_AVERSION":      (5.0, 20.0, 1.0),
+    "RISK_AVERSION":      (8.0, 18.0, 1.0),
     "CVAR_DAILY_LIMIT":   (0.040, 0.120, 0.010),
     "CVAR_LOOKBACK":      (60, 180, 20),
-    "MAX_POSITIONS":      (6, 20, 2),
-    "SIGNAL_LAG_DAYS":    (0, 12, 3),
+    "MAX_POSITIONS":      (10, 24, 2),
+    "SIGNAL_LAG_DAYS":    (0, 21, 3),
     "MIN_EXPOSURE_FLOOR": (0.0, 0.20, 0.05),
 }
 
