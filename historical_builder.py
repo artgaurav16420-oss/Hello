@@ -530,7 +530,9 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
             "Run build_historical_csv() first."
         )
 
-    df = pd.read_csv(csv, parse_dates=["date"])
+    df = pd.read_csv(csv)
+    # BUG-HB-02: parse_dates is deprecated in pandas 2.x; use explicit pd.to_datetime instead.
+    df["date"] = pd.to_datetime(df["date"])
     if df.empty or "date" not in df.columns or "ticker" not in df.columns:
         raise ValueError(
             f"[HistoricalBuilder] CSV at {csv_path} is empty or missing required columns."
