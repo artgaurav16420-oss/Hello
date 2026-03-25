@@ -186,13 +186,13 @@ class JsonFormatter(logging.Formatter):
 
     _RESERVED = frozenset({
         "ts", "level", "logger", "msg", "correlation_id",
-        "scan_label", "pid", "thread",
+        "scan_label", "pid",
         # Standard LogRecord attributes we don't want duplicated
         "args", "created", "exc_info", "exc_text", "filename",
         "funcName", "levelname", "levelno", "lineno", "message",
         "module", "msecs", "name", "pathname", "process",
         "processName", "relativeCreated", "stack_info", "taskName",
-        "thread", "threadName",
+        "thread", "thread_id", "thread_name", "threadName",
     })
 
     def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
@@ -236,7 +236,8 @@ class JsonFormatter(logging.Formatter):
                 "correlation_id": getattr(_local, "correlation_id", None),
                 "scan_label":     getattr(_local, "scan_label",     None),
                 "pid":            record.process,
-                "thread":         record.threadName,
+                "thread_id":      record.thread,
+                "thread_name":    record.threadName,
             }
 
             # Merge caller-supplied extra fields (skip reserved / LogRecord internals).
