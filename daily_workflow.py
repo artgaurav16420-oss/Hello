@@ -657,10 +657,24 @@ def load_portfolio_state(name: str) -> PortfolioState:
                             if isinstance(v, bool):
                                 return v
                             return bool(int(v))
-                        ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
-                        ps.override_active      = _rb("override_active",      ps.override_active)
-                        ps.override_cooldown    = _ri("override_cooldown",     ps.override_cooldown)
-                        ps.decay_rounds         = _ri("decay_rounds",          ps.decay_rounds)
+                        # BUG-DW-06: wrap each field individually so a bad value
+                        # in one field does not silently skip all remaining merges.
+                        try:
+                            ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
+                        except (TypeError, ValueError) as _e:
+                            logger.warning("Risk overlay: could not merge consecutive_failures: %s", _e)
+                        try:
+                            ps.override_active = _rb("override_active", ps.override_active)
+                        except (TypeError, ValueError) as _e:
+                            logger.warning("Risk overlay: could not merge override_active: %s", _e)
+                        try:
+                            ps.override_cooldown = _ri("override_cooldown", ps.override_cooldown)
+                        except (TypeError, ValueError) as _e:
+                            logger.warning("Risk overlay: could not merge override_cooldown: %s", _e)
+                        try:
+                            ps.decay_rounds = _ri("decay_rounds", ps.decay_rounds)
+                        except (TypeError, ValueError) as _e:
+                            logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
                         absent_raw = risk.get("absent_periods")
                         if isinstance(absent_raw, dict):
                             for k, v in absent_raw.items():
@@ -668,9 +682,12 @@ def load_portfolio_state(name: str) -> PortfolioState:
                                     ps.absent_periods[str(k)] = int(v)
                                 except (TypeError, ValueError):
                                     pass
-                        lrd = risk.get("last_rebalance_date")
-                        if lrd and isinstance(lrd, str):
-                            ps.last_rebalance_date = lrd
+                        try:
+                            lrd = risk.get("last_rebalance_date")
+                            if lrd and isinstance(lrd, str):
+                                ps.last_rebalance_date = lrd
+                        except (TypeError, ValueError) as _e:
+                            logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
                     except Exception as exc:
                         logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
                 return ps
@@ -1078,7 +1095,13 @@ def _run_scan(
                     [(s, f"{d}d") for s, d in _rebalance_stale_held],
                 )
                 optimization_succeeded = False
-                apply_decay = False
+                # BUG-DW-02: Forced liquidations (CVaR hard breach) must bypass
+                # stale-price suppression to ensure the execution condition
+                # (rebalance_allowed or _force_full_cash) and (optimization_succeeded or
+                # apply_decay) evaluates to True. Only reset apply_decay when not in a
+                # forced liquidation scenario.
+                if not _force_full_cash:
+                    apply_decay = False
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)

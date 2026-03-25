@@ -1060,7 +1060,7 @@ def run_optimization(
     trials    = list(getattr(study, "trials", []))
     completed = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
     if completed:
-        top10 = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:10]
+        top10 = sorted(completed, key=lambda t: t.value if t.value is not None else -999, reverse=True)[:10]
         print(f"\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
         print(f"\033[90m{'Trial':>6}  {'Score':>7}  {'AvgCAGR':>8}  {'AvgDD':>7}  {'CeilHits':>9}  {'DDGate':>7}\033[0m")
         print(f"\033[90m{'─'*58}\033[0m")
@@ -1092,7 +1092,7 @@ def run_optimization(
     print(f"\033[90mPASS   = Calmar > 0.5  AND  MaxDD <= {OOS_MAX_DD_CAP:.0f}%\033[0m")
     print(f"\033[90mNEAR   = Calmar > 0.5  AND  MaxDD <= {OOS_SOFT_MAX_DD_CAP:.0f}%  (diagnostic only)\033[0m\n")
 
-    top_k_trials = sorted(completed, key=lambda t: t.value or -999, reverse=True)[:OOS_TOP_K]
+    top_k_trials = sorted(completed, key=lambda t: t.value if t.value is not None else -999, reverse=True)[:OOS_TOP_K]
 
     if not top_k_trials:
         logger.warning("No completed trials for OOS validation; skipping tournament.")

@@ -1354,9 +1354,10 @@ class InstitutionalRiskEngine:
         if np.sum(adv_limit) < l_gamma:
             l_gamma = np.sum(adv_limit) * 0.99
 
+        # BUG-ME-06: monotonicity is guaranteed by the preceding
+        # `u_gamma = max(u_gamma, l_gamma)` statement, so the
+        # `if l_gamma > u_gamma` block is unreachable dead code and has been removed.
         u_gamma = max(u_gamma, l_gamma)
-        if l_gamma > u_gamma:
-            l_gamma = max(0.0, u_gamma - 1e-4)
 
         impact     = np.clip(
             self.cfg.IMPACT_COEFF * portfolio_value

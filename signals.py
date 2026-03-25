@@ -201,6 +201,16 @@ def compute_regime_score(
 
             # Calculate the rolling 50-day SMA, then isolate the final 15 days
             rolling_sma50 = _px_slice.rolling(window=50, min_periods=20).mean().tail(15)
+
+            # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
+            # history during warmup), breadth_flags.mean() would return 0.0,
+            # triggering a false bear signal. Skip the breadth override entirely.
+            if not rolling_sma50.notna().any().any():
+                logger.debug(
+                    "[Signals] rolling_sma50 is entirely NaN — skipping breadth override."
+                )
+                return base_score
+
             recent_px = _px_slice.tail(15)
 
             # Create a 15-day history of market breadth (% of stocks > their 50-SMA)
@@ -332,9 +342,21 @@ def generate_signals(
     active_symbols = list(log_rets.columns)
 
     signal_lag_days = max(int(getattr(cfg, "SIGNAL_LAG_DAYS", 0)), 0)
-    if signal_lag_days > 0 and len(log_rets) > signal_lag_days:
+    if signal_lag_days > 0 and len(log_rets) >= signal_lag_days:
+        if len(log_rets) == signal_lag_days:
+            logger.warning(
+                "[Signals] Signal lag of %d days equals available rows (%d); "
+                "signal_log_rets will be empty.",
+                signal_lag_days, len(log_rets),
+            )
         signal_log_rets = log_rets.iloc[:-signal_lag_days]
     else:
+        if signal_lag_days > 0:
+            logger.warning(
+                "[Signals] Signal lag of %d days cannot be fully applied: "
+                "only %d rows available.",
+                signal_lag_days, len(log_rets),
+            )
         signal_log_rets = log_rets
 
     fast_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_FAST).mean().iloc[-1].values

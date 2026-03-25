@@ -149,6 +149,8 @@ _SECTOR_MAP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
 _HISTORICAL_UNIVERSE_DATES_CACHE: Dict[Path, pd.DatetimeIndex] = {}
 _UNIVERSE_LOOKUP_CACHE: Dict[tuple[str, pd.Timestamp], List[str]] = {}
+# BUG-UM-02: bound the cache to prevent unbounded growth in long-running processes.
+_UNIVERSE_LOOKUP_CACHE_MAXSIZE = 1024
 
 
 def _clear_historical_universe_caches(hist_file: Path) -> None:
@@ -302,6 +304,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                 else:
                     result = _normalize_historical_members(_coerce_historical_members(constituents))
 
+                # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
+                if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
+                    oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
+                    del _UNIVERSE_LOOKUP_CACHE[oldest_key]
                 _UNIVERSE_LOOKUP_CACHE[cache_key] = result
                 return result
 
