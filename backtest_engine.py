@@ -159,15 +159,9 @@ class BacktestEngine:
                     old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
                     self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
 
-            # FIX-NEW-BE-04: Run rebalance BEFORE sweeping dividends on the same
-            # day.  Previously dividends were added to state.cash first, so the
-            # dividend income inflated pv inside _run_rebalance (T+0 optimism).
-            # Real settlement is T+1: the dividend is received after the market
-            # closes, so it should not be available for reinvestment on the same
-            # rebalance bar.  Rebalancing first ensures the PV used for sizing
-            # reflects only pre-dividend capital, consistent with the live scan
-            # path in daily_workflow._run_scan (which only calls
-            # detect_and_apply_splits after computing pv, never before).
+            # BUG-BE-06: Rebalance runs before dividend sweep so T+0 reinvestment
+            # is prevented. Dividends are credited to cash before record_eod, so
+            # same-day equity includes the dividend cash.
             if date in rebal_set:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
