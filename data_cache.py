@@ -904,10 +904,13 @@ def load_or_fetch(
 
     standardized_tickers = list(dict.fromkeys(_clean_ticker(t) for t in tickers))
 
+    if not required_start:
+        raise ValueError("required_start must be provided")
+
     cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
     dynamic_padding_days = max(400, cfg_lookback * 2)
     padded_start = (
-        pd.Timestamp(required_start or "2020-01-01") - timedelta(days=dynamic_padding_days)
+        pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)
     ).strftime("%Y-%m-%d")
 
     latest_bday = _latest_business_day()
