@@ -735,7 +735,7 @@ def _download_with_timeout(
             errors.append(exc)
             logger.debug("[Cache] Download attempt %d failed: %s", attempt + 1, exc)
             if attempt == max_retries - 1:
-                logger.error("[Cache] Provider failed after %d retries.", max_retries)
+                logger.error("[Cache] Provider failed after %d retries.", max_retries, exc_info=True)
                 raise errors[-1] from errors[0]
             time.sleep((2 ** attempt) + random.random())
 
@@ -773,7 +773,7 @@ def _save_manifest(manifest_data: dict) -> None:
             os.fsync(file.fileno())
         temp_file.replace(MANIFEST_FILE)
     except Exception as exc:
-        logger.error("[Cache] Failed to save manifest: %s", exc)
+        logger.error("[Cache] Failed to save manifest: %s", exc, exc_info=True)
 
 
 def invalidate_cache() -> None:
@@ -782,7 +782,7 @@ def invalidate_cache() -> None:
             MANIFEST_FILE.unlink()
             logger.info("[Cache] Market data cache invalidated.")
         except OSError as e:
-            logger.error("[Cache] Failed to invalidate cache: %s", e)
+            logger.error("[Cache] Failed to invalidate cache: %s", e, exc_info=True)
 
 
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
@@ -854,16 +854,24 @@ def _latest_business_day() -> str:
     """
     Return the most recent Mon–Fri business day before today as 'YYYY-MM-DD'.
 
-    Note: uses pandas BDay (Mon–Fri only) rather than an NSE-specific holiday
-    calendar.  On the trading day immediately following an NSE market holiday
-    (e.g. Holi, Diwali) this will return the holiday date — a day with no NSE
-    data — causing the staleness check to mark every symbol as stale and trigger
-    spurious re-downloads.  The downloads themselves succeed (providers return
-    the data up to the last real trading day), so this is a performance/noise
-    issue rather than a correctness bug.  A future improvement would integrate
-    a pandas_market_calendars 'NSE' calendar here.
+    Uses pandas_market_calendars 'NSE' when available to respect exchange
+    holidays (not just Mon–Fri weekdays). Falls back to pandas BDay logic on
+    any calendar import/runtime failure.
     """
     today = pd.Timestamp.today().normalize()
+    try:
+        import pandas_market_calendars as mcal
+
+        nse_calendar = mcal.get_calendar("NSE")
+        valid_days = nse_calendar.valid_days(
+            start_date=today - pd.Timedelta(days=366),
+            end_date=today - pd.Timedelta(days=1),
+        )
+        if len(valid_days) > 0:
+            return pd.Timestamp(valid_days[-1]).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
     latest_bday_ts = today - pd.offsets.BDay(1)
     return latest_bday_ts.strftime("%Y-%m-%d")
 
@@ -1088,7 +1096,7 @@ def _process_chunk(
             saved_tickers.add(ticker)
 
         except Exception as exc:
-            logger.error("[Cache] Failed processing downloaded dataframe for %s: %s", ticker, exc)
+            logger.error("[Cache] Failed processing downloaded dataframe for %s: %s", ticker, exc, exc_info=True)
 
     return saved_tickers
 

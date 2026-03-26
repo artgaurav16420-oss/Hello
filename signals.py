@@ -341,7 +341,8 @@ def generate_signals(
 
     active_symbols = list(log_rets.columns)
 
-    signal_lag_days = max(int(getattr(cfg, "SIGNAL_LAG_DAYS", 0)), 0)
+    _raw_lag = getattr(cfg, "SIGNAL_LAG_DAYS", 0)
+    signal_lag_days = max(int(_raw_lag if _raw_lag is not None else 0), 0)
     if signal_lag_days > 0 and len(log_rets) >= signal_lag_days:
         if len(log_rets) == signal_lag_days:
             logger.warning(

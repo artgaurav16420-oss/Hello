@@ -46,7 +46,7 @@ CACHE_DIR            = DATA_DIR / "cache"
 UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
-_ADV_MAX_WORKERS     = 1
+_ADV_MAX_WORKERS     = 1  # Reserved for future parallel ADV fetching. Currently unused; single-threaded fetch avoids data-provider rate-limit issues.
 
 # Default timeout for individual yfinance sector info calls (seconds).
 # Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.
@@ -460,6 +460,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                 chunk_idx,
                 len(chunk),
                 exc,
+                exc_info=True,
             )
 
     if chunk_failures:
@@ -649,10 +650,10 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         )
                     sector = str(info.get("sector", "Unknown") or "Unknown")
                 except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e)
+                    logger.warning("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
                 resolved_map[bare_sym] = sector
         except Exception as exc:
-            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc)
+            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
 
             # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
             # to prevent indefinite hangs (previously no timeout was set, allowing
@@ -691,7 +692,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         result_sector = str(info.get("sector", "Unknown") or "Unknown")
                     return sym, result_sector
                 except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", sym, e)
+                    logger.warning("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
                     return sym, "Unknown"
 
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:

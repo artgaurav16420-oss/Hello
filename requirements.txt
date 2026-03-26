@@ -8,3 +8,4 @@ requests
 beautifulsoup4
 pyarrow
 optuna
+pandas-market-calendars>=4.0
