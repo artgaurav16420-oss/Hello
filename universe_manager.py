@@ -650,7 +650,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         )
                     sector = str(info.get("sector", "Unknown") or "Unknown")
                 except Exception as e:
-                    logger.warning("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
+                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
                 resolved_map[bare_sym] = sector
         except Exception as exc:
             logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
@@ -692,7 +692,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         result_sector = str(info.get("sector", "Unknown") or "Unknown")
                     return sym, result_sector
                 except Exception as e:
-                    logger.warning("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
+                    logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
                     return sym, "Unknown"
 
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:

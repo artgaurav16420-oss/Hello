@@ -8,7 +8,7 @@ The project includes both live/paper workflow orchestration and historical resea
 
 ## Prerequisites
 
-- Python 3.x
+- Python 3.10+ (required for modern typing syntax such as `str | None` and compatibility with dependencies including `pandas-market-calendars>=4.0`)
 - System dependencies required by Python packages in `requirements.txt` (for example, compiler/build tooling as needed by your platform)
 
 ## Installation

@@ -869,8 +869,8 @@ def _latest_business_day() -> str:
         )
         if len(valid_days) > 0:
             return pd.Timestamp(valid_days[-1]).strftime("%Y-%m-%d")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Falling back to BDay due to NSE calendar error: %s", exc, exc_info=True)
 
     latest_bday_ts = today - pd.offsets.BDay(1)
     return latest_bday_ts.strftime("%Y-%m-%d")
