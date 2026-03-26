@@ -52,6 +52,7 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
+_IST_TZ = "Asia/Kolkata"
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()
@@ -858,7 +859,7 @@ def _latest_business_day() -> str:
     holidays (not just Mon–Fri weekdays). Falls back to pandas BDay logic on
     any calendar import/runtime failure.
     """
-    today = pd.Timestamp.today().normalize()
+    today = pd.Timestamp.now(tz=_IST_TZ).normalize()
     try:
         import pandas_market_calendars as mcal
 
@@ -868,7 +869,12 @@ def _latest_business_day() -> str:
             end_date=today - pd.Timedelta(days=1),
         )
         if len(valid_days) > 0:
-            return pd.Timestamp(valid_days[-1]).strftime("%Y-%m-%d")
+            last_valid = pd.Timestamp(valid_days[-1])
+            if last_valid.tzinfo is None:
+                last_valid = last_valid.tz_localize(_IST_TZ)
+            else:
+                last_valid = last_valid.tz_convert(_IST_TZ)
+            return last_valid.strftime("%Y-%m-%d")
     except Exception as exc:
         logger.debug("Falling back to BDay due to NSE calendar error: %s", exc, exc_info=True)
 
@@ -1086,7 +1092,7 @@ def _process_chunk(
             expected_gap = 7
 
             manifest_entries[ticker] = {
-                "fetched_at":    datetime.now().isoformat(),
+                "fetched_at":    pd.Timestamp.now(tz=_IST_TZ).isoformat(),
                 "rows":          len(df),
                 "last_date":     df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":     max_gap_days > expected_gap,
@@ -1142,9 +1148,9 @@ def _recover_from_stale_cache(
             # retry_after acts as a cooldown: we do not attempt a re-download
             # until at least the next business day.  last_date is preserved
             # accurately so callers know the true data freshness.
-            _tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            _tomorrow = (pd.Timestamp.now(tz=_IST_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
             entries[ticker] = {
-                "fetched_at":   existing.get("fetched_at", datetime.now().isoformat()),
+                "fetched_at":   existing.get("fetched_at", pd.Timestamp.now(tz=_IST_TZ).isoformat()),
                 "rows":         len(fallback_df),
                 "last_date":    fallback_df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":    existing.get("suspended", False),
