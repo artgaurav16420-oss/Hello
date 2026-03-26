@@ -46,7 +46,7 @@ CACHE_DIR            = DATA_DIR / "cache"
 UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
-_ADV_MAX_WORKERS     = 1
+_ADV_MAX_WORKERS     = 1  # Reserved for future parallel ADV fetching. Currently unused; single-threaded fetch avoids data-provider rate-limit issues.
 
 # Default timeout for individual yfinance sector info calls (seconds).
 # Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.
@@ -460,6 +460,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                 chunk_idx,
                 len(chunk),
                 exc,
+                exc_info=True,
             )
 
     if chunk_failures:
@@ -634,7 +635,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 ticker_obj = ticker_objs.get(ns_sym)
                 if ticker_obj is None:
                     ticker_obj = yf.Ticker(ns_sym)
-                sector = "Unknown"
                 try:
                     info = getattr(ticker_obj, "info", {}) or {}
                     # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
@@ -648,16 +648,16 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                             bare_sym,
                         )
                     sector = str(info.get("sector", "Unknown") or "Unknown")
+                    resolved_map[bare_sym] = sector
                 except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e)
-                resolved_map[bare_sym] = sector
+                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
         except Exception as exc:
-            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc)
+            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
 
             # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
             # to prevent indefinite hangs (previously no timeout was set, allowing
             # up to 30s per symbol × 8 workers = 240s total wall-time hang).
-            def _fetch_single_sector(sym: str) -> Tuple[str, str]:
+            def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
                 # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
                 # (SIGALRM) inside this worker function.  Python's signal module
                 # strictly requires that signals are set and handled only in the
@@ -691,12 +691,13 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         result_sector = str(info.get("sector", "Unknown") or "Unknown")
                     return sym, result_sector
                 except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", sym, e)
-                    return sym, "Unknown"
+                    logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
+                    return sym, None
 
             with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
                 for sym, sector in pool.map(_fetch_single_sector, missing_tickers):
-                    resolved_map[sym] = sector
+                    if sector is not None:
+                        resolved_map[sym] = sector
 
         # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
         if use_cache:
@@ -704,13 +705,16 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 current_cache = _load_universe_cache()
                 existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
                 fetched_at = datetime.now().isoformat()
-                existing_sector_cache.update({
-                    sym: {
-                        "sector": resolved_map[sym],
-                        "fetched_at": fetched_at,
+                existing_sector_cache.update(
+                    {
+                        sym: {
+                            "sector": resolved_map[sym],
+                            "fetched_at": fetched_at,
+                        }
+                        for sym in missing_tickers
+                        if sym in resolved_map
                     }
-                    for sym in missing_tickers
-                })
+                )
 
                 current_cache["sector_map"] = {
                     "fetched_at": fetched_at,

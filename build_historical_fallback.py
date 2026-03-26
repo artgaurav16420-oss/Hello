@@ -166,7 +166,7 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
                 return resp
             logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
         except Exception as exc:
-            logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries)
+            logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
         if attempt < retries - 1:
             time.sleep(delay * (attempt + 1))
     return None
@@ -410,7 +410,7 @@ def fetch_nifty500_current() -> List[str]:
                 logger.info("  ✓ Fetched %d Nifty 500 symbols.", len(syms))
                 return sorted(syms)
         except Exception as exc:
-            logger.warning("  Parse error: %s", exc)
+            logger.warning("  Parse error: %s", exc, exc_info=True)
 
     logger.error("All Nifty 500 URLs failed — check your internet / proxy settings.")
     return []
@@ -436,7 +436,7 @@ def fetch_nse_total_current() -> List[str]:
                 logger.info("  ✓ Fetched %d NSE Total equity symbols.", len(syms))
                 return sorted(syms)
         except Exception as exc:
-            logger.warning("  Parse error: %s", exc)
+            logger.warning("  Parse error: %s", exc, exc_info=True)
 
     logger.error("All NSE Total URLs failed.")
     return []

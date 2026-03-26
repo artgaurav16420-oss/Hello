@@ -326,6 +326,7 @@ def _fitness_from_metrics(
     avg_exposure        = 1.0
     avg_positions       = 0.0
     n_rebalances        = 0
+    # forced_cash_penalty is dead code (always 0.0) per BUG-OPT-05; preserved for log-parser and test compatibility
     forced_cash_penalty = 0.0
 
     if rebal_log is not None and not rebal_log.empty:
@@ -413,6 +414,8 @@ def _fitness_from_metrics(
     # forced_cash_penalty is logged for observability but no longer affects
     # the fitness score — see BUG-OPT-05.  Always emit 0.0 so downstream
     # test assertions and log parsers remain stable.
+    # Intentional redundant reassignment for observability stability: downstream logs/tests
+    # expect forced_cash_penalty to be emitted from this point as a stable 0.0 field.
     forced_cash_penalty = 0.0
 
     diag = {
@@ -784,10 +787,13 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     # (TEST_START_2="2025-01-01" to TEST_END_2=today) always ran on an empty price
     # matrix — every trial vacuously failed P2 and the optimizer permanently fell
     # back to "P1-ONLY" mode, defeating the dual-period holdout entirely.
-    _fetch_end = max(TEST_END, TEST_END_2)
+    test_end_2 = _get_test_end_2()
+    if test_end_2 != "2025-12-31":
+        logger.debug("Using dynamic OPTIMIZER_OOS_CUTOFF for Period-2 end date: %s", test_end_2)
+    _fetch_end = max(TEST_END, test_end_2)
     logger.info(
         "Fetching %d symbols from %s (warmup) to %s (covers P1=%s and P2=%s)...",
-        len(symbols_to_fetch), _actual_warmup_start, _fetch_end, TEST_END, TEST_END_2,
+        len(symbols_to_fetch), _actual_warmup_start, _fetch_end, TEST_END, test_end_2,
     )
     kwargs = dict(
         tickers        = symbols_to_fetch,
@@ -1195,7 +1201,8 @@ def run_optimization(
 
     oos_results_list.sort(key=lambda x: x[0], reverse=True)
 
-    print(f"\n\033[1;36m=== PERIOD-2 OOS HOLDOUT — {TEST_START_2} → {TEST_END_2} ===\033[0m")
+    test_end_2 = _get_test_end_2()
+    print(f"\n\033[1;36m=== PERIOD-2 OOS HOLDOUT — {TEST_START_2} → {test_end_2} ===\033[0m")
     print(f"\033[90mA trial must pass BOTH periods to be selected as winner.\033[0m\n")
 
     dual_pass_list = []
@@ -1217,7 +1224,7 @@ def run_optimization(
                 precomputed_matrices = precomputed_matrices,
                 universe_type        = universe_type,
                 start_date           = TEST_START_2,
-                end_date             = TEST_END_2,
+                end_date             = test_end_2,
                 cfg                  = p2_cfg,
             )
             p2_m       = p2_result.metrics

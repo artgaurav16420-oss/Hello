@@ -526,6 +526,12 @@ def _build_adv_vector(
     cfg: Optional[UltimateConfig] = None,
 ) -> np.ndarray:
     adv = []
+    adv_zero_reasons = {
+        "missing_column": [],
+        "empty_lookback": [],
+        "nonfinite_mean": [],
+        "exception": [],
+    }
     signal_date: Optional[pd.Timestamp] = None
 
     if not volume.empty:
@@ -566,9 +572,14 @@ def _build_adv_vector(
                 lookback = notional.tail(adv_lookback)
                 if lookback.empty:
                     adv.append(0.0)
+                    adv_zero_reasons["empty_lookback"].append(sym)
                 else:
                     val = float(lookback.mean())
-                    adv.append(val if np.isfinite(val) else 0.0)
+                    if np.isfinite(val):
+                        adv.append(val)
+                    else:
+                        adv.append(0.0)
+                        adv_zero_reasons["nonfinite_mean"].append(sym)
             except (KeyError, TypeError, ValueError, AttributeError, IndexError):
                 # Specific exceptions only — mirrors BUG-FIX-BROAD-EXCEPT in
                 # signals.py.  A bare 'except Exception' would silently swallow
@@ -576,8 +587,19 @@ def _build_adv_vector(
                 # for all symbols, triggering the liquidity gate and forcing a
                 # total portfolio liquidation without a visible error trace.
                 adv.append(0.0)
+                adv_zero_reasons["exception"].append(sym)
         else:
             adv.append(0.0)
+            adv_zero_reasons["missing_column"].append(sym)
+    if any(adv_zero_reasons.values()):
+        reason_counts = {k: len(v) for k, v in adv_zero_reasons.items()}
+        reason_samples = {k: v[:5] for k, v in adv_zero_reasons.items() if v}
+        logger.info(
+            "[Backtest] ADV=0 summary on %s: counts=%s samples=%s",
+            date,
+            reason_counts,
+            reason_samples,
+        )
     return np.array(adv, dtype=float)
 
 

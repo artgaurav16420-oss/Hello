@@ -8,4 +8,5 @@ requests==2.32.5
 beautifulsoup4==4.14.3
 pyarrow==23.0.1
 optuna==4.7.0
+pandas-market-calendars==4.4.0
 pytest==9.0.2
