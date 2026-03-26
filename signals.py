@@ -457,6 +457,10 @@ def generate_signals(
     valid_mask = np.isfinite(adj_scores)
     # Initialise here so gate_counts can reference it even when the continuity
     # block is skipped (no prev_weights or no valid scores).
+    # NOTE (FIX-MB-SIG-01): When prev_weights is None (first scan),
+    # knife_pre_bonus_suppress is all-zeros by design — no prior positions means
+    # no continuity bonus to suppress.  Consequently knife_failed counts only
+    # hard-gated symbols on the first scan; this is correct expected behaviour.
     knife_pre_bonus_suppress = np.zeros(len(active_symbols), dtype=bool)
 
     if prev_weights and valid_mask.any():
