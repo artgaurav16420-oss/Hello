@@ -587,8 +587,20 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
         with open(state_file, "r", encoding="utf-8") as _vf:
             _raw = _vf.read()
         try:
-            json.loads(_raw)
-        except json.JSONDecodeError as _jexc:
+            _parsed = json.loads(_raw)
+            # FIX-MB-DW-03: semantic round-trip — verify critical fields match
+            # the in-memory state so truncated or partial writes are caught now.
+            _state_dict = state.to_dict()
+            if "cash" not in _parsed or "shares" not in _parsed:
+                raise RuntimeError(
+                    "State file semantic corruption: missing 'cash' or 'shares'."
+                )
+            if (_parsed.get("cash") != _state_dict.get("cash")
+                    or _parsed.get("shares") != _state_dict.get("shares")):
+                raise RuntimeError(
+                    "State file semantic corruption: read-back values do not match in-memory state."
+                )
+        except (json.JSONDecodeError, RuntimeError) as _jexc:
             logger.critical(
                 "State file write-back verification FAILED for '%s': %s. "
                 "The file on disk may be corrupted. Backups are intact. "
@@ -677,6 +689,10 @@ def load_portfolio_state(name: str) -> PortfolioState:
                             logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
                         absent_raw = risk.get("absent_periods")
                         if isinstance(absent_raw, dict):
+                            # FIX-MB-DW-02: clear before applying overlay so the
+                            # overlay is the authoritative source; stale entries
+                            # from prior sessions do not persist as ghost entries.
+                            ps.absent_periods.clear()
                             for k, v in absent_raw.items():
                                 try:
                                     ps.absent_periods[str(k)] = int(v)

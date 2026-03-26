@@ -254,7 +254,16 @@ def _iter_wfo_slices(train_start: str, train_end: str):
         is_end    = oos_start - pd.Timedelta(days=1)
 
         if is_start < start:
+            original_is_start = is_start
             is_start = start
+            logger.warning(
+                "[WFO] Fold OOS=%d: IS window shortened. Original start %s clamped to %s. "
+                "Resulting IS window: %d calendar days.",
+                y,
+                original_is_start.strftime("%Y-%m-%d"),
+                start.strftime("%Y-%m-%d"),
+                (is_end - is_start).days + 1,
+            )
 
         is_calendar_days = (is_end - is_start).days + 1
         if is_calendar_days < _MIN_IS_CALENDAR_DAYS:
@@ -789,7 +798,14 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         kwargs["cfg"] = cfg
     try:
         market_data = load_or_fetch(**kwargs)
-    except TypeError:
+    except TypeError as _te:
+        # FIX-MB-OPT-02: log the dropped parameter so forward-compatibility
+        # shims are visible during debugging rather than failing silently.
+        logger.warning(
+            "pre_load_data: dropped 'cfg' kwarg due to TypeError (%s). "
+            "load_or_fetch does not accept cfg; retrying without it.",
+            _te,
+        )
         kwargs.pop("cfg", None)
         market_data = load_or_fetch(**kwargs)
 

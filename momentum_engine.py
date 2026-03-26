@@ -69,7 +69,9 @@ _GHOST_SEED_CACHE: Dict[str, int] = {}
 def _ghost_seed_for(sym: str) -> int:
     """Return a deterministic integer seed for a given symbol, cached per process."""
     if sym not in _GHOST_SEED_CACHE:
-        _GHOST_SEED_CACHE[sym] = int(hashlib.sha256(sym.encode()).hexdigest()[:8], 16) % (2 ** 31)
+        # FIX-MB-ME-05: 63-bit seed (vs original 31-bit) reduces cross-symbol
+        # collision probability; capped at 2**63 to stay within np.int64 range.
+        _GHOST_SEED_CACHE[sym] = int(hashlib.sha256(sym.encode()).hexdigest()[:16], 16) % (2 ** 63)
     return _GHOST_SEED_CACHE[sym]
 
 
@@ -331,6 +333,11 @@ class PortfolioState:
         # AFTER clearing override_active so that a sustained breach spanning the
         # entire cooldown period re-arms the override immediately on the step
         # cooldown reaches zero, rather than allowing one unprotected rebalance.
+        # FIX-MB-ME-06: save original cooldown before decrement so the re-arm
+        # max() below can correctly preserve a longer externally-set cooldown.
+        # Previously override_cooldown was already 0 at the max() call, making
+        # max(0, 4) always resolve to 4 and defeating cooldown preservation.
+        original_cooldown = self.override_cooldown
         if self.override_cooldown > 0:
             self.override_cooldown -= 1
 
@@ -349,10 +356,7 @@ class PortfolioState:
             override_mult            = max(cfg.MIN_EXPOSURE_FLOOR, halved)
             self.exposure_multiplier = min(new_mult, override_mult)
             self.override_active     = True
-            # FIX-MB-M-05: use max(current, 4) so any longer externally-set
-            # cooldown (e.g. from activate_override_on_stress) is not shortened
-            # back to 4 by this re-arm.
-            self.override_cooldown   = max(self.override_cooldown, 4)
+            self.override_cooldown   = max(original_cooldown, 4)
         else:
             self.exposure_multiplier = new_mult
 
@@ -1069,9 +1073,11 @@ def compute_book_cvar(
                 # Fallback for non-datetime index: use positional integers
                 days_since_epoch = np.arange(len(rets), dtype=np.int64)
 
+            # FIX-MB-ME-05: XOR in uint64 space to prevent signed overflow;
+            # cast back to int64 for SeedSequence compatibility.
             row_seeds = (
-                np.int64(sym_base_seed) ^ days_since_epoch
-            ) & np.int64(0x7FFFFFFF)
+                np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
+            ).astype(np.int64)
 
             ss = np.random.SeedSequence(row_seeds.tolist())
             rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]

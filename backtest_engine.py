@@ -253,7 +253,7 @@ class BacktestEngine:
                         _c = close.loc[:signal_date, _adv_sym].dropna()
                         _v = volume.loc[:signal_date, _adv_sym].dropna()
                         _not = (_c * _v).clip(lower=0).dropna()
-                        _trail = _not.tail(_adv_lookback * 5)  # 5x window for robustness
+                        _trail = _not.tail(_adv_lookback)
                         if not _trail.empty:
                             _fallback_adv = float(_trail.mean())
                             if _fallback_adv > 0:
@@ -733,7 +733,9 @@ def build_precomputed_matrices(
     if cfg is None:
         cfg = UltimateConfig()
 
-    target_symbols = set(symbols or set())
+    # FIX-MB-BE-05: strip .NS suffix so caller-supplied symbols with the suffix
+    # match the bare-symbol keys used internally throughout the engine.
+    target_symbols = {s[:-3] if s.endswith(".NS") else s for s in (symbols or set())}
     if not target_symbols:
         for key in market_data.keys():
             if isinstance(key, str) and key.endswith(".NS"):
@@ -1071,6 +1073,10 @@ def _compute_metrics(
     # (treating each row as one period).  The original code used len(eq)-1 which
     # would overstate CAGR by roughly 1/N.  We switch to len(eq) for consistency.
     # FIX-MB-BE-04: Use calendar days not trading days for annualization
+    # FIX-MB-BE-03 / FIX-MB-BE-04: CAGR uses elapsed calendar days
+    # (days_elapsed / 365.25) to correctly annualise performance across weekends,
+    # holidays, and irregular trading calendars, avoiding systematic over/under-
+    # statement caused by assuming exactly 252 trading bars per year.
     if not eq.empty and len(eq) >= 2:
         first_date = pd.Timestamp(eq.index[0])
         last_date = pd.Timestamp(eq.index[-1])
@@ -1147,7 +1153,9 @@ def _compute_metrics(
             # e.g. buy Rs.100 and sell Rs.100 against Rs.100 average equity -> 1.0.
             turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
             if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
-                years = (eq.index[-1] - eq.index[0]).days / 365.25
+                # FIX-MB-M-01 (datetime branch): clamp to at least 1/252 to prevent
+                # near-zero years from inflating annualised turnover in short backtests.
+                years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1.0 / 252)
             else:
                 # FIX-NEW-BE-01: n_periods was removed in FIX-MB-BE-03; use
                 # len(eq)-1 (number of return intervals) as the fallback for

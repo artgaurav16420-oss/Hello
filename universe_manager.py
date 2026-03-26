@@ -150,6 +150,7 @@ _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
 _HISTORICAL_UNIVERSE_DATES_CACHE: Dict[Path, pd.DatetimeIndex] = {}
 _UNIVERSE_LOOKUP_CACHE: Dict[tuple[str, pd.Timestamp], List[str]] = {}
 # BUG-UM-02: bound the cache to prevent unbounded growth in long-running processes.
+_HISTORICAL_CACHE_MAXSIZE: int = 32
 _UNIVERSE_LOOKUP_CACHE_MAXSIZE = 1024
 
 
@@ -229,6 +230,12 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
             "parquet engine.  List-valued tickers column may not round-trip correctly."
         )
         df = pd.read_parquet(hist_file)
+    # FIX-MB-UM-03: FIFO eviction — mirror the pattern used for
+    # _UNIVERSE_LOOKUP_CACHE to bound memory in long-running processes.
+    if len(_HISTORICAL_UNIVERSE_DF_CACHE) >= _HISTORICAL_CACHE_MAXSIZE:
+        oldest_key = next(iter(_HISTORICAL_UNIVERSE_DF_CACHE))
+        del _HISTORICAL_UNIVERSE_DF_CACHE[oldest_key]
+        _HISTORICAL_UNIVERSE_DATES_CACHE.pop(oldest_key, None)
     _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
     _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = pd.DatetimeIndex(df.index.unique()).sort_values()
     return df
