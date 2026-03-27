@@ -703,7 +703,7 @@ def load_portfolio_state(name: str) -> PortfolioState:
                     ps.last_rebalance_date = lrd
             except (TypeError, ValueError) as _e:
                 logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
-        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError, FileNotFoundError) as exc:
             logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
         return ps
 
