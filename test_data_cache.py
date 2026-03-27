@@ -214,12 +214,12 @@ def test_recover_from_stale_cache_logs_summary_not_per_symbol(tmp_path, monkeypa
     for ticker in ("AAA.NS", "BBB.NS"):
         df = pd.DataFrame(
             {
-                "Open": [100.0],
-                "High": [101.0],
-                "Low": [99.0],
-                "Close": [100.0],
-                "Adj Close": [100.0],
-                "Volume": [1000.0],
+                "Open": [100.0] * len(idx),
+                "High": [101.0] * len(idx),
+                "Low": [99.0] * len(idx),
+                "Close": [100.0] * len(idx),
+                "Adj Close": [100.0] * len(idx),
+                "Volume": [1000.0] * len(idx),
             },
             index=idx,
         )

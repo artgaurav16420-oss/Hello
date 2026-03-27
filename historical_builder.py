@@ -425,8 +425,14 @@ def _build_pit_csv_from_yfinance_approx(
     # Prefer the shared provider chain so Groww credentials are reused.
     try:
         from data_cache import load_or_fetch
+        from momentum_engine import UltimateConfig
 
-        cached = load_or_fetch(candidate_tickers, effective_start, effective_end)
+        cached = load_or_fetch(
+            candidate_tickers,
+            effective_start,
+            effective_end,
+            cfg=UltimateConfig(),
+        )
         for tkr, df in cached.items():
             if isinstance(df, pd.DataFrame) and not df.empty:
                 market_data[tkr] = df
