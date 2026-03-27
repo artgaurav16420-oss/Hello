@@ -154,8 +154,13 @@ def _get_test_end_2() -> str:
     called pd.Timestamp.utcnow() at import time, firing a Pandas4Warning on every
     import of this module — including every test run that does
     `optimizer = pytest.importorskip("optimizer")`.  The fix defers evaluation
-    to first use so imports are warning-free.  The env-var override is still
-    respected because os.environ is read at call time.
+    to first use so imports are warning-free.
+
+    Value origin/caching: _get_test_end_2 delegates to the lru_cache-decorated
+    _get_test_end_2_cached(), which calls _resolve_period_2_end() exactly once
+    per process cache lifetime. That means OPTIMIZER_OOS_CUTOFF is read on the
+    first invocation only; later env-var changes are ignored unless
+    _get_test_end_2_cached.cache_clear() is called (or the process restarts).
     """
     # lru_cache(maxsize=1) gives process-lifetime memoization. It is safe under
     # concurrency here because all threads resolve the same deterministic value

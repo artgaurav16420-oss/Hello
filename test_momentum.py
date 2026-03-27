@@ -543,6 +543,35 @@ def test_portfolio_state_from_dict_missing_risk_control_fields_uses_defaults_wit
     assert not any(r.levelno == logging.CRITICAL for r in caplog.records)
 
 
+def test_portfolio_state_from_dict_missing_presence_aware_caps_stay_none():
+    ps = PortfolioState.from_dict({"cash": 1000.0})
+    assert ps.equity_hist_cap is None
+    assert ps.max_absent_periods is None
+
+
+def test_portfolio_state_from_dict_rejects_negative_nonneg_counters(caplog):
+    with caplog.at_level(logging.ERROR, logger="momentum_engine"):
+        ps = PortfolioState.from_dict(
+            {
+                "override_cooldown": -1,
+                "consecutive_failures": -2,
+                "decay_rounds": -3,
+                "max_absent_periods": -4,
+            }
+        )
+
+    assert ps.override_cooldown == 0
+    assert ps.consecutive_failures == 0
+    assert ps.decay_rounds == 0
+    assert ps.max_absent_periods is None
+    critical_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert any("override_cooldown" in msg for msg in critical_msgs)
+    assert any("consecutive_failures" in msg for msg in critical_msgs)
+    assert any("decay_rounds" in msg for msg in critical_msgs)
+    error_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("max_absent_periods" in msg for msg in error_msgs)
+
+
 def test_portfolio_state_from_dict_valid_partial_state_loads_cleanly(caplog):
     payload = {
         "cash": 250_000.0,

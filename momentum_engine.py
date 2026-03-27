@@ -304,8 +304,10 @@ class PortfolioState:
     override_active:      bool             = False
     override_cooldown:    int              = 0
     consecutive_failures: int              = 0
-    equity_hist_cap:      int              = 500  # Keep aligned with UltimateConfig.EQUITY_HIST_CAP.
-    max_absent_periods:   int              = 12
+    # Presence-aware optional fields: None means "missing from persisted state",
+    # allowing callers to apply UltimateConfig defaults only when absent.
+    equity_hist_cap:      Optional[int]    = None  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+    max_absent_periods:   Optional[int]    = None
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
     last_known_volatility:Dict[str, float] = field(default_factory=dict)
@@ -393,6 +395,7 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
+        max_absent_periods = self.max_absent_periods if self.max_absent_periods is not None else 12
         pv = self.cash
         for sym, n_shares in self.shares.items():
             px = prices.get(sym)
@@ -408,12 +411,12 @@ class PortfolioState:
                     px = 0.0
                 else:
                     absent_n = int(self.absent_periods.get(sym, 0))
-                    px = absent_symbol_effective_price(last_px, absent_n, self.max_absent_periods)
+                    px = absent_symbol_effective_price(last_px, absent_n, max_absent_periods)
             pv += n_shares * float(px or 0.0)
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        cap = self.equity_hist_cap
+        cap = self.equity_hist_cap if self.equity_hist_cap is not None else 500
         if cap > 0 and len(self.equity_hist) > cap:
             self.equity_hist = self.equity_hist[-cap:]
 
@@ -466,6 +469,12 @@ class PortfolioState:
                 raise ValueError(f"integer bool flag must be 0/1, got {value}")
             raise TypeError(f"unsupported bool type: {type(value).__name__}")
 
+        def _as_nonneg_int(value) -> int:
+            parsed = int(value)
+            if parsed < 0:
+                raise ValueError(f"value must be non-negative, got {parsed}")
+            return parsed
+
         def _get(key, converter, default):
             try:
                 return converter(d[key]) if key in d else default
@@ -485,14 +494,14 @@ class PortfolioState:
         ps.cash                 = _get("cash",                 float,                                           ps.cash)
         ps.exposure_multiplier  = _get("exposure_multiplier",  float,                                           1.0)
         ps.override_active      = _get("override_active",      _as_bool,                                        False)
-        ps.override_cooldown    = _get("override_cooldown",    int,                                             0)
-        ps.consecutive_failures = _get("consecutive_failures", int,                                             0)
-        ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             500)  # Keep aligned with UltimateConfig.EQUITY_HIST_CAP.
-        ps.max_absent_periods   = _get("max_absent_periods",   int,                                             12)
+        ps.override_cooldown    = _get("override_cooldown",    _as_nonneg_int,                                 0)
+        ps.consecutive_failures = _get("consecutive_failures", _as_nonneg_int,                                 0)
+        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_nonneg_int,                                 None)  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+        ps.max_absent_periods   = _get("max_absent_periods",   _as_nonneg_int,                                 None)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
+        ps.decay_rounds         = _get("decay_rounds",         _as_nonneg_int,                                 0)
         ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
         ps.last_rebalance_date  = _get("last_rebalance_date",  str,                                             "")
 
@@ -1404,14 +1413,17 @@ class InstitutionalRiskEngine:
 
         # Estimate target weights from the same alpha vector that drives the OSQP
         # objective: positive expected returns are normalised to a long-only hint.
-        # We then estimate per-name traded notional as |w_target - w_current| * PV.
+        # Scale this hint by feasible gross exposure (u_gamma) so turnover
+        # penalties match the optimizer's budget envelope instead of assuming
+        # an unconditional 100% gross target.
         target_weight_hint = np.clip(expected_returns, 0.0, None)
         total_hint = float(np.sum(target_weight_hint))
         if total_hint > 0:
             target_weight_hint = target_weight_hint / total_hint
         else:
             target_weight_hint = np.zeros_like(expected_returns, dtype=float)
-        trade_estimate_notionals = np.abs(target_weight_hint - prev_w_arr) * float(portfolio_value)
+        scaled_target_weight_hint = target_weight_hint * float(u_gamma)
+        trade_estimate_notionals = np.abs(scaled_target_weight_hint - prev_w_arr) * float(portfolio_value)
 
         turnover_costs = np.array(
             [

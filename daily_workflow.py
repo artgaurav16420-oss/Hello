@@ -777,13 +777,12 @@ def _run_scan(
     def _scan_body(cfg: UltimateConfig) -> tuple:
         global _CONSECUTIVE_EMPTY_SCANS
         engine = InstitutionalRiskEngine(cfg)
-        # FIX-MB2-EQUITYCAP: Only apply cfg defaults when the state field still holds
-        # its dataclass default (500 for equity_hist_cap, 12 for max_absent_periods).
-        # A user who persisted a custom value (e.g. equity_hist_cap=1000) must not have
-        # it silently reset to cfg.EQUITY_HIST_CAP=500 on every scan call.
-        if state.equity_hist_cap == 500:
+        # FIX-MB2-EQUITYCAP: apply cfg defaults only when these fields were absent
+        # in persisted state (represented as None by PortfolioState.from_dict).
+        # Explicit persisted values (including 500/12) must be preserved.
+        if state.equity_hist_cap is None:
             state.equity_hist_cap = cfg.EQUITY_HIST_CAP
-        if state.max_absent_periods == 12:
+        if state.max_absent_periods is None:
             state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
         today = pd.Timestamp(datetime.today().date())
