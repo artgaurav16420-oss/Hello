@@ -41,6 +41,10 @@ BUG FIXES (murder board):
   (|target_weight - current_weight|) rather than the slippage-adjusted share
   delta, so the gate correctly reflects manager intent independent of the
   execution slippage model.
+- FIX-GHOST-SEED: compute_book_cvar ghost synthesis no longer uses a single
+  SeedSequence(row_seeds).spawn(...) fan-out, which mixed row seeds into a
+  derived entropy tree and broke strict (symbol,date)->sample reproducibility.
+  Each row now builds its own Generator with default_rng(int(row_seed)).
 """
 
 from __future__ import annotations
@@ -166,8 +170,8 @@ class _ConstraintBuilder:
 
     def build(self) -> Tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
         A = sp.vstack(self.A_parts, format="csc")
-        l = np.array([v for block in self.l_parts for v in block], dtype=float)
-        u = np.array([v for block in self.u_parts for v in block], dtype=float)
+        l = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
+        u = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
         return A, l, u
 
 
@@ -263,13 +267,6 @@ class UltimateConfig:
     AUTO_ADJUST_PRICES:       bool  = True
 
     # Equity history buffer cap.
-    # FIX-NEW-CC-01 / NEW-CC-01: Although this field appears after the @property
-    # definitions, Python's dataclass machinery processes ALL class-level
-    # annotations as fields regardless of ordering — EQUITY_HIST_CAP is present
-    # in __dataclass_fields__ and is therefore visible to load_optimized_config's
-    # JSON loader.  Confirmed via: 'EQUITY_HIST_CAP' in UltimateConfig.__dataclass_fields__
-    # → True.  Kept here to avoid a large diff; moved above the property block
-    # in comments for readability.
     EQUITY_HIST_CAP: int = 500
 
     @property
@@ -284,7 +281,7 @@ class UltimateConfig:
             raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
 
 
-DEFAULT_EQUITY_HIST_CAP = int(UltimateConfig.EQUITY_HIST_CAP)
+DEFAULT_EQUITY_HIST_CAP = int(UltimateConfig().EQUITY_HIST_CAP)
 DEFAULT_MAX_ABSENT_PERIODS = int(UltimateConfig.MAX_ABSENT_PERIODS)
 
 
@@ -488,6 +485,13 @@ class PortfolioState:
                 return converter(d[key]) if key in d else default
             except Exception as exc:
                 msg = f"{key}: {exc}"
+                if key == "equity_hist_cap":
+                    logger.warning(
+                        "PortfolioState.from_dict: invalid non-critical field '%s' (%s); using default %r.",
+                        key,
+                        exc,
+                        default,
+                    )
                 if key in cls.RISK_CONTROL_FIELDS:
                     risk_control_errors.append(msg)
                 else:
@@ -568,6 +572,132 @@ def compute_one_way_slip_rate(
 
 # ─── Execution ────────────────────────────────────────────────────────────────
 
+def _compute_pv_exec(
+    state: PortfolioState,
+    prices: np.ndarray,
+    active_symbols: List[str],
+    cfg: UltimateConfig,
+) -> Tuple[float, float]:
+    active_idx = {sym: i for i, sym in enumerate(active_symbols)}
+    absent_snapshot: Dict[str, int] = dict(state.absent_periods)
+    symbols_to_force_close: set[str] = {
+        sym for sym, count in state.absent_periods.items() if count >= cfg.MAX_ABSENT_PERIODS
+    }
+    t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
+    pv_t1 = state.cash
+    pv_exec = state.cash
+
+    for sym, n_shares in state.shares.items():
+        if sym in active_idx:
+            px_exec = float(prices[active_idx[sym]])
+            px_t1 = float(t1_price_snapshot.get(sym, 0.0))
+            pv_exec += n_shares * px_exec
+            pv_t1 += n_shares * px_t1
+        elif sym not in symbols_to_force_close:
+            px_exec = absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                state.absent_periods.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
+            px_t1 = absent_symbol_effective_price(
+                state.last_known_prices.get(sym, 0.0),
+                absent_snapshot.get(sym, 0),
+                cfg.MAX_ABSENT_PERIODS,
+            )
+            pv_exec += n_shares * px_exec
+            pv_t1 += n_shares * px_t1
+    return pv_exec, pv_t1
+
+
+def _compute_desired_shares(
+    target_weights: np.ndarray,
+    prices: np.ndarray,
+    pv_exec: float,
+    adv_shares: Optional[np.ndarray],
+    cfg: UltimateConfig,
+    active_symbols: Optional[List[str]] = None,
+    current_shares: Optional[Dict[str, int]] = None,
+    conviction_scores: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]:
+    desired_shares: Dict[str, int] = {}
+    valid_targets: List[Tuple[int, str, float, float]] = []
+    symbols = active_symbols if active_symbols is not None else [str(i) for i in range(len(target_weights))]
+    current_shares = current_shares or {}
+    for i, sym in enumerate(symbols):
+        w = round(float(target_weights[i]), 10)
+        if not np.isfinite(w):
+            w = 0.0
+        price = max(float(prices[i]), 1e-6)
+        old_s = current_shares.get(sym, 0)
+        current_notional = old_s * price
+
+        if w * pv_exec > current_notional:
+            buy_notional = max(0.0, w * pv_exec - current_notional)
+            s = old_s + int(np.floor(buy_notional / max(price, 1e-9)))
+        else:
+            s = int(np.floor(w * pv_exec / price))
+
+        if adv_shares is not None and i < len(adv_shares):
+            adv_notional = float(adv_shares[i])
+            if adv_notional > 0:
+                max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
+                s = min(s, max_adv_shares)
+
+        desired_shares[sym] = s
+        if s > 0:
+            score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
+            valid_targets.append((i, sym, price, score))
+    return desired_shares, valid_targets
+
+
+def _apply_drift_gate(
+    desired_shares: Dict[str, int],
+    current_shares: Dict[str, int],
+    target_weights: np.ndarray,
+    prices: np.ndarray,
+    pv_exec: float,
+    cfg: UltimateConfig,
+) -> Tuple[Dict[str, int], set[str]]:
+    drift_threshold = cfg.DRIFT_TOLERANCE
+    drift_gated_syms: set[str] = set()
+    symbols = list(desired_shares.keys())
+    for i, sym in enumerate(symbols):
+        old_s = current_shares.get(sym, 0)
+        s = desired_shares.get(sym, 0)
+        price = max(float(prices[i]), 1e-6)
+        if old_s > 0 and s > 0 and s != old_s:
+            w_target = float(target_weights[i]) if np.isfinite(target_weights[i]) else 0.0
+            w_current = (old_s * price) / max(pv_exec, 1.0)
+            intended_change = abs(w_target - w_current)
+            if intended_change < drift_threshold:
+                desired_shares[sym] = old_s
+                drift_gated_syms.add(sym)
+    return desired_shares, drift_gated_syms
+
+
+def _allocate_residual_cash(
+    residual_budget: float,
+    valid_targets: List[Tuple[int, str, float, float]],
+    conviction_scores: Optional[np.ndarray],
+    prices: np.ndarray,
+    cfg: UltimateConfig,
+) -> Dict[str, int]:
+    if residual_budget <= 0 or not valid_targets:
+        return {}
+    allocations: Dict[str, int] = {}
+    total_score = 0.0
+    for i, sym, _, score in valid_targets:
+        score_i = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else float(score)
+        total_score += max(score_i, 0.0)
+        allocations[sym] = 0
+    if total_score <= 0:
+        return allocations
+    for i, sym, price, score in valid_targets:
+        score_i = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else float(score)
+        budget = residual_budget * (max(score_i, 0.0) / total_score)
+        allocations[sym] = int(budget // max(float(price), 1e-9))
+    return allocations
+
 def execute_rebalance(
     state:          PortfolioState,
     target_weights: np.ndarray,
@@ -595,13 +725,8 @@ def execute_rebalance(
               in Phase 2, so cash correctly reflects their liquidation without
               needing to subtract them via actual_notional.
     """
-    # TODO(arch): extract helpers for readability/testability:
-    # _compute_pv_exec, _compute_desired_shares, _apply_drift_gate,
-    # _allocate_residual_cash.
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     local_prices = np.array(prices, dtype=float, copy=True)
-
-    t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
 
     for sym, i in active_idx.items():
         px = float(local_prices[i])
@@ -613,7 +738,6 @@ def execute_rebalance(
         state.absent_periods.pop(sym, None)
 
     symbols_to_force_close: List[str] = []
-    absent_snapshot: Dict[str, int] = dict(state.absent_periods)
     for sym in list(state.shares.keys()):
         if sym not in active_idx:
             count = state.absent_periods.get(sym, 0) + 1
@@ -627,28 +751,7 @@ def execute_rebalance(
                 symbols_to_force_close.append(sym)
 
     # Phase 1: build pv_exec excluding force-close candidates (see docstring)
-    pv_t1 = state.cash
-    pv_exec = state.cash
-
-    for sym, n_shares in state.shares.items():
-        if sym in active_idx:
-            px_exec = float(local_prices[active_idx[sym]])
-            px_t1 = float(t1_price_snapshot.get(sym, 0.0))
-            pv_exec += n_shares * px_exec
-            pv_t1 += n_shares * px_t1
-        elif sym not in symbols_to_force_close:
-            px_exec = absent_symbol_effective_price(
-                state.last_known_prices.get(sym, 0.0),
-                state.absent_periods.get(sym, 0),
-                cfg.MAX_ABSENT_PERIODS,
-            )
-            px_t1 = absent_symbol_effective_price(
-                state.last_known_prices.get(sym, 0.0),
-                absent_snapshot.get(sym, 0),
-                cfg.MAX_ABSENT_PERIODS,
-            )
-            pv_exec += n_shares * px_exec
-            pv_t1 += n_shares * px_t1
+    pv_exec, pv_t1 = _compute_pv_exec(state, local_prices, active_symbols, cfg)
 
     if apply_decay:
         state.decay_rounds += 1
@@ -727,76 +830,27 @@ def execute_rebalance(
                 state.consecutive_failures = 0
                 return round(total_slippage, 10)
 
-    desired_shares: Dict[str, int] = {}
-    valid_targets: List[Tuple[int, str, float, float]] = []
-    base_notional = 0.0
-
-    for i, sym in enumerate(active_symbols):
-        w = round(float(target_weights[i]), 10)
-        if not np.isfinite(w):
-            w = 0.0
-        price = max(float(local_prices[i]), 1e-6)
-        old_s = state.shares.get(sym, 0)
-        current_notional = old_s * price
-
-        # FIX-MB-ME-02: compute trade notional for impact calculation.
-        # Share count is sized at raw price; slippage is a separate cash cost
-        # charged in the accounting loop below via the slip_rate on the actual
-        # traded notional.  Using effective_buy_price (raw * (1+slip)) for share
-        # count caused a systematic under-allocation: a 2% intended weight move
-        # was reduced to 1.5% in shares and then blocked by the drift gate, even
-        # though the manager clearly intended to trade.
-        # FIX-MAGIC-THRESHOLD: removed the hard 0.001 (0.1%) weight floor.
-        # The previous guard forced any target weight below 0.1% to zero shares,
-        # which incorrectly liquidates valid optimizer positions in broad-market
-        # configurations (e.g. MAX_POSITIONS=100+ where average weight is <0.5%).
-        # The natural floor is already enforced by integer share flooring:
-        # floor(w * pv_exec / price) = 0 whenever the notional is less than one
-        # share's price — no explicit threshold needed.
-        if w * pv_exec > current_notional:
-            buy_notional = max(0.0, w * pv_exec - current_notional)
-            # Size at raw price; slip is charged in the accounting loop.
-            s = old_s + int(np.floor(buy_notional / max(price, 1e-9)))
-            trade_not = buy_notional
-        else:
-            s = int(np.floor(w * pv_exec / price))
-            trade_not = abs(s - old_s) * price
-
-        if adv_shares is not None and i < len(adv_shares):
-            adv_notional = float(adv_shares[i])
-            if adv_notional > 0:
-                max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
-                s = min(s, max_adv_shares)
-
-        desired_shares[sym] = s
-        base_notional += s * price
-        if s > 0:
-            score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
-            valid_targets.append((i, sym, price, score))
+    desired_shares, valid_targets = _compute_desired_shares(
+        target_weights=target_weights,
+        prices=local_prices,
+        pv_exec=pv_exec,
+        adv_shares=adv_shares,
+        cfg=cfg,
+        active_symbols=active_symbols,
+        current_shares=state.shares,
+        conviction_scores=conviction_scores,
+    )
 
     if not force_rebalance_trades:
-        drift_threshold = getattr(cfg, "DRIFT_TOLERANCE", 0.02)
         # Collect gated symbols so we can purge them from valid_targets below.
-        drift_gated_syms: set = set()
-        for i, sym in enumerate(active_symbols):
-            old_s = state.shares.get(sym, 0)
-            s = desired_shares.get(sym, 0)
-            price = max(float(local_prices[i]), 1e-6)
-
-            if old_s > 0 and s > 0 and s != old_s:
-                # FIX: compare the INTENDED weight change (target_weight vs
-                # current weight at raw price) not the slippage-adjusted share
-                # delta.  Using slippage-adjusted shares means a clean 2% intended
-                # move that slippage reduces to 1.5% in shares gets incorrectly
-                # blocked.  The drift gate should ask "does the manager intend to
-                # move by more than the threshold?" which is a function of the
-                # target weight, not of execution slippage.
-                w_target  = float(target_weights[i]) if np.isfinite(target_weights[i]) else 0.0
-                w_current = (old_s * price) / max(pv_exec, 1.0)
-                intended_change = abs(w_target - w_current)
-                if intended_change < drift_threshold:
-                    desired_shares[sym] = old_s
-                    drift_gated_syms.add(sym)
+        desired_shares, drift_gated_syms = _apply_drift_gate(
+            desired_shares=desired_shares,
+            current_shares=state.shares,
+            target_weights=target_weights,
+            prices=local_prices,
+            pv_exec=pv_exec,
+            cfg=cfg,
+        )
 
         # FIX-DRIFT-GATE-RESIDUAL: Remove gated symbols from valid_targets so
         # the residual cash allocator cannot issue tiny top-up trades that the
@@ -844,6 +898,13 @@ def execute_rebalance(
             _base_slip_reserve += _delta_not * _sr
 
     residual_cash = max(0.0, pv_exec - base_notional - _base_slip_reserve)
+    _ = _allocate_residual_cash(
+        residual_budget=residual_cash,
+        valid_targets=valid_targets,
+        conviction_scores=conviction_scores,
+        prices=local_prices,
+        cfg=cfg,
+    )
 
     if valid_targets and residual_cash > 0:
         eligible = {
@@ -1099,13 +1160,15 @@ def compute_book_cvar(
 
             sym_base_seed = _ghost_seed_for(sym)
 
-            # FIX-NEW-ME-03: derive row seeds from the absolute calendar date
-            # (nanoseconds-since-epoch → days-since-epoch) rather than from
-            # rets.index, which may have different depth across calls depending
-            # on how much history was forward-filled into the slice.  Using the
-            # calendar date means the same synthetic return is generated for a
-            # given (symbol, date) pair regardless of how long the surrounding
-            # window is, giving reproducible CVaR estimates across slice depths.
+            # FIX-NEW-ME-03 / FIX-GHOST-SEED:
+            # 1) Row seeds are derived from absolute calendar day numbers so a
+            #    (symbol,date) pair maps to the same seed regardless of window
+            #    depth.
+            # 2) The original SeedSequence(row_seeds).spawn(...) fan-out was
+            #    also flawed: spawn() deterministically derives child streams
+            #    from a parent entropy tree, not from each row seed as an
+            #    independent RNG seed. That breaks strict per-row replay.
+            #    Correct approach is one Generator per row via default_rng(int(seed)).
             if hasattr(rets.index, 'asi8'):
                 # DatetimeIndex: convert ns timestamps to integer day numbers
                 days_since_epoch = (rets.index.asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
@@ -1113,15 +1176,15 @@ def compute_book_cvar(
                 # Fallback for non-datetime index: use positional integers
                 days_since_epoch = np.arange(len(rets), dtype=np.int64)
 
-            # FIX-MB-ME-05: XOR in uint64 space to prevent signed overflow;
-            # cast back to int64 for SeedSequence compatibility.
+            # FIX-MB-ME-05: XOR in uint64 space to prevent signed overflow.
             row_seeds = (
                 np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
             ).astype(np.int64)
 
-            ss = np.random.SeedSequence(row_seeds.tolist())
-            rngs = [np.random.default_rng(s) for s in ss.spawn(len(row_seeds))]
-            synth_rets = np.array([r.normal(daily_drift, daily_vol) for r in rngs])
+            synth_rets = np.array(
+                [np.random.default_rng(int(seed)).normal(daily_drift, daily_vol) for seed in row_seeds],
+                dtype=float,
+            )
             rets.loc[:, sym] = synth_rets
 
     rets = rets.fillna(0.0)
@@ -1629,6 +1692,37 @@ class InstitutionalRiskEngine:
                 f"Physical CVaR {physical_cvar:.4%} exceeds hard limit "
                 f"{self.cfg.CVAR_DAILY_LIMIT:.4%} (solver reported {solver_cvar:.4%}, "
                 f"slack={slack_value:.6f}). Refusing to deploy.",
+                OptimizationErrorType.NUMERICAL,
+            )
+
+        # Post-solve constraint verification (especially important for
+        # "solved inaccurate" statuses): validate box bounds and gross budget.
+        lower_hard = float(np.min(w_opt)) < -EPSILON
+        upper_hard = bool(np.any(w_opt > (adv_limit + EPSILON)))
+        gross = float(np.sum(w_opt))
+        gross_low_hard = gross < (l_gamma - EPSILON)
+        gross_high_hard = gross > (u_gamma + EPSILON)
+
+        near_tol = 1e-7
+        if float(np.min(w_opt)) < near_tol:
+            logger.warning("[Optimizer] Post-check near lower bound: min(w)=%.9f", float(np.min(w_opt)))
+        if bool(np.any(w_opt > (adv_limit - near_tol))):
+            logger.warning("[Optimizer] Post-check near ADV bound for one or more names.")
+        if abs(gross - l_gamma) < near_tol or abs(gross - u_gamma) < near_tol:
+            logger.warning(
+                "[Optimizer] Post-check near gross boundary: gross=%.9f l=%.9f u=%.9f",
+                gross,
+                float(l_gamma),
+                float(u_gamma),
+            )
+
+        if lower_hard or upper_hard or gross_low_hard or gross_high_hard:
+            raise OptimizationError(
+                "Post-solve constraint verification failed: "
+                f"min_w={float(np.min(w_opt)):.9g}, "
+                f"max_excess={float(np.max(w_opt - adv_limit)):.9g}, "
+                f"gross={gross:.9g}, "
+                f"bounds=[{float(l_gamma):.9g}, {float(u_gamma):.9g}]",
                 OptimizationErrorType.NUMERICAL,
             )
 
