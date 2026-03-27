@@ -210,16 +210,16 @@ def test_recover_from_stale_cache_logs_summary_not_per_symbol(tmp_path, monkeypa
     cache_dir.mkdir()
     monkeypatch.setattr(data_cache, "CACHE_DIR", cache_dir)
 
-    idx = pd.to_datetime(["2026-03-24"])
+    idx = pd.date_range("2026-03-17", periods=6, freq="D")
     for ticker in ("AAA.NS", "BBB.NS"):
         df = pd.DataFrame(
             {
-                "Open": [100.0],
-                "High": [101.0],
-                "Low": [99.0],
-                "Close": [100.0],
-                "Adj Close": [100.0],
-                "Volume": [1000.0],
+                "Open": [100.0] * len(idx),
+                "High": [101.0] * len(idx),
+                "Low": [99.0] * len(idx),
+                "Close": [100.0] * len(idx),
+                "Adj Close": [100.0] * len(idx),
+                "Volume": [1000.0] * len(idx),
             },
             index=idx,
         )

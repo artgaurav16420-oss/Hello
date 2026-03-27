@@ -113,6 +113,7 @@ __version__ = "11.48"
 
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
+DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
 
 # PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
 # empty universe (provider outage / all symbols filtered).  Reset to zero on
@@ -392,7 +393,7 @@ def _get_custom_universe() -> List[str]:
     return []
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    if not state.shares and not state.equity_hist and abs(state.cash - 1_000_000.0) < 1.0:
+    if not state.shares and not state.equity_hist and abs(state.cash - DEFAULT_INITIAL_CAPITAL) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
         try:
             raw_cap = input(f"  {C.CYN}Enter your starting capital (₹) [Default 10,00,000]: {C.RST}").replace(",", "").strip()
@@ -562,6 +563,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
     os.makedirs("data", exist_ok=True)
     state_file = f"data/portfolio_state_{name}.json"
+    risk_file  = f"data/portfolio_risk_{name}.json"
     tmp_file   = f"{state_file}.tmp"
     try:
         for i in range(BACKUP_GENERATIONS - 1, -1, -1):
@@ -622,6 +624,14 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             finally:
                 os.close(dir_fd)
 
+        # If a durable full state save succeeded, a paper-mode risk overlay is
+        # stale by definition and must not leak into future normal-mode loads.
+        if os.path.exists(risk_file):
+            try:
+                os.remove(risk_file)
+            except OSError as exc:
+                logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
+
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
         if os.path.exists(tmp_file):
@@ -632,6 +642,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
 def load_portfolio_state(name: str) -> PortfolioState:
     state_file = f"data/portfolio_state_{name}.json"
+    risk_file = f"data/portfolio_risk_{name}.json"
     # FIX-NEW-DW-03: backups list covers the primary file plus all BACKUP_GENERATIONS
     # rotation slots (bak.0 … bak.{BACKUP_GENERATIONS-1}).  All slots are tried in
     # order; only files that exist AND parse successfully are returned.  Files that
@@ -640,72 +651,70 @@ def load_portfolio_state(name: str) -> PortfolioState:
     # are simply absent (normal on a fresh installation).
     backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
     corrupted_paths = []
+    found_any_state_file = False
+    found_risk_overlay = os.path.exists(risk_file)
+
+    def _apply_risk_overlay(ps: PortfolioState) -> PortfolioState:
+        if not os.path.exists(risk_file):
+            return ps
+        try:
+            with open(risk_file) as rf:
+                risk = json.load(rf)
+
+            def _ri(key, fallback):
+                v = risk.get(key)
+                return int(v) if v is not None else fallback
+
+            def _rb(key, fallback):
+                v = risk.get(key)
+                if v is None:
+                    return fallback
+                if isinstance(v, bool):
+                    return v
+                return bool(int(v))
+
+            try:
+                ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
+            except (TypeError, ValueError) as _e:
+                logger.warning("Risk overlay: could not merge consecutive_failures: %s", _e)
+            try:
+                ps.override_active = _rb("override_active", ps.override_active)
+            except (TypeError, ValueError) as _e:
+                logger.warning("Risk overlay: could not merge override_active: %s", _e)
+            try:
+                ps.override_cooldown = _ri("override_cooldown", ps.override_cooldown)
+            except (TypeError, ValueError) as _e:
+                logger.warning("Risk overlay: could not merge override_cooldown: %s", _e)
+            try:
+                ps.decay_rounds = _ri("decay_rounds", ps.decay_rounds)
+            except (TypeError, ValueError) as _e:
+                logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
+            absent_raw = risk.get("absent_periods")
+            if isinstance(absent_raw, dict):
+                ps.absent_periods.clear()
+                for k, v in absent_raw.items():
+                    try:
+                        ps.absent_periods[str(k)] = int(v)
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                lrd = risk.get("last_rebalance_date")
+                if lrd and isinstance(lrd, str):
+                    ps.last_rebalance_date = lrd
+            except (TypeError, ValueError) as _e:
+                logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError, FileNotFoundError) as exc:
+            logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
+        return ps
 
     for path in backups:
         if os.path.exists(path):
+            found_any_state_file = True
             try:
                 with open(path) as f:
                     ps = PortfolioState.from_dict(json.load(f))
-                # FIX-MB2-PAPERRISK: Merge paper-mode risk overlay if present.
-                # This restores consecutive_failures / override state across
-                # paper-mode process restarts without loading trade/share changes.
-                risk_file = f"data/portfolio_risk_{name}.json"
-                if os.path.exists(risk_file):
-                    try:
-                        with open(risk_file) as rf:
-                            risk = json.load(rf)
-                        # FIX-NEW-DW-01: wrap each field merge individually so a
-                        # corrupted or missing key in one field does not silently
-                        # skip ALL merges.  Each int/bool coercion is guarded so
-                        # a stale or hand-edited overlay cannot produce a TypeError
-                        # or ValueError that leaves the state at an unsafe default.
-                        def _ri(key, fallback):
-                            v = risk.get(key)
-                            return int(v) if v is not None else fallback
-                        def _rb(key, fallback):
-                            v = risk.get(key)
-                            if v is None:
-                                return fallback
-                            if isinstance(v, bool):
-                                return v
-                            return bool(int(v))
-                        # BUG-DW-06: wrap each field individually so a bad value
-                        # in one field does not silently skip all remaining merges.
-                        try:
-                            ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
-                        except (TypeError, ValueError) as _e:
-                            logger.warning("Risk overlay: could not merge consecutive_failures: %s", _e)
-                        try:
-                            ps.override_active = _rb("override_active", ps.override_active)
-                        except (TypeError, ValueError) as _e:
-                            logger.warning("Risk overlay: could not merge override_active: %s", _e)
-                        try:
-                            ps.override_cooldown = _ri("override_cooldown", ps.override_cooldown)
-                        except (TypeError, ValueError) as _e:
-                            logger.warning("Risk overlay: could not merge override_cooldown: %s", _e)
-                        try:
-                            ps.decay_rounds = _ri("decay_rounds", ps.decay_rounds)
-                        except (TypeError, ValueError) as _e:
-                            logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
-                        absent_raw = risk.get("absent_periods")
-                        if isinstance(absent_raw, dict):
-                            # FIX-MB-DW-02: clear before applying overlay so the
-                            # overlay is the authoritative source; stale entries
-                            # from prior sessions do not persist as ghost entries.
-                            ps.absent_periods.clear()
-                            for k, v in absent_raw.items():
-                                try:
-                                    ps.absent_periods[str(k)] = int(v)
-                                except (TypeError, ValueError):
-                                    pass
-                        try:
-                            lrd = risk.get("last_rebalance_date")
-                            if lrd and isinstance(lrd, str):
-                                ps.last_rebalance_date = lrd
-                        except (TypeError, ValueError) as _e:
-                            logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
-                    except Exception as exc:
-                        logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
+                if PAPER_MODE:
+                    return _apply_risk_overlay(ps)
                 return ps
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
@@ -726,6 +735,19 @@ def load_portfolio_state(name: str) -> PortfolioState:
             name, len(corrupted_paths), corrupted_paths,
         )
         return PortfolioState()
+
+    if not found_any_state_file:
+        if PAPER_MODE and found_risk_overlay:
+            logger.info(
+                "Primary state files missing for '%s', but risk overlay exists. "
+                "Recovering risk metadata into default PortfolioState().",
+                name,
+            )
+            return _apply_risk_overlay(PortfolioState())
+        logger.info(
+            "No portfolio state files found for '%s'. Starting clean first-run state.",
+            name,
+        )
 
     return PortfolioState()
 
@@ -1027,51 +1049,14 @@ def _run_scan(
         # The execute_rebalance call below receives the target weights and handles
         # residual distribution correctly with no pre-call adjustment needed.
     
-        # Fix 2: Per-symbol price staleness gate.
-        # If any HELD position's last price bar is older than 2 trading days,
-        # something is wrong with the data feed for that symbol. Running a
-        # rebalance with a stale price for a held name can produce badly wrong
-        # weight calculations — better to skip and wait for fresh data.
-        # Exception: _force_full_cash (CVaR hard breach) always executes because
-        # liquidating to cash is safe regardless of price staleness.
-        _cadence_stale_held: list = []
-        _MAX_STALE_TRADING_DAYS = 2
-        if rebalance_allowed and not _force_full_cash and not close.empty:
-            _last_bar_date = close.index[-1]
-            # Count trading days between last bar and today using the close index
-            # (business-day calendar of actual market data in the matrix).
-            _trading_days_since_last = int(
-                (close.index <= today).sum() - len(close.index[close.index <= _last_bar_date])
-            )
-            # Simpler: how many bars ago is the last row relative to today?
-            _days_stale = (today - _last_bar_date).days
-            for _hsym in state.shares:
-                if _hsym not in active_idx:
-                    continue  # absent symbols handled by absent_periods
-                _sym_series = close.get(_hsym)
-                if _sym_series is None:
-                    continue
-                _last_valid = _sym_series.last_valid_index()
-                if _last_valid is None:
-                    _cadence_stale_held.append(_hsym)
-                    continue
-                # BUG-FIX-MONDAY: count bars in the close index that fall
-                # strictly after _last_valid and up to today.  This is NSE-calendar
-                # aware and never falsely fires on Monday (Friday close = 0 bars
-                # elapsed over the weekend, 1 bar elapsed by Monday close).
-                _bars_elapsed = int((close.index > _last_valid).sum())
-                if _bars_elapsed > _MAX_STALE_TRADING_DAYS:
-                    _cadence_stale_held.append(_hsym)
-            if _cadence_stale_held:
-                logger.warning(
-                    "[Scan] STALENESS GATE: skipping rebalance because %d held symbol(s) "
-                    "have prices older than %d trading days: %s. "
-                    "Wait for fresh market data before rebalancing.",
-                    len(_cadence_stale_held), _MAX_STALE_TRADING_DAYS, _cadence_stale_held,
-                )
-                rebalance_allowed = False
-    
-        # FIX-STALE-PRICE: Before executing a rebalance, check whether any held
+        # FIX-STALE-PRICE: Single source-of-truth stale-price gate. We validate
+        # held symbols against market_data using the close-index trading calendar
+        # and suppress normal rebalances when stale, while still allowing
+        # _force_full_cash liquidations in stress events.
+        # Use an authoritative expected session date derived from market calendar
+        # (fallback: latest business day) so uniformly stale payloads cannot pass
+        # just because every series shares the same stale close.index endpoint.
+        # Before executing a rebalance, check whether any held
         # position has a price that is older than _STALE_PRICE_DAYS trading days.
         # A rebalance using a 3-day-old price is likely worse than no rebalance,
         # because the optimizer will size incorrectly relative to the current
@@ -1080,6 +1065,39 @@ def _run_scan(
         _STALE_PRICE_DAYS = 2  # trading days
         _rebalance_stale_held: list = []
         if rebalance_allowed and (optimization_succeeded or apply_decay) and not _force_full_cash:
+            valid_days = None
+            expected_session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).tz_localize(None)
+            try:
+                import pandas_market_calendars as mcal
+
+                nse_calendar = mcal.get_calendar("NSE")
+                valid_days = nse_calendar.valid_days(
+                    start_date=calendar_window_start,
+                    end_date=expected_session_date,
+                )
+                if len(valid_days) > 0:
+                    expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert("Asia/Kolkata").tz_localize(None).normalize()
+                else:
+                    expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
+            except Exception:
+                expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
+
+            trusted_close_index = pd.DatetimeIndex([])
+            if valid_days is not None and len(valid_days) > 0:
+                trusted_close_index = pd.DatetimeIndex(valid_days)
+                if trusted_close_index.tz is not None:
+                    trusted_close_index = trusted_close_index.tz_convert("Asia/Kolkata").tz_localize(None)
+                trusted_close_index = trusted_close_index.normalize()
+                trusted_close_index = trusted_close_index[trusted_close_index <= expected_session_date]
+
+            if trusted_close_index.empty or trusted_close_index.max() < expected_session_date:
+                trusted_close_index = pd.date_range(
+                    start=calendar_window_start,
+                    end=expected_session_date,
+                    freq="B",
+                )
+
             for _chk_sym in state.shares:
                 if _chk_sym not in active_idx:
                     continue  # absent symbols handled by execute_rebalance itself
@@ -1097,12 +1115,12 @@ def _run_scan(
                     # (the weekend produced no trading bars), correctly passing the
                     # gate.  Calendar-day arithmetic (today - last_ts).days would
                     # yield 3, suppressing every Monday rebalance as a false alarm.
-                    _trading_bars_elapsed = int((close.index > _last_ts).sum())
+                    _trading_bars_elapsed = int((trusted_close_index > _last_ts).sum())
                     if _trading_bars_elapsed > _STALE_PRICE_DAYS:
                         _rebalance_stale_held.append((_chk_sym, _trading_bars_elapsed))
             if _rebalance_stale_held:
                 logger.warning(
-                    "[Scan] REBALANCE SUPPRESSED: %d held symbol(s) have prices "
+                    "[Scan] STALENESS GATE: %d held symbol(s) have prices "
                     "older than %d trading bar(s) in the NSE close index: %s. "
                     "Skipping rebalance to avoid sizing on stale data. "
                     "Will retry on next scan once provider returns fresh data.",
@@ -1309,7 +1327,7 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
 
 def _portfolio_activity_badge(state: PortfolioState) -> str:
-    has_activity = bool(state.shares or state.equity_hist or abs(state.cash - 1_000_000.0) >= 1.0)
+    has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
     positions = len(state.shares)
@@ -1386,7 +1404,7 @@ def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Option
     return None
 
 def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> None:
-    """Copy stress-tracking risk fields from *source* into *target* in-place."""
+    """Copy latest scan risk-state fields from *source* into *target* in-place."""
     target.consecutive_failures = source.consecutive_failures
     target.override_cooldown    = source.override_cooldown
     target.override_active      = source.override_active
@@ -1429,6 +1447,9 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "nse_total")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
+                # Intentional behavior: even when trade edits are discarded, the
+                # risk-state emitted by the latest scan (failure counters, decay,
+                # cooldowns, absent symbols) remains authoritative.
                 _preserve_risk_metadata(source=preview, target=states["nse_total"])
                 save_portfolio_state(states["nse_total"], "nse_total")
                 print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
@@ -1563,8 +1584,9 @@ def main_menu() -> None:
                     print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
 
         elif c == "5":
+            status_cfg = load_optimized_config()
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
-                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - 1_000_000.0) >= 1.0
+                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
                 if has_activity:
                     mkt = mkt_cache.get(name) or {}
                     if not mkt and states[name].shares:
@@ -1574,10 +1596,11 @@ def main_menu() -> None:
                             syms,
                             (datetime.today() - timedelta(days=22)).strftime("%Y-%m-%d"),
                             end,
+                            cfg=status_cfg,
                         )
                         mkt_cache[name] = mkt
-                    _print_status(states[name], label, mkt)
-            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - 1_000_000.0) >= 1.0) for n in states):
+                    _print_status(states[name], label, mkt, cfg=status_cfg)
+            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0) for n in states):
                 print(f"  {C.GRY}All portfolios are empty.{C.RST}")
 
         elif c == "6":
