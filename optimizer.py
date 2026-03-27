@@ -62,8 +62,6 @@ def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
             if key:
                 os.environ.setdefault(key, value)
 
-_load_dotenv_if_present()
-
 from momentum_engine import UltimateConfig, OptimizationError, OptimizationErrorType
 from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
@@ -1348,6 +1346,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    _load_dotenv_if_present()
     args = _parse_args()
     run_optimization(
         universe_type = args.universe,

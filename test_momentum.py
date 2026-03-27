@@ -27,6 +27,10 @@ from momentum_engine import (
     compute_decay_targets,
     absent_symbol_effective_price,
     _ConstraintBuilder,
+    _compute_pv_exec,
+    _compute_desired_shares,
+    _apply_drift_gate,
+    _allocate_residual_cash,
 )
 from backtest_engine import BacktestEngine, run_backtest, _compute_metrics, _build_adv_vector
 from universe_manager import STATIC_NSE_SECTORS
@@ -216,6 +220,31 @@ def test_regime_score_neutral_below_vol_lookback_requirement():
         index=pd.date_range("2020-01-01", periods=251),
     )
     assert compute_regime_score(idx) > 0.5
+
+
+def test_compute_regime_score_short_history_expanding_mean_path():
+    idx = pd.DataFrame({"Close": np.linspace(100.0, 103.0, 30)}, index=pd.date_range("2024-01-01", periods=30))
+    universe = pd.DataFrame({"A": np.linspace(10.0, 11.0, 30)}, index=idx.index)
+    score = compute_regime_score(idx, UltimateConfig(REGIME_SMA_WINDOW=50), universe_close_hist=universe)
+    assert 0.0 <= score <= 1.0
+
+
+def test_compute_regime_score_vol_spike_penalty_path():
+    closes = np.concatenate([np.linspace(100, 110, 260), np.array([90, 120, 85, 125, 80])])
+    idx = pd.DataFrame({"Close": closes}, index=pd.date_range("2023-01-01", periods=len(closes)))
+    score = compute_regime_score(idx, UltimateConfig())
+    assert score < 0.8
+
+
+def test_compute_regime_score_crash_and_early_warning_paths():
+    dates = pd.date_range("2024-01-01", periods=80)
+    idx = pd.DataFrame({"Close": np.linspace(100, 105, 80)}, index=dates)
+    weak = pd.DataFrame({f"S{i}": np.concatenate([np.ones(65) * 100, np.ones(15) * (80 if i < 7 else 120)]) for i in range(10)}, index=dates)
+    crash = pd.DataFrame({f"S{i}": np.concatenate([np.ones(65) * 100, np.ones(15) * (70 if i < 8 else 120)]) for i in range(10)}, index=dates)
+    score_weak = compute_regime_score(idx, UltimateConfig(), universe_close_hist=weak)
+    score_crash = compute_regime_score(idx, UltimateConfig(), universe_close_hist=crash)
+    assert score_weak <= 0.5
+    assert score_crash == 0.0
 
 
 
@@ -549,6 +578,15 @@ def test_portfolio_state_from_dict_missing_presence_aware_caps_stay_none():
     assert ps.max_absent_periods is None
 
 
+def test_portfolio_state_from_dict_logs_warning_for_invalid_equity_hist_cap(caplog):
+    with caplog.at_level(logging.WARNING, logger="momentum_engine"):
+        ps = PortfolioState.from_dict({"equity_hist_cap": -5})
+
+    assert ps.equity_hist_cap is None
+    warning_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("equity_hist_cap" in msg for msg in warning_msgs)
+
+
 def test_portfolio_state_from_dict_rejects_negative_nonneg_counters(caplog):
     with caplog.at_level(logging.ERROR, logger="momentum_engine"):
         ps = PortfolioState.from_dict(
@@ -808,6 +846,58 @@ def test_execute_rebalance_cash_conservation():
     notional = sum(state.shares.get(s, 0) * p for s, p in zip(["A", "B", "C"], prices))
     assert state.cash >= 0
     assert state.cash + notional <= 1_000_000.0 + 1e-2
+
+
+def test_compute_pv_exec_helper_includes_active_and_stale_positions():
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=10)
+    state = PortfolioState(cash=100.0)
+    state.shares = {"A": 2, "B": 3}
+    state.last_known_prices = {"A": 10.0, "B": 5.0}
+    state.absent_periods = {"B": 1}
+    pv_exec, pv_t1 = _compute_pv_exec(state, np.array([11.0]), ["A"], cfg)
+    assert pv_exec == pytest.approx(100.0 + 2 * 11.0 + 3 * absent_symbol_effective_price(5.0, 1, 10))
+    assert pv_t1 == pytest.approx(100.0 + 2 * 10.0 + 3 * absent_symbol_effective_price(5.0, 1, 10))
+
+
+def test_compute_desired_shares_helper_handles_simple_case():
+    cfg = UltimateConfig(MAX_ADV_PCT=1.0)
+    desired, valid = _compute_desired_shares(
+        target_weights=np.array([0.5]),
+        prices=np.array([100.0]),
+        pv_exec=1000.0,
+        adv_shares=np.array([1e9]),
+        cfg=cfg,
+        active_symbols=["A"],
+        current_shares={"A": 0},
+    )
+    assert desired["A"] == 5
+    assert valid and valid[0][1] == "A"
+
+
+def test_apply_drift_gate_helper_blocks_small_change():
+    cfg = UltimateConfig(DRIFT_TOLERANCE=0.05)
+    desired, gated = _apply_drift_gate(
+        desired_shares={"A": 101},
+        current_shares={"A": 100},
+        target_weights=np.array([0.51]),
+        prices=np.array([100.0]),
+        pv_exec=20_000.0,
+        cfg=cfg,
+    )
+    assert desired["A"] == 100
+    assert "A" in gated
+
+
+def test_allocate_residual_cash_helper_allocates_by_score():
+    cfg = UltimateConfig()
+    alloc = _allocate_residual_cash(
+        residual_budget=1000.0,
+        valid_targets=[(0, "A", 100.0, 1.0), (1, "B", 100.0, 1.0)],
+        conviction_scores=np.array([3.0, 1.0]),
+        prices=np.array([100.0, 100.0]),
+        cfg=cfg,
+    )
+    assert alloc["A"] >= alloc["B"]
 
 
 def test_detect_and_apply_splits_fractional_cash():

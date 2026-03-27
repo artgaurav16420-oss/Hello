@@ -87,8 +87,8 @@ def compute_regime_score(
 
     close_series = idx_hist["Close"]
 
-    sma_window = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
-    sma_fast_window = int(getattr(cfg, "REGIME_SMA_FAST_WINDOW", 50)) if cfg else 50
+    sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
+    sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50
     min_sma_periods = 20
     min_fast_periods = max(10, min_sma_periods // 2)
 
@@ -112,10 +112,10 @@ def compute_regime_score(
     trend_dev_slow = (last_price / sma200) - 1.0
     trend_dev_fast = (last_price / sma_fast) - 1.0 if sma_fast > 0 and np.isfinite(sma_fast) else trend_dev_slow
     trend_deviation = 0.6 * trend_dev_fast + 0.4 * trend_dev_slow
-    trend_steepness = float(getattr(cfg, "REGIME_SIGMOID_STEEPNESS", 10.0)) if cfg else 10.0
+    trend_steepness = float(cfg.REGIME_SIGMOID_STEEPNESS) if cfg else 10.0
     base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
 
-    ewma_span = int(getattr(cfg, "REGIME_VOL_EWMA_SPAN", 20)) if cfg else 20
+    ewma_span = int(cfg.REGIME_VOL_EWMA_SPAN) if cfg else 20
     all_returns = close_series.pct_change(fill_method=None).dropna()
 
     vol_component = 0.5
@@ -123,10 +123,10 @@ def compute_regime_score(
         ewma_var = all_returns.ewm(span=ewma_span, adjust=False).var()
         vol_ewma = float(ewma_var.iloc[-1] ** 0.5 * np.sqrt(252)) if pd.notna(ewma_var.iloc[-1]) else 0.0
 
-        vol_floor = float(getattr(cfg, "REGIME_VOL_FLOOR", 0.18)) if cfg else 0.18
-        vol_mult = float(getattr(cfg, "REGIME_VOL_MULTIPLIER", 1.5)) if cfg else 1.5
+        vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
+        vol_mult = float(cfg.REGIME_VOL_MULTIPLIER) if cfg else 1.5
 
-        lt_ewma_span = int(getattr(cfg, "REGIME_LT_VOL_EWMA_SPAN", 1260)) if cfg else 1260
+        lt_ewma_span = int(cfg.REGIME_LT_VOL_EWMA_SPAN) if cfg else 1260
         # FIX-MB-REGIMEWARMUP: min_periods=252 prevents cold-start false precision.
         # Returns NaN for the first ~252 days → falls back to vol_floor below.
         lt_ewma_var = all_returns.ewm(span=lt_ewma_span, adjust=False, min_periods=252).var()
@@ -151,7 +151,7 @@ def compute_regime_score(
     # override; window lengths intentionally differ, so keep them decoupled
     # until a dedicated refactor ticket unifies naming and responsibilities.
     breadth_component = 0.5
-    _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
+    _sma_win = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty:
         # FIX-NEW-SIG-02: exclude benchmark index columns (names starting with
         # "^") before computing breadth. When the active universe is empty or
@@ -252,7 +252,7 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
         if notional.empty:
             return 0.0
 
-        adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
+        adv_lookback = int(cfg.ADV_LOOKBACK) if cfg else 20
         min_periods = max(1, adv_lookback // 2)
 
         adv_val = float(
@@ -299,7 +299,7 @@ def compute_adv(
 
     if notional_df.empty:
         return np.zeros(len(active_symbols), dtype=float)
-    adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg else 20
+    adv_lookback = int(cfg.ADV_LOOKBACK) if cfg else 20
     min_periods = max(1, adv_lookback // 2)
 
     recent_notional = notional_df.iloc[-adv_lookback:]
