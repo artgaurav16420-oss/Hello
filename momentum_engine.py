@@ -54,7 +54,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -577,12 +577,10 @@ def _compute_pv_exec(
     prices: np.ndarray,
     active_symbols: List[str],
     cfg: UltimateConfig,
+    symbols_to_force_close: Set[str],
 ) -> Tuple[float, float]:
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     absent_snapshot: Dict[str, int] = dict(state.absent_periods)
-    symbols_to_force_close: set[str] = {
-        sym for sym, count in state.absent_periods.items() if count >= cfg.MAX_ABSENT_PERIODS
-    }
     t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
     pv_t1 = state.cash
     pv_exec = state.cash
@@ -657,13 +655,17 @@ def _apply_drift_gate(
     prices: np.ndarray,
     pv_exec: float,
     cfg: UltimateConfig,
+    active_symbols: List[str],
 ) -> Tuple[Dict[str, int], set[str]]:
     drift_threshold = cfg.DRIFT_TOLERANCE
     drift_gated_syms: set[str] = set()
-    symbols = list(desired_shares.keys())
-    for i, sym in enumerate(symbols):
+    active_idx = {sym: i for i, sym in enumerate(active_symbols)}
+    for sym in active_symbols:
+        if sym not in desired_shares:
+            continue
         old_s = current_shares.get(sym, 0)
         s = desired_shares.get(sym, 0)
+        i = active_idx[sym]
         price = max(float(prices[i]), 1e-6)
         if old_s > 0 and s > 0 and s != old_s:
             w_target = float(target_weights[i]) if np.isfinite(target_weights[i]) else 0.0
@@ -751,7 +753,8 @@ def execute_rebalance(
                 symbols_to_force_close.append(sym)
 
     # Phase 1: build pv_exec excluding force-close candidates (see docstring)
-    pv_exec, pv_t1 = _compute_pv_exec(state, local_prices, active_symbols, cfg)
+    force_close_set = set(symbols_to_force_close)
+    pv_exec, pv_t1 = _compute_pv_exec(state, local_prices, active_symbols, cfg, force_close_set)
 
     if apply_decay:
         state.decay_rounds += 1
@@ -850,6 +853,7 @@ def execute_rebalance(
             prices=local_prices,
             pv_exec=pv_exec,
             cfg=cfg,
+            active_symbols=active_symbols,
         )
 
         # FIX-DRIFT-GATE-RESIDUAL: Remove gated symbols from valid_targets so
@@ -898,13 +902,9 @@ def execute_rebalance(
             _base_slip_reserve += _delta_not * _sr
 
     residual_cash = max(0.0, pv_exec - base_notional - _base_slip_reserve)
-    _ = _allocate_residual_cash(
-        residual_budget=residual_cash,
-        valid_targets=valid_targets,
-        conviction_scores=conviction_scores,
-        prices=local_prices,
-        cfg=cfg,
-    )
+    # TODO: _allocate_residual_cash was intended to replace the inline allocation
+    # loop below, but currently lacks ADV caps, per-name concentration limits,
+    # and multi-pass tracking.
 
     if valid_targets and residual_cash > 0:
         eligible = {

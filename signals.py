@@ -345,8 +345,7 @@ def generate_signals(
 
     active_symbols = list(log_rets.columns)
 
-    _raw_lag = getattr(cfg, "SIGNAL_LAG_DAYS", 0)
-    signal_lag_days = max(int(_raw_lag if _raw_lag is not None else 0), 0)
+    signal_lag_days = max(cfg.SIGNAL_LAG_DAYS, 0)
     if signal_lag_days > 0 and len(log_rets) >= signal_lag_days:
         if len(log_rets) == signal_lag_days:
             logger.warning(
@@ -402,7 +401,7 @@ def generate_signals(
     # CONTINUITY_MAX_SCALAR * CONTINUITY_DISPERSION_FLOOR.  Use the floor
     # value directly in this degenerate case.
     if not gate_pass_mask.any():
-        std_cross = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
+        std_cross = cfg.CONTINUITY_DISPERSION_FLOOR
     else:
         std_cross = max(np.nanstd(norm_src), 1e-8)
 
@@ -469,7 +468,7 @@ def generate_signals(
     knife_pre_bonus_suppress = np.zeros(len(active_symbols), dtype=bool)
 
     if prev_weights and valid_mask.any():
-        cap = float(getattr(cfg, "CONTINUITY_MAX_SCALAR", 0.20))
+        cap = cfg.CONTINUITY_MAX_SCALAR
         # FIX-MB-DISPERSION: Scale the continuity bonus by the cross-sectional
         # return dispersion, clamped at CONTINUITY_DISPERSION_FLOOR. std_cross
         # was computed above from gate-passing symbols; using it here makes the
@@ -478,7 +477,7 @@ def generate_signals(
         # markets. Without this scaling, CONTINUITY_DISPERSION_FLOOR in
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
-        dispersion_floor = float(getattr(cfg, "CONTINUITY_DISPERSION_FLOOR", 0.1))
+        dispersion_floor = cfg.CONTINUITY_DISPERSION_FLOOR
         # FIX-DISPERSION-SCALE: scale bonus DOWN in low-dispersion markets.
         # Previous code multiplied by max(std_cross, floor) which both inverted
         # the direction (high-dispersion got bigger bonus) and produced a unit
@@ -486,11 +485,11 @@ def generate_signals(
         dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
         base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
 
-        activity_window = max(int(getattr(cfg, "CONTINUITY_ACTIVITY_WINDOW", 5)), 1)
-        stale_sessions = max(int(getattr(cfg, "CONTINUITY_STALE_SESSIONS", 10)), 1)
-        min_nonzero_days = max(int(getattr(cfg, "CONTINUITY_MIN_NONZERO_DAYS", 1)), 1)
-        flat_ret_eps = float(getattr(cfg, "CONTINUITY_FLAT_RET_EPS", 1e-12))
-        continuity_min_adv = float(getattr(cfg, "CONTINUITY_MIN_ADV_NOTIONAL", 0.0))
+        activity_window = max(cfg.CONTINUITY_ACTIVITY_WINDOW, 1)
+        stale_sessions = max(cfg.CONTINUITY_STALE_SESSIONS, 1)
+        min_nonzero_days = max(cfg.CONTINUITY_MIN_NONZERO_DAYS, 1)
+        flat_ret_eps = cfg.CONTINUITY_FLAT_RET_EPS
+        continuity_min_adv = cfg.CONTINUITY_MIN_ADV_NOTIONAL
 
         stale_denied = 0
         liquidity_denied = 0
@@ -530,7 +529,7 @@ def generate_signals(
                 if is_stale or not passes_continuity_liquidity or not continuity_eligible:
                     continue
 
-                decay = float(np.clip(prev_w / max(getattr(cfg, "CONTINUITY_MAX_HOLD_WEIGHT", 0.10), 1e-6), 0.25, 1.0))
+                decay = float(np.clip(prev_w / max(cfg.CONTINUITY_MAX_HOLD_WEIGHT, 1e-6), 0.25, 1.0))
                 adj_scores[i] += base_bonus * decay
 
         if stale_denied or liquidity_denied:
