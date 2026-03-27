@@ -1076,8 +1076,12 @@ def _run_scan(
             trusted_close_index = trusted_close_index.normalize()
 
             if trusted_close_index.empty or trusted_close_index.max() < expected_session_date:
+                if trusted_close_index.empty:
+                    trusted_start = expected_session_date - pd.offsets.BDay(260)
+                else:
+                    trusted_start = trusted_close_index.min()
                 trusted_close_index = pd.date_range(
-                    start=min(trusted_close_index.min(), expected_session_date) if not trusted_close_index.empty else expected_session_date - pd.offsets.BDay(260),
+                    start=trusted_start,
                     end=expected_session_date,
                     freq="B",
                 )
