@@ -113,6 +113,7 @@ __version__ = "11.48"
 
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
+DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
 
 # PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
 # empty universe (provider outage / all symbols filtered).  Reset to zero on
@@ -392,7 +393,7 @@ def _get_custom_universe() -> List[str]:
     return []
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    if not state.shares and not state.equity_hist and abs(state.cash - 1_000_000.0) < 1.0:
+    if not state.shares and not state.equity_hist and abs(state.cash - DEFAULT_INITIAL_CAPITAL) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
         try:
             raw_cap = input(f"  {C.CYN}Enter your starting capital (₹) [Default 10,00,000]: {C.RST}").replace(",", "").strip()
@@ -640,9 +641,11 @@ def load_portfolio_state(name: str) -> PortfolioState:
     # are simply absent (normal on a fresh installation).
     backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
     corrupted_paths = []
+    found_any_state_file = False
 
     for path in backups:
         if os.path.exists(path):
+            found_any_state_file = True
             try:
                 with open(path) as f:
                     ps = PortfolioState.from_dict(json.load(f))
@@ -726,6 +729,12 @@ def load_portfolio_state(name: str) -> PortfolioState:
             name, len(corrupted_paths), corrupted_paths,
         )
         return PortfolioState()
+
+    if not found_any_state_file:
+        logger.info(
+            "No portfolio state files found for '%s'. Starting clean first-run state.",
+            name,
+        )
 
     return PortfolioState()
 
@@ -1027,51 +1036,11 @@ def _run_scan(
         # The execute_rebalance call below receives the target weights and handles
         # residual distribution correctly with no pre-call adjustment needed.
     
-        # Fix 2: Per-symbol price staleness gate.
-        # If any HELD position's last price bar is older than 2 trading days,
-        # something is wrong with the data feed for that symbol. Running a
-        # rebalance with a stale price for a held name can produce badly wrong
-        # weight calculations — better to skip and wait for fresh data.
-        # Exception: _force_full_cash (CVaR hard breach) always executes because
-        # liquidating to cash is safe regardless of price staleness.
-        _cadence_stale_held: list = []
-        _MAX_STALE_TRADING_DAYS = 2
-        if rebalance_allowed and not _force_full_cash and not close.empty:
-            _last_bar_date = close.index[-1]
-            # Count trading days between last bar and today using the close index
-            # (business-day calendar of actual market data in the matrix).
-            _trading_days_since_last = int(
-                (close.index <= today).sum() - len(close.index[close.index <= _last_bar_date])
-            )
-            # Simpler: how many bars ago is the last row relative to today?
-            _days_stale = (today - _last_bar_date).days
-            for _hsym in state.shares:
-                if _hsym not in active_idx:
-                    continue  # absent symbols handled by absent_periods
-                _sym_series = close.get(_hsym)
-                if _sym_series is None:
-                    continue
-                _last_valid = _sym_series.last_valid_index()
-                if _last_valid is None:
-                    _cadence_stale_held.append(_hsym)
-                    continue
-                # BUG-FIX-MONDAY: count bars in the close index that fall
-                # strictly after _last_valid and up to today.  This is NSE-calendar
-                # aware and never falsely fires on Monday (Friday close = 0 bars
-                # elapsed over the weekend, 1 bar elapsed by Monday close).
-                _bars_elapsed = int((close.index > _last_valid).sum())
-                if _bars_elapsed > _MAX_STALE_TRADING_DAYS:
-                    _cadence_stale_held.append(_hsym)
-            if _cadence_stale_held:
-                logger.warning(
-                    "[Scan] STALENESS GATE: skipping rebalance because %d held symbol(s) "
-                    "have prices older than %d trading days: %s. "
-                    "Wait for fresh market data before rebalancing.",
-                    len(_cadence_stale_held), _MAX_STALE_TRADING_DAYS, _cadence_stale_held,
-                )
-                rebalance_allowed = False
-    
-        # FIX-STALE-PRICE: Before executing a rebalance, check whether any held
+        # FIX-STALE-PRICE: Single source-of-truth stale-price gate. We validate
+        # held symbols against market_data using the close-index trading calendar
+        # and suppress normal rebalances when stale, while still allowing
+        # _force_full_cash liquidations in stress events.
+        # Before executing a rebalance, check whether any held
         # position has a price that is older than _STALE_PRICE_DAYS trading days.
         # A rebalance using a 3-day-old price is likely worse than no rebalance,
         # because the optimizer will size incorrectly relative to the current
@@ -1102,7 +1071,7 @@ def _run_scan(
                         _rebalance_stale_held.append((_chk_sym, _trading_bars_elapsed))
             if _rebalance_stale_held:
                 logger.warning(
-                    "[Scan] REBALANCE SUPPRESSED: %d held symbol(s) have prices "
+                    "[Scan] STALENESS GATE: %d held symbol(s) have prices "
                     "older than %d trading bar(s) in the NSE close index: %s. "
                     "Skipping rebalance to avoid sizing on stale data. "
                     "Will retry on next scan once provider returns fresh data.",
@@ -1309,7 +1278,7 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
 
 def _portfolio_activity_badge(state: PortfolioState) -> str:
-    has_activity = bool(state.shares or state.equity_hist or abs(state.cash - 1_000_000.0) >= 1.0)
+    has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
     positions = len(state.shares)
@@ -1386,7 +1355,7 @@ def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Option
     return None
 
 def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> None:
-    """Copy stress-tracking risk fields from *source* into *target* in-place."""
+    """Copy latest scan risk-state fields from *source* into *target* in-place."""
     target.consecutive_failures = source.consecutive_failures
     target.override_cooldown    = source.override_cooldown
     target.override_active      = source.override_active
@@ -1429,6 +1398,9 @@ def main_menu() -> None:
                 save_portfolio_state(preview, "nse_total")
                 print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
             else:
+                # Intentional behavior: even when trade edits are discarded, the
+                # risk-state emitted by the latest scan (failure counters, decay,
+                # cooldowns, absent symbols) remains authoritative.
                 _preserve_risk_metadata(source=preview, target=states["nse_total"])
                 save_portfolio_state(states["nse_total"], "nse_total")
                 print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
@@ -1564,7 +1536,7 @@ def main_menu() -> None:
 
         elif c == "5":
             for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
-                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - 1_000_000.0) >= 1.0
+                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
                 if has_activity:
                     mkt = mkt_cache.get(name) or {}
                     if not mkt and states[name].shares:
@@ -1577,7 +1549,7 @@ def main_menu() -> None:
                         )
                         mkt_cache[name] = mkt
                     _print_status(states[name], label, mkt)
-            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - 1_000_000.0) >= 1.0) for n in states):
+            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0) for n in states):
                 print(f"  {C.GRY}All portfolios are empty.{C.RST}")
 
         elif c == "6":

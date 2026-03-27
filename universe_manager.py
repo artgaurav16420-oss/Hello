@@ -31,7 +31,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -146,6 +146,8 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
 _MISSING_PARQUET_WARNED: Dict[str, bool] = {}
 _NO_RECORD_WARNED: Dict[str, bool] = {}
 _SECTOR_MAP_CACHE_LOCK = threading.Lock()
+_HISTORICAL_UNIVERSE_DF_CACHE_LOCK = threading.Lock()
+_UNIVERSE_LOOKUP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
 _HISTORICAL_UNIVERSE_DATES_CACHE: Dict[Path, pd.DatetimeIndex] = {}
 _UNIVERSE_LOOKUP_CACHE: Dict[tuple[str, pd.Timestamp], List[str]] = {}
@@ -156,14 +158,18 @@ _UNIVERSE_LOOKUP_CACHE_MAXSIZE = 1024
 
 def _clear_historical_universe_caches(hist_file: Path) -> None:
     universe_type = hist_file.stem.removeprefix("historical_")
-    _HISTORICAL_UNIVERSE_DF_CACHE.pop(hist_file, None)
-    _HISTORICAL_UNIVERSE_DATES_CACHE.pop(hist_file, None)
-    stale_keys = [
-        key for key in _UNIVERSE_LOOKUP_CACHE
-        if key[0] == universe_type
-    ]
-    for key in stale_keys:
-        _UNIVERSE_LOOKUP_CACHE.pop(key, None)
+    # Lock acquisition order must remain stable across this module:
+    # 1) _HISTORICAL_UNIVERSE_DF_CACHE_LOCK, 2) _UNIVERSE_LOOKUP_CACHE_LOCK.
+    with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        _HISTORICAL_UNIVERSE_DF_CACHE.pop(hist_file, None)
+        _HISTORICAL_UNIVERSE_DATES_CACHE.pop(hist_file, None)
+        with _UNIVERSE_LOOKUP_CACHE_LOCK:
+            stale_keys = [
+                key for key in _UNIVERSE_LOOKUP_CACHE
+                if key[0] == universe_type
+            ]
+            for key in stale_keys:
+                _UNIVERSE_LOOKUP_CACHE.pop(key, None)
 
 
 def _coerce_historical_members(value) -> List[str]:
@@ -188,7 +194,17 @@ def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACH
         fetched_time = datetime.fromisoformat(fetched_at)
     except (TypeError, ValueError):
         return False
-    return datetime.now() - fetched_time < timedelta(hours=ttl_hours)
+    now_utc = datetime.now(tz=timezone.utc)
+    if fetched_time.tzinfo is None:
+        fetched_time = fetched_time.replace(tzinfo=timezone.utc)
+    try:
+        return now_utc - fetched_time < timedelta(hours=ttl_hours)
+    except TypeError:
+        # Defensive migration path for legacy cache rows that may mix naive and
+        # aware timestamps. Normalize both to UTC-naive to avoid crashes.
+        return (
+            now_utc.replace(tzinfo=None) - fetched_time.replace(tzinfo=None)
+        ) < timedelta(hours=ttl_hours)
 
 
 def _normalize_sector_cache_entry(
@@ -208,10 +224,10 @@ def _normalize_sector_cache_entry(
 def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     """Load historical universe parquet with mtime-based in-memory caching."""
     mtime = hist_file.stat().st_mtime
-    cached = _HISTORICAL_UNIVERSE_DF_CACHE.get(hist_file)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-
+    with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        cached = _HISTORICAL_UNIVERSE_DF_CACHE.get(hist_file)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
     if cached is not None and cached[0] != mtime:
         _clear_historical_universe_caches(hist_file)
 
@@ -232,12 +248,13 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
         df = pd.read_parquet(hist_file)
     # FIX-MB-UM-03: FIFO eviction — mirror the pattern used for
     # _UNIVERSE_LOOKUP_CACHE to bound memory in long-running processes.
-    if len(_HISTORICAL_UNIVERSE_DF_CACHE) >= _HISTORICAL_CACHE_MAXSIZE:
-        oldest_key = next(iter(_HISTORICAL_UNIVERSE_DF_CACHE))
-        del _HISTORICAL_UNIVERSE_DF_CACHE[oldest_key]
-        _HISTORICAL_UNIVERSE_DATES_CACHE.pop(oldest_key, None)
-    _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
-    _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = pd.DatetimeIndex(df.index.unique()).sort_values()
+    with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        if len(_HISTORICAL_UNIVERSE_DF_CACHE) >= _HISTORICAL_CACHE_MAXSIZE:
+            oldest_key = next(iter(_HISTORICAL_UNIVERSE_DF_CACHE))
+            del _HISTORICAL_UNIVERSE_DF_CACHE[oldest_key]
+            _HISTORICAL_UNIVERSE_DATES_CACHE.pop(oldest_key, None)
+        _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
+        _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = pd.DatetimeIndex(df.index.unique()).sort_values()
     return df
 
 
@@ -278,17 +295,20 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
         try:
             lookup_date = pd.Timestamp(date).normalize()
             df = _load_historical_universe_df(hist_file)
-            available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
+            with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+                available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
             if available_dates is None:
                 available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
-                _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
+                with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+                    _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
 
             target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
 
             if target_pos >= 0:
                 target_date = pd.Timestamp(available_dates[target_pos])
                 cache_key = (universe_type, target_date)
-                cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
+                with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                    cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
                 if cached_members is not None:
                     return cached_members
 
@@ -312,10 +332,11 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
                     result = _normalize_historical_members(_coerce_historical_members(constituents))
 
                 # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
-                if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
-                    oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
-                    del _UNIVERSE_LOOKUP_CACHE[oldest_key]
-                _UNIVERSE_LOOKUP_CACHE[cache_key] = result
+                with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                    if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
+                        oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
+                        del _UNIVERSE_LOOKUP_CACHE[oldest_key]
+                    _UNIVERSE_LOOKUP_CACHE[cache_key] = result
                 return result
 
             logger.warning(
@@ -490,13 +511,12 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text))
 
-def fetch_nse_equity_universe(cfg=None) -> List[str]:
+def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     cache = _load_universe_cache()
     entry = cache.get("total_equity", {})
 
     if entry:
-        fetched_time = datetime.fromisoformat(entry["fetched_at"])
-        if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
+        if _is_cache_entry_fresh(entry.get("fetched_at")):
             return entry["tickers"]
 
     try:
@@ -506,23 +526,17 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
 
         equity_df = df[df["SERIES"] == "EQ"]
         tickers = equity_df["SYMBOL"].unique().tolist()
+        if apply_adv_filter:
+            tickers = _apply_adv_filter(tickers, cfg=cfg)
 
         logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
         cache["total_equity"] = {
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
             "tickers":    tickers,
         }
         _save_universe_cache(cache)
         return tickers
 
-    except UniverseFetchError as exc:
-        logger.error("[Universe] NSE master fetch failed during ADV filtering: %s", exc)
-        if entry:
-            logger.warning("[Universe] Using stale cache for NSE Total Equity.")
-            return entry["tickers"]
-
-        exc.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise
     except Exception as exc:
         logger.error("[Universe] NSE master fetch failed: %s", exc)
         if entry:
@@ -533,13 +547,12 @@ def fetch_nse_equity_universe(cfg=None) -> List[str]:
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
         raise error
 
-def get_nifty500() -> List[str]:
+def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     cache = _load_universe_cache()
     entry = cache.get("nifty500", {})
 
     if entry:
-        fetched_time = datetime.fromisoformat(entry["fetched_at"])
-        if datetime.now() - fetched_time < timedelta(hours=UNIVERSE_CACHE_TTL_H):
+        if _is_cache_entry_fresh(entry.get("fetched_at")):
             return entry["tickers"]
 
     try:
@@ -548,9 +561,11 @@ def get_nifty500() -> List[str]:
         df.columns = [col.strip().upper() for col in df.columns]
 
         tickers = df["SYMBOL"].unique().tolist()
+        if apply_adv_filter:
+            tickers = _apply_adv_filter(tickers, cfg=cfg)
 
         cache["nifty500"] = {
-            "fetched_at": datetime.now().isoformat(),
+            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
             "tickers": tickers
         }
         _save_universe_cache(cache)
@@ -579,6 +594,15 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     sector_timeout = float(
         getattr(cfg, "SECTOR_FETCH_TIMEOUT", _DEFAULT_SECTOR_FETCH_TIMEOUT)
     ) if cfg is not None else _DEFAULT_SECTOR_FETCH_TIMEOUT
+    batch_session = requests.Session()
+    _batch_request = batch_session.request
+    _batch_timeout = max(1.0, float(sector_timeout))
+    batch_session.request = lambda method, url, **kwargs: _batch_request(
+        method,
+        url,
+        timeout=kwargs.pop("timeout", _batch_timeout),
+        **kwargs,
+    )
 
     resolved_map = {}
     missing_tickers = []
@@ -628,7 +652,13 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         import yfinance as yf
 
         try:
-            batch = yf.Tickers(" ".join(f"{sym}.NS" for sym in missing_tickers))
+            batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
+            try:
+                batch = yf.Tickers(batch_symbols, session=batch_session)
+            except TypeError:
+                # Backward-compatible fallback for test doubles/older wrappers
+                # that do not accept the optional `session` argument.
+                batch = yf.Tickers(batch_symbols)
             ticker_objs = getattr(batch, "tickers", {}) or {}
             for bare_sym in missing_tickers:
                 ns_sym = f"{bare_sym}.NS"
@@ -704,7 +734,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             with _SECTOR_MAP_CACHE_LOCK:
                 current_cache = _load_universe_cache()
                 existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
-                fetched_at = datetime.now().isoformat()
+                fetched_at = datetime.now(tz=timezone.utc).isoformat()
                 existing_sector_cache.update(
                     {
                         sym: {
@@ -726,5 +756,5 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     for ticker in tickers:
         bare_ticker = _bare(ticker)
         final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
-
+    batch_session.close()
     return final_map

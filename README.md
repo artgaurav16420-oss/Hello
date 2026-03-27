@@ -28,6 +28,10 @@ pip install -r requirements.txt
 ## Running the Daily Workflow
 
 Use `daily_workflow.py` for the end-to-end daily run. Use `--paper` mode for paper-trading/simulation workflows.
+When you reject previewed trades in the CLI, the workflow still persists the
+latest risk metadata (for example: consecutive failure counters, override
+cooldowns, decay rounds, and absent-symbol tracking) so risk controls continue
+from the most recent scan state rather than reverting to older values.
 
 ## Running Backtests
 

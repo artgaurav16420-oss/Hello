@@ -482,11 +482,13 @@ class GrowwProvider(DataProvider):
             return None
 
         combined = pd.concat(frames, axis=1)
+        # Build the expected MultiIndex directly as (Ticker, Price) so downstream
+        # extractors can access per-symbol frames via level-0 ticker keys.
         combined.columns = pd.MultiIndex.from_tuples(
-            [(col, tkr) for tkr, col in combined.columns],
-            names=["Price", "Ticker"],
+            [(ticker, field) for ticker, field in combined.columns],
+            names=["Ticker", "Price"],
         )
-        combined = combined.swaplevel(0, 1, axis=1).sort_index(axis=1)
+        combined = combined.sort_index(axis=1)
         return _normalize_history_index(combined)
 
 
@@ -914,7 +916,14 @@ def load_or_fetch(
         t_str = str(t).strip()
         if t_str.startswith("^"):
             return t_str
-        return t_str.replace(".NSE", "").replace(".NS", "") + ".NS"
+        upper_t = t_str.upper()
+        # Strip only terminal exchange suffixes. Order matters: .NSE must be
+        # checked before .NS so ".NSE" is removed as one suffix (not partial).
+        if upper_t.endswith(".NSE"):
+            upper_t = upper_t[:-4]
+        elif upper_t.endswith(".NS"):
+            upper_t = upper_t[:-3]
+        return upper_t + ".NS"
 
     standardized_tickers = list(dict.fromkeys(_clean_ticker(t) for t in tickers))
 
@@ -1005,13 +1014,16 @@ def load_or_fetch(
             # unresolved tickers (reassigned to missing_from_provider each pass),
             # so a non-empty chunk is the correct and complete recovery signal.
             if chunk:
-                _recover_from_stale_cache(chunk, entries, market_data)
+                _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
 
         # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
         # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
         # full JSON serialisations and atomic renames. One write is sufficient
         # because the manifest is only read at startup and the per-chunk
         # entries have already been mutated in-place in `manifest`.
+        # Note: _save_manifest is intentionally called only on download/recovery
+        # paths. Any future code path that mutates `entries` without downloading
+        # must explicitly call _save_manifest() to keep manifest state in sync.
         _save_manifest(manifest)
 
     # FIX-BUG-10: only clip data at required_end, not at a computed start bound.
@@ -1111,6 +1123,7 @@ def _recover_from_stale_cache(
     chunk: List[str],
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
+    cfg=None,
 ) -> None:
     """
     Load stale-but-present parquets as a fallback when all providers fail.
@@ -1131,6 +1144,11 @@ def _recover_from_stale_cache(
         try:
             fallback_df = _normalize_history_index(pd.read_parquet(parquet_path))
             if fallback_df is None or fallback_df.empty:
+                continue
+            # Recovery must enforce the same structural/row-count thresholds as
+            # the primary download path; otherwise very short stale frames can
+            # sneak in and poison downstream signals.
+            if not _is_valid_dataframe(fallback_df, ticker=ticker, cfg=cfg):
                 continue
             market_data[ticker] = fallback_df
             recovered += 1
