@@ -84,4 +84,6 @@ def test_wbm_cdx_timestamps_merges_scheme_variants_and_month_collapses(monkeypat
         "http://example.com/file.csv",
         "*://example.com/file.csv",
     ]
+    # Month-collapse rule: earliest timestamp per month wins across scheme variants.
+    # January explicitly checks 20150101 beats 20150125.
     assert out == ["20150101120000", "20150201120000", "20150301120000"]

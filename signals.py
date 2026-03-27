@@ -146,6 +146,10 @@ def compute_regime_score(
             base_score *= 0.85
         vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
 
+    # TODO(refactor-signals): this breadth block contributes to the composite
+    # regime score, while the later 15-day breadth block is a hard-crash
+    # override; window lengths intentionally differ, so keep them decoupled
+    # until a dedicated refactor ticket unifies naming and responsibilities.
     breadth_component = 0.5
     _sma_win = int(getattr(cfg, "REGIME_SMA_WINDOW", 200)) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty:

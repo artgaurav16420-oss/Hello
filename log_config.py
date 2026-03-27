@@ -56,6 +56,10 @@ class ScanContext:
             logger.info("Scan started", extra={"universe_size": 500})
             # ... scan logic ...
         # correlation_id is cleared after the block
+
+    Note: this is intentional context propagation (set/restore around a block),
+    not per-object state isolation. That contrasts with ad-hoc threading.local()
+    reads/writes elsewhere that may outlive a logical operation if not paired.
     """
 
     def __init__(self, label: str = "", correlation_id: Optional[str] = None):

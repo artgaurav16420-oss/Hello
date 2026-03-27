@@ -7,6 +7,7 @@ Every test either asserts a real invariant or does not exist.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import numpy as np
 import pandas as pd
@@ -508,6 +509,61 @@ def test_portfolio_state_from_dict_bool_numeric_parsing():
     assert ps_true.override_active is True
     assert ps_false.override_active is False
     assert ps_invalid.override_active is False
+
+
+def test_portfolio_state_from_dict_logs_critical_for_risk_control_bool_parse_failure(caplog):
+    with caplog.at_level(logging.CRITICAL, logger="momentum_engine"):
+        ps = PortfolioState.from_dict({"override_active": "definitely-not-bool"})
+
+    assert ps.override_active is False
+    critical_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert any("risk-control field(s) reset to defaults" in msg for msg in critical_msgs)
+    assert any("override_active" in msg for msg in critical_msgs)
+
+
+def test_portfolio_state_from_dict_logs_critical_for_risk_control_int_parse_failure(caplog):
+    with caplog.at_level(logging.CRITICAL, logger="momentum_engine"):
+        ps = PortfolioState.from_dict({"override_cooldown": "not-an-int"})
+
+    assert ps.override_cooldown == 0
+    critical_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert any("risk-control field(s) reset to defaults" in msg for msg in critical_msgs)
+    assert any("override_cooldown" in msg for msg in critical_msgs)
+
+
+def test_portfolio_state_from_dict_missing_risk_control_fields_uses_defaults_without_critical(caplog):
+    with caplog.at_level(logging.CRITICAL, logger="momentum_engine"):
+        ps = PortfolioState.from_dict({"cash": 123.45})
+
+    assert ps.override_active is False
+    assert ps.override_cooldown == 0
+    assert ps.consecutive_failures == 0
+    assert ps.decay_rounds == 0
+    assert ps.cash == pytest.approx(123.45)
+    assert not any(r.levelno == logging.CRITICAL for r in caplog.records)
+
+
+def test_portfolio_state_from_dict_valid_partial_state_loads_cleanly(caplog):
+    payload = {
+        "cash": 250_000.0,
+        "weights": {"A": 0.4},
+        "shares": {"A": 10},
+        "override_active": True,
+        "override_cooldown": 3,
+        "equity_hist_cap": 500,
+    }
+    with caplog.at_level(logging.ERROR, logger="momentum_engine"):
+        ps = PortfolioState.from_dict(payload)
+
+    assert ps.cash == pytest.approx(250_000.0)
+    assert ps.weights == {"A": pytest.approx(0.4)}
+    assert ps.shares == {"A": 10}
+    assert ps.override_active is True
+    assert ps.override_cooldown == 3
+    assert ps.consecutive_failures == 0
+    assert ps.decay_rounds == 0
+    assert ps.equity_hist_cap == 500
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 def test_normalise_start_date_default_and_validation():

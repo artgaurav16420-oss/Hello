@@ -726,6 +726,10 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             if pd.isna(adj_anchor):
                 adj_anchor = close_anchor
             # FIX-NEW-BE-03: preserve the pre-gap Adj Close / Close ratio.
+            # Assumption: no split/dividend corporate action occurs during the
+            # suspension gap. That is usually true for short halt windows; if it
+            # is violated, this synthetic fill is still acceptable because such
+            # in-gap events are rare and the simulation is a robustness fallback.
             adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
             synth["Adj Close"] = synth["Close"] * adj_close_ratio
 

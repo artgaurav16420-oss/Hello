@@ -38,6 +38,7 @@ def test_run_optimization_raises_when_no_completed_trials(monkeypatch):
 
 def test_optimizer_logger_does_not_duplicate_handlers_on_reload():
     before = len(optimizer.logger.handlers)
+    optimizer._get_test_end_2_cached.cache_clear()
     importlib.reload(optimizer)
     after = len(optimizer.logger.handlers)
 
@@ -288,11 +289,9 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    # FIX-BUG-13: required_end must be max(TEST_END, TEST_END_2) so Period-2 OOS
-    # backtests have price data available.
-    # backtests have price data available.  Previously asserted == TEST_END, which
-    # encoded the bug (P2 always running on an empty matrix).
-    assert captured["required_end"] == max(optimizer.TEST_END, optimizer.TEST_END_2)
+    # Period-2 end is dynamic (today/env override), so tests must resolve it via
+    # _get_test_end_2() rather than a static module constant.
+    assert captured["required_end"] == max(optimizer.TEST_END, optimizer._get_test_end_2())
     assert captured["tickers"].count("ABC") == 1
     assert "^NSEI" in captured["tickers"]
     assert "^CRSLDX" in captured["tickers"]
@@ -329,8 +328,9 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    # FIX-BUG-13: required_end must be max(TEST_END, TEST_END_2).
-    assert captured["required_end"] == max(optimizer.TEST_END, optimizer.TEST_END_2)
+    # Period-2 end is dynamic (today/env override), so tests must resolve it via
+    # _get_test_end_2() rather than a static module constant.
+    assert captured["required_end"] == max(optimizer.TEST_END, optimizer._get_test_end_2())
     assert "LIVEONLY" in captured["tickers"]
     assert "OLD1" in captured["tickers"]
     assert "OLD2" in captured["tickers"]
