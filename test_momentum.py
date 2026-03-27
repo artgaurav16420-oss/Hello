@@ -854,9 +854,25 @@ def test_compute_pv_exec_helper_includes_active_and_stale_positions():
     state.shares = {"A": 2, "B": 3}
     state.last_known_prices = {"A": 10.0, "B": 5.0}
     state.absent_periods = {"B": 1}
-    pv_exec, pv_t1 = _compute_pv_exec(state, np.array([11.0]), ["A"], cfg)
+    pv_exec, pv_t1 = _compute_pv_exec(state, np.array([11.0]), ["A"], cfg, symbols_to_force_close=set())
     assert pv_exec == pytest.approx(100.0 + 2 * 11.0 + 3 * absent_symbol_effective_price(5.0, 1, 10))
     assert pv_t1 == pytest.approx(100.0 + 2 * 10.0 + 3 * absent_symbol_effective_price(5.0, 1, 10))
+
+
+def test_compute_pv_exec_excludes_force_close_symbols():
+    cfg = UltimateConfig(MAX_ABSENT_PERIODS=10)
+    state = PortfolioState(cash=100.0)
+    state.shares = {"KEEP": 2, "FORCE": 3}
+    state.last_known_prices = {"KEEP": 10.0, "FORCE": 5.0}
+    pv_exec, pv_t1 = _compute_pv_exec(
+        state,
+        prices=np.array([11.0]),
+        active_symbols=["KEEP"],
+        cfg=cfg,
+        symbols_to_force_close={"FORCE"},
+    )
+    assert pv_exec == pytest.approx(100.0 + 2 * 11.0)
+    assert pv_t1 == pytest.approx(100.0 + 2 * 10.0)
 
 
 def test_compute_desired_shares_helper_handles_simple_case():
@@ -883,6 +899,7 @@ def test_apply_drift_gate_helper_blocks_small_change():
         prices=np.array([100.0]),
         pv_exec=20_000.0,
         cfg=cfg,
+        active_symbols=["A"],
     )
     assert desired["A"] == 100
     assert "A" in gated
