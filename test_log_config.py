@@ -17,6 +17,7 @@ def test_json_formatter_format_time_is_iso_utc_with_microseconds():
         exc_info=None,
     )
     record.created = 1700000000.123456
+    record.msecs = (record.created - int(record.created)) * 1000
     out = fmt.formatTime(record)
 
     assert out.endswith("Z")
@@ -32,6 +33,7 @@ def test_json_formatter_format_time_uses_utc_not_localtime():
     fmt = JsonFormatter()
     record = logging.LogRecord("t", logging.INFO, __file__, 1, "x", (), None)
     record.created = 0.0
+    record.msecs = (record.created - int(record.created)) * 1000
     out = fmt.formatTime(record)
     assert out.startswith("1970-01-01T00:00:00.")
     assert out.endswith("Z")

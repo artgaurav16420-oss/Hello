@@ -170,9 +170,9 @@ class _ConstraintBuilder:
 
     def build(self) -> Tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
         A = sp.vstack(self.A_parts, format="csc")
-        l = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
-        u = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
-        return A, l, u
+        lb = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
+        ub = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
+        return A, lb, ub
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -1571,7 +1571,7 @@ class InstitutionalRiskEngine:
             tc_u.extend([p, -p])
         builder.add_constraint(tc.tocsc(), [-np.inf] * (2 * m), tc_u)
 
-        A, l, u = builder.build()
+        A, lb, ub = builder.build()
 
         P_upper = sp.triu(P, format="csc")
         current_shape = (m, T_cvar)
@@ -1593,7 +1593,7 @@ class InstitutionalRiskEngine:
         if not is_same_structure:
             self._solver = osqp.OSQP()
             self._solver.setup(
-                P_upper, q, A, l, u,
+                P_upper, q, A, lb, ub,
                 verbose=False, eps_abs=1e-4, eps_rel=1e-4,
                 polish=True, adaptive_rho=True, max_iter=50000,
                 warm_starting=True,
@@ -1606,7 +1606,7 @@ class InstitutionalRiskEngine:
             )
         else:
             self._solver.update(
-                q=q, l=l, u=u,
+                q=q, l=lb, u=ub,
                 Px=P_upper.data, Ax=A.data,
             )
 
