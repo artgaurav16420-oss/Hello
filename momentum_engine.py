@@ -284,6 +284,10 @@ class UltimateConfig:
             raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
 
 
+DEFAULT_EQUITY_HIST_CAP = int(UltimateConfig.EQUITY_HIST_CAP)
+DEFAULT_MAX_ABSENT_PERIODS = int(UltimateConfig.MAX_ABSENT_PERIODS)
+
+
 # ─── Portfolio state ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -395,7 +399,11 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
-        max_absent_periods = self.max_absent_periods if self.max_absent_periods is not None else 12
+        max_absent_periods = (
+            self.max_absent_periods
+            if self.max_absent_periods is not None
+            else DEFAULT_MAX_ABSENT_PERIODS
+        )
         pv = self.cash
         for sym, n_shares in self.shares.items():
             px = prices.get(sym)
@@ -416,7 +424,7 @@ class PortfolioState:
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        cap = self.equity_hist_cap if self.equity_hist_cap is not None else 500
+        cap = self.equity_hist_cap if self.equity_hist_cap is not None else DEFAULT_EQUITY_HIST_CAP
         if cap > 0 and len(self.equity_hist) > cap:
             self.equity_hist = self.equity_hist[-cap:]
 
