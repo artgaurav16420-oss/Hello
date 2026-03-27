@@ -50,7 +50,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 EPSILON = 1e-6
 
 # ─── Ghost synthesis determinism cache ───────────────────────────────────────
+# Benign race note: concurrent first-write races can occur when two threads
+# compute the same symbol seed at once, but the value is deterministic from
+# SHA-256(sym), so both writers store the same integer.
 _GHOST_SEED_CACHE: Dict[str, int] = {}
 
 
@@ -281,10 +284,20 @@ class UltimateConfig:
             raise ValueError(f"SLIPPAGE_BPS must be numeric, received {value!r}") from exc
 
 
+DEFAULT_EQUITY_HIST_CAP = int(UltimateConfig.EQUITY_HIST_CAP)
+DEFAULT_MAX_ABSENT_PERIODS = int(UltimateConfig.MAX_ABSENT_PERIODS)
+
+
 # ─── Portfolio state ──────────────────────────────────────────────────────────
 
 @dataclass
 class PortfolioState:
+    RISK_CONTROL_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "override_active",
+        "override_cooldown",
+        "consecutive_failures",
+        "decay_rounds",
+    )
     weights:              Dict[str, float] = field(default_factory=dict)
     shares:               Dict[str, int]   = field(default_factory=dict)
     entry_prices:         Dict[str, float] = field(default_factory=dict)
@@ -295,8 +308,10 @@ class PortfolioState:
     override_active:      bool             = False
     override_cooldown:    int              = 0
     consecutive_failures: int              = 0
-    equity_hist_cap:      int              = 250
-    max_absent_periods:   int              = 12
+    # Presence-aware optional fields: None means "missing from persisted state",
+    # allowing callers to apply UltimateConfig defaults only when absent.
+    equity_hist_cap:      Optional[int]    = None  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+    max_absent_periods:   Optional[int]    = None
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
     last_known_volatility:Dict[str, float] = field(default_factory=dict)
@@ -384,6 +399,11 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
+        max_absent_periods = (
+            self.max_absent_periods
+            if self.max_absent_periods is not None
+            else DEFAULT_MAX_ABSENT_PERIODS
+        )
         pv = self.cash
         for sym, n_shares in self.shares.items():
             px = prices.get(sym)
@@ -399,12 +419,12 @@ class PortfolioState:
                     px = 0.0
                 else:
                     absent_n = int(self.absent_periods.get(sym, 0))
-                    px = absent_symbol_effective_price(last_px, absent_n, self.max_absent_periods)
+                    px = absent_symbol_effective_price(last_px, absent_n, max_absent_periods)
             pv += n_shares * float(px or 0.0)
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        cap = self.equity_hist_cap
+        cap = self.equity_hist_cap if self.equity_hist_cap is not None else DEFAULT_EQUITY_HIST_CAP
         if cap > 0 and len(self.equity_hist) > cap:
             self.equity_hist = self.equity_hist[-cap:]
 
@@ -439,6 +459,7 @@ class PortfolioState:
     def from_dict(cls, d: dict) -> "PortfolioState":
         ps     = cls()
         errors: List[str] = []
+        risk_control_errors: List[str] = []
 
         def _as_bool(value) -> bool:
             if isinstance(value, bool):
@@ -456,11 +477,21 @@ class PortfolioState:
                 raise ValueError(f"integer bool flag must be 0/1, got {value}")
             raise TypeError(f"unsupported bool type: {type(value).__name__}")
 
+        def _as_nonneg_int(value) -> int:
+            parsed = int(value)
+            if parsed < 0:
+                raise ValueError(f"value must be non-negative, got {parsed}")
+            return parsed
+
         def _get(key, converter, default):
             try:
                 return converter(d[key]) if key in d else default
             except Exception as exc:
-                errors.append(f"{key}: {exc}")
+                msg = f"{key}: {exc}"
+                if key in cls.RISK_CONTROL_FIELDS:
+                    risk_control_errors.append(msg)
+                else:
+                    errors.append(msg)
                 return default
 
         ps.weights              = _get("weights",              lambda v: {k: float(x) for k, x in v.items()}, {})
@@ -471,20 +502,26 @@ class PortfolioState:
         ps.cash                 = _get("cash",                 float,                                           ps.cash)
         ps.exposure_multiplier  = _get("exposure_multiplier",  float,                                           1.0)
         ps.override_active      = _get("override_active",      _as_bool,                                        False)
-        ps.override_cooldown    = _get("override_cooldown",    int,                                             0)
-        ps.consecutive_failures = _get("consecutive_failures", int,                                             0)
-        ps.equity_hist_cap      = _get("equity_hist_cap",      int,                                             250)
-        ps.max_absent_periods   = _get("max_absent_periods",   int,                                             12)
+        ps.override_cooldown    = _get("override_cooldown",    _as_nonneg_int,                                 0)
+        ps.consecutive_failures = _get("consecutive_failures", _as_nonneg_int,                                 0)
+        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_nonneg_int,                                 None)  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+        ps.max_absent_periods   = _get("max_absent_periods",   _as_nonneg_int,                                 None)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.decay_rounds         = _get("decay_rounds",         int,                                             0)
+        ps.decay_rounds         = _get("decay_rounds",         _as_nonneg_int,                                 0)
         ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
         ps.last_rebalance_date  = _get("last_rebalance_date",  str,                                             "")
 
         if errors:
             logger.error(
                 "PortfolioState.from_dict: %d field(s) reset to defaults: %s", len(errors), errors
+            )
+        if risk_control_errors:
+            logger.critical(
+                "PortfolioState.from_dict: %d risk-control field(s) reset to defaults: %s",
+                len(risk_control_errors),
+                risk_control_errors,
             )
         return ps
 
@@ -558,6 +595,9 @@ def execute_rebalance(
               in Phase 2, so cash correctly reflects their liquidation without
               needing to subtract them via actual_notional.
     """
+    # TODO(arch): extract helpers for readability/testability:
+    # _compute_pv_exec, _compute_desired_shares, _apply_drift_gate,
+    # _allocate_residual_cash.
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     local_prices = np.array(prices, dtype=float, copy=True)
 
@@ -1379,10 +1419,31 @@ class InstitutionalRiskEngine:
         P_aux = sp.eye(n_vars - m, format="csc") * 1e-6
         P     = sp.block_diag([sp.csc_matrix(P_w), P_aux], format="csc")
 
+        # Estimate target weights from the same alpha vector that drives the OSQP
+        # objective: positive expected returns are normalised to a long-only hint.
+        # Scale this hint by feasible gross exposure (u_gamma) so turnover
+        # penalties match the optimizer's budget envelope instead of assuming
+        # an unconditional 100% gross target.
+        target_weight_hint = np.clip(expected_returns, 0.0, None)
+        total_hint = float(np.sum(target_weight_hint))
+        if total_hint > 0:
+            target_weight_hint = target_weight_hint / total_hint
+        else:
+            target_weight_hint = np.zeros_like(expected_returns, dtype=float)
+        scaled_target_weight_hint = target_weight_hint * float(u_gamma)
+        trade_estimate_notionals = np.abs(scaled_target_weight_hint - prev_w_arr) * float(portfolio_value)
+
         turnover_costs = np.array(
             [
-                compute_one_way_slip_rate(self.cfg, portfolio_value, float(adv))
-                for adv in adv_shares
+                # Keep optimizer friction scaling consistent with FIX-MB-ME-02 in
+                # execute_rebalance: use per-name trade delta notional, not full PV.
+                compute_one_way_slip_rate(
+                    self.cfg,
+                    portfolio_value,
+                    float(adv),
+                    trade_notional=float(trade_estimate_notionals[i]),
+                )
+                for i, adv in enumerate(adv_shares)
             ],
             dtype=float,
         )

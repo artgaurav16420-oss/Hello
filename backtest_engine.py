@@ -54,6 +54,7 @@ import pandas as pd
 from momentum_engine import (
     InstitutionalRiskEngine,
     UltimateConfig,
+    DEFAULT_MAX_ABSENT_PERIODS,
     OptimizationError,
     OptimizationErrorType,
     PortfolioState,
@@ -509,7 +510,12 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
             continue
         absent_n = int(state.absent_periods.get(sym, 0))
         if absent_n > 0:
-            px = float(absent_symbol_effective_price(raw_px, absent_n, state.max_absent_periods))
+            state_max_absent_periods = (
+                state.max_absent_periods
+                if state.max_absent_periods is not None
+                else DEFAULT_MAX_ABSENT_PERIODS
+            )
+            px = float(absent_symbol_effective_price(raw_px, absent_n, state_max_absent_periods))
         else:
             px = float(raw_px)
         if px <= 0:
@@ -726,6 +732,10 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             if pd.isna(adj_anchor):
                 adj_anchor = close_anchor
             # FIX-NEW-BE-03: preserve the pre-gap Adj Close / Close ratio.
+            # Assumption: no split/dividend corporate action occurs during the
+            # suspension gap. That is usually true for short halt windows; if it
+            # is violated, this synthetic fill is still acceptable because such
+            # in-gap events are rare and the simulation is a robustness fallback.
             adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
             synth["Adj Close"] = synth["Close"] * adj_close_ratio
 

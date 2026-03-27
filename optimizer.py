@@ -1,14 +1,18 @@
 """
-optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.56
+optimizer.py — Institutional Bayesian Time-Series CV Optimizer v11.58
 ====================================================================
 Automates the discovery of optimal risk and momentum parameters using Optuna.
 Uses walk-forward time-series cross-validation for parameter selection,
 followed by true holdout Out-of-Sample (OOS) validation periods.
 
-CHANGES vs v11_55:
-- OBJECTIVE_VERSION = fitness_v11_56 to force a clean Optuna study.
-- N_TRIALS raised to 300 and OOS_TOP_K raised to 20 for broader tournament
-  coverage on the widened search space.
+CHANGES:
+- v11.57:
+  - Added dynamic Period-2 OOS end-date resolution via _resolve_period_2_end
+    and lazy _get_test_end_2() lookup to avoid stale hard-coded holdout bounds.
+- v11.58:
+  - OBJECTIVE_VERSION = fitness_v11_58 to force a clean Optuna study.
+  - N_TRIALS = 400 and OOS_TOP_K = 10 tuned for deeper search with tighter
+    final OOS tournament selection.
 - Walk-forward CV now uses a fixed rolling 2-year IS window instead of an
   expanding window, reducing later-fold history advantage.
 - Fitness scoring now uses log1p(raw) for positive raw scores, removing the
@@ -21,6 +25,7 @@ CHANGES vs v11_55:
   and SIGNAL_LAG_DAYS as optional optimization dimensions.
 """
 import argparse
+import functools
 import json
 import logging
 import os
@@ -149,18 +154,23 @@ def _get_test_end_2() -> str:
     called pd.Timestamp.utcnow() at import time, firing a Pandas4Warning on every
     import of this module — including every test run that does
     `optimizer = pytest.importorskip("optimizer")`.  The fix defers evaluation
-    to first use so imports are warning-free.  The env-var override is still
-    respected because os.environ is read at call time.
+    to first use so imports are warning-free.
+
+    Value origin/caching: _get_test_end_2 delegates to the lru_cache-decorated
+    _get_test_end_2_cached(), which calls _resolve_period_2_end() exactly once
+    per process cache lifetime. That means OPTIMIZER_OOS_CUTOFF is read on the
+    first invocation only; later env-var changes are ignored unless
+    _get_test_end_2_cached.cache_clear() is called (or the process restarts).
     """
-    if not hasattr(_get_test_end_2, "_cached"):
-        _get_test_end_2._cached = _resolve_period_2_end(
-            os.environ.get("OPTIMIZER_OOS_CUTOFF")
-        )
-    return _get_test_end_2._cached
+    # lru_cache(maxsize=1) gives process-lifetime memoization. It is safe under
+    # concurrency here because all threads resolve the same deterministic value
+    # for a given environment snapshot; duplicate first-call races are benign.
+    return _get_test_end_2_cached()
 
 
-# Fixed default Period-2 holdout window endpoint.
-TEST_END_2 = "2025-12-31"
+@functools.lru_cache(maxsize=1)
+def _get_test_end_2_cached() -> str:
+    return _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
 
 N_TRIALS = 400
 
@@ -788,7 +798,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     # matrix — every trial vacuously failed P2 and the optimizer permanently fell
     # back to "P1-ONLY" mode, defeating the dual-period holdout entirely.
     test_end_2 = _get_test_end_2()
-    if test_end_2 != "2025-12-31":
+    if os.environ.get("OPTIMIZER_OOS_CUTOFF"):
         logger.debug("Using dynamic OPTIMIZER_OOS_CUTOFF for Period-2 end date: %s", test_end_2)
     _fetch_end = max(TEST_END, test_end_2)
     logger.info(
