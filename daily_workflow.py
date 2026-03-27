@@ -563,6 +563,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
 
     os.makedirs("data", exist_ok=True)
     state_file = f"data/portfolio_state_{name}.json"
+    risk_file  = f"data/portfolio_risk_{name}.json"
     tmp_file   = f"{state_file}.tmp"
     try:
         for i in range(BACKUP_GENERATIONS - 1, -1, -1):
@@ -622,6 +623,14 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+
+        # If a durable full state save succeeded, a paper-mode risk overlay is
+        # stale by definition and must not leak into future normal-mode loads.
+        if os.path.exists(risk_file):
+            try:
+                os.remove(risk_file)
+            except OSError as exc:
+                logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
 
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
@@ -704,7 +713,9 @@ def load_portfolio_state(name: str) -> PortfolioState:
             try:
                 with open(path) as f:
                     ps = PortfolioState.from_dict(json.load(f))
-                return _apply_risk_overlay(ps)
+                if PAPER_MODE:
+                    return _apply_risk_overlay(ps)
+                return ps
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
                 corrupted_paths.append(path)
@@ -726,7 +737,7 @@ def load_portfolio_state(name: str) -> PortfolioState:
         return PortfolioState()
 
     if not found_any_state_file:
-        if found_risk_overlay:
+        if PAPER_MODE and found_risk_overlay:
             logger.info(
                 "Primary state files missing for '%s', but risk overlay exists. "
                 "Recovering risk metadata into default PortfolioState().",
@@ -1054,13 +1065,15 @@ def _run_scan(
         _STALE_PRICE_DAYS = 2  # trading days
         _rebalance_stale_held: list = []
         if rebalance_allowed and (optimization_succeeded or apply_decay) and not _force_full_cash:
+            valid_days = None
             expected_session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).tz_localize(None)
             try:
                 import pandas_market_calendars as mcal
 
                 nse_calendar = mcal.get_calendar("NSE")
                 valid_days = nse_calendar.valid_days(
-                    start_date=expected_session_date - pd.Timedelta(days=366),
+                    start_date=calendar_window_start,
                     end_date=expected_session_date,
                 )
                 if len(valid_days) > 0:
@@ -1070,18 +1083,17 @@ def _run_scan(
             except Exception:
                 expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
 
-            trusted_close_index = pd.DatetimeIndex(close.index)
-            if trusted_close_index.tz is not None:
-                trusted_close_index = trusted_close_index.tz_convert("UTC").tz_localize(None)
-            trusted_close_index = trusted_close_index.normalize()
+            trusted_close_index = pd.DatetimeIndex([])
+            if valid_days is not None and len(valid_days) > 0:
+                trusted_close_index = pd.DatetimeIndex(valid_days)
+                if trusted_close_index.tz is not None:
+                    trusted_close_index = trusted_close_index.tz_convert("Asia/Kolkata").tz_localize(None)
+                trusted_close_index = trusted_close_index.normalize()
+                trusted_close_index = trusted_close_index[trusted_close_index <= expected_session_date]
 
             if trusted_close_index.empty or trusted_close_index.max() < expected_session_date:
-                if trusted_close_index.empty:
-                    trusted_start = expected_session_date - pd.offsets.BDay(260)
-                else:
-                    trusted_start = trusted_close_index.min()
                 trusted_close_index = pd.date_range(
-                    start=trusted_start,
+                    start=calendar_window_start,
                     end=expected_session_date,
                     freq="B",
                 )
@@ -1587,7 +1599,7 @@ def main_menu() -> None:
                             cfg=status_cfg,
                         )
                         mkt_cache[name] = mkt
-                    _print_status(states[name], label, mkt)
+                    _print_status(states[name], label, mkt, cfg=status_cfg)
             if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0) for n in states):
                 print(f"  {C.GRY}All portfolios are empty.{C.RST}")
 
