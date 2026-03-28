@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -175,6 +176,80 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
     state.last_known_prices = {"BAD": 99.0}
 
     dw._run_scan(["BAD", "GOOD"], state, "TEST", cfg_override=UltimateConfig())
+
+
+def test_run_scan_forward_fills_after_union_index_alignment(monkeypatch):
+    fri = pd.Timestamp("2026-03-27")
+    sat = pd.Timestamp("2026-03-28")
+    idx_fri = pd.DatetimeIndex([fri])
+    idx_weekend = pd.DatetimeIndex([fri, sat])
+    md = {
+        "AAA.NS": pd.DataFrame({"Close": [100.0], "Dividends": [0.0]}, index=idx_fri),
+        "BBB.NS": pd.DataFrame({"Close": [200.0, np.nan], "Dividends": [0.0, 0.0]}, index=idx_weekend),
+        "^NSEI": pd.DataFrame({"Close": [100.0]}, index=idx_fri),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0]}, index=idx_fri),
+    }
+    captured = {"prices": None, "active": None}
+
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9, 1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        return np.array([0.01, 0.02]), np.array([0.0, 0.0]), [0, 1], {
+            "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 2
+        }
+
+    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **_kwargs):
+            return np.array([0.5, 0.5])
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+
+    def _capture_rebalance(state, weights, prices, active, cfg, **kwargs):
+        captured["prices"] = np.array(prices, dtype=float)
+        captured["active"] = list(active)
+        return 0.0
+
+    monkeypatch.setattr(dw, "execute_rebalance", _capture_rebalance)
+
+    state = PortfolioState(cash=10_000.0)
+    dw._run_scan(["AAA", "BBB"], state, "TEST", cfg_override=UltimateConfig())
+
+    assert captured["active"] == ["AAA", "BBB"]
+    assert captured["prices"] is not None
+    assert np.all(np.isfinite(captured["prices"]))
+    assert captured["prices"].tolist() == pytest.approx([100.0, 200.0])
+
+
+def test_print_status_uses_last_non_nan_close(capsys):
+    state = PortfolioState(
+        shares={"AAA": 10},
+        entry_prices={"AAA": 90.0},
+        last_known_prices={"AAA": 90.0},
+        cash=0.0,
+    )
+    market_data = {
+        "AAA.NS": pd.DataFrame(
+            {"Close": [100.0, np.nan]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-03-27"), pd.Timestamp("2026-03-28")]),
+        )
+    }
+
+    dw._print_status(state, "TEST", market_data, cfg=UltimateConfig())
+    out = capsys.readouterr().out
+
+    assert "nan" not in out.lower()
+    assert "100.00" in out
 
 def test_load_portfolio_state_returns_safe_default_when_all_backups_corrupted(
     tmp_path: Path, monkeypatch
