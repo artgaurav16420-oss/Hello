@@ -902,9 +902,9 @@ def execute_rebalance(
             _base_slip_reserve += _delta_not * _sr
 
     residual_cash = max(0.0, pv_exec - base_notional - _base_slip_reserve)
-    # TODO: _allocate_residual_cash was intended to replace the inline allocation
-    # loop below, but currently lacks ADV caps, per-name concentration limits,
-    # and multi-pass tracking.
+    # Canonical implementation: keep residual-cash allocation inline so
+    # ADV caps, concentration limits, and multi-pass budget tracking stay in
+    # one place with execution-time state.
 
     if valid_targets and residual_cash > 0:
         eligible = {

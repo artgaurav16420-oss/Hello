@@ -99,6 +99,12 @@ class BacktestEngine:
         self._eq_vals:  list       = []
         self._rebal_rows: list     = []
 
+    def _reset_run_state(self) -> None:
+        self._eq_dates = []
+        self._eq_vals = []
+        self._rebal_rows = []
+        self.trades = []
+
     def run(
         self,
         close:           pd.DataFrame,
@@ -116,6 +122,11 @@ class BacktestEngine:
         splits:          Optional[pd.DataFrame] = None,
         universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
     ) -> pd.DataFrame:
+        # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
+        # runs; without clearing per-run buffers, equity/trade/rebalance state
+        # accumulates and contaminates subsequent outputs.
+        self._reset_run_state()
+
         if close.empty:
             logger.warning("[Backtest] Received empty close dataframe; skipping run.")
             return pd.DataFrame({"equity": pd.Series(dtype=float)})
@@ -264,7 +275,14 @@ class BacktestEngine:
                                     "ADV=%.0f for held position %s on %s.",
                                     _fallback_adv, _adv_sym, date,
                                 )
-                    except Exception:
+                    except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+                        # FIX-BE-BROAD-EXCEPT: narrow this fallback to known
+                        # data-shape/type errors, mirroring _build_adv_vector.
+                        logger.debug(
+                            "[Backtest] ADV fallback failed for %s on %s; keeping ADV=0.",
+                            _adv_sym,
+                            date,
+                        )
                         pass  # leave at 0; absent_periods will handle it
 
         valuation_close = close.loc[signal_date]
@@ -718,7 +736,9 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
         seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
-        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16) % (2**31)
+        # FIX-BE-SEED-WIDTH: align deterministic gap-repair seed width with
+        # momentum_engine._ghost_seed_for (63-bit), reducing collision risk.
+        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**63)
         rng  = np.random.RandomState(seed)
         noise_rets   = rng.normal(0, hist_vol, len(synth_idx))
         walk_returns = np.cumprod(1.0 + noise_rets)

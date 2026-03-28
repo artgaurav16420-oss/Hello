@@ -1675,6 +1675,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    from log_config import load_dotenv_safe
+    from log_config import configure_logging
+    from data_cache import configure_data_cache
+
+    # Load .env first so startup-time environment-derived settings resolve from
+    # the same source as other entry points.
+    load_dotenv_safe()
+    _EMPTY_UNIVERSE_HALT_AFTER = int(os.environ.get("EMPTY_UNIVERSE_HALT_AFTER", "3"))
+    _DEFAULT_SCREENER_URL = os.environ.get(
+        "SCREENER_URL",
+        "https://www.screener.in/screens/3506127/hello/",
+    )
+
     args = _parse_args()
     PAPER_MODE = bool(args.paper)
 
@@ -1683,12 +1696,12 @@ if __name__ == "__main__":
     # PROD-FIX-5: use structured JSON logging in production.
     # Pass json_stdout=False to keep human-readable output in dev.
     _use_json = os.environ.get("LOG_JSON", "1").strip().lower() not in ("0", "false", "no")
-    from log_config import configure_logging
     configure_logging(
         level=logging.INFO,
         json_stdout=_use_json,
         log_file="logs/ultimate.log",
     )
+    configure_data_cache()
 
     logger.info("Ultimate Momentum v%s started", __version__)
     if PAPER_MODE:

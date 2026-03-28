@@ -156,6 +156,23 @@ _HISTORICAL_CACHE_MAXSIZE: int = 32
 _UNIVERSE_LOOKUP_CACHE_MAXSIZE = 1024
 
 
+def _clear_all_caches() -> None:
+    """Clear all module-level caches in a thread-safe way.
+
+    Register any future module-level caches here so reset behavior stays
+    centralized for tests and runtime diagnostics.
+    """
+    _MISSING_PARQUET_WARNED.clear()
+    _NO_RECORD_WARNED.clear()
+    # Keep lock acquisition order aligned with _clear_historical_universe_caches:
+    # 1) _HISTORICAL_UNIVERSE_DF_CACHE_LOCK, 2) _UNIVERSE_LOOKUP_CACHE_LOCK.
+    with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        _HISTORICAL_UNIVERSE_DF_CACHE.clear()
+        _HISTORICAL_UNIVERSE_DATES_CACHE.clear()
+        with _UNIVERSE_LOOKUP_CACHE_LOCK:
+            _UNIVERSE_LOOKUP_CACHE.clear()
+
+
 def _clear_historical_universe_caches(hist_file: Path) -> None:
     universe_type = hist_file.stem.removeprefix("historical_")
     # Lock acquisition order must remain stable across this module:

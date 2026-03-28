@@ -3,6 +3,8 @@ data_cache.py — Persistent Atomic Downloader v11.49
 ===================================================
 Robustly manages downloading, parsing, and persisting yfinance data.
 
+Callers must invoke configure_data_cache() before using module functions.
+
 BUG FIXES (murder board):
 - FIX-MB-GROWWADJ: GrowwProvider._build_adj_close_from_batches uses only ffill
   (no bfill) when aligning the adjustment ratio, preventing look-ahead
@@ -18,8 +20,8 @@ BUG FIXES (murder board):
 - BUG-FIX-FALLBACK: _process_chunk now returns the set of validated-and-saved
   tickers. The fallback chain uses this ground-truth set instead of raw column
   presence, so NaN-only provider responses no longer block SecondaryProvider.
-- BUG-FIX-DOTENV-DC: _load_local_env_file now strips inline comments before
-  removing quotes, matching the fix applied to optimizer.py.
+- BUG-FIX-DOTENV-DC: shared load_dotenv_safe() strips inline comments before
+  removing quotes, and is used across cache/optimizer/fallback modules.
 - BUG-FIX-MANIFEST-IO: _save_manifest moved outside the for-chunk loop;
   one write per load_or_fetch call instead of one per chunk.
 - BUG-FIX-FILLNA: GrowwProvider._build_adj_close_from_batches replaces
@@ -42,6 +44,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+from log_config import load_dotenv_safe
 
 import requests
 from datetime import datetime, timedelta
@@ -93,39 +97,21 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
     return data
 
 
-def _load_local_env_file(env_path: Path = Path('.env')) -> None:
-    if not env_path.exists():
-        return
-    try:
-        for raw_line in env_path.read_text(encoding='utf-8').splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            key, value = line.split('=', 1)
-            key = key.strip()
-            value = value.strip()
-            # BUG-FIX-DOTENV-DC: strip inline comments before removing quotes.
-            # "FALLBACK_API_KEY=mykey # comment" left " # comment" in the value.
-            if value and value[0] in ('"', "'"):
-                q = value[0]
-                if value.endswith(q) and len(value) >= 2:
-                    value = value[1:-1]
-            else:
-                for _sep in (' #', '\t#'):
-                    if _sep in value:
-                        value = value[:value.index(_sep)].rstrip()
-                        break
-            if key and key not in os.environ:
-                os.environ[key] = value
-    except Exception as exc:
-        logger.debug('[Cache] Could not parse .env file at %s: %s', env_path, exc)
-
-
-_load_local_env_file()
 
 CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
+
+
+def configure_data_cache(dotenv_path: Optional[Path] = None) -> None:
+    """Initialize data-cache environment and filesystem paths.
+
+    Callers must invoke configure_data_cache() once before using module
+    functions so cache paths and optional local env vars are initialized.
+    """
+    load_dotenv_safe(dotenv_path)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 _GROWW_BASE_URL           = "https://api.groww.in/v1"
 _GROWW_DAILY_INTERVAL     = 1440
@@ -154,6 +140,9 @@ class GrowwProvider(DataProvider):
     FIX-MB-GROWW429: 429 returns _RATE_LIMITED sentinel for exponential backoff.
     FIX-MB-DC-02: Exponential backoff capped at _MAX_RATE_LIMIT_RETRIES to
       prevent indefinite blocking when a token is revoked or account suspended.
+
+    Recommended usage: `with GrowwProvider(...) as provider:` so HTTP sessions
+    are always released deterministically.
     """
 
     _GROWW_SLEEP_SECS = 0.2
@@ -161,6 +150,21 @@ class GrowwProvider(DataProvider):
     def __init__(self, api_token: Optional[str] = None) -> None:
         self.api_token = api_token or os.getenv("GROWW_API_TOKEN", "").strip()
         self._session: Optional[requests.Session] = None
+
+    def close(self) -> None:
+        # FIX-GROWW-SESSION-LEAK: close the session deterministically so pooled
+        # sockets are released promptly in long-running processes/tests.
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def __enter__(self) -> "GrowwProvider":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # FIX-GROWW-SESSION-LEAK: always close on context-manager exit.
+        self.close()
+        return False
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -965,66 +969,71 @@ def load_or_fetch(
                 tickers_to_download.append(ticker)
 
     providers = _build_provider_chain(cfg)
+    try:
+        if tickers_to_download:
+            logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
+            chunks = [
+                tickers_to_download[i:i + _DOWNLOAD_CHUNK_SIZE]
+                for i in range(0, len(tickers_to_download), _DOWNLOAD_CHUNK_SIZE)
+            ]
 
-    if tickers_to_download:
-        logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
-        chunks = [
-            tickers_to_download[i:i + _DOWNLOAD_CHUNK_SIZE]
-            for i in range(0, len(tickers_to_download), _DOWNLOAD_CHUNK_SIZE)
-        ]
+            for chunk in chunks:
+                raw_data = None
+                for provider in providers:
+                    try:
+                        _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
+                        raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
+                    except Exception as exc:
+                        logger.warning(
+                            "[Cache] Provider %s failed for chunk starting with %s: %s",
+                            type(provider).__name__, chunk[0], exc,
+                        )
+                        raw_data = None
 
-        for chunk in chunks:
-            raw_data = None
-            for provider in providers:
-                try:
-                    _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
-                    raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
-                except Exception as exc:
-                    logger.warning(
-                        "[Cache] Provider %s failed for chunk starting with %s: %s",
-                        type(provider).__name__, chunk[0], exc,
-                    )
-                    raw_data = None
+                    if raw_data is not None and not raw_data.empty:
+                        # BUG-FIX-FALLBACK: use validated-and-saved tickers from
+                        # _process_chunk, not raw column presence.  A provider that
+                        # returns a column full of NaN values causes that ticker to
+                        # appear in raw column names but fail _is_valid_dataframe
+                        # and never be saved.  Using column names would mark it as
+                        # "served" and block the SecondaryProvider fallback.
+                        saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
+                        missing_from_provider = [t for t in chunk if t not in saved]
 
-                if raw_data is not None and not raw_data.empty:
-                    # BUG-FIX-FALLBACK: use validated-and-saved tickers from
-                    # _process_chunk, not raw column presence.  A provider that
-                    # returns a column full of NaN values causes that ticker to
-                    # appear in raw column names but fail _is_valid_dataframe
-                    # and never be saved.  Using column names would mark it as
-                    # "served" and block the SecondaryProvider fallback.
-                    saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
-                    missing_from_provider = [t for t in chunk if t not in saved]
+                        if not missing_from_provider:
+                            break
 
-                    if not missing_from_provider:
-                        break
+                        chunk = missing_from_provider
+                        raw_data = None
+                        continue
 
-                    chunk = missing_from_provider
-                    raw_data = None
-                    continue
+                # FIX-BUG-8: guard recovery on whether `chunk` still has unresolved
+                # tickers, not on the state of `raw_data`.  The old check
+                #   `if raw_data is None or raw_data.empty`
+                # missed the case where the last provider returned a non-empty
+                # DataFrame but every ticker in it failed _is_valid_dataframe:
+                # raw_data was truthy so _recover_from_stale_cache was never called,
+                # silently dropping those tickers with no fallback and no WARNING.
+                # After the provider loop `chunk` always reflects the residual set of
+                # unresolved tickers (reassigned to missing_from_provider each pass),
+                # so a non-empty chunk is the correct and complete recovery signal.
+                if chunk:
+                    _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
 
-            # FIX-BUG-8: guard recovery on whether `chunk` still has unresolved
-            # tickers, not on the state of `raw_data`.  The old check
-            #   `if raw_data is None or raw_data.empty`
-            # missed the case where the last provider returned a non-empty
-            # DataFrame but every ticker in it failed _is_valid_dataframe:
-            # raw_data was truthy so _recover_from_stale_cache was never called,
-            # silently dropping those tickers with no fallback and no WARNING.
-            # After the provider loop `chunk` always reflects the residual set of
-            # unresolved tickers (reassigned to missing_from_provider each pass),
-            # so a non-empty chunk is the correct and complete recovery signal.
-            if chunk:
-                _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
-
-        # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
-        # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
-        # full JSON serialisations and atomic renames. One write is sufficient
-        # because the manifest is only read at startup and the per-chunk
-        # entries have already been mutated in-place in `manifest`.
-        # Note: _save_manifest is intentionally called only on download/recovery
-        # paths. Any future code path that mutates `entries` without downloading
-        # must explicitly call _save_manifest() to keep manifest state in sync.
-        _save_manifest(manifest)
+            # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
+            # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
+            # full JSON serialisations and atomic renames. One write is sufficient
+            # because the manifest is only read at startup and the per-chunk
+            # entries have already been mutated in-place in `manifest`.
+            # Note: _save_manifest is intentionally called only on download/recovery
+            # paths. Any future code path that mutates `entries` without downloading
+            # must explicitly call _save_manifest() to keep manifest state in sync.
+            _save_manifest(manifest)
+    finally:
+        for provider in providers:
+            close_fn = getattr(provider, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     # FIX-BUG-10: only clip data at required_end, not at a computed start bound.
     # The old logic computed effective_start = min(df.index[0], padded_start_ts):

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -268,6 +269,43 @@ class JsonFormatter(logging.Formatter):
                 f"{record.levelname} {record.name} {record.getMessage()}"
             )
 
+
+
+def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
+    """Best-effort .env loader that never overrides existing environment vars."""
+    env_path = dotenv_path or (Path.cwd() / ".env")
+    if not env_path.exists():
+        return
+
+    log = logging.getLogger(__name__)
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+
+            if value and value[0] in ("\"", "'"):
+                q = value[0]
+                close_i = value.find(q, 1)
+                if close_i != -1:
+                    value = value[1:close_i]
+                elif value.endswith(q) and len(value) >= 2:
+                    value = value[1:-1]
+            else:
+                # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
+                for sep in (" #", "\t#"):
+                    if sep in value:
+                        value = value[:value.index(sep)].rstrip()
+                        break
+
+            os.environ.setdefault(key, value)
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, IndexError, AttributeError) as exc:
+        log.debug("[Env] Could not parse .env at %s: %s", env_path, exc)
 
 # ─── One-call setup ───────────────────────────────────────────────────────────
 

@@ -39,29 +39,7 @@ import optuna
 from optuna.samplers import TPESampler
 
 
-def _load_dotenv_if_present(dotenv_path: str = ".env") -> None:
-    if not os.path.exists(dotenv_path):
-        return
-    with open(dotenv_path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if value and value[0] in ('"', "'"):
-                q = value[0]
-                if value.endswith(q) and len(value) >= 2:
-                    value = value[1:-1]
-            else:
-                for _sep in (" #", "\t#"):
-                    if _sep in value:
-                        value = value[:value.index(_sep)].rstrip()
-                        break
-            if key:
-                os.environ.setdefault(key, value)
-
+from log_config import load_dotenv_safe
 from momentum_engine import UltimateConfig, OptimizationError, OptimizationErrorType
 from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
@@ -78,21 +56,31 @@ if hasattr(sys.stdout, "reconfigure"):
 
 logger = logging.getLogger("Optimizer")
 logger.setLevel(logging.INFO)
-if not logger.handlers:
+
+
+def configure_optimizer_logging(color: bool = True) -> None:
+    """Optional CLI helper to install a local stream handler explicitly."""
+    if logger.handlers:
+        return
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("\033[90m[%(asctime)s]\033[0m %(message)s", "%H:%M:%S"))
+    fmt = "\033[90m[%(asctime)s]\033[0m %(message)s" if color else "[%(asctime)s] %(message)s"
+    handler.setFormatter(logging.Formatter(fmt, "%H:%M:%S"))
     logger.addHandler(handler)
 
-logging.getLogger("universe_manager").setLevel(logging.ERROR)
-logging.getLogger("backtest_engine").setLevel(logging.ERROR)
-logging.getLogger("momentum_engine").setLevel(logging.ERROR)
-logging.getLogger("signals").setLevel(logging.ERROR)
-logging.getLogger("data_cache").setLevel(logging.ERROR)
+
+load_dotenv_safe()
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2019-01-01"
 TRAIN_END   = "2025-12-31"
+# Reproducibility guardrail: TRAIN_END must remain static so optimizer results
+# are date-stable; extend manually when developers intentionally move the window.
+if (pd.Timestamp.now("UTC").tz_convert(None).normalize() - pd.Timestamp(TRAIN_END)).days > 183:
+    logger.warning(
+        "TRAIN_END=%s is >6 months stale relative to current date; continuing for reproducibility.",
+        TRAIN_END,
+    )
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TEST_START_2 = "2025-01-01"
@@ -1346,7 +1334,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    _load_dotenv_if_present()
+    configure_optimizer_logging()
     args = _parse_args()
     run_optimization(
         universe_type = args.universe,

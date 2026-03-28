@@ -1,8 +1,10 @@
 import logging
+import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
-from log_config import JsonFormatter
+from log_config import JsonFormatter, load_dotenv_safe
 
 
 def test_json_formatter_format_time_is_iso_utc_with_microseconds():
@@ -35,3 +37,13 @@ def test_json_formatter_format_time_uses_utc_not_localtime():
     out = fmt.formatTime(record)
     assert out.startswith("1970-01-01T00:00:00.")
     assert out.endswith("Z")
+
+
+def test_env_loader_handles_quoted_value_with_comment(tmp_path, monkeypatch):
+    env_file = Path(tmp_path) / ".env"
+    env_file.write_text('KEY="value" # note\n', encoding="utf-8")
+    monkeypatch.delenv("KEY", raising=False)
+
+    load_dotenv_safe(env_file)
+
+    assert os.getenv("KEY") == "value"
