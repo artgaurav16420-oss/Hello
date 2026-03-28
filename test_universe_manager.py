@@ -250,6 +250,30 @@ def test_get_sector_map_prefers_batched_yfinance_tickers(monkeypatch):
     assert calls["tickers"] == 1
 
 
+def test_get_sector_map_falls_back_when_batch_tickers_raises_runtime_error(monkeypatch):
+    class _YFDataException(Exception):
+        pass
+
+    class _Obj:
+        def __init__(self, sector):
+            self.info = {"sector": sector}
+
+    class _YF:
+        @staticmethod
+        def Tickers(_symbols):
+            raise _YFDataException("Yahoo API requires curl_cffi session")
+
+        @staticmethod
+        def Ticker(_symbol, session=None):
+            return _Obj("Unknown")
+
+    monkeypatch.setitem(__import__("sys").modules, "yfinance", _YF)
+
+    out = um.get_sector_map(["FOO.NS"], use_cache=False)
+
+    assert out == {"FOO.NS": "Unknown"}
+
+
 def test_apply_adv_filter_deduplicates_ns_equivalents(monkeypatch):
     import data_cache
     from momentum_engine import UltimateConfig

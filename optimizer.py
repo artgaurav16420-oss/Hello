@@ -55,32 +55,42 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 logger = logging.getLogger("Optimizer")
-logger.setLevel(logging.INFO)
+
+
+def _utc_today() -> pd.Timestamp:
+    """Return current UTC date as timezone-naive midnight timestamp."""
+    return pd.Timestamp.now("UTC").tz_convert(None).normalize()
 
 
 def configure_optimizer_logging(color: bool = True) -> None:
-    """Optional CLI helper to install a local stream handler explicitly."""
-    if logger.handlers:
-        return
-    handler = logging.StreamHandler(sys.stdout)
-    fmt = "\033[90m[%(asctime)s]\033[0m %(message)s" if color else "[%(asctime)s] %(message)s"
-    handler.setFormatter(logging.Formatter(fmt, "%H:%M:%S"))
-    logger.addHandler(handler)
+    """Call once from __main__ before any optimizer work begins."""
+    load_dotenv_safe()
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        fmt = "\033[90m[%(asctime)s]\033[0m %(message)s" if color else "[%(asctime)s] %(message)s"
+        handler.setFormatter(logging.Formatter(fmt, "%H:%M:%S"))
+        logger.addHandler(handler)
 
-
-load_dotenv_safe()
+    # Staleness check: warn if TRAIN_END is more than 6 months behind today.
+    # This is advisory only — behavior and results are never altered.
+    # To extend the training window, update TRAIN_END above and re-run the optimizer.
+    _today = _utc_today()
+    _train_end_ts = pd.Timestamp(TRAIN_END)
+    _days_stale = (_today - _train_end_ts).days
+    if _today > _train_end_ts + pd.DateOffset(months=TRAIN_END_STALENESS_THRESHOLD_MONTHS):
+        logger.warning(
+            "TRAIN_END=%s is %d days behind today. Optimizer results remain "
+            "reproducible but exclude recent data. Update TRAIN_END in "
+            "optimizer.py to include it.",
+            TRAIN_END,
+            _days_stale,
+        )
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2019-01-01"
 TRAIN_END   = "2025-12-31"
-# Reproducibility guardrail: TRAIN_END must remain static so optimizer results
-# are date-stable; extend manually when developers intentionally move the window.
-if (pd.Timestamp.now("UTC").tz_convert(None).normalize() - pd.Timestamp(TRAIN_END)).days > 183:
-    logger.warning(
-        "TRAIN_END=%s is >6 months stale relative to current date; continuing for reproducibility.",
-        TRAIN_END,
-    )
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TEST_START_2 = "2025-01-01"

@@ -827,7 +827,7 @@ def _run_scan(
             ns = to_ns(sym)
             if ns in market_data:
                 col = "Adj Close" if use_adj and "Adj Close" in market_data[ns].columns else "Close"
-                close_d[to_bare(ns)] = market_data[ns][col].ffill()
+                close_d[to_bare(ns)] = market_data[ns][col]
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
@@ -858,7 +858,30 @@ def _run_scan(
         _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
     
         close    = pd.DataFrame(close_d).sort_index()
-        active   = list(close.columns)
+        # BUG-FIX-WEEKEND-ALIGN: fill *after* frame assembly so NaNs introduced by
+        # union-index alignment (e.g. mixed Friday/Saturday last bars across symbols)
+        # are forward-filled consistently for every column.
+        # Bound forward fill to avoid carrying very old quotes too far forward.
+        # Convert stale-day allowance to row-count (daily OHLCV cadence => 1 row/day).
+        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", cfg.DEFAULT_MAX_PRICE_STALE_DAYS))
+        limit_rows = max(1, max_stale_days)
+        close    = close.ffill(axis=0, limit=limit_rows)
+        close    = close.loc[close.index <= pd.Timestamp(end_date)]
+        latest_row = close.iloc[-1]
+        active = [
+            sym for sym, px in latest_row.items()
+            if np.isfinite(px) and float(px) > 0.0
+        ]
+        if not active:
+            logger.warning(
+                "[Scan] No symbols have a sufficiently recent valid close after bounded "
+                "forward-fill (MAX_PRICE_STALE_DAYS=%d).",
+                max_stale_days,
+            )
+            for held_sym in list(state.shares.keys()):
+                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+            return state, market_data
+        close = close.loc[:, active]
         prices   = close.iloc[-1].values.astype(float)
         active_idx = {sym: i for i, sym in enumerate(active)}
     
@@ -1256,7 +1279,9 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     for sym in active:
         ns = to_ns(sym)
         if ns in market_data and not market_data[ns].empty:
-            prices_now[sym] = float(market_data[ns]["Close"].iloc[-1])
+            close_series = market_data[ns]["Close"].dropna()
+            if not close_series.empty:
+                prices_now[sym] = float(close_series.iloc[-1])
 
     mtm = sum(
         state.shares[s] * (prices_now.get(s) or state.last_known_prices.get(s, 0.0))

@@ -630,15 +630,6 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
     sector_timeout = float(
         getattr(cfg, "SECTOR_FETCH_TIMEOUT", _DEFAULT_SECTOR_FETCH_TIMEOUT)
     ) if cfg is not None else _DEFAULT_SECTOR_FETCH_TIMEOUT
-    batch_session = requests.Session()
-    _batch_request = batch_session.request
-    _batch_timeout = max(1.0, float(sector_timeout))
-    batch_session.request = lambda method, url, **kwargs: _batch_request(
-        method,
-        url,
-        timeout=kwargs.pop("timeout", _batch_timeout),
-        **kwargs,
-    )
 
     def _bare(t: str) -> str:
         """Strip any NSE/BSE exchange suffix to get the bare ticker symbol.
@@ -654,7 +645,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 return t[: -len(sfx)]
         return t
 
-    try:
+    if True:
         resolved_map = {}
         missing_tickers = []
 
@@ -690,19 +681,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
 
             try:
                 batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
-                try:
-                    batch = yf.Tickers(batch_symbols, session=batch_session)
-                except TypeError:
-                    # Backward-compatible fallback for test doubles/older wrappers
-                    # that do not accept the optional `session` argument.
-                    logger.warning(
-                        "[Universe] yf.Tickers(..., session=batch_session) is not "
-                        "supported in this runtime; falling back without timeout "
-                        "session. batch_session=%r timeout=%ss",
-                        batch_session,
-                        _batch_timeout,
-                    )
-                    batch = yf.Tickers(batch_symbols)
+                batch = yf.Tickers(batch_symbols)
                 ticker_objs = getattr(batch, "tickers", {}) or {}
                 for bare_sym in missing_tickers:
                     ns_sym = f"{bare_sym}.NS"
@@ -801,5 +780,3 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             bare_ticker = _bare(ticker)
             final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
         return final_map
-    finally:
-        batch_session.close()
