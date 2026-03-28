@@ -271,7 +271,7 @@ class JsonFormatter(logging.Formatter):
 
 
 
-def load_dotenv_safe(dotenv_path: Path = None) -> None:
+def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
     """Best-effort .env loader that never overrides existing environment vars."""
     env_path = dotenv_path or (Path.cwd() / ".env")
     if not env_path.exists():

@@ -103,7 +103,7 @@ MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
 
 
-def configure_data_cache(dotenv_path: Path = None) -> None:
+def configure_data_cache(dotenv_path: Optional[Path] = None) -> None:
     """Initialize data-cache environment and filesystem paths.
 
     Callers must invoke configure_data_cache() once before using module
