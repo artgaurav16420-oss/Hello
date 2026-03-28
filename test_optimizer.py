@@ -1,5 +1,6 @@
 import importlib
 import json
+import logging
 import numbers
 from pathlib import Path
 
@@ -43,6 +44,30 @@ def test_optimizer_logger_does_not_duplicate_handlers_on_reload():
     after = len(optimizer.logger.handlers)
 
     assert after == before
+
+
+def test_train_end_staleness_warning_emitted_after_configure(caplog, monkeypatch):
+    """Warning must reach the log — i.e. fire after handlers are installed."""
+    import optimizer
+
+    monkeypatch.setattr(optimizer, "TRAIN_END", "2024-12-31")
+    with caplog.at_level(logging.WARNING, logger="Optimizer"):
+        optimizer.configure_optimizer_logging(color=False)
+
+    assert any(
+        "TRAIN_END" in record.message and "days behind" in record.message
+        for record in caplog.records
+    )
+
+
+def test_train_end_staleness_does_not_raise():
+    """Staleness check must never alter control flow."""
+    import optimizer
+
+    try:
+        optimizer.configure_optimizer_logging(color=False)
+    except Exception as exc:
+        pytest.fail(f"configure_optimizer_logging raised unexpectedly: {exc}")
 
 
 def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
