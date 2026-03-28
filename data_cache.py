@@ -969,66 +969,71 @@ def load_or_fetch(
                 tickers_to_download.append(ticker)
 
     providers = _build_provider_chain(cfg)
+    try:
+        if tickers_to_download:
+            logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
+            chunks = [
+                tickers_to_download[i:i + _DOWNLOAD_CHUNK_SIZE]
+                for i in range(0, len(tickers_to_download), _DOWNLOAD_CHUNK_SIZE)
+            ]
 
-    if tickers_to_download:
-        logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
-        chunks = [
-            tickers_to_download[i:i + _DOWNLOAD_CHUNK_SIZE]
-            for i in range(0, len(tickers_to_download), _DOWNLOAD_CHUNK_SIZE)
-        ]
+            for chunk in chunks:
+                raw_data = None
+                for provider in providers:
+                    try:
+                        _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
+                        raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
+                    except Exception as exc:
+                        logger.warning(
+                            "[Cache] Provider %s failed for chunk starting with %s: %s",
+                            type(provider).__name__, chunk[0], exc,
+                        )
+                        raw_data = None
 
-        for chunk in chunks:
-            raw_data = None
-            for provider in providers:
-                try:
-                    _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
-                    raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
-                except Exception as exc:
-                    logger.warning(
-                        "[Cache] Provider %s failed for chunk starting with %s: %s",
-                        type(provider).__name__, chunk[0], exc,
-                    )
-                    raw_data = None
+                    if raw_data is not None and not raw_data.empty:
+                        # BUG-FIX-FALLBACK: use validated-and-saved tickers from
+                        # _process_chunk, not raw column presence.  A provider that
+                        # returns a column full of NaN values causes that ticker to
+                        # appear in raw column names but fail _is_valid_dataframe
+                        # and never be saved.  Using column names would mark it as
+                        # "served" and block the SecondaryProvider fallback.
+                        saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
+                        missing_from_provider = [t for t in chunk if t not in saved]
 
-                if raw_data is not None and not raw_data.empty:
-                    # BUG-FIX-FALLBACK: use validated-and-saved tickers from
-                    # _process_chunk, not raw column presence.  A provider that
-                    # returns a column full of NaN values causes that ticker to
-                    # appear in raw column names but fail _is_valid_dataframe
-                    # and never be saved.  Using column names would mark it as
-                    # "served" and block the SecondaryProvider fallback.
-                    saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
-                    missing_from_provider = [t for t in chunk if t not in saved]
+                        if not missing_from_provider:
+                            break
 
-                    if not missing_from_provider:
-                        break
+                        chunk = missing_from_provider
+                        raw_data = None
+                        continue
 
-                    chunk = missing_from_provider
-                    raw_data = None
-                    continue
+                # FIX-BUG-8: guard recovery on whether `chunk` still has unresolved
+                # tickers, not on the state of `raw_data`.  The old check
+                #   `if raw_data is None or raw_data.empty`
+                # missed the case where the last provider returned a non-empty
+                # DataFrame but every ticker in it failed _is_valid_dataframe:
+                # raw_data was truthy so _recover_from_stale_cache was never called,
+                # silently dropping those tickers with no fallback and no WARNING.
+                # After the provider loop `chunk` always reflects the residual set of
+                # unresolved tickers (reassigned to missing_from_provider each pass),
+                # so a non-empty chunk is the correct and complete recovery signal.
+                if chunk:
+                    _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
 
-            # FIX-BUG-8: guard recovery on whether `chunk` still has unresolved
-            # tickers, not on the state of `raw_data`.  The old check
-            #   `if raw_data is None or raw_data.empty`
-            # missed the case where the last provider returned a non-empty
-            # DataFrame but every ticker in it failed _is_valid_dataframe:
-            # raw_data was truthy so _recover_from_stale_cache was never called,
-            # silently dropping those tickers with no fallback and no WARNING.
-            # After the provider loop `chunk` always reflects the residual set of
-            # unresolved tickers (reassigned to missing_from_provider each pass),
-            # so a non-empty chunk is the correct and complete recovery signal.
-            if chunk:
-                _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
-
-        # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
-        # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
-        # full JSON serialisations and atomic renames. One write is sufficient
-        # because the manifest is only read at startup and the per-chunk
-        # entries have already been mutated in-place in `manifest`.
-        # Note: _save_manifest is intentionally called only on download/recovery
-        # paths. Any future code path that mutates `entries` without downloading
-        # must explicitly call _save_manifest() to keep manifest state in sync.
-        _save_manifest(manifest)
+            # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
+            # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
+            # full JSON serialisations and atomic renames. One write is sufficient
+            # because the manifest is only read at startup and the per-chunk
+            # entries have already been mutated in-place in `manifest`.
+            # Note: _save_manifest is intentionally called only on download/recovery
+            # paths. Any future code path that mutates `entries` without downloading
+            # must explicitly call _save_manifest() to keep manifest state in sync.
+            _save_manifest(manifest)
+    finally:
+        for provider in providers:
+            close_fn = getattr(provider, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     # FIX-BUG-10: only clip data at required_end, not at a computed start bound.
     # The old logic computed effective_start = min(df.index[0], padded_start_ts):

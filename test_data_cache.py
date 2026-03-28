@@ -178,11 +178,13 @@ def test_configure_data_cache_loads_env_missing_keys_only(tmp_path, monkeypatch)
 
     monkeypatch.delenv("GROWW_API_TOKEN", raising=False)
     monkeypatch.setenv("EXISTING_KEY", "already_set")
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path / "cache")
 
     data_cache.configure_data_cache(env_file)
 
     assert os.getenv("GROWW_API_TOKEN") == "from_file"
     assert os.getenv("EXISTING_KEY") == "already_set"
+    assert data_cache.CACHE_DIR.exists()
 
 
 def test_ensure_price_columns_coerces_object_dividends_and_prices():

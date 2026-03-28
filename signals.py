@@ -229,8 +229,11 @@ def _check_market_crash(
         return None
 
     recent_px = px_slice.tail(15)
-    breadth_flags = (recent_px > rolling_sma50) & recent_px.notna() & rolling_sma50.notna()
-    breadth_history = breadth_flags.mean(axis=1)
+    valid_mask = recent_px.notna() & rolling_sma50.notna()
+    numerator = ((recent_px > rolling_sma50) & valid_mask).sum(axis=1)
+    denominator = valid_mask.sum(axis=1)
+    breadth_history = numerator.div(denominator.replace(0, np.nan))
+    breadth_history = breadth_history.fillna(0.0)
 
     current_breadth = float(breadth_history.iloc[-1])
     min_recent_breadth = float(breadth_history.min())

@@ -1334,6 +1334,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    configure_optimizer_logging()
     args = _parse_args()
     run_optimization(
         universe_type = args.universe,

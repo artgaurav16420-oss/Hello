@@ -291,7 +291,10 @@ def load_dotenv_safe(dotenv_path: Path = None) -> None:
 
             if value and value[0] in ("\"", "'"):
                 q = value[0]
-                if value.endswith(q) and len(value) >= 2:
+                close_i = value.find(q, 1)
+                if close_i != -1:
+                    value = value[1:close_i]
+                elif value.endswith(q) and len(value) >= 2:
                     value = value[1:-1]
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
