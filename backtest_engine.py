@@ -736,9 +736,9 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
         seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
-        # FIX-BE-SEED-WIDTH: align deterministic gap-repair seed width with
-        # momentum_engine._ghost_seed_for (63-bit), reducing collision risk.
-        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**63)
+        # FIX-BE-SEED-WIDTH: RandomState accepts only [0, 2**32-1] seeds.
+        # Keep deterministic hashing, but bound to uint32 to avoid ValueError.
+        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**32 - 1)
         rng  = np.random.RandomState(seed)
         noise_rets   = rng.normal(0, hist_vol, len(synth_idx))
         walk_returns = np.cumprod(1.0 + noise_rets)
@@ -927,8 +927,23 @@ def run_backtest(
 
     matrices = precomputed_matrices
     if matrices:
-        # FIX-MB2-SORTEDUNIV: Sort union_universe before selecting columns.
-        selected = sorted(sym for sym in union_universe if sym in matrices["close"].columns)
+        close_cols = list(matrices["close"].columns)
+        close_col_set = set(close_cols)
+        close_col_bare = {
+            col[:-3] if isinstance(col, str) and col.endswith(".NS") else col
+            for col in close_cols
+        }
+
+        # FIX-MB-BE-06: normalize universe symbols when selecting precomputed
+        # columns. `build_precomputed_matrices` stores bare symbols (e.g. "TCS")
+        # while historical universes are .NS-suffixed (e.g. "TCS.NS"). The
+        # previous exact-match check could drop every symbol and hard-fail.
+        selected = sorted(
+            sym
+            for sym in union_universe
+            if sym in close_col_set
+            or (sym[:-3] if isinstance(sym, str) and sym.endswith(".NS") else sym) in close_col_bare
+        )
         if not selected:
             raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
 
@@ -948,15 +963,32 @@ def run_backtest(
                 result = result.loc[:_end_ts]
             return result
 
-        close     = _clip(matrices["close"])[selected]
-        close_adj = _clip(matrices["close_adj"])[selected]
-        open_px   = _clip(matrices["open"])[selected]
-        high_px   = _clip(matrices["high"])[selected]
-        low_px    = _clip(matrices["low"])[selected]
-        dividends = _clip(matrices["dividends"])[selected]
-        splits    = _clip(matrices["splits"])[selected]
-        volume    = _clip(matrices["volume"])[selected]
-        returns   = _clip(matrices["returns"])[selected]
+        def _resolve_column(df: pd.DataFrame, sym: str) -> pd.Series:
+            if sym in df.columns:
+                return df[sym]
+            if isinstance(sym, str) and sym.endswith(".NS"):
+                bare = sym[:-3]
+                if bare in df.columns:
+                    return df[bare]
+            ns_sym = f"{sym}.NS" if isinstance(sym, str) and not sym.endswith(".NS") else sym
+            if ns_sym in df.columns:
+                return df[ns_sym]
+            raise KeyError(sym)
+
+        def _select_with_universe_labels(df: pd.DataFrame) -> pd.DataFrame:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return df
+            return pd.DataFrame({sym: _resolve_column(df, sym) for sym in selected}, index=df.index)
+
+        close     = _select_with_universe_labels(_clip(matrices["close"]))
+        close_adj = _select_with_universe_labels(_clip(matrices["close_adj"]))
+        open_px   = _select_with_universe_labels(_clip(matrices["open"]))
+        high_px   = _select_with_universe_labels(_clip(matrices["high"]))
+        low_px    = _select_with_universe_labels(_clip(matrices["low"]))
+        dividends = _select_with_universe_labels(_clip(matrices["dividends"]))
+        splits    = _select_with_universe_labels(_clip(matrices["splits"]))
+        volume    = _select_with_universe_labels(_clip(matrices["volume"]))
+        returns   = _select_with_universe_labels(_clip(matrices["returns"]))
     else:
         # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
         # which kept almost every DataFrame (any series starting before warmup_start
