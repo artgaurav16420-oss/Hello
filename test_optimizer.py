@@ -64,10 +64,7 @@ def test_train_end_staleness_does_not_raise():
     """Staleness check must never alter control flow."""
     import optimizer
 
-    try:
-        optimizer.configure_optimizer_logging(color=False)
-    except Exception as exc:
-        pytest.fail(f"configure_optimizer_logging raised unexpectedly: {exc}")
+    optimizer.configure_optimizer_logging(color=False)
 
 
 def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
