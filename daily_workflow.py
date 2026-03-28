@@ -863,7 +863,14 @@ def _run_scan(
         # are forward-filled consistently for every column.
         # Bound forward fill to avoid carrying very old quotes too far forward.
         # Convert stale-day allowance to row-count (daily OHLCV cadence => 1 row/day).
-        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", cfg.DEFAULT_MAX_PRICE_STALE_DAYS))
+        # FIX-PROD-MAXSTALE-DEFAULT: Some persisted/optimized configs are loaded
+        # into UltimateConfig instances that do not define
+        # DEFAULT_MAX_PRICE_STALE_DAYS. Falling back directly to that attribute
+        # raises AttributeError and aborts the scan before signal generation.
+        # Keep compatibility with older/newer config shapes by resolving both
+        # attributes defensively and defaulting to the policy baseline (2 days).
+        default_max_stale_days = int(getattr(cfg, "DEFAULT_MAX_PRICE_STALE_DAYS", 2))
+        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", default_max_stale_days))
         limit_rows = max(1, max_stale_days)
         close    = close.ffill(axis=0, limit=limit_rows)
         close    = close.loc[close.index <= pd.Timestamp(end_date)]
