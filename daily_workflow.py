@@ -861,9 +861,27 @@ def _run_scan(
         # BUG-FIX-WEEKEND-ALIGN: fill *after* frame assembly so NaNs introduced by
         # union-index alignment (e.g. mixed Friday/Saturday last bars across symbols)
         # are forward-filled consistently for every column.
-        close    = close.ffill(axis=0)
+        # Bound forward fill to avoid carrying very old quotes too far forward.
+        # Convert stale-day allowance to row-count (daily OHLCV cadence => 1 row/day).
+        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", 2))
+        limit_rows = max(1, max_stale_days)
+        close    = close.ffill(axis=0, limit=limit_rows)
         close    = close.loc[close.index <= pd.Timestamp(end_date)]
-        active   = list(close.columns)
+        latest_row = close.iloc[-1]
+        active = [
+            sym for sym, px in latest_row.items()
+            if np.isfinite(px) and float(px) > 0.0
+        ]
+        if not active:
+            logger.warning(
+                "[Scan] No symbols have a sufficiently recent valid close after bounded "
+                "forward-fill (MAX_PRICE_STALE_DAYS=%d).",
+                max_stale_days,
+            )
+            for held_sym in list(state.shares.keys()):
+                state.absent_periods[held_sym] = int(state.absent_periods.get(held_sym, 0)) + 1
+            return state, market_data
+        close = close.loc[:, active]
         prices   = close.iloc[-1].values.astype(float)
         active_idx = {sym: i for i, sym in enumerate(active)}
     

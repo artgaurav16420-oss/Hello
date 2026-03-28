@@ -231,6 +231,59 @@ def test_run_scan_forward_fills_after_union_index_alignment(monkeypatch):
     assert captured["prices"].tolist() == pytest.approx([100.0, 200.0])
 
 
+def test_run_scan_excludes_symbol_with_long_price_gap_after_bounded_fill(monkeypatch):
+    old_date = pd.Timestamp("2026-03-01")
+    recent_idx = pd.date_range("2026-03-24", periods=5, freq="D")
+    md = {
+        "STALE.NS": pd.DataFrame({"Close": [100.0], "Dividends": [0.0]}, index=pd.DatetimeIndex([old_date])),
+        "FRESH.NS": pd.DataFrame(
+            {"Close": [200.0, 201.0, 202.0, 203.0, 204.0], "Dividends": [0.0] * 5},
+            index=recent_idx,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [100.0] * 5}, index=recent_idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0] * 5}, index=recent_idx),
+    }
+    captured = {"prices": None, "active": None}
+
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+
+    def _fake_generate_signals(*_args, **_kwargs):
+        return np.array([0.02]), np.array([0.0]), [0], {
+            "total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1
+        }
+
+    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **_kwargs):
+            return np.array([1.0])
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+
+    def _capture_rebalance(state, weights, prices, active, cfg, **kwargs):
+        captured["prices"] = np.array(prices, dtype=float)
+        captured["active"] = list(active)
+        return 0.0
+
+    monkeypatch.setattr(dw, "execute_rebalance", _capture_rebalance)
+
+    state = PortfolioState(cash=10_000.0)
+    dw._run_scan(["STALE", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
+
+    assert captured["active"] == ["FRESH"]
+    assert captured["prices"] is not None
+    assert captured["prices"].tolist() == pytest.approx([204.0])
+
+
 def test_print_status_uses_last_non_nan_close(capsys):
     state = PortfolioState(
         shares={"AAA": 10},

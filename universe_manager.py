@@ -645,7 +645,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 return t[: -len(sfx)]
         return t
 
-    try:
+    if True:
         resolved_map = {}
         missing_tickers = []
 
@@ -780,5 +780,3 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             bare_ticker = _bare(ticker)
             final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
         return final_map
-    finally:
-        pass
