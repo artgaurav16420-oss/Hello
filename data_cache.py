@@ -3,6 +3,8 @@ data_cache.py — Persistent Atomic Downloader v11.49
 ===================================================
 Robustly manages downloading, parsing, and persisting yfinance data.
 
+Callers must invoke configure_data_cache() before using module functions.
+
 BUG FIXES (murder board):
 - FIX-MB-GROWWADJ: GrowwProvider._build_adj_close_from_batches uses only ffill
   (no bfill) when aligning the adjustment ratio, preventing look-ahead
@@ -18,8 +20,8 @@ BUG FIXES (murder board):
 - BUG-FIX-FALLBACK: _process_chunk now returns the set of validated-and-saved
   tickers. The fallback chain uses this ground-truth set instead of raw column
   presence, so NaN-only provider responses no longer block SecondaryProvider.
-- BUG-FIX-DOTENV-DC: _load_local_env_file now strips inline comments before
-  removing quotes, matching the fix applied to optimizer.py.
+- BUG-FIX-DOTENV-DC: shared load_dotenv_safe() strips inline comments before
+  removing quotes, and is used across cache/optimizer/fallback modules.
 - BUG-FIX-MANIFEST-IO: _save_manifest moved outside the for-chunk loop;
   one write per load_or_fetch call instead of one per chunk.
 - BUG-FIX-FILLNA: GrowwProvider._build_adj_close_from_batches replaces
@@ -42,6 +44,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from abc import ABC, abstractmethod
 from pathlib import Path
+
+from log_config import load_dotenv_safe
 
 import requests
 from datetime import datetime, timedelta
@@ -93,39 +97,21 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
     return data
 
 
-def _load_local_env_file(env_path: Path = Path('.env')) -> None:
-    if not env_path.exists():
-        return
-    try:
-        for raw_line in env_path.read_text(encoding='utf-8').splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            key, value = line.split('=', 1)
-            key = key.strip()
-            value = value.strip()
-            # BUG-FIX-DOTENV-DC: strip inline comments before removing quotes.
-            # "FALLBACK_API_KEY=mykey # comment" left " # comment" in the value.
-            if value and value[0] in ('"', "'"):
-                q = value[0]
-                if value.endswith(q) and len(value) >= 2:
-                    value = value[1:-1]
-            else:
-                for _sep in (' #', '\t#'):
-                    if _sep in value:
-                        value = value[:value.index(_sep)].rstrip()
-                        break
-            if key and key not in os.environ:
-                os.environ[key] = value
-    except Exception as exc:
-        logger.debug('[Cache] Could not parse .env file at %s: %s', env_path, exc)
-
-
-_load_local_env_file()
 
 CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 75
+
+
+def configure_data_cache(dotenv_path: Path = None) -> None:
+    """Initialize data-cache environment and filesystem paths.
+
+    Callers must invoke configure_data_cache() once before using module
+    functions so cache paths and optional local env vars are initialized.
+    """
+    load_dotenv_safe(dotenv_path)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 _GROWW_BASE_URL           = "https://api.groww.in/v1"
 _GROWW_DAILY_INTERVAL     = 1440
@@ -154,6 +140,9 @@ class GrowwProvider(DataProvider):
     FIX-MB-GROWW429: 429 returns _RATE_LIMITED sentinel for exponential backoff.
     FIX-MB-DC-02: Exponential backoff capped at _MAX_RATE_LIMIT_RETRIES to
       prevent indefinite blocking when a token is revoked or account suspended.
+
+    Recommended usage: `with GrowwProvider(...) as provider:` so HTTP sessions
+    are always released deterministically.
     """
 
     _GROWW_SLEEP_SECS = 0.2
@@ -161,6 +150,21 @@ class GrowwProvider(DataProvider):
     def __init__(self, api_token: Optional[str] = None) -> None:
         self.api_token = api_token or os.getenv("GROWW_API_TOKEN", "").strip()
         self._session: Optional[requests.Session] = None
+
+    def close(self) -> None:
+        # FIX-GROWW-SESSION-LEAK: close the session deterministically so pooled
+        # sockets are released promptly in long-running processes/tests.
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def __enter__(self) -> "GrowwProvider":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # FIX-GROWW-SESSION-LEAK: always close on context-manager exit.
+        self.close()
+        return False
 
     def _get_session(self) -> requests.Session:
         if self._session is None:

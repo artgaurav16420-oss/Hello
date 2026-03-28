@@ -35,50 +35,14 @@ import pandas as pd
 import requests
 
 
-def _load_env_file_fallback(env_path: Path = Path('.env')) -> None:
-    """Minimal `.env` parser used when python-dotenv is unavailable.
-
-    FIX-NEW-BHF-01: This function is intentionally duplicated from
-    data_cache._load_local_env_file.  build_historical_fallback.py is a
-    standalone CLI script that may be invoked before data_cache is importable
-    (e.g. missing dependencies), so it cannot import from data_cache.
-    Both copies must be kept in sync.  If the parsing logic changes, update
-    both functions and both test suites (test_build_historical_fallback.py
-    and test_data_cache.py) together.
-    """
-    if not env_path.exists():
-        return
-    try:
-        for raw_line in env_path.read_text(encoding='utf-8').splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith('#') or '=' not in line:
-                continue
-            key, value = line.split('=', 1)
-            key = key.strip()
-            value = value.strip()
-            if value and value[0] in ('"', "'"):
-                q = value[0]
-                if value.endswith(q) and len(value) >= 2:
-                    value = value[1:-1]
-            else:
-                for _sep in (' #', '\t#'):
-                    if _sep in value:
-                        value = value[:value.index(_sep)].rstrip()
-                        break
-            if key and key not in os.environ:
-                os.environ[key] = value
-    except Exception as exc:
-        _bhf_logger = logging.getLogger(__name__)
-        _bhf_logger.debug('[Env] Could not parse .env fallback at %s: %s', env_path, exc)
-
-
 def _bootstrap_env() -> None:
     """Load env vars from `.env` with optional python-dotenv dependency."""
     try:
         from dotenv import load_dotenv  # type: ignore
         load_dotenv()
     except Exception:
-        _load_env_file_fallback()
+        from log_config import load_dotenv_safe
+        load_dotenv_safe()
 
 
 _bootstrap_env()

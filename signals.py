@@ -146,10 +146,6 @@ def compute_regime_score(
             base_score *= 0.85
         vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
 
-    # TODO(refactor-signals): this breadth block contributes to the composite
-    # regime score, while the later 15-day breadth block is a hard-crash
-    # override; window lengths intentionally differ, so keep them decoupled
-    # until a dedicated refactor ticket unifies naming and responsibilities.
     breadth_component = 0.5
     _sma_win = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     if universe_close_hist is not None and not universe_close_hist.empty:
@@ -197,47 +193,54 @@ def compute_regime_score(
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     base_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
 
-    if universe_close_hist is not None and len(universe_close_hist) >= 65:
-        equity_cols = [c for c in universe_close_hist.columns if not str(c).startswith("^")]
-        if equity_cols:
-            # Grab the last 65 days (50 for the SMA window + 15 days of rolling lookback)
-            _px_slice = universe_close_hist.loc[:, equity_cols].tail(65)
-
-            # Calculate the rolling 50-day SMA, then isolate the final 15 days
-            rolling_sma50 = _px_slice.rolling(window=50, min_periods=20).mean().tail(15)
-
-            # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
-            # history during warmup), breadth_flags.mean() would return 0.0,
-            # triggering a false bear signal. Skip the breadth override entirely.
-            if not rolling_sma50.notna().any().any():
-                logger.debug(
-                    "[Signals] rolling_sma50 is entirely NaN — skipping breadth override."
-                )
-                return base_score
-
-            recent_px = _px_slice.tail(15)
-
-            # Create a 15-day history of market breadth (% of stocks > their 50-SMA)
-            breadth_flags = (recent_px > rolling_sma50) & recent_px.notna() & rolling_sma50.notna()
-            breadth_history = breadth_flags.mean(axis=1)
-
-            current_breadth = float(breadth_history.iloc[-1])
-            min_recent_breadth = float(breadth_history.min())
-
-            # 1. Hard Crash Exit (Current breadth collapses)
-            if current_breadth < 0.35:
-                return 0.0
-
-            # 2. HYSTERESIS (The Schmitt Trigger)
-            # If the market crashed recently (<35%), demand a strong bounce (>50%) to allow re-entry.
-            if min_recent_breadth < 0.35 and current_breadth < 0.50:
-                return 0.0
-
-            # 3. Early Warning Trim (Market is weakening but hasn't crashed)
-            if current_breadth < 0.45:
-                return min(base_score, 0.5)
+    crash_override = _check_market_crash(universe_close_hist, cfg)
+    if crash_override is not None:
+        return min(base_score, crash_override) if crash_override == 0.5 else crash_override
 
     return base_score
+
+
+def _check_market_crash(
+    close_hist: Optional[pd.DataFrame],
+    cfg: Optional['UltimateConfig'] = None,
+) -> Optional[float]:
+    """Crash override from 15-day breadth history.
+
+    Returns 0.0 for crash conditions, 0.5 for early-warning cap, and None
+    when there is no crash override.
+    """
+    if close_hist is None or close_hist.empty or len(close_hist) < 65:
+        return None
+
+    equity_cols = [c for c in close_hist.columns if not str(c).startswith("^")]
+    if not equity_cols:
+        return None
+
+    px_slice = close_hist.loc[:, equity_cols].tail(65)
+    rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().tail(15)
+
+    # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
+    # history during warmup), breadth_flags.mean() would return 0.0,
+    # triggering a false bear signal. Skip the breadth override entirely.
+    if not rolling_sma50.notna().any().any():
+        logger.debug(
+            "[Signals] rolling_sma50 is entirely NaN — skipping breadth override."
+        )
+        return None
+
+    recent_px = px_slice.tail(15)
+    breadth_flags = (recent_px > rolling_sma50) & recent_px.notna() & rolling_sma50.notna()
+    breadth_history = breadth_flags.mean(axis=1)
+
+    current_breadth = float(breadth_history.iloc[-1])
+    min_recent_breadth = float(breadth_history.min())
+    if current_breadth < 0.35:
+        return 0.0
+    if min_recent_breadth < 0.35 and current_breadth < 0.50:
+        return 0.0
+    if current_breadth < 0.45:
+        return 0.5
+    return None
 
 
 def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None) -> float:

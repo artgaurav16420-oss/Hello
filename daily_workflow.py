@@ -1684,11 +1684,13 @@ if __name__ == "__main__":
     # Pass json_stdout=False to keep human-readable output in dev.
     _use_json = os.environ.get("LOG_JSON", "1").strip().lower() not in ("0", "false", "no")
     from log_config import configure_logging
+    from data_cache import configure_data_cache
     configure_logging(
         level=logging.INFO,
         json_stdout=_use_json,
         log_file="logs/ultimate.log",
     )
+    configure_data_cache()
 
     logger.info("Ultimate Momentum v%s started", __version__)
     if PAPER_MODE:
