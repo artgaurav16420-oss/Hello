@@ -6,9 +6,6 @@ Uses walk-forward time-series cross-validation for parameter selection,
 followed by true holdout Out-of-Sample (OOS) validation periods.
 
 CHANGES:
-- v11.57:
-  - Added dynamic Period-2 OOS end-date resolution via _resolve_period_2_end
-    and lazy _get_test_end_2() lookup to avoid stale hard-coded holdout bounds.
 - v11.58:
   - OBJECTIVE_VERSION = fitness_v11_58 to force a clean Optuna study.
   - N_TRIALS = 400 and OOS_TOP_K = 10 tuned for deeper search with tighter
@@ -19,13 +16,11 @@ CHANGES:
   old Michaelis-Menten ceiling while still compressing extremes.
 - forced_cash_penalty no longer affects fitness and is always emitted as 0.0
   in diagnostics for observability compatibility.
-- OOS selection now requires a secondary 2025+ holdout pass when available,
-  with fallback to the best Period-1 passer if no dual-period winner exists.
+- OOS selection uses a single primary OOS holdout tournament for final selection.
 - SEARCH_SPACE_BOUNDS widened substantially and now includes MAX_POSITIONS
   and SIGNAL_LAG_DAYS as optional optimization dimensions.
 """
 import argparse
-import functools
 import json
 import logging
 import os
@@ -93,81 +88,7 @@ TRAIN_START = "2019-01-01"
 TRAIN_END   = "2025-12-31"
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
-TEST_START_2 = "2025-01-01"
 TRAIN_END_STALENESS_THRESHOLD_MONTHS = 6
-
-
-def _resolve_period_2_end(
-    env_cutoff: str | None = None,
-    *,
-    today: pd.Timestamp | None = None,
-) -> str:
-    """
-    Resolve the Period-2 OOS end date.
-
-    Critical guardrail: the previous hard-coded default ("2024-12-31") sat
-    before TEST_START_2 ("2025-01-01"), which made the secondary holdout
-    window invalid by default and forced every optimization run into the
-    single-period fallback path. We now default to today's UTC date (clamped
-    to at least TEST_START_2), and we also clamp invalid env overrides that
-    point before the Period-2 start.
-    """
-    start_ts = pd.Timestamp(TEST_START_2)
-
-    if env_cutoff not in (None, ""):
-        try:
-            cutoff_ts = pd.Timestamp(env_cutoff)
-        except (ValueError, TypeError):
-            logger.warning(
-                "Invalid OPTIMIZER_OOS_CUTOFF %r; using %s instead.",
-                env_cutoff,
-                TEST_START_2,
-            )
-            return TEST_START_2
-
-        if cutoff_ts < start_ts:
-            logger.warning(
-                "OPTIMIZER_OOS_CUTOFF %s is before Period-2 start %s; clamping to %s.",
-                cutoff_ts.strftime("%Y-%m-%d"),
-                TEST_START_2,
-                TEST_START_2,
-            )
-            cutoff_ts = start_ts
-        return cutoff_ts.strftime("%Y-%m-%d")
-
-    today_ts = today if today is not None else pd.Timestamp.now("UTC").replace(tzinfo=None)
-    if getattr(today_ts, "tzinfo", None) is not None:
-        today_ts = today_ts.tz_convert(None)
-    today_ts = pd.Timestamp(today_ts).normalize()
-    return max(today_ts, start_ts).strftime("%Y-%m-%d")
-
-
-def _get_test_end_2() -> str:
-    """
-    Lazily resolve the Period-2 OOS end date.
-
-    FIX-BUG-7: the original module-level assignment
-        TEST_END_2 = _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
-    called pd.Timestamp.utcnow() at import time, firing a Pandas4Warning on every
-    import of this module — including every test run that does
-    `optimizer = pytest.importorskip("optimizer")`.  The fix defers evaluation
-    to first use so imports are warning-free.
-
-    Value origin/caching: _get_test_end_2 delegates to the lru_cache-decorated
-    _get_test_end_2_cached(), which calls _resolve_period_2_end() exactly once
-    per process cache lifetime. That means OPTIMIZER_OOS_CUTOFF is read on the
-    first invocation only; later env-var changes are ignored unless
-    _get_test_end_2_cached.cache_clear() is called (or the process restarts).
-    """
-    # lru_cache(maxsize=1) gives process-lifetime memoization. It is safe under
-    # concurrency here because all threads resolve the same deterministic value
-    # for a given environment snapshot; duplicate first-call races are benign.
-    return _get_test_end_2_cached()
-
-
-@functools.lru_cache(maxsize=1)
-def _get_test_end_2_cached() -> str:
-    return _resolve_period_2_end(os.environ.get("OPTIMIZER_OOS_CUTOFF"))
 
 N_TRIALS = 400
 
@@ -789,18 +710,10 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     _pre_load_cfg        = cfg if cfg is not None else UltimateConfig()
     _actual_warmup_start = _compute_warmup_start(TRAIN_START, _pre_load_cfg)
-    # FIX-BUG-13: fetch data through the Period-2 OOS horizon, not just TEST_END.
-    # Previously required_end=TEST_END ("2024-12-31") meant the P2 backtest
-    # (TEST_START_2="2025-01-01" to TEST_END_2=today) always ran on an empty price
-    # matrix — every trial vacuously failed P2 and the optimizer permanently fell
-    # back to "P1-ONLY" mode, defeating the dual-period holdout entirely.
-    test_end_2 = _get_test_end_2()
-    if os.environ.get("OPTIMIZER_OOS_CUTOFF"):
-        logger.debug("Using dynamic OPTIMIZER_OOS_CUTOFF for Period-2 end date: %s", test_end_2)
-    _fetch_end = max(TEST_END, test_end_2)
+    _fetch_end           = TEST_END
     logger.info(
-        "Fetching %d symbols from %s (warmup) to %s (covers P1=%s and P2=%s)...",
-        len(symbols_to_fetch), _actual_warmup_start, _fetch_end, TEST_END, test_end_2,
+        "Fetching %d symbols from %s (warmup) to %s...",
+        len(symbols_to_fetch), _actual_warmup_start, _fetch_end,
     )
     kwargs = dict(
         tickers        = symbols_to_fetch,
@@ -1207,100 +1120,17 @@ def run_optimization(
         )
 
     oos_results_list.sort(key=lambda x: x[0], reverse=True)
+    best_p1_calmar, best_oos_trial, best_oos_params, best_oos_metrics = oos_results_list[0]
 
-    test_end_2 = _get_test_end_2()
-    print(f"\n\033[1;36m=== PERIOD-2 OOS HOLDOUT — {TEST_START_2} → {test_end_2} ===\033[0m")
-    print(f"\033[90mA trial must pass BOTH periods to be selected as winner.\033[0m\n")
-
-    dual_pass_list = []
-    valid_fields = UltimateConfig.__dataclass_fields__
-
-    for p1_calmar, p1_trial, p1_params, p1_metrics in oos_results_list:
-        p2_cfg = UltimateConfig()
-        resolved_cfg = p1_trial.user_attrs.get("resolved_cfg", {})
-        for k, v in resolved_cfg.items():
-            if k in valid_fields:
-                setattr(p2_cfg, k, v)
-        for k, v in p1_params.items():
-            if k in valid_fields:
-                setattr(p2_cfg, k, v)
-
-        try:
-            p2_result  = run_backtest(
-                market_data          = market_data,
-                precomputed_matrices = precomputed_matrices,
-                universe_type        = universe_type,
-                start_date           = TEST_START_2,
-                end_date             = test_end_2,
-                cfg                  = p2_cfg,
-            )
-            p2_m       = p2_result.metrics
-            p2_calmar  = p2_m.get("calmar", 0.0)
-            p2_maxdd   = p2_m.get("max_dd", -100.0)
-            p2_passes  = p2_calmar > 0.5 and abs(p2_maxdd) <= OOS_MAX_DD_CAP
-
-            status = (
-                "\033[32mPASS\033[0m" if p2_passes else
-                "\033[33mNEAR\033[0m" if p2_calmar > 0.5 and abs(p2_maxdd) <= OOS_SOFT_MAX_DD_CAP else
-                "\033[31mFAIL\033[0m"
-            )
-            print(
-                f"  Trial #{p1_trial.number:>5}  "
-                f"P1 Calmar {p1_calmar:>6.2f}  "
-                f"P2 Calmar {p2_calmar:>6.2f}  "
-                f"P2 MaxDD {abs(p2_maxdd):>6.1f}%  "
-                f"{status}"
-            )
-
-            if p2_passes:
-                dual_pass_list.append(
-                    (p1_calmar, p2_calmar, p1_trial, p1_params, p1_metrics, p2_m)
-                )
-
-        except Exception as exc:
-            print(
-                f"  Trial #{p1_trial.number:>5}  "
-                f"P1 Calmar {p1_calmar:>6.2f}  "
-                f"P2: \033[31mERROR: {exc}\033[0m"
-            )
-
-    if dual_pass_list:
-        dual_pass_list.sort(
-            key=lambda x: (2 * x[0] * x[1]) / max(x[0] + x[1], 1e-9),
-            reverse=True,
-        )
-        (best_p1_calmar, best_p2_calmar,
-         best_oos_trial, best_oos_params,
-         best_oos_metrics, _) = dual_pass_list[0]
-        winning_mode = "DUAL"
-    else:
-        logger.warning(
-            "[Optimizer] No trial passed both OOS periods. "
-            "Falling back to best Period-1 passer. "
-            "Consider running more trials or expanding search bounds."
-        )
-        print(
-            f"\n\033[1;33m[WARNING] No dual-period passer found. "
-            f"Selecting best Period-1 passer as fallback.\033[0m"
-        )
-        oos_results_list.sort(key=lambda x: x[0], reverse=True)
-        best_p1_calmar, best_oos_trial, best_oos_params, best_oos_metrics = (
-            oos_results_list[0]
-        )
-        best_p2_calmar = 0.0
-        winning_mode   = "P1-ONLY"
-
-    print(f"\n\033[1;32m=== OOS TOURNAMENT WINNER ({winning_mode}) ===\033[0m")
+    print(f"\n\033[1;32m=== OOS TOURNAMENT WINNER (SINGLE PERIOD) ===\033[0m")
     print(
         f"  Trial      : #{best_oos_trial.number}  "
         f"(IS score {best_oos_trial.value:.4f})"
     )
-    print(f"  P1 Calmar  : {best_p1_calmar:.2f}")
-    if winning_mode == "DUAL":
-        print(f"  P2 Calmar  : {best_p2_calmar:.2f}")
-    print(f"  P1 CAGR    : {best_oos_metrics.get('cagr', 0):.2f}%")
-    print(f"  P1 MaxDD   : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
-    print(f"  P1 Sharpe  : {best_oos_metrics.get('sharpe', 0):.2f}")
+    print(f"  OOS Calmar : {best_p1_calmar:.2f}")
+    print(f"  OOS CAGR   : {best_oos_metrics.get('cagr', 0):.2f}%")
+    print(f"  OOS MaxDD  : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
+    print(f"  OOS Sharpe : {best_oos_metrics.get('sharpe', 0):.2f}")
     print(f"\n  Winning Parameters:")
     for k, v in best_oos_params.items():
         print(f"    {k}: \033[33m{v}\033[0m")
@@ -1308,8 +1138,7 @@ def run_optimization(
     save_optimal_config(best_oos_params)
     print(
         f"\n\033[1;32m[PASS]\033[0m OOS tournament complete "
-        f"({'dual-period' if winning_mode == 'DUAL' else 'single-period fallback'}) "
-        f"parameters saved."
+        f"(single-period) parameters saved."
     )
 
 
