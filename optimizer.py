@@ -57,6 +57,11 @@ if hasattr(sys.stdout, "reconfigure"):
 logger = logging.getLogger("Optimizer")
 
 
+def _utc_today() -> pd.Timestamp:
+    """Return current UTC date as timezone-naive midnight timestamp."""
+    return pd.Timestamp.now("UTC").tz_convert(None).normalize()
+
+
 def configure_optimizer_logging(color: bool = True) -> None:
     """Call once from __main__ before any optimizer work begins."""
     load_dotenv_safe()
@@ -70,8 +75,10 @@ def configure_optimizer_logging(color: bool = True) -> None:
     # Staleness check: warn if TRAIN_END is more than 6 months behind today.
     # This is advisory only — behavior and results are never altered.
     # To extend the training window, update TRAIN_END above and re-run the optimizer.
-    _days_stale = (pd.Timestamp.now("UTC").tz_convert(None).normalize() - pd.Timestamp(TRAIN_END)).days
-    if _days_stale > 183:
+    _today = _utc_today()
+    _train_end_ts = pd.Timestamp(TRAIN_END)
+    _days_stale = (_today - _train_end_ts).days
+    if _today > _train_end_ts + pd.DateOffset(months=6):
         logger.warning(
             "TRAIN_END=%s is %d days behind today. Optimizer results remain "
             "reproducible but exclude recent data. Update TRAIN_END in "

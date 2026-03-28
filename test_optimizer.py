@@ -50,7 +50,8 @@ def test_train_end_staleness_warning_emitted_after_configure(caplog, monkeypatch
     """Warning must reach the log — i.e. fire after handlers are installed."""
     import optimizer
 
-    monkeypatch.setattr(optimizer, "TRAIN_END", "2024-12-31")
+    monkeypatch.setattr(optimizer, "TRAIN_END", "2020-01-01")
+    monkeypatch.setattr(optimizer, "_utc_today", lambda: pd.Timestamp("2020-09-01"))
     with caplog.at_level(logging.WARNING, logger="Optimizer"):
         optimizer.configure_optimizer_logging(color=False)
 
@@ -65,6 +66,20 @@ def test_train_end_staleness_does_not_raise():
     import optimizer
 
     optimizer.configure_optimizer_logging(color=False)
+
+
+def test_train_end_staleness_warning_not_emitted_when_fresh(caplog, monkeypatch):
+    import optimizer
+
+    monkeypatch.setattr(optimizer, "TRAIN_END", "2020-01-01")
+    monkeypatch.setattr(optimizer, "_utc_today", lambda: pd.Timestamp("2020-02-01"))
+    with caplog.at_level(logging.WARNING, logger="Optimizer"):
+        optimizer.configure_optimizer_logging(color=False)
+
+    assert not any(
+        "TRAIN_END" in record.message and "days behind" in record.message
+        for record in caplog.records
+    )
 
 
 def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
