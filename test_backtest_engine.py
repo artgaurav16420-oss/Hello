@@ -224,6 +224,59 @@ def test_run_backtest_custom_universe_requires_recent_contiguous_volume():
     assert captured["universe_by_rebalance_date"][pd.Timestamp("2020-01-13")] == set()
 
 
+def test_run_backtest_accepts_precomputed_bare_columns_for_ns_universe(monkeypatch):
+    cfg = UltimateConfig(REBALANCE_FREQ="D")
+    idx = pd.DatetimeIndex([pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
+
+    market_data = {
+        "AAA.NS": pd.DataFrame(
+            {
+                "Close": [10.0, 11.0],
+                "Adj Close": [10.0, 11.0],
+                "Open": [10.0, 11.0],
+                "High": [10.0, 11.0],
+                "Low": [10.0, 11.0],
+                "Volume": [1000.0, 1200.0],
+                "Dividends": [0.0, 0.0],
+                "Stock Splits": [0.0, 0.0],
+            },
+            index=idx,
+        ),
+        "^NSEI": pd.DataFrame({"Close": [1.0, 1.0]}, index=idx),
+    }
+
+    precomputed = {
+        "close": pd.DataFrame({"AAA": [10.0, 11.0]}, index=idx),
+        "close_adj": pd.DataFrame({"AAA": [10.0, 11.0]}, index=idx),
+        "open": pd.DataFrame({"AAA": [10.0, 11.0]}, index=idx),
+        "high": pd.DataFrame({"AAA": [10.0, 11.0]}, index=idx),
+        "low": pd.DataFrame({"AAA": [10.0, 11.0]}, index=idx),
+        "dividends": pd.DataFrame({"AAA": [0.0, 0.0]}, index=idx),
+        "splits": pd.DataFrame({"AAA": [0.0, 0.0]}, index=idx),
+        "volume": pd.DataFrame({"AAA": [1000.0, 1200.0]}, index=idx),
+        "returns": pd.DataFrame({"AAA": [0.0, 0.1]}, index=idx),
+    }
+
+    captured = {}
+
+    def _fake_run(self, close, volume, returns, rebalance_dates, start_date, **kwargs):
+        captured["columns"] = list(close.columns)
+        return pd.DataFrame({"equity": pd.Series(dtype=float)})
+
+    import unittest.mock as mock
+    with mock.patch.object(be.BacktestEngine, "run", _fake_run):
+        be.run_backtest(
+            market_data=market_data,
+            precomputed_matrices=precomputed,
+            start_date="2020-01-01",
+            end_date="2020-01-02",
+            cfg=cfg,
+            universe=["AAA.NS"],
+        )
+
+    assert captured["columns"] == ["AAA.NS"]
+
+
 def test_backtest_run_handles_empty_close_dataframe():
     cfg = UltimateConfig()
     engine = InstitutionalRiskEngine(cfg)
