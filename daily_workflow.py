@@ -863,7 +863,7 @@ def _run_scan(
         # are forward-filled consistently for every column.
         # Bound forward fill to avoid carrying very old quotes too far forward.
         # Convert stale-day allowance to row-count (daily OHLCV cadence => 1 row/day).
-        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", 2))
+        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", cfg.DEFAULT_MAX_PRICE_STALE_DAYS))
         limit_rows = max(1, max_stale_days)
         close    = close.ffill(axis=0, limit=limit_rows)
         close    = close.loc[close.index <= pd.Timestamp(end_date)]
