@@ -14,7 +14,7 @@ The project includes both live/paper workflow orchestration and historical resea
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-lock.txt
 ```
 
 ## Configuration
