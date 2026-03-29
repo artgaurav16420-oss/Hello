@@ -49,10 +49,6 @@ BUG FIXES (murder board):
 
 from __future__ import annotations
 
-# OSQP must be imported BEFORE numpy/pandas on some Windows/3.13/NumPy2.x builds
-# to avoid silent process termination due to ABI initialisation ordering.
-import osqp
-
 import hashlib
 import logging
 import warnings
@@ -62,6 +58,7 @@ from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+import osqp
 import scipy.sparse as sp
 from sklearn.covariance import LedoitWolf
 
@@ -570,17 +567,6 @@ def compute_one_way_slip_rate(
         else portfolio_value
 
     impact_rate = (cfg.IMPACT_COEFF * numerator) / float(adv_notional)
-    # [PHASE 2 FIX] H-02: Log when the 5% market-impact cap is binding.
-    # Without this, positions sized against the cap leave no audit trail,
-    # making it impossible to distinguish genuine slippage from the cap.
-    if impact_rate >= 0.05:
-        logger.debug(
-            "[Slippage] Impact cap binding: raw impact=%.4f%% capped to 5.00%% "
-            "(trade_notional=%.0f adv_notional=%.0f)",
-            impact_rate * 100,
-            numerator if numerator else 0.0,
-            adv_notional,
-        )
     return max(base_rate, min(0.05, impact_rate))
 
 
@@ -1609,7 +1595,7 @@ class InstitutionalRiskEngine:
             self._solver.setup(
                 P_upper, q, A, l, u,
                 verbose=False, eps_abs=1e-4, eps_rel=1e-4,
-                polishing=True, adaptive_rho=True, max_iter=50000,  # [PHASE 2 FIX] C-04: polish→polishing (deprecated)
+                polish=True, adaptive_rho=True, max_iter=50000,
                 warm_starting=True,
             )
             self._solver_shape = current_shape
@@ -1701,15 +1687,7 @@ class InstitutionalRiskEngine:
             t_cvar            = T_cvar,
         )
 
-        # [PHASE 2 FIX] C-02: Widen post-solve tolerance from EPSILON (1e-6)
-        # to POST_SOLVE_TOL (1e-4) to match OSQP's eps_abs/eps_rel convergence
-        # guarantee.  A solution feasible to 1e-5 is within the solver's
-        # tolerance but was being rejected by the tighter 1e-6 check, causing
-        # false OptimizationErrors, incrementing consecutive_failures, and
-        # triggering decay cascades on perfectly valid solutions.
-        POST_SOLVE_TOL = 1e-4
-
-        if physical_cvar > self.cfg.CVAR_DAILY_LIMIT + POST_SOLVE_TOL:
+        if physical_cvar > self.cfg.CVAR_DAILY_LIMIT + EPSILON:
             raise OptimizationError(
                 f"Physical CVaR {physical_cvar:.4%} exceeds hard limit "
                 f"{self.cfg.CVAR_DAILY_LIMIT:.4%} (solver reported {solver_cvar:.4%}, "
@@ -1719,11 +1697,11 @@ class InstitutionalRiskEngine:
 
         # Post-solve constraint verification (especially important for
         # "solved inaccurate" statuses): validate box bounds and gross budget.
-        lower_hard = float(np.min(w_opt)) < -POST_SOLVE_TOL
-        upper_hard = bool(np.any(w_opt > (adv_limit + POST_SOLVE_TOL)))
+        lower_hard = float(np.min(w_opt)) < -EPSILON
+        upper_hard = bool(np.any(w_opt > (adv_limit + EPSILON)))
         gross = float(np.sum(w_opt))
-        gross_low_hard = gross < (l_gamma - POST_SOLVE_TOL)
-        gross_high_hard = gross > (u_gamma + POST_SOLVE_TOL)
+        gross_low_hard = gross < (l_gamma - EPSILON)
+        gross_high_hard = gross > (u_gamma + EPSILON)
 
         near_tol = 1e-7
         if float(np.min(w_opt)) < near_tol:

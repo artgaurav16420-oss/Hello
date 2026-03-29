@@ -86,7 +86,7 @@ class ScanContext:
         )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         elapsed = time.monotonic() - self.start_time
         status  = "error" if exc_type else "ok"
         logging.getLogger(__name__).info(
@@ -103,7 +103,6 @@ class ScanContext:
         )
         _local.correlation_id = self._prev_id
         _local.scan_label     = self._prev_label
-        return False  # do not suppress exceptions
 
 
 # ─── Dead-letter tracker ─────────────────────────────────────────────────────
@@ -315,6 +314,7 @@ def configure_logging(
     log_file: Optional[str] = None,
     max_bytes: int = 50 * 1024 * 1024,   # 50 MB
     backup_count: int = 5,
+    force: bool = True,
 ) -> None:
     """
     Configure the root logger for production use.
@@ -328,6 +328,11 @@ def configure_logging(
                   stdout is used.
     max_bytes:    Rotating file max size in bytes (default 50 MB).
     backup_count: Number of rotated files to keep (default 5).
+    force:        If True (default), remove all existing root handlers before
+                  installing new ones — the normal production behaviour.  Set to
+                  False in test environments where pytest installs its own log-
+                  capture handler that must not be dropped.  When False, this
+                  function is a no-op if the root logger already has handlers.
 
     Call once at process entry-point::
 
@@ -337,7 +342,13 @@ def configure_logging(
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Remove any handlers added by basicConfig or pytest capture
+    # LC-01: honour the force flag so test environments can retain their own
+    # capture handlers.  In production (force=True, the default) we unconditionally
+    # replace any handlers added by basicConfig, a previous configure_logging call,
+    # or pytest.  When force=False, skip setup entirely if handlers already exist.
+    if not force and root.handlers:
+        return
+
     for h in list(root.handlers):
         root.removeHandler(h)
 

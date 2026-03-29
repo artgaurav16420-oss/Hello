@@ -144,7 +144,7 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9]))
     monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
     monkeypatch.setattr(dw, "execute_rebalance", lambda *args, **kwargs: 0.0)
 
@@ -152,8 +152,8 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
         import numpy as np
         # FIX-MB2-TESTGATENAMES: Use renamed keys from FIX-MB-GATENAMES.
         # "history_gated"/"adv_gated"/"knife_gated" → "history_failed"/"adv_failed"/"knife_failed"
-        return np.array([0.0, 0.01]), np.array([0.0, 1.0]), [1], {
-            "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 1, "selected": 1
+        return np.array([0.01]), np.array([1.0]), [0], {
+            "total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1
         }
 
     monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
@@ -488,7 +488,7 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
 
 def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
-    stale_idx = pd.date_range("2024-01-01", periods=3)
+    stale_idx = pd.date_range("2024-01-01", periods=4)
     md = {
         "ABC.NS": pd.DataFrame({"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)}, index=stale_idx),
         "FRESH.NS": pd.DataFrame({"Close": [100.0] * len(idx), "Dividends": [0.0] * len(idx)}, index=idx),
@@ -544,7 +544,7 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
 
 def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(monkeypatch, caplog):
     idx = pd.date_range("2024-01-01", periods=6)
-    stale_idx = pd.date_range("2024-01-01", periods=3)
+    stale_idx = pd.date_range("2024-01-01", periods=4)
     md = {
         "ABC.NS": pd.DataFrame(
             {"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)},

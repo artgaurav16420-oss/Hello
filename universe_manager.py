@@ -521,10 +521,10 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             )
 
     if chunk_failures:
-        failed_symbol_preview = [
-            symbol
+        failed_symbol_preview: list[str] = [
+            str(symbol)
             for failure in chunk_failures
-            for symbol in failure["symbols"][:3]
+            for symbol in (failure["symbols"] if isinstance(failure["symbols"], list) else [failure["symbols"]])[:3]
         ][:6]
         preview_txt = ", ".join(failed_symbol_preview) if failed_symbol_preview else "n/a"
         raise UniverseFetchError(
@@ -734,7 +734,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                             # Wrap Session.request so every call carries the timeout,
                             # regardless of which yfinance code path invokes it.
                             _orig_request = _session.request
-                            _session.request = lambda method, url, **kwargs: _orig_request(
+                            _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
                                 method, url,
                                 timeout=kwargs.pop("timeout", _timeout),
                                 **kwargs,
@@ -748,9 +748,9 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                         return sym, None
 
                 with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
-                    for sym, sector in pool.map(_fetch_single_sector, missing_tickers):
+                    for sym, sector in pool.map(_fetch_single_sector, missing_tickers):  # type: ignore[assignment]
                         if sector is not None:
-                            resolved_map[sym] = sector
+                            resolved_map[sym] = str(sector)
 
         # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
             if use_cache:

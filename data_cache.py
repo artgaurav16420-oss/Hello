@@ -161,10 +161,9 @@ class GrowwProvider(DataProvider):
     def __enter__(self) -> "GrowwProvider":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb) -> None:
         # FIX-GROWW-SESSION-LEAK: always close on context-manager exit.
         self.close()
-        return False
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
@@ -197,7 +196,7 @@ class GrowwProvider(DataProvider):
         _RATE_LIMITED sentinel on HTTP 429 so the caller can back off.
         """
         session = self._get_session()
-        params = {
+        params: Dict[str, str | int] = {
             "exchange":           "NSE",
             "segment":            "CASH",
             "groww_symbol":       f"NSE-{groww_symbol}",
@@ -1047,7 +1046,7 @@ def load_or_fetch(
     for t, df in list(market_data.items()):
         if df.empty:
             continue
-        market_data[t] = df.loc[:required_end]
+        market_data[t] = df.loc[:pd.Timestamp(required_end)]
 
     return market_data
 

@@ -79,6 +79,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+# OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
+# a silent ABI crash (exit code 0xC0000005). momentum_engine imports osqp,
+# but by the time Python resolves that import numpy is already loaded — too late.
+import osqp  # noqa: F401
+
 import numpy as np
 import pandas as pd
 
@@ -104,10 +109,10 @@ from universe_manager import (
     get_historical_universe,
     UniverseFetchError,
 )
-from data_cache import get_cache_summary, invalidate_cache, load_or_fetch
+from data_cache import load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
-from log_config import ScanContext, DeadLetterTracker, current_correlation_id
+from log_config import ScanContext, DeadLetterTracker
 
 __version__ = "11.48"
 
@@ -141,9 +146,10 @@ def _save_circuit_breaker_count(n: int) -> None:
     try:
         os.makedirs("data", exist_ok=True)
         tmp = _CIRCUIT_BREAKER_FILE + ".tmp"
-        pathlib.Path(tmp).write_text(
-            json.dumps({"consecutive_empty": n}), encoding="utf-8"
-        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"consecutive_empty": n}))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, _CIRCUIT_BREAKER_FILE)
     except Exception as _exc:
         logger.warning("Could not persist circuit breaker count: %s", _exc)
@@ -289,7 +295,7 @@ def _scrape_screener(base_url: str) -> List[str]:
 
     _TIMEOUT = (5, 30)
 
-    symbols = set()
+    symbols: set[str] = set()
     page = 1
     max_pages = 50
 
@@ -322,7 +328,7 @@ def _scrape_screener(base_url: str) -> List[str]:
 
             before_count = len(symbols)
             for link in links:
-                match = re.search(r'/company/([^/]+)/', link['href'])
+                match = re.search(r'/company/([^/]+)/', str(link['href']))
                 if match:
                     symbols.add(match.group(1).upper())
 
@@ -447,7 +453,54 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             continue
 
         if getattr(cfg, "AUTO_ADJUST_PRICES", True):
+            # [PHASE 2 FIX] C-03: When AUTO_ADJUST_PRICES=True, yfinance
+            # already adjusts historical Close/Adj Close prices for splits.
+            # However, yfinance does NOT adjust our state.shares — that is
+            # the engine's responsibility.  The original `continue` here
+            # skipped ALL split logic, so any stock split would leave share
+            # counts un-adjusted while prices were halved, silently halving
+            # the portfolio value and potentially triggering CVaR cascades.
+            #
+            # Fix: use the explicit `Stock Splits` column (always present in
+            # yfinance data) to detect split events and adjust shares/entry
+            # accordingly.  Guard against double-application via the
+            # dividend_ledger marker keyed by date:ratio.
+            if "Stock Splits" in row.columns:
+                split_series = row["Stock Splits"].fillna(0.0)
+                positive_splits = split_series[split_series > 0]
+                if not positive_splits.empty and sym in state.shares:
+                    # Determine which splits are new (not yet applied)
+                    for split_date, split_val in positive_splits.items():
+                        split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
+                        marker_key = f"split:{sym}"
+                        last_marker = state.dividend_ledger.get(marker_key, "")
+                        event_id = f"{split_date_str}:{split_val:.8f}"
+                        if event_id == last_marker:
+                            continue  # already applied — skip
+
+                        old_shares = state.shares[sym]
+                        theoretical = old_shares * split_val
+                        new_shares = int(np.floor(theoretical + 1e-12))
+                        old_entry = state.entry_prices.get(sym, current_price * split_val)
+                        new_entry = old_entry / split_val
+
+                        fractional = max(0.0, theoretical - new_shares)
+                        one_way_slip = (cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000.0
+                        fractional_value = fractional * current_price * max(0.0, 1.0 - one_way_slip)
+                        state.cash = round(state.cash + fractional_value, 10)
+
+                        logger.warning(
+                            "SPLIT DETECTED (adj-price mode): %s ratio=%.6f "
+                            "shares %d→%d entry ₹%.2f→₹%.2f",
+                            sym, split_val, old_shares, new_shares, old_entry, new_entry,
+                        )
+                        state.shares[sym] = new_shares
+                        state.entry_prices[sym] = round(new_entry, 4)
+                        state.dividend_ledger[marker_key] = event_id
+                        adjusted.append(sym)
+
             state.last_known_prices[sym] = current_price
+            continue
 
         split_ratio = 0.0
         if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
@@ -555,10 +608,19 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             with open(tmp, "w") as f:
                 json.dump(risk_payload, f, indent=2, sort_keys=True)
                 f.flush()
+                # [PHASE 2 FIX] Windows fsync safely skips dir flushing, but
+                # file-level fsync remains strictly POSIX-compliant locally via fd.
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
         except Exception as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
+            # [PHASE 2 FIX] Patch Paper Mode Persistence Race Condition:
+            # Guarantee orphaned .tmp files are reliably cleaned on os.replace failures.
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         return
 
     os.makedirs("data", exist_ok=True)
@@ -618,7 +680,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
         # a remounted read-only filesystem). Without finally, a raised exception
         # would leave the fd open indefinitely, exhausting the process fd table.
         if os.name == "posix":
-            dir_fd = os.open("data", os.O_DIRECTORY)
+            dir_fd = os.open("data", getattr(os, "O_DIRECTORY", 0))
             try:
                 os.fsync(dir_fd)
             finally:
@@ -759,7 +821,6 @@ def _run_scan(
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
 ) -> tuple:
-    global _CONSECUTIVE_EMPTY_SCANS  # PROD-FIX-3: circuit breaker counter
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
 
@@ -792,7 +853,7 @@ def _run_scan(
             logger.info(
                 "[Scan] Cadence gate active: last rebalance %s, next due %s (%s). Scan will mark-to-market only.",
                 state.last_rebalance_date,
-                next_due.strftime("%Y-%m-%d"),
+                next_due.strftime("%Y-%m-%d") if next_due else "None",
                 cfg.REBALANCE_FREQ,
             )
 
@@ -863,14 +924,9 @@ def _run_scan(
         # are forward-filled consistently for every column.
         # Bound forward fill to avoid carrying very old quotes too far forward.
         # Convert stale-day allowance to row-count (daily OHLCV cadence => 1 row/day).
-        # FIX-PROD-MAXSTALE-DEFAULT: Some persisted/optimized configs are loaded
-        # into UltimateConfig instances that do not define
-        # DEFAULT_MAX_PRICE_STALE_DAYS. Falling back directly to that attribute
-        # raises AttributeError and aborts the scan before signal generation.
-        # Keep compatibility with older/newer config shapes by resolving both
-        # attributes defensively and defaulting to the policy baseline (2 days).
-        default_max_stale_days = int(getattr(cfg, "DEFAULT_MAX_PRICE_STALE_DAYS", 2))
-        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", default_max_stale_days))
+        # CC-01: Now that MAX_PRICE_STALE_DAYS is structurally defined in
+        # UltimateConfig, we can simplify this without fearing AttributeError.
+        max_stale_days = int(getattr(cfg, "MAX_PRICE_STALE_DAYS", 2))
         limit_rows = max(1, max_stale_days)
         close    = close.ffill(axis=0, limit=limit_rows)
         close    = close.loc[close.index <= pd.Timestamp(end_date)]
@@ -938,7 +994,10 @@ def _run_scan(
         initial_cash = state.cash
         initial_gross_exposure = mtm_notional / pv if pv > 0 else 1.0
     
-        close_hist    = close.iloc[:-1]
+        today_ts = pd.Timestamp(end_date)
+        # DW-03: Date-based T-1 exclusion handles pre-market/holiday boundaries better
+        # than positional .iloc[:-1], which could accidentally exclude T-2 if today is missing.
+        close_hist = close.loc[close.index < today_ts]
         regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
         log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
         adv_arr       = compute_adv(market_data, active, cfg=cfg)
@@ -1165,6 +1224,20 @@ def _run_scan(
                 # forced liquidation scenario.
                 if not _force_full_cash:
                     apply_decay = False
+
+            # [PHASE 2 FIX] Stale Price Gate Bypass: Ensure forced liquidation handling
+            # holds stale/halted symbols at their current weight, bypassing sell-orders
+            # so CVaR execution avoids fake realizations at stale prices.
+            if _rebalance_stale_held and (_force_full_cash or apply_decay):
+                from momentum_engine import to_ns
+                for _s_bare, _ in _rebalance_stale_held:
+                    _s = to_ns(_s_bare)
+                    if _s in active_idx:
+                        _s_idx = active_idx[_s]
+                        _s_shares = state.shares.get(_s, 0)
+                        _s_px = max(float(prices[_s_idx]), 1e-6)
+                        _mtm_w = (_s_shares * _s_px) / max(pv, 1.0)
+                        weights[_s_idx] = _mtm_w
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
@@ -1312,7 +1385,7 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
             "entry": entry, "weight": weight, "notional": notional, "pnl": pnl,
         })
 
-    rows.sort(key=lambda x: x["weight"], reverse=True)
+    rows.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)  # type: ignore[arg-type]
     c_pipe = f"{C.GRY}│{C.RST}"
 
     print(f"  {C.GRY}┌──────────────┬─────────┬───────────┬───────────┬────────┬─────────────┬─────────────┐{C.RST}")
@@ -1325,8 +1398,9 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
 
     for r in rows:
-        pnl_raw   = f"₹{r['pnl']:+,.0f}" if np.isfinite(r["pnl"]) else "n/a"
-        pnl_color = C.B_GRN if r["pnl"] > 0 else (C.B_RED if r["pnl"] < 0 else C.RST)
+        _pnl_val = float(r['pnl'])  # type: ignore[arg-type]
+        pnl_raw   = f"₹{_pnl_val:+,.0f}" if np.isfinite(_pnl_val) else "n/a"
+        pnl_color = C.B_GRN if _pnl_val > 0 else (C.B_RED if _pnl_val < 0 else C.RST)
         print(
             f"  {c_pipe} {C.BLD}{r['sym']:<12}{C.RST} {c_pipe} {r['shares']:>7,d} "
             f"{c_pipe} {r['price']:>9,.2f} {c_pipe} {r['entry']:>9,.2f} "
@@ -1463,6 +1537,7 @@ def main_menu() -> None:
         if c == "1":
             _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
             cfg = load_optimized_config()
+            _universe: list[str] | None
             try:
                 _universe = fetch_nse_equity_universe()
             except UniverseFetchError as e:
@@ -1536,7 +1611,7 @@ def main_menu() -> None:
 
         elif c == "4":
             print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
-            print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+            print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
             bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
             if not bt_c:
                 continue
@@ -1636,7 +1711,7 @@ def main_menu() -> None:
 
         elif c == "6":
             print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
-            print(f"  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+            print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
             p_c = _prompt_menu_choice(f"  {C.CYN}Choice: {C.RST}", ["1", "2", "3"])
             if not p_c:
                 continue

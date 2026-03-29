@@ -30,6 +30,11 @@ from typing import List, Optional
 import io as _io_mod
 import time as _time_mod
 
+# OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
+# a silent ABI crash (exit code 0xC0000005). momentum_engine imports osqp,
+# but by the time Python resolves that import numpy is already loaded — too late.
+import osqp  # noqa: F401
+
 import numpy as np
 import pandas as pd
 import requests
@@ -118,22 +123,25 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
     """GET with exponential backoff. Returns Response or None on failure."""
     session = requests.Session()
     try:
-        session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    for attempt in range(retries):
         try:
-            resp = session.get(url, headers=NSE_HEADERS, timeout=20)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                return resp
-            logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
-        except Exception as exc:
-            logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
-        if attempt < retries - 1:
-            time.sleep(delay * (attempt + 1))
-    return None
+            session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        for attempt in range(retries):
+            try:
+                resp = session.get(url, headers=NSE_HEADERS, timeout=20)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    return resp
+                logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
+            except Exception as exc:
+                logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+        return None
+    finally:
+        session.close()
 
 
 # ─── Wayback Machine PIT fetch ───────────────────────────────────────────────
@@ -443,16 +451,19 @@ def build_parquet(
     output_path = DATA_DIR / f"historical_{universe_type}.parquet"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
+    # BHF-02: use UTC-normalised date instead of local today() to ensure consistency
+    # with the rest of the engine's TZ-naive UTC timestamps.
+    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
     if snapshot_dates.empty:
-        snapshot_dates = pd.DatetimeIndex([pd.Timestamp.today().normalize()])
+        snapshot_dates = pd.DatetimeIndex([today_utc])
 
     logger.info(
         "  Building %d volume-gated snapshots from %s → today for %d symbols.",
         len(snapshot_dates), start_date, len(valid_trading_days.columns),
     )
 
-    rows = []
+    rows: list[list[str]] = []
     for d in snapshot_dates:
         past_data = valid_trading_days[valid_trading_days.index <= d]
         if past_data.empty:
@@ -478,7 +489,8 @@ def build_csv_from_symbols(
 ) -> Path:
     """Write the companion CSV incorporating strict volume existence gates."""
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
-    snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
+    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
 
     csv_rows = []
     for d in snapshot_dates:
@@ -505,7 +517,8 @@ def _build_adnv_ranked_snapshots(
     snap_freq: str = "QS",
 ) -> pd.DataFrame:
     """Build quarterly PIT rows using ADNV ranking over available candidate symbols."""
-    snapshot_dates = pd.date_range(start=start_date, end=pd.Timestamp.today(), freq=snap_freq)
+    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
     rows: list[list[str]] = []
 
     for d in snapshot_dates:
@@ -527,7 +540,7 @@ def _build_adnv_ranked_snapshots(
             except Exception:
                 continue
 
-        ranked = sorted(scores, key=scores.get, reverse=True)[:top_n]
+        ranked = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n]
         rows.append(ranked)
 
     return pd.DataFrame({"tickers": rows}, index=pd.DatetimeIndex(snapshot_dates, name="date"))

@@ -180,6 +180,16 @@ def compute_regime_score(
                     sma_vals = recent_valid.mean()
                     last_valid = _hist.iloc[-1][valid]
                     breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
+                else:
+                    # S-02: symmetric DEBUG log for full-history path when no
+                    # symbols pass the validity filter (mirrors FIX-MB-L-02 for
+                    # the short-history branch). Allows operators to correlate a
+                    # neutral breadth signal with data gaps in the close matrix.
+                    logger.debug(
+                        "[Signals] Full-history breadth: no symbols passed validity filter "
+                        "(obs_count >= %d && last.notna()); breadth_component defaulting to 0.5.",
+                        min_obs,
+                    )
             else:
                 # FIX-MB2-BREADTHNONE: proportional floor, min 5 rows.
                 min_obs = max(5, int(np.ceil(len(_hist) * 0.8)))
@@ -239,8 +249,15 @@ def _check_market_crash(
     min_recent_breadth = float(breadth_history.min())
     if current_breadth < 0.35:
         return 0.0
+    # S-03: when breadth recently pierced 0.35 but has recovered to [0.35, 0.50),
+    # return 0.5 (early-warning cap) rather than 0.0 (full shutdown).  A single
+    # historical spike below 0.35 in the 15-day window previously kept the
+    # portfolio at zero exposure even after breadth fully recovered, because the
+    # condition returned 0.0 regardless of the recovery trajectory.  Using 0.5
+    # here matches the intent of the early-warning tier: the market is healing
+    # but should remain cautious, not fully liquidated.
     if min_recent_breadth < 0.35 and current_breadth < 0.50:
-        return 0.0
+        return 0.5
     if current_breadth < 0.45:
         return 0.5
     return None
@@ -301,7 +318,7 @@ def compute_adv(
 
     notional_df = pd.DataFrame(notional_cols)
     if target_date is not None:
-        notional_df = notional_df.loc[:target_date]
+        notional_df = notional_df.loc[:pd.Timestamp(target_date)]
 
     if notional_df.empty:
         return np.zeros(len(active_symbols), dtype=float)
@@ -314,8 +331,16 @@ def compute_adv(
     adv_last_row = adv_last_row.where(valid_counts >= min_periods, other=0.0)
 
     def _safe_adv(sym: str) -> float:
-        x = adv_last_row.get(sym, 0.0)
-        return float(x) if np.isfinite(x) else 0.0
+        # S-01: adv_last_row.get() can return pd.NA for symbols that were never
+        # in notional_cols; pd.NA is not recognised as a float by np.isfinite
+        # (raises TypeError on older NumPy).  Cast to float first, treating NA
+        # as 0.0 so the ADV gate treats the symbol as illiquid.
+        raw = adv_last_row.get(sym, 0.0)
+        try:
+            x = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return x if np.isfinite(x) else 0.0
 
     return np.array([_safe_adv(sym) for sym in active_symbols], dtype=float)
 
@@ -368,6 +393,19 @@ def generate_signals(
                 signal_lag_days, len(log_rets),
             )
         signal_log_rets = log_rets
+
+    # [PHASE 2 FIX] C-01: Guard against empty signal_log_rets after lag
+    # truncation.  When SIGNAL_LAG_DAYS >= len(log_rets) the slice produces an
+    # empty DataFrame.  Without this guard, the .iloc[-1] call below crashes
+    # with IndexError ("single positional indexer is out-of-bounds").
+    # Raise SignalGenerationError so callers' existing except handlers
+    # (backtest_engine line 364, daily_workflow line 1047) treat this as a
+    # recoverable data error and freeze state rather than crash the process.
+    if signal_log_rets.empty:
+        raise SignalGenerationError(
+            f"no valid data after lag truncation: SIGNAL_LAG_DAYS={signal_lag_days} "
+            f"consumed all {len(log_rets)} available rows"
+        )
 
     fast_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_FAST).mean().iloc[-1].values
     slow_ema = signal_log_rets.ewm(halflife=cfg.HALFLIFE_SLOW).mean().iloc[-1].values
@@ -526,13 +564,18 @@ def generate_signals(
                 )
 
                 passes_continuity_liquidity = np.isfinite(adv_arr[i]) and adv_arr[i] >= continuity_min_adv
-                continuity_eligible = has_recent_activity or passes_continuity_liquidity
 
+                # S-04: removed the `or not continuity_eligible` clause. The variable
+                # `continuity_eligible = has_recent_activity or passes_continuity_liquidity`
+                # was dead code: `not continuity_eligible` fires only when BOTH
+                # has_recent_activity=False AND passes_continuity_liquidity=False, but
+                # `not passes_continuity_liquidity` already covers that superset.
+                # Policy: skip if stale (halted data) OR illiquid (ADV gate).
                 if is_stale:
                     stale_denied += 1
                 if not passes_continuity_liquidity:
                     liquidity_denied += 1
-                if is_stale or not passes_continuity_liquidity or not continuity_eligible:
+                if is_stale or not passes_continuity_liquidity:
                     continue
 
                 decay = float(np.clip(prev_w / max(cfg.CONTINUITY_MAX_HOLD_WEIGHT, 1e-6), 0.25, 1.0))

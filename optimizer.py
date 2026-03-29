@@ -28,9 +28,15 @@ import sys
 import tempfile
 import warnings
 
+# OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
+# a silent ABI crash (exit code 0xC0000005). momentum_engine imports osqp,
+# but by the time Python resolves that import numpy is already loaded — too late.
+import osqp  # noqa: F401
+
 import numpy as np
 import pandas as pd
 import optuna
+from typing import Any
 from optuna.samplers import TPESampler
 
 
@@ -145,7 +151,7 @@ def _stdout_supports_rupee(stdout=None) -> bool:
 def _build_sampler() -> TPESampler:
     if OPTUNA_SEED in (None, ""):
         return TPESampler(n_ei_candidates=24, multivariate=True)
-    return TPESampler(seed=int(OPTUNA_SEED), n_ei_candidates=24, multivariate=True)
+    return TPESampler(seed=int(str(OPTUNA_SEED)), n_ei_candidates=24, multivariate=True)
 
 
 def _normalize_universe_type(universe_type: str | None) -> str:
@@ -393,20 +399,20 @@ class MomentumObjective:
         if len(halflife_fast_bounds) == 3:
             halflife_fast_min, halflife_fast_max, halflife_fast_step = halflife_fast_bounds
         else:
-            halflife_fast_min, halflife_fast_max = halflife_fast_bounds
+            halflife_fast_min, halflife_fast_max = halflife_fast_bounds[:2]
             halflife_fast_step = 1
 
         if len(halflife_slow_bounds) == 3:
             halflife_slow_min, halflife_slow_max, halflife_slow_step = halflife_slow_bounds
         else:
-            halflife_slow_min, halflife_slow_max = halflife_slow_bounds
+            halflife_slow_min, halflife_slow_max = halflife_slow_bounds[:2]
             halflife_slow_step = 1
 
         cfg.HALFLIFE_FAST = trial.suggest_int(
-            "HALFLIFE_FAST", halflife_fast_min, halflife_fast_max, step=halflife_fast_step
+            "HALFLIFE_FAST", int(halflife_fast_min), int(halflife_fast_max), step=int(halflife_fast_step)
         )
         cfg.HALFLIFE_SLOW = trial.suggest_int(
-            "HALFLIFE_SLOW", halflife_slow_min, halflife_slow_max, step=halflife_slow_step
+            "HALFLIFE_SLOW", int(halflife_slow_min), int(halflife_slow_max), step=int(halflife_slow_step)
         )
 
         if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
@@ -438,7 +444,7 @@ class MomentumObjective:
             cfg.CVAR_LOOKBACK = max(UltimateConfig().CVAR_LOOKBACK, effective_cvar_lb_min)
         else:
             cfg.CVAR_LOOKBACK = trial.suggest_int(
-                "CVAR_LOOKBACK", effective_cvar_lb_min, cvar_lb_max, step=cvar_lb_step
+                "CVAR_LOOKBACK", int(effective_cvar_lb_min), int(cvar_lb_max), step=int(cvar_lb_step)
             )
 
         _mp_bounds = self.search_space.get("MAX_POSITIONS")
@@ -715,7 +721,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         "Fetching %d symbols from %s (warmup) to %s...",
         len(symbols_to_fetch), _actual_warmup_start, _fetch_end,
     )
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         tickers        = symbols_to_fetch,
         required_start = _actual_warmup_start,
         required_end   = _fetch_end,
@@ -865,7 +871,7 @@ def run_optimization(
         )
         effective_n_jobs = 1
 
-    print(f"\n\033[1;36m=== INSTITUTIONAL TIME-SERIES CV OPTIMIZER ===\033[0m")
+    print("\n\033[1;36m=== INSTITUTIONAL TIME-SERIES CV OPTIMIZER ===\033[0m")
     print(f"\033[90mIn-Sample (Train) : {TRAIN_START} to {TRAIN_END}\033[0m")
     print(f"\033[90mOut-of-Sample     : {TEST_START} to {TEST_END}\033[0m")
     print(f"\033[90mTrials            : {N_TRIALS}\033[0m\n")
@@ -897,17 +903,7 @@ def run_optimization(
         storage        = effective_storage,
         load_if_exists = True,
     )
-    my_starting_params = {
-        "HALFLIFE_FAST": 50,
-        "HALFLIFE_SLOW": 150,
-        "CONTINUITY_BONUS": 0.1,
-        "RISK_AVERSION": 11.0,
-        "CVAR_DAILY_LIMIT": 0.08,
-        "CVAR_LOOKBACK": 120,
-        "MAX_POSITIONS": 20,
-        "SIGNAL_LAG_DAYS": 12,
-        "MIN_EXPOSURE_FLOOR": 0.1
-    }
+
 
     objective = MomentumObjective(
         market_data,
@@ -969,7 +965,7 @@ def run_optimization(
             n_trials          = N_TRIALS,
             show_progress_bar = True,
             n_jobs            = effective_n_jobs,
-            catch             = (OptimizationError,),
+            catch             = (Exception,),
             callbacks         = [_best_trial_callback],
         )
     except Exception:
@@ -993,7 +989,7 @@ def run_optimization(
     best_params     = best_trial.params
     best_is_fitness = study.best_value
 
-    print(f"\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
+    print("\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
     print(f"\033[1mBest Fitness Score (IS):\033[0m {best_is_fitness:.4f}")
     print("\033[1mWinning Parameters:\033[0m")
     for k, v in best_params.items():
@@ -1003,7 +999,7 @@ def run_optimization(
     completed = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
     if completed:
         top10 = sorted(completed, key=lambda t: t.value if t.value is not None else -999, reverse=True)[:10]
-        print(f"\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
+        print("\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
         print(f"\033[90m{'Trial':>6}  {'Score':>7}  {'AvgCAGR':>8}  {'AvgDD':>7}  {'CeilHits':>9}  {'DDGate':>7}\033[0m")
         print(f"\033[90m{'─'*58}\033[0m")
         for t in top10:
@@ -1030,7 +1026,7 @@ def run_optimization(
     # ── OOS Top-K tournament ─────────────────────────────────────────────────
     print(f"\n\033[1;36m=== INITIATING OUT-OF-SAMPLE (OOS) VALIDATION — TOP-{OOS_TOP_K} TOURNAMENT ===\033[0m")
     print(f"\033[90mEvaluating top {OOS_TOP_K} IS trials on unseen data {TEST_START} -> {TEST_END}\033[0m")
-    print(f"\033[90mWinner = best OOS Calmar (not best IS score)\033[0m")
+    print("\033[90mWinner = best OOS Calmar (not best IS score)\033[0m")
     print(f"\033[90mPASS   = Calmar > 0.5  AND  MaxDD <= {OOS_MAX_DD_CAP:.0f}%\033[0m")
     print(f"\033[90mNEAR   = Calmar > 0.5  AND  MaxDD <= {OOS_SOFT_MAX_DD_CAP:.0f}%  (diagnostic only)\033[0m\n")
 
@@ -1041,7 +1037,6 @@ def run_optimization(
         save_optimal_config(best_params)
         return
 
-    _rs          = "\u20b9" if _stdout_supports_rupee() else "Rs."
     valid_fields = UltimateConfig.__dataclass_fields__
 
     print(
@@ -1122,7 +1117,13 @@ def run_optimization(
     oos_results_list.sort(key=lambda x: x[0], reverse=True)
     best_p1_calmar, best_oos_trial, best_oos_params, best_oos_metrics = oos_results_list[0]
 
-    print(f"\n\033[1;32m=== OOS TOURNAMENT WINNER (SINGLE PERIOD) ===\033[0m")
+    # OPT-02: save the full resolved_cfg from the winning trial so that parameters
+    # outside the search space (e.g. CVAR_HARD_BREACH_MULTIPLIER) are not lost.
+    # Overlay the trial.params on top just in case they differ.
+    final_oos_params = best_oos_trial.user_attrs.get("resolved_cfg", {}).copy()
+    final_oos_params.update(best_oos_params)
+
+    print("\n\033[1;32m=== OOS TOURNAMENT WINNER (SINGLE PERIOD) ===\033[0m")
     print(
         f"  Trial      : #{best_oos_trial.number}  "
         f"(IS score {best_oos_trial.value:.4f})"
@@ -1131,14 +1132,14 @@ def run_optimization(
     print(f"  OOS CAGR   : {best_oos_metrics.get('cagr', 0):.2f}%")
     print(f"  OOS MaxDD  : {abs(best_oos_metrics.get('max_dd', 0)):.2f}%")
     print(f"  OOS Sharpe : {best_oos_metrics.get('sharpe', 0):.2f}")
-    print(f"\n  Winning Parameters:")
-    for k, v in best_oos_params.items():
+    print("\n  Winning Parameters:")
+    for k, v in final_oos_params.items():
         print(f"    {k}: \033[33m{v}\033[0m")
 
-    save_optimal_config(best_oos_params)
+    save_optimal_config(final_oos_params)
     print(
-        f"\n\033[1;32m[PASS]\033[0m OOS tournament complete "
-        f"(single-period) parameters saved."
+        "\n\033[1;32m[PASS]\033[0m OOS tournament complete "
+        "(single-period) parameters saved."
     )
 
 

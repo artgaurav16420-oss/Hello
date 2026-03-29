@@ -303,8 +303,7 @@ class BacktestEngine:
         )
         prev_w_dict = _build_prev_weights(self.state, active_symbols, pv)
 
-        _idx_ok      = idx_df is not None and not (hasattr(idx_df, "empty") and idx_df.empty)
-        idx_slice    = idx_df.loc[:signal_date] if _idx_ok else None
+        idx_slice    = idx_df.loc[:signal_date] if idx_df is not None and not getattr(idx_df, "empty", False) else None
         regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date])
 
         if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
@@ -550,7 +549,7 @@ def _build_adv_vector(
     cfg: Optional[UltimateConfig] = None,
 ) -> np.ndarray:
     adv = []
-    adv_zero_reasons = {
+    adv_zero_reasons: dict[str, list[str]] = {
         "missing_column": [],
         "empty_lookback": [],
         "nonfinite_mean": [],
@@ -1006,7 +1005,6 @@ def run_backtest(
         if not matrices:
             raise ValueError("No valid symbols found in market_data for the dynamic historical universe.")
         close = matrices["close"]
-        close_adj = matrices["close_adj"]
         open_px = matrices["open"]
         high_px = matrices["high"]
         low_px = matrices["low"]
@@ -1103,7 +1101,7 @@ def print_backtest_results(results: BacktestResults) -> None:
         print("\n  \033[31m[!] Backtest returned no metrics. Check date range.\033[0m")
         return
 
-    print(f"\n  \033[1;36mBACKTEST RESULTS\033[0m")
+    print("\n  \033[1;36mBACKTEST RESULTS\033[0m")
     print(f"  \033[90m{chr(9472)*65}\033[0m")
     sortino = m.get('sortino', 0)
     sortino_display = f"{sortino:.2f}" if np.isfinite(sortino) else "N/A"
