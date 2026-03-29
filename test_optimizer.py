@@ -1081,8 +1081,8 @@ def test_optimizer_osqp_setup_falls_back_to_polish_keyword(monkeypatch):
     class _FakeOSQP:
         def setup(self, _P, q, _A, _l, _u, **kwargs):
             calls.append(dict(kwargs))
-            if "polishing" in kwargs:
-                raise TypeError("unexpected keyword argument 'polishing'")
+            if "warm_starting" in kwargs:
+                raise TypeError("unexpected keyword argument 'warm_starting'")
             self._n_vars = len(q)
 
         def solve(self):
@@ -1103,7 +1103,9 @@ def test_optimizer_osqp_setup_falls_back_to_polish_keyword(monkeypatch):
     assert weights.shape == (2,)
     assert len(calls) == 2
     assert "polishing" in calls[0]
+    assert "warm_starting" in calls[0]
     assert "polish" in calls[1]
+    assert "warm_start" in calls[1]
 
 
 def test_objective_cvar_lookback_min_scales_with_dimensionality(monkeypatch):

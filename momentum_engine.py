@@ -1612,23 +1612,25 @@ class InstitutionalRiskEngine:
                 eps_rel=1e-4,
                 adaptive_rho=True,
                 max_iter=50000,
-                warm_starting=True,
             )
             try:
                 self._solver.setup(
                     P_upper, q, A, l, u,
                     polishing=True,
+                    warm_starting=True,
                     **setup_kwargs,
                 )
             except TypeError as exc:
                 # OSQP keyword differs across versions:
-                # - newer python package expects `polishing`
-                # - older python package expects `polish`
-                if "polishing" not in str(exc):
+                # - newer python package expects `polishing` + `warm_starting`
+                # - older python package expects `polish` + `warm_start`
+                msg = str(exc)
+                if ("polishing" not in msg) and ("warm_starting" not in msg):
                     raise
                 self._solver.setup(
                     P_upper, q, A, l, u,
                     polish=True,
+                    warm_start=True,
                     **setup_kwargs,
                 )
             self._solver_shape = current_shape
