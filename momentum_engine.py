@@ -457,6 +457,23 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PortfolioState":
+        """
+        Construct a PortfolioState from a plain dictionary, applying robust parsing and sensible defaults.
+        
+        Parses and coerces persisted fields from the input mapping `d` into a new PortfolioState instance. Accepts string/int/float representations where appropriate and applies the following behaviours for malformed or missing values:
+        - Fields listed in `PortfolioState.RISK_CONTROL_FIELDS` are treated as critical: parsing errors for these fields are recorded and logged at CRITICAL level, and the corresponding attributes are reset to their default values.
+        - `equity_hist_cap` and `max_absent_periods` accept `null`/`None` to indicate "no persisted override" and are returned as `None` in that case; an invalid `equity_hist_cap` value is logged as a non-critical warning and the default is used.
+        - Boolean fields accept common textual and numeric representations (`"true"`, `"false"`, `"1"`, `"0"`, `"yes"`, `"no"`, etc.); integer boolean flags must be 0 or 1.
+        - Non-negative integer fields are validated to be >= 0.
+        
+        Only keys present in the input dict are converted; missing keys leave attributes at their class defaults (or the explicitly documented default for a few fields). Parsing errors for non-risk-control fields are logged at ERROR level and those attributes are reset to defaults.
+        
+        Parameters:
+            d (dict): Mapping of persisted PortfolioState fields to values (typically produced by to_dict/from persistence).
+        
+        Returns:
+            PortfolioState: A newly constructed PortfolioState populated from `d`, with invalid fields reset to defaults and parsing errors logged.
+        """
         ps     = cls()
         errors: List[str] = []
         risk_control_errors: List[str] = []
@@ -478,17 +495,53 @@ class PortfolioState:
             raise TypeError(f"unsupported bool type: {type(value).__name__}")
 
         def _as_nonneg_int(value) -> int:
+            """
+            Validate and convert a value to a non-negative integer.
+            
+            Parameters:
+                value: Any object convertible to int.
+            
+            Returns:
+                int: The converted integer, guaranteed to be greater than or equal to zero.
+            
+            Raises:
+                ValueError: If the converted integer is negative.
+            """
             parsed = int(value)
             if parsed < 0:
                 raise ValueError(f"value must be non-negative, got {parsed}")
             return parsed
 
         def _as_optional_nonneg_int(value) -> Optional[int]:
+            """
+            Return `None` unchanged or convert the input to a non-negative integer.
+            
+            Parameters:
+                value: A value that is either `None` or convertible/parsable to a non-negative integer.
+            
+            Returns:
+                Optional[int]: `None` if `value` is `None`, otherwise the parsed non-negative integer.
+            """
             if value is None:
                 return None
             return _as_nonneg_int(value)
 
         def _get(key, converter, default):
+            """
+            Retrieve and convert a value from the surrounding dict `d`, returning `default` when the key is absent or conversion fails.
+            
+            Parameters:
+                key (str): Dictionary key to look up in `d`.
+                converter (Callable[[Any], Any]): Function applied to `d[key]` to produce the returned value.
+                default (Any): Value returned when `key` is not present or when conversion raises an exception.
+            
+            Returns:
+                Any: The converted value for `d[key]` when present and conversion succeeds, otherwise `default`.
+            
+            Side effects:
+                - On conversion exceptions, appends an error message ("{key}: {exception}") to either `risk_control_errors` (if `key` is in `cls.RISK_CONTROL_FIELDS`) or `errors`.
+                - If `key` equals `"equity_hist_cap"`, emits a warning via `logger` stating the field is invalid and that the default will be used.
+            """
             try:
                 return converter(d[key]) if key in d else default
             except Exception as exc:
