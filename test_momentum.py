@@ -1293,6 +1293,15 @@ class TestPortfolioState:
         assert ps.max_absent_periods is None
 
     @staticmethod
+    def test_portfolio_state_from_dict_none_presence_aware_caps_stay_none_without_errors(caplog):
+        with caplog.at_level(logging.ERROR, logger="momentum_engine"):
+            ps = PortfolioState.from_dict({"equity_hist_cap": None, "max_absent_periods": None})
+
+        assert ps.equity_hist_cap is None
+        assert ps.max_absent_periods is None
+        assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    @staticmethod
     def test_portfolio_state_from_dict_logs_warning_for_invalid_equity_hist_cap(caplog):
         with caplog.at_level(logging.WARNING, logger="momentum_engine"):
             ps = PortfolioState.from_dict({"equity_hist_cap": -5})
@@ -2039,4 +2048,3 @@ class TestWorkflowAndUtilities:
         assert not bt.state.shares, "Positions must be fully liquidated on decay exhaustion."
         assert bt.state.decay_rounds == 0, "decay_rounds must reset to 0."
         assert bt.state.consecutive_failures == 0, "consecutive_failures must reset to 0."
-
