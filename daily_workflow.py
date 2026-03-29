@@ -1229,7 +1229,6 @@ def _run_scan(
             # holds stale/halted symbols at their current weight, bypassing sell-orders
             # so CVaR execution avoids fake realizations at stale prices.
             if _rebalance_stale_held and (_force_full_cash or apply_decay):
-                from momentum_engine import to_ns
                 for _s_bare, _ in _rebalance_stale_held:
                     _s = to_ns(_s_bare)
                     if _s in active_idx:
