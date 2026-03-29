@@ -1013,7 +1013,7 @@ def run_backtest(
         volume = matrices["volume"]
         returns = matrices["returns"]
 
-    if close.empty or len(close.columns) == 0:
+    if close.empty:
         raise RuntimeError(
             "Backtest aborted: no tradable symbol price history was loaded. "
             "Please verify data providers/cache connectivity and try again."
