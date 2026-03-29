@@ -1013,6 +1013,19 @@ def run_backtest(
         volume = matrices["volume"]
         returns = matrices["returns"]
 
+    if close.empty or len(close.columns) == 0:
+        raise RuntimeError(
+            "Backtest aborted: no tradable symbol price history was loaded. "
+            "Please verify data providers/cache connectivity and try again."
+        )
+
+    symbols_with_data = int(close.notna().any(axis=0).sum())
+    if symbols_with_data == 0:
+        raise RuntimeError(
+            "Backtest aborted: downloaded price frames contain no usable close "
+            "data for the requested universe/date range."
+        )
+
     trading_index = pd.DatetimeIndex(close.index).sort_values()
     valid = []
     for target in all_target_dates:
@@ -1027,6 +1040,11 @@ def run_backtest(
         valid.append(eligible[-1])
 
     rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
+    if rebal_dates.empty:
+        raise RuntimeError(
+            "Backtest aborted: no valid rebalance dates intersect available "
+            "trading history in the requested window."
+        )
 
     # FIX-MB-SNAP: Apply the holiday-snap re-keying unconditionally.
     if universe_by_rebalance_date:
