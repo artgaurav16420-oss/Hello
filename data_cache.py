@@ -76,8 +76,35 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
     """
     out_buf = StringIO()
     err_buf = StringIO()
-    with redirect_stdout(out_buf), redirect_stderr(err_buf):
-        data = yf.download(*args, **kwargs)
+    yfinance_logger_names = {"yfinance"}
+    yfinance_logger_names.update(
+        name for name in logging.Logger.manager.loggerDict
+        if name == "yfinance" or name.startswith("yfinance.")
+    )
+
+    previous_logger_states: dict[str, tuple[int, bool, bool]] = {}
+    for name in yfinance_logger_names:
+        logger_obj = logging.getLogger(name)
+        previous_logger_states[name] = (
+            logger_obj.level,
+            logger_obj.propagate,
+            logger_obj.disabled,
+        )
+        # yfinance emits per-symbol fetch failures at ERROR level which can
+        # flood structured logs for large universes. Suppress these temporary
+        # noisy logs here and rely on our compact cache-level summaries.
+        logger_obj.setLevel(logging.CRITICAL + 1)
+        logger_obj.propagate = False
+
+    try:
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            data = yf.download(*args, **kwargs)
+    finally:
+        for name, (level, propagate, disabled) in previous_logger_states.items():
+            logger_obj = logging.getLogger(name)
+            logger_obj.setLevel(level)
+            logger_obj.propagate = propagate
+            logger_obj.disabled = disabled
 
     noisy_lines: list[str] = []
     for text in (out_buf.getvalue(), err_buf.getvalue()):
