@@ -965,6 +965,7 @@ def load_or_fetch(
     padded_start = (
         pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)
     ).strftime("%Y-%m-%d")
+    yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
 
     latest_bday = _latest_business_day()
 
@@ -996,6 +997,48 @@ def load_or_fetch(
 
     providers = _build_provider_chain(cfg)
     try:
+        def _retry_unresolved_individually(unresolved: List[str]) -> List[str]:
+            """
+            Retry unresolved symbols one-by-one through the full provider chain.
+
+            A chunk-level provider failure can drop many otherwise valid symbols
+            at once (for example when one problematic symbol poisons a batched
+            response). This best-effort pass limits blast radius by retrying
+            each unresolved symbol in isolation before stale-cache recovery.
+            Returns the still-missing tickers after individual retries.
+            """
+            still_missing: List[str] = []
+            if not unresolved:
+                return still_missing
+
+            for ticker in unresolved:
+                resolved = False
+                for provider in providers:
+                    try:
+                        raw_single = _download_with_timeout(
+                            [ticker], padded_start, yf_end, provider=provider
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Cache] Provider %s failed on individual retry for %s: %s",
+                            type(provider).__name__,
+                            ticker,
+                            exc,
+                        )
+                        raw_single = None
+
+                    if raw_single is None or raw_single.empty:
+                        continue
+
+                    saved = _process_chunk([ticker], raw_single, entries, market_data, cfg)
+                    if ticker in saved:
+                        resolved = True
+                        break
+
+                if not resolved:
+                    still_missing.append(ticker)
+            return still_missing
+
         if tickers_to_download:
             logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
             chunks = [
@@ -1007,8 +1050,7 @@ def load_or_fetch(
                 raw_data = None
                 for provider in providers:
                     try:
-                        _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
-                        raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
+                        raw_data = _download_with_timeout(chunk, padded_start, yf_end, provider=provider)
                     except Exception as exc:
                         logger.warning(
                             "[Cache] Provider %s failed for chunk starting with %s: %s",
@@ -1044,7 +1086,9 @@ def load_or_fetch(
                 # unresolved tickers (reassigned to missing_from_provider each pass),
                 # so a non-empty chunk is the correct and complete recovery signal.
                 if chunk:
-                    _recover_from_stale_cache(chunk, entries, market_data, cfg=cfg)
+                    unresolved_after_retry = _retry_unresolved_individually(chunk)
+                    if unresolved_after_retry:
+                        _recover_from_stale_cache(unresolved_after_retry, entries, market_data, cfg=cfg)
 
             # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
             # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
