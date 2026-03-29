@@ -932,9 +932,9 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
 
     chain.append(YFinanceProvider())
 
-    fallback_key = os.getenv("FALLBACK_API_KEY", "").strip()
-    if fallback_key:
-        chain.append(SecondaryProvider())
+    provider = SecondaryProvider()
+    if provider.api_key:
+        chain.append(provider)
     else:
         logger.info("[Cache] SecondaryProvider disabled (FALLBACK_API_KEY not set).")
 
