@@ -965,6 +965,7 @@ def load_or_fetch(
     padded_start = (
         pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)
     ).strftime("%Y-%m-%d")
+    yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
 
     latest_bday = _latest_business_day()
 
@@ -1014,9 +1015,8 @@ def load_or_fetch(
                 resolved = False
                 for provider in providers:
                     try:
-                        _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
                         raw_single = _download_with_timeout(
-                            [ticker], padded_start, _yf_end, provider=provider
+                            [ticker], padded_start, yf_end, provider=provider
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1050,8 +1050,7 @@ def load_or_fetch(
                 raw_data = None
                 for provider in providers:
                     try:
-                        _yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
-                        raw_data = _download_with_timeout(chunk, padded_start, _yf_end, provider=provider)
+                        raw_data = _download_with_timeout(chunk, padded_start, yf_end, provider=provider)
                     except Exception as exc:
                         logger.warning(
                             "[Cache] Provider %s failed for chunk starting with %s: %s",
