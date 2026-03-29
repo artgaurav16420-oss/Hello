@@ -1064,6 +1064,48 @@ def test_optimizer_turnover_penalty_respects_execution_floor_and_cap(monkeypatch
     assert turnover_q[1] == pytest.approx(0.05)
 
 
+def test_optimizer_osqp_setup_falls_back_to_polish_keyword(monkeypatch):
+    cfg = UltimateConfig()
+    engine = InstitutionalRiskEngine(cfg)
+    calls = []
+
+    class _FakeResInfo:
+        status = "solved"
+
+    class _FakeRes:
+        def __init__(self, n_vars):
+            self.info = _FakeResInfo()
+            self.x = np.zeros(n_vars, dtype=float)
+            self.x[:2] = 0.25
+
+    class _FakeOSQP:
+        def setup(self, _P, q, _A, _l, _u, **kwargs):
+            calls.append(dict(kwargs))
+            if "polishing" in kwargs:
+                raise TypeError("unexpected keyword argument 'polishing'")
+            self._n_vars = len(q)
+
+        def solve(self):
+            return _FakeRes(self._n_vars)
+
+    monkeypatch.setattr("momentum_engine.osqp.OSQP", _FakeOSQP)
+
+    hist = pd.DataFrame(np.tile([0.001, -0.001], (20, 1)), columns=["A", "B"])
+    weights = engine.optimize(
+        expected_returns=np.array([0.01, 0.01], dtype=float),
+        historical_returns=hist,
+        adv_shares=np.array([1e8, 1e8], dtype=float),
+        prices=np.array([100.0, 100.0], dtype=float),
+        portfolio_value=1_000_000.0,
+        prev_w=np.array([0.0, 0.0], dtype=float),
+    )
+
+    assert weights.shape == (2,)
+    assert len(calls) == 2
+    assert "polishing" in calls[0]
+    assert "polish" in calls[1]
+
+
 def test_objective_cvar_lookback_min_scales_with_dimensionality(monkeypatch):
     class _Result:
         metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}

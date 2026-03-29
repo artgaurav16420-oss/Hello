@@ -1606,12 +1606,31 @@ class InstitutionalRiskEngine:
 
         if not is_same_structure:
             self._solver = osqp.OSQP()
-            self._solver.setup(
-                P_upper, q, A, l, u,
-                verbose=False, eps_abs=1e-4, eps_rel=1e-4,
-                polishing=True, adaptive_rho=True, max_iter=50000,  # [PHASE 2 FIX] C-04: polish→polishing (deprecated)
+            setup_kwargs = dict(
+                verbose=False,
+                eps_abs=1e-4,
+                eps_rel=1e-4,
+                adaptive_rho=True,
+                max_iter=50000,
                 warm_starting=True,
             )
+            try:
+                self._solver.setup(
+                    P_upper, q, A, l, u,
+                    polishing=True,
+                    **setup_kwargs,
+                )
+            except TypeError as exc:
+                # OSQP keyword differs across versions:
+                # - newer python package expects `polishing`
+                # - older python package expects `polish`
+                if "polishing" not in str(exc):
+                    raise
+                self._solver.setup(
+                    P_upper, q, A, l, u,
+                    polish=True,
+                    **setup_kwargs,
+                )
             self._solver_shape = current_shape
             self._solver_nnz   = current_nnz
             self._solver_struct = (
