@@ -127,7 +127,11 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
 
 CACHE_DIR     = Path("data/cache")
 MANIFEST_FILE = CACHE_DIR / "_manifest.json"
-_DOWNLOAD_CHUNK_SIZE = 75
+# Large multi-ticker yfinance requests are brittle for mixed universes that
+# include newly listed/suspended symbols. Smaller chunks reduce the chance that
+# one malformed ticker poisons the whole batch and improves completion rates on
+# constrained retail connections.
+_DOWNLOAD_CHUNK_SIZE = 25
 
 
 def configure_data_cache(dotenv_path: Optional[Path] = None) -> None:
