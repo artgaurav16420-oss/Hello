@@ -483,6 +483,11 @@ class PortfolioState:
                 raise ValueError(f"value must be non-negative, got {parsed}")
             return parsed
 
+        def _as_optional_nonneg_int(value) -> Optional[int]:
+            if value is None:
+                return None
+            return _as_nonneg_int(value)
+
         def _get(key, converter, default):
             try:
                 return converter(d[key]) if key in d else default
@@ -495,6 +500,7 @@ class PortfolioState:
                         exc,
                         default,
                     )
+                    return default
                 if key in cls.RISK_CONTROL_FIELDS:
                     risk_control_errors.append(msg)
                 else:
@@ -511,8 +517,8 @@ class PortfolioState:
         ps.override_active      = _get("override_active",      _as_bool,                                        False)
         ps.override_cooldown    = _get("override_cooldown",    _as_nonneg_int,                                 0)
         ps.consecutive_failures = _get("consecutive_failures", _as_nonneg_int,                                 0)
-        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_nonneg_int,                                 None)  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
-        ps.max_absent_periods   = _get("max_absent_periods",   _as_nonneg_int,                                 None)
+        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_optional_nonneg_int,                        None)  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+        ps.max_absent_periods   = _get("max_absent_periods",   _as_optional_nonneg_int,                        None)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
