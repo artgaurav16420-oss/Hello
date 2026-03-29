@@ -236,3 +236,33 @@ def test_recover_from_stale_cache_logs_summary_not_per_symbol(tmp_path, monkeypa
     assert "Recovered 2 symbol(s) from stale local cache" in caplog.text
     assert "Using stale cached parquet for AAA.NS" not in caplog.text
     assert set(market_data.keys()) == {"AAA.NS", "BBB.NS"}
+
+
+def test_safe_yf_download_temporarily_mutes_yfinance_loggers(monkeypatch):
+    yf_logger = data_cache.logging.getLogger("yfinance")
+    child_logger = data_cache.logging.getLogger("yfinance.multi")
+    original_yf_level = yf_logger.level
+    original_yf_propagate = yf_logger.propagate
+    original_child_level = child_logger.level
+    original_child_propagate = child_logger.propagate
+
+    captured_states: dict[str, tuple[int, bool]] = {}
+
+    def _fake_download(*args, **kwargs):
+        captured_states["yfinance"] = (yf_logger.level, yf_logger.propagate)
+        captured_states["yfinance.multi"] = (child_logger.level, child_logger.propagate)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(data_cache.yf, "download", _fake_download)
+
+    out = data_cache._safe_yf_download(["ABC.NS"], start="2024-01-01", end="2024-01-31")
+
+    assert out.empty
+    assert captured_states["yfinance"][0] > data_cache.logging.CRITICAL
+    assert captured_states["yfinance.multi"][0] > data_cache.logging.CRITICAL
+    assert captured_states["yfinance"][1] is False
+    assert captured_states["yfinance.multi"][1] is False
+    assert yf_logger.level == original_yf_level
+    assert yf_logger.propagate == original_yf_propagate
+    assert child_logger.level == original_child_level
+    assert child_logger.propagate == original_child_propagate
