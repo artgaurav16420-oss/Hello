@@ -79,7 +79,7 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
     yfinance_logger_names = {"yfinance"}
     yfinance_logger_names.update(
         name for name in logging.Logger.manager.loggerDict
-        if name == "yfinance" or name.startswith("yfinance.")
+        if name.startswith("yfinance.")
     )
 
     previous_logger_states: dict[str, tuple[int, bool, bool]] = {}
