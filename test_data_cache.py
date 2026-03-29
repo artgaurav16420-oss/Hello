@@ -74,6 +74,20 @@ def test_secondary_provider_returns_none_without_api_key(monkeypatch):
     assert out is None
 
 
+
+
+def test_build_provider_chain_excludes_secondary_without_api_key(monkeypatch):
+    monkeypatch.delenv("FALLBACK_API_KEY", raising=False)
+    providers = data_cache._build_provider_chain()
+
+    assert not any(isinstance(p, data_cache.SecondaryProvider) for p in providers)
+
+
+def test_build_provider_chain_includes_secondary_with_api_key(monkeypatch):
+    monkeypatch.setenv("FALLBACK_API_KEY", "k")
+    providers = data_cache._build_provider_chain()
+
+    assert any(isinstance(p, data_cache.SecondaryProvider) for p in providers)
 def test_load_or_fetch_skips_symbols_on_chunk_failure(monkeypatch):
     monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
     monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)

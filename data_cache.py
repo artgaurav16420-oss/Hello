@@ -589,7 +589,11 @@ class SecondaryProvider(DataProvider):
 
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         if not self.api_key:
-            logger.warning("[Cache][Fallback] FALLBACK_API_KEY not set; skipping secondary provider.")
+            # This path is retained for direct unit use of SecondaryProvider.
+            # In production load_or_fetch, _build_provider_chain excludes this
+            # provider when FALLBACK_API_KEY is absent, preventing repeated
+            # per-chunk warnings.
+            logger.debug("[Cache][Fallback] FALLBACK_API_KEY not set; skipping secondary provider.")
             return None
 
         last_call_ts = 0.0
@@ -927,7 +931,13 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
         )
 
     chain.append(YFinanceProvider())
-    chain.append(SecondaryProvider())
+
+    fallback_key = os.getenv("FALLBACK_API_KEY", "").strip()
+    if fallback_key:
+        chain.append(SecondaryProvider())
+    else:
+        logger.info("[Cache] SecondaryProvider disabled (FALLBACK_API_KEY not set).")
+
     return chain
 
 
