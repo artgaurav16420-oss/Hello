@@ -603,8 +603,8 @@ def generate_signals(
     # counted enough valid bars across the full tail window.
     adj_scores = np.where(np.isnan(adj_scores), -np.inf, adj_scores)
     sorted_indices = np.argsort(adj_scores)
-    _n_pos = max(int(cfg.MAX_POSITIONS), 1)
-    top_n_indices = sorted_indices[-_n_pos:]
+    _n_pos = int(cfg.MAX_POSITIONS)
+    top_n_indices = sorted_indices[-_n_pos:] if _n_pos > 0 else np.array([], dtype=int)
 
     selected_indices = [
         int(idx) for idx in top_n_indices
