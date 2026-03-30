@@ -24,6 +24,7 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import time
 import random
 from pathlib import Path
@@ -113,6 +114,7 @@ NIFTY50_CORE = [
 ]
 
 _NSE_SESSION: "requests.Session | None" = None  # FIX-10
+_NSE_SESSION_LOCK = threading.Lock()
 
 
 # FIX-MB-DUPNS: Single canonical definition of _ns(). The original module had
@@ -126,14 +128,27 @@ def _ns(sym: str) -> str:
 def _get_nse_session() -> requests.Session:
     """Create and warm a singleton session for NSE requests."""
     global _NSE_SESSION
-    if _NSE_SESSION is None:  # FIX-10
-        _NSE_SESSION = requests.Session()  # FIX-10
-        try:
-            _NSE_SESSION.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)  # FIX-10
-            time.sleep(0.5)  # FIX-10
-        except Exception:
-            pass
+    with _NSE_SESSION_LOCK:
+        if _NSE_SESSION is None:  # FIX-10
+            _NSE_SESSION = requests.Session()  # FIX-10
+            try:
+                _NSE_SESSION.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)  # FIX-10
+                time.sleep(0.5)  # FIX-10
+            except Exception:
+                pass
     return _NSE_SESSION
+
+
+def _invalidate_nse_session() -> None:
+    """Close and invalidate the singleton session on connection failures."""
+    global _NSE_SESSION
+    with _NSE_SESSION_LOCK:
+        if _NSE_SESSION is not None:
+            try:
+                _NSE_SESSION.close()
+            except Exception:
+                pass
+            _NSE_SESSION = None
 
 
 def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optional[requests.Response]:
@@ -145,6 +160,11 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
             if resp.status_code == 200 and len(resp.content) > 100:
                 return resp
             logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
+        except requests.ConnectionError as exc:
+            logger.warning("  [%s] ConnectionError, invalidating session, attempt %d/%d", url[:60], attempt + 1, retries, exc_info=True)
+            _invalidate_nse_session()
+            if attempt < retries - 1:
+                session = _get_nse_session()
         except Exception as exc:
             logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
         if attempt < retries - 1:
@@ -193,7 +213,15 @@ def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
                 resume_key = None  # FIX-6
                 for row in rows[1:]:  # FIX-6
                     if len(row) == 1:  # FIX-6
-                        resume_key = row[0]  # FIX-6
+                        candidate = str(row[0]).strip()
+                        # Validate: not empty, not a timestamp (e.g., "20210131120000")
+                        if candidate and len(candidate) > 0:
+                            # Reject if it looks like a timestamp (8+ chars, first 4 are digits)
+                            if len(candidate) >= 8 and candidate[:4].isdigit():
+                                # This looks like a timestamp, not a resume key
+                                continue
+                            # Accept as resume key
+                            resume_key = candidate
                         continue
                     if len(row) >= 2 and row[1] == "200":  # FIX-6
                         ts = str(row[0]).strip()
@@ -354,6 +382,8 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
+        fd2 = None
+        tmp2 = None
         try:
             fd2, tmp_path2 = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
             tmp2 = Path(tmp_path2)
@@ -366,7 +396,7 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
                 path,
             )
         except Exception:
-            if tmp2.exists():
+            if tmp2 is not None and tmp2.exists():
                 tmp2.unlink(missing_ok=True)
             raise
 
@@ -410,7 +440,10 @@ def _compute_vol_gate_snapshots(
     to ensure consistent PIT timestamps across parquet and CSV outputs.
     """
     if end_date is None:
-        end_date = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     calendar_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
     trading_days_index = pd.DatetimeIndex(valid_trading_days.index)
 
@@ -566,6 +599,11 @@ def build_parquet(
     Create a PIT parquet from valid_trading_days by backfilling quarterly
     snapshots from start_date to today.
     """
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     assert all(
         s.endswith(".NS") or s.startswith("^") for s in valid_trading_days.columns
     ), "MB-15: all columns in valid_trading_days must be .NS-suffixed or index tickers"
@@ -621,6 +659,11 @@ def build_csv_from_symbols(
     end_date: "pd.Timestamp | None" = None,
 ) -> Path:
     """Write the companion CSV incorporating strict volume existence gates."""
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     snapshot_df = _compute_vol_gate_snapshots(  # FIX-15
         valid_trading_days=valid_trading_days,
@@ -651,7 +694,10 @@ def _build_adnv_ranked_snapshots(
 ) -> pd.DataFrame:
     """Build quarterly PIT rows using ADNV ranking over available candidate symbols."""
     if end_date is None:
-        end_date = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     snapshot_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
     rows: list[list[str]] = []
 
