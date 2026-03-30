@@ -1298,10 +1298,9 @@ def compute_book_cvar(
                     if nearest is not None:
                         vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
 
-            raw = np.array(
-                [np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds],
-                dtype=float,
-            )
+            # AFTER — one Generator per ghost symbol; draws all rows in a single vectorized call
+            rng = np.random.default_rng(int(sym_base_seed))
+            raw = rng.standard_normal(len(row_seeds))
             synth_rets = daily_drift + vol_series * raw
             rets.loc[:, sym] = synth_rets
 
