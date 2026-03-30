@@ -92,6 +92,8 @@ class BacktestEngine:
     def __init__(self, engine: InstitutionalRiskEngine, initial_cash: float = 1_000_000):
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
+        self._initial_cash       = float(initial_cash)
+        self.state._initial_cash = self._initial_cash
         self.state.equity_hist_cap = engine.cfg.EQUITY_HIST_CAP
         self.state.max_absent_periods = engine.cfg.MAX_ABSENT_PERIODS
         self.trades:  List[Trade]  = []
@@ -100,6 +102,7 @@ class BacktestEngine:
         self._rebal_rows: list     = []
 
     def _reset_run_state(self) -> None:
+        self.state.reset()
         self._eq_dates = []
         self._eq_vals = []
         self._rebal_rows = []
@@ -195,11 +198,10 @@ class BacktestEngine:
                     if pd.notna(div_val) and float(div_val) > 0:
                         self.state.cash = round(self.state.cash + float(div_val) * shares, 10)
 
-            price_dict = {
-                sym: prices_t[active_idx[sym]]
-                for sym in symbols
-                if pd.notna(close_t[sym])
-            }
+            close_vals = close_t.values
+            valid_mask = np.isfinite(close_vals)
+            valid_syms = [s for s, v in zip(symbols, valid_mask) if v]
+            price_dict = {s: prices_t[active_idx[s]] for s in valid_syms}
             self.state.record_eod(price_dict)
             post_pv = self.state.equity_hist[-1] if self.state.equity_hist else self.state.cash
 
@@ -238,7 +240,12 @@ class BacktestEngine:
             active_positions = [sym_to_global_idx[sym] for sym in active_symbols]
             active_prices = prices_t[active_positions]
 
-        prev_idx = close.index.get_loc(date) - 1
+        _loc = close.index.get_loc(date)
+        assert isinstance(_loc, (int, np.integer)), (
+            f"Duplicate timestamp {date} detected in close index. "
+            "Deduplicate the index in build_precomputed_matrices before running backtest."
+        )
+        prev_idx = _loc - 1
         if prev_idx < 0:
             return
         signal_date = close.index[prev_idx]
@@ -248,7 +255,9 @@ class BacktestEngine:
             .replace([np.inf, -np.inf], np.nan)
         )
 
-        adv_vector = _build_adv_vector(active_symbols, close, volume, date, cfg=cfg)
+        adv_vector, close_notional = _build_adv_vector(
+            active_symbols, close, volume, date, cfg=cfg, return_notional=True
+        )
 
         # FIX-ADV-GLITCH: A one-day data gap (missing volume for a liquid stock)
         # causes _build_adv_vector to return ADV=0, which the OSQP constraint
@@ -262,10 +271,7 @@ class BacktestEngine:
             if adv_vector[_adv_i] == 0.0 and self.state.shares.get(_adv_sym, 0) > 0:
                 if _adv_sym in close.columns and _adv_sym in volume.columns:
                     try:
-                        _c = close.loc[:signal_date, _adv_sym].dropna()
-                        _v = volume.loc[:signal_date, _adv_sym].dropna()
-                        _not = (_c * _v).clip(lower=0).dropna()
-                        _trail = _not.tail(_adv_lookback)
+                        _trail = close_notional[_adv_sym].iloc[-_adv_lookback:].clip(lower=0).dropna()
                         if not _trail.empty:
                             _fallback_adv = float(_trail.mean())
                             if _fallback_adv > 0:
@@ -547,8 +553,8 @@ def _build_adv_vector(
     volume: pd.DataFrame,
     date: pd.Timestamp,
     cfg: Optional[UltimateConfig] = None,
-) -> np.ndarray:
-    adv = []
+    return_notional: bool = False,
+) -> np.ndarray | tuple[np.ndarray, pd.DataFrame]:
     adv_zero_reasons: dict[str, list[str]] = {
         "missing_column": [],
         "empty_lookback": [],
@@ -585,35 +591,29 @@ def _build_adv_vector(
                     date,
                 )
 
-    for sym in symbols:
-        if sym in volume.columns and sym in close.columns and signal_date is not None:
-            try:
-                c_series = close.loc[:signal_date, sym]
-                v_series = volume.loc[:signal_date, sym]
-                notional = (c_series * v_series).clip(lower=0).dropna()
-                adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
-                lookback = notional.tail(adv_lookback)
-                if lookback.empty:
-                    adv.append(0.0)
-                    adv_zero_reasons["empty_lookback"].append(sym)
-                else:
-                    val = float(lookback.mean())
+    close_notional = pd.DataFrame(index=close.index if signal_date is None else close.loc[:signal_date].index)
+    adv = np.zeros(len(symbols), dtype=float)
+    if signal_date is not None:
+        close_sub = close.loc[:signal_date]
+        volume_sub = volume.loc[:signal_date]
+        common_cols = [s for s in symbols if s in close_sub.columns and s in volume_sub.columns]
+        if common_cols:
+            close_notional = (close_sub[common_cols] * volume_sub[common_cols]).clip(lower=0)
+            adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
+            adv_vector = close_notional.iloc[-adv_lookback:].mean(axis=0)
+            for i, sym in enumerate(symbols):
+                if sym in adv_vector.index:
+                    val = float(adv_vector[sym])
                     if np.isfinite(val):
-                        adv.append(val)
+                        adv[i] = val
                     else:
-                        adv.append(0.0)
                         adv_zero_reasons["nonfinite_mean"].append(sym)
-            except (KeyError, TypeError, ValueError, AttributeError, IndexError):
-                # Specific exceptions only — mirrors BUG-FIX-BROAD-EXCEPT in
-                # signals.py.  A bare 'except Exception' would silently swallow
-                # unexpected bugs (e.g. a pandas API change) and return ADV=0
-                # for all symbols, triggering the liquidity gate and forcing a
-                # total portfolio liquidation without a visible error trace.
-                adv.append(0.0)
-                adv_zero_reasons["exception"].append(sym)
+                else:
+                    adv_zero_reasons["missing_column"].append(sym)
         else:
-            adv.append(0.0)
-            adv_zero_reasons["missing_column"].append(sym)
+            adv_zero_reasons["missing_column"].extend(symbols)
+    else:
+        adv_zero_reasons["empty_lookback"].extend(symbols)
     if any(adv_zero_reasons.values()):
         reason_counts = {k: len(v) for k, v in adv_zero_reasons.items()}
         reason_samples = {k: v[:5] for k, v in adv_zero_reasons.items() if v}
@@ -623,7 +623,10 @@ def _build_adv_vector(
             reason_counts,
             reason_samples,
         )
-    return np.array(adv, dtype=float)
+    adv_out = np.array(adv, dtype=float)
+    if return_notional:
+        return adv_out, close_notional
+    return adv_out
 
 
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
@@ -659,12 +662,6 @@ def _execution_prices(
     if open_px is not None and date in open_px.index:
         opens = open_px.loc[date].reindex(symbols).values.astype(float)
         exec_px = np.where(np.isfinite(opens) & (opens > 0), opens, exec_px)
-
-    if high_px is not None and low_px is not None and date in high_px.index and date in low_px.index:
-        highs = high_px.loc[date].reindex(symbols).values.astype(float)
-        lows  = low_px.loc[date].reindex(symbols).values.astype(float)
-        vwap  = (highs + lows + close_prices) / 3.0
-        exec_px = np.where(np.isfinite(vwap) & (vwap > 0), vwap, exec_px)
 
     return exec_px
 
@@ -822,6 +819,9 @@ def build_precomputed_matrices(
         return {}
 
     close = pd.DataFrame(close_d).sort_index()
+    if not close.index.is_unique:
+        close = close[~close.index.duplicated(keep="last")]
+    close = close.dropna(how="all")
     shared_index = close.index
     close_adj = pd.DataFrame(close_adj_d).reindex(shared_index)
     open_df = pd.DataFrame(open_d).reindex(shared_index)
@@ -834,6 +834,17 @@ def build_precomputed_matrices(
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
+    returns = returns_base.pct_change(fill_method=None).clip(lower=-0.99)
+    assert (close.index == volume_df.index).all(), "close and volume index mismatch"
+    returns_matches = (
+        (len(returns.index) == len(close.index) and (close.index == returns.index).all())
+        or (
+            len(returns.index) == len(close.index) + 1
+            and (close.index == returns.index[1:]).all()
+        )
+    )
+    assert returns_matches, "close and returns index mismatch after clipping"
+
     return {
         "close": close,
         "close_adj": close_adj,
@@ -843,7 +854,7 @@ def build_precomputed_matrices(
         "dividends": dividends_df,
         "splits": splits_df,
         "volume": volume_df,
-        "returns": returns_base.pct_change(fill_method=None).clip(lower=-0.99),
+        "returns": returns,
     }
 
 
@@ -891,14 +902,21 @@ def run_backtest(
 
         if vol_dict:
             cum_vol_df = pd.DataFrame(vol_dict).sort_index()
+            pit_eligible_map = (
+                cum_vol_df
+                .reindex(cum_vol_df.index.union(all_target_dates))
+                .sort_index()
+                .ffill()
+                .reindex(all_target_dates)
+                >= history_gate
+            )
             for d in all_target_dates:
-                ts   = pd.Timestamp(d)
-                past = cum_vol_df[cum_vol_df.index <= ts]
-                if past.empty:
+                ts = pd.Timestamp(d)
+                if ts not in pit_eligible_map.index:
                     universe_by_rebalance_date[ts] = set()
                     continue
-                eligible = past.iloc[-1]
-                pit_syms = set(eligible[eligible >= history_gate].index.tolist())
+                eligible_row = pit_eligible_map.loc[ts]
+                pit_syms = set(eligible_row[eligible_row].index.tolist())
                 universe_by_rebalance_date[ts] = pit_syms & union_universe
                 logger.debug(
                     "[Backtest][MB-04] %s: %d/%d custom universe symbols pass PIT volume gate.",
@@ -980,14 +998,16 @@ def run_backtest(
             return pd.DataFrame({sym: _resolve_column(df, sym) for sym in selected}, index=df.index)
 
         close     = _select_with_universe_labels(_clip(matrices["close"]))
-        close_adj = _select_with_universe_labels(_clip(matrices["close_adj"]))
         open_px   = _select_with_universe_labels(_clip(matrices["open"]))
         high_px   = _select_with_universe_labels(_clip(matrices["high"]))
         low_px    = _select_with_universe_labels(_clip(matrices["low"]))
         dividends = _select_with_universe_labels(_clip(matrices["dividends"]))
         splits    = _select_with_universe_labels(_clip(matrices["splits"]))
         volume    = _select_with_universe_labels(_clip(matrices["volume"]))
-        returns   = _select_with_universe_labels(_clip(matrices["returns"]))
+        returns_raw = _clip(matrices["returns"])
+        clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
+        safe_start = returns_raw.index[max(int(clip_start_iloc), 1)]
+        returns = _select_with_universe_labels(returns_raw.loc[safe_start:pd.Timestamp(end_date)])
     else:
         # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
         # which kept almost every DataFrame (any series starting before warmup_start
@@ -1012,6 +1032,11 @@ def run_backtest(
         splits = matrices["splits"]
         volume = matrices["volume"]
         returns = matrices["returns"]
+
+    returns_raw = returns
+    clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
+    safe_start = returns_raw.index[max(int(clip_start_iloc), 1)]
+    returns = returns_raw.loc[safe_start:pd.Timestamp(end_date)]
 
     if close.empty:
         raise RuntimeError(
