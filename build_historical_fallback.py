@@ -366,9 +366,11 @@ def _compute_vol_gate_snapshots(
     history_gate: int,
     start_date: str,
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> "pd.DataFrame":
-    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
+    if end_date is None:
+        end_date = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+    snapshot_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
     rows = []
     for d in snapshot_dates:
         past = valid_trading_days[valid_trading_days.index <= d]
@@ -505,6 +507,7 @@ def build_parquet(
     history_gate: int,
     start_date: str = "2015-01-01",
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> Path:
     """
     Create a PIT parquet from valid_trading_days by backfilling quarterly
@@ -523,6 +526,7 @@ def build_parquet(
         history_gate=history_gate,
         start_date=start_date,
         snap_freq=snap_freq,
+        end_date=end_date,  # FIX-4
     )
     snapshot_dates = pd.DatetimeIndex(snapshot_df.index)
     trading_days = pd.DatetimeIndex(valid_trading_days.index)  # FIX-8
@@ -533,8 +537,8 @@ def build_parquet(
             aligned.append(prior[-1])
     snapshot_dates = pd.DatetimeIndex(sorted(set(aligned)), name="date")  # FIX-8
     if snapshot_dates.empty:
-        today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-        snapshot_dates = pd.DatetimeIndex([today_utc], name="date")
+        fallback_end = end_date if end_date is not None else pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        snapshot_dates = pd.DatetimeIndex([fallback_end], name="date")  # FIX-4
 
     rows = []
     for d in snapshot_dates:
@@ -561,6 +565,7 @@ def build_csv_from_symbols(
     history_gate: int,
     start_date: str = "2015-01-01",
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> Path:
     """Write the companion CSV incorporating strict volume existence gates."""
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
@@ -569,6 +574,7 @@ def build_csv_from_symbols(
         history_gate=history_gate,
         start_date=start_date,
         snap_freq=snap_freq,
+        end_date=end_date,  # FIX-4
     )
 
     csv_rows = []
@@ -594,10 +600,12 @@ def _build_adnv_ranked_snapshots(
     lookback_days: int = 126,
     min_trading_days: int = 60,
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> pd.DataFrame:
     """Build quarterly PIT rows using ADNV ranking over available candidate symbols."""
-    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
+    if end_date is None:
+        end_date = pd.Timestamp.now("UTC").tz_convert(None).normalize()
+    snapshot_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
     rows: list[list[str]] = []
 
     for d in snapshot_dates:
@@ -697,11 +705,14 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         skipped_none, skipped_empty, skipped_no_vol = [], [], []  # FIX-11
         for sym, df in market_data.items():
             if df is None:
-                skipped_none.append(sym); continue
+                skipped_none.append(sym)
+                continue
             if df.empty:
-                skipped_empty.append(sym); continue
+                skipped_empty.append(sym)
+                continue
             if "Volume" not in df.columns:
-                skipped_no_vol.append(sym); continue
+                skipped_no_vol.append(sym)
+                continue
             vol_dict[sym] = df["Volume"].replace(0, np.nan)
         logger.info(
             "[VolGate] Skipped — None: %d, empty: %d, no-Volume: %d. Included: %d.",
@@ -713,10 +724,10 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         valid_trading_days = vol_matrix.notna().cumsum()
 
         parquet_path = build_parquet(
-            "nifty500", valid_trading_days, history_gate, start_date
+            "nifty500", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
         build_csv_from_symbols(
-            "nifty500", valid_trading_days, history_gate, start_date
+            "nifty500", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
 
         if snapshots:
@@ -811,6 +822,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
                 market_data=market_data,
                 start_date=start_date,
                 top_n=500,
+                end_date=TODAY_UTC,  # FIX-4
             )
             non_empty = int(sum(bool(x) for x in adnv_df["tickers"]))
             if non_empty > 0:
@@ -904,11 +916,14 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         skipped_none, skipped_empty, skipped_no_vol = [], [], []  # FIX-11
         for sym, df in market_data.items():
             if df is None:
-                skipped_none.append(sym); continue
+                skipped_none.append(sym)
+                continue
             if df.empty:
-                skipped_empty.append(sym); continue
+                skipped_empty.append(sym)
+                continue
             if "Volume" not in df.columns:
-                skipped_no_vol.append(sym); continue
+                skipped_no_vol.append(sym)
+                continue
             vol_dict[sym] = df["Volume"].replace(0, np.nan)
         logger.info(
             "[VolGate] Skipped — None: %d, empty: %d, no-Volume: %d. Included: %d.",
@@ -921,10 +936,10 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         valid_trading_days = vol_matrix.notna().cumsum()
 
         parquet_path = build_parquet(
-            "nse_total", valid_trading_days, history_gate, start_date
+            "nse_total", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
         build_csv_from_symbols(
-            "nse_total", valid_trading_days, history_gate, start_date
+            "nse_total", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
 
         df_check = pd.read_parquet(parquet_path)
