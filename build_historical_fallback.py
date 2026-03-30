@@ -673,10 +673,27 @@ def build_csv_from_symbols(
         end_date=end_date,  # FIX-4
     )
 
+    # FIX-EMPTY-CSV: When snapshot_df is empty (no valid snapshots),
+    # apply the same fallback logic as build_parquet to ensure both
+    # artifacts describe the same build with consistent snapshot dates.
+    if snapshot_df.empty:
+        fallback_end = end_date if end_date is not None else pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        # Create a fallback snapshot with the fabricated date and empty ticker list.
+        # In CSV format, this is represented as a single row with the date and no ticker.
+        snapshot_df = pd.DataFrame(
+            {"tickers": [[]]},
+            index=pd.DatetimeIndex([fallback_end], name="date")
+        )
+
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
-        for sym in tickers:
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
+        if not tickers:
+            # Empty ticker list: emit one row with date and empty ticker field
+            # to indicate the snapshot date exists but has no members
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
+        else:
+            for sym in tickers:
+                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
 
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
