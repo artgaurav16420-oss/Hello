@@ -1007,7 +1007,7 @@ def execute_rebalance(
             cash_entitlements = (weights_arr / total_eligible_w) * residual_cash
             adv_limits_arr = np.full(len(eligible_syms), np.iinfo(np.int64).max, dtype=np.int64)
             if adv_shares is not None:
-                adv_notional_arr = np.array([float(adv_shares[i]) if i < len(adv_shares) else np.nan for i in idx_arr], dtype=float)
+                adv_notional_arr = adv_shares[idx_arr].astype(float)
             else:
                 adv_notional_arr = np.full(len(eligible_syms), np.nan, dtype=float)
             slip_rates = _compute_one_way_slip_rate_vectorized(
