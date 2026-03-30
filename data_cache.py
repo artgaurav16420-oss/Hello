@@ -156,7 +156,7 @@ def configure_data_cache(
             dotenv_path = candidate
             cache_dir = None
     load_dotenv_safe(dotenv_path)
-    resolved_cache_dir = cache_dir or Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
+    resolved_cache_dir = cache_dir or _DEFAULT_CACHE_DIR
     CACHE_DIR = Path(resolved_cache_dir)
     MANIFEST_FILE = CACHE_DIR / "_manifest.json"
     _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
