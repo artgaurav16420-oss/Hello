@@ -146,7 +146,7 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
 _WARNED_LOCK = threading.Lock()
 _MISSING_PARQUET_WARNED: set[str] = set()
 _NO_RECORD_WARNED: set[str] = set()
-_SECTOR_MAP_CACHE_LOCK = threading.Lock()
+_UNIVERSE_CACHE_FILE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE_LOCK = threading.Lock()
 _UNIVERSE_LOOKUP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
@@ -459,8 +459,11 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     if cfg is None:
         cfg = UltimateConfig()
 
+    adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
+    lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
+
     end_date   = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=max(150, int(cfg.ADV_LOOKBACK) * 2))).strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 
     chunk_size  = _ADV_CHUNK_SIZE
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
@@ -513,7 +516,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                     frame = data[ns_sym]
                     if "Close" in frame.columns and "Volume" in frame.columns:
                         notional = (frame["Close"] * frame["Volume"]).clip(lower=0)
-                        lookback = int(getattr(cfg, "ADV_LOOKBACK", None) or 20)
                         adv = float(notional.tail(lookback).mean()) if notional.notna().any() else 0.0
                     else:
                         adv = 0.0
@@ -568,8 +570,9 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    cache = _load_universe_cache()
-    entry = cache.get("total_equity", {})
+    with _UNIVERSE_CACHE_FILE_LOCK:
+        cache = _load_universe_cache()
+        entry = cache.get("total_equity", {})
 
     if entry:
         if _is_cache_entry_fresh(entry.get("fetched_at")):
@@ -586,11 +589,13 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
             tickers = _apply_adv_filter(tickers, cfg=cfg)
 
         logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
-        cache["total_equity"] = {
-            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-            "tickers":    tickers,
-        }
-        _save_universe_cache(cache)
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            cache["total_equity"] = {
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "tickers":    tickers,
+            }
+            _save_universe_cache(cache)
         return tickers
 
     except Exception as exc:
@@ -607,8 +612,9 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
         raise error
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    cache = _load_universe_cache()
-    entry = cache.get("nifty500", {})
+    with _UNIVERSE_CACHE_FILE_LOCK:
+        cache = _load_universe_cache()
+        entry = cache.get("nifty500", {})
 
     if entry:
         if _is_cache_entry_fresh(entry.get("fetched_at")):
@@ -623,11 +629,13 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
         if apply_adv_filter:
             tickers = _apply_adv_filter(tickers, cfg=cfg)
 
-        cache["nifty500"] = {
-            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-            "tickers": tickers
-        }
-        _save_universe_cache(cache)
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            cache["nifty500"] = {
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "tickers": tickers
+            }
+            _save_universe_cache(cache)
         return tickers
 
     except Exception as exc:
@@ -791,7 +799,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
 
         # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
         if use_cache:
-            with _SECTOR_MAP_CACHE_LOCK:
+            with _UNIVERSE_CACHE_FILE_LOCK:
                 current_cache = _load_universe_cache()
                 existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
                 fetched_at = datetime.now(tz=timezone.utc).isoformat()

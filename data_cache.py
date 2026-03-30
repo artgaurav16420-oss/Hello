@@ -832,7 +832,11 @@ def invalidate_cache() -> None:
 
 
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
-    min_rows = int(getattr(cfg, "HISTORY_GATE", None) or 5) if cfg is not None else 5
+    if cfg is not None:
+        history_gate_raw = getattr(cfg, "HISTORY_GATE", None)
+        min_rows = int(history_gate_raw) if history_gate_raw is not None else 5
+    else:
+        min_rows = 5
     if df is None or df.empty or len(df) < min_rows:
         return False
     if not isinstance(df.index, pd.DatetimeIndex):
