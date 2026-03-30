@@ -177,15 +177,127 @@ def _ensure_cache_paths_configured() -> None:
 
 
 class _ManifestProcessFileLock:
-    """Cross-process lock implemented using an atomic lock directory."""
+    """Cross-process lock implemented using an atomic lock directory with stale-lock cleanup."""
 
     def __init__(self, lock_dir: Path, timeout_s: float = _MANIFEST_LOCK_TIMEOUT_SEC) -> None:
         self._lock_dir = lock_dir
         self._timeout_s = timeout_s
         self._owner_file = lock_dir / "owner"
 
+    def _is_process_alive(self, pid: int) -> bool:
+        """Check if a process with the given PID is alive."""
+        if pid <= 0:
+            return False
+        try:
+            # os.kill with signal 0 checks process existence without sending a signal
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            # Process doesn't exist or we don't have permission to check
+            return False
+        except Exception:
+            # Fallback: assume process might be alive on unexpected errors
+            return True
+
+    def _is_lock_stale(self) -> bool:
+        """
+        Detect if the current lock is stale by checking:
+        1. Owner file existence and parsability
+        2. Process liveness via os.kill(pid, 0)
+        3. Lock age against a stale threshold (2x timeout)
+
+        Returns True if the lock is stale and can be safely removed.
+        """
+        if not self._owner_file.exists():
+            # Owner file missing but lock dir exists - treat as stale
+            return True
+
+        try:
+            # Read and parse owner file
+            content = self._owner_file.read_text(encoding="utf-8").strip()
+            pid = None
+            for part in content.split():
+                if part.startswith("pid="):
+                    try:
+                        pid = int(part.split("=", 1)[1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+
+            # If we can't parse the PID, check file age only
+            if pid is None:
+                logger.debug("[Lock] Could not parse PID from owner file, checking age only")
+            else:
+                # Check if the owning process is still alive
+                if self._is_process_alive(pid):
+                    # Process is alive, now check if lock is unreasonably old
+                    # (possible deadlock or hung process)
+                    stat_info = self._owner_file.stat()
+                    lock_age = time.time() - stat_info.st_mtime
+                    # Stale threshold: 2x the configured timeout
+                    stale_threshold = max(60.0, self._timeout_s * 2.0)
+                    if lock_age < stale_threshold:
+                        # Process alive and lock is fresh
+                        return False
+                    logger.debug(
+                        "[Lock] Lock held by live PID %d but age %.1fs exceeds stale threshold %.1fs",
+                        pid, lock_age, stale_threshold
+                    )
+                else:
+                    logger.debug("[Lock] Owner PID %d is dead, lock is stale", pid)
+
+            # Additional check: file age as final arbiter
+            stat_info = self._owner_file.stat()
+            lock_age = time.time() - stat_info.st_mtime
+            stale_threshold = max(60.0, self._timeout_s * 2.0)
+
+            return lock_age >= stale_threshold
+
+        except FileNotFoundError:
+            # Owner file disappeared between exists check and read
+            return True
+        except Exception as exc:
+            # On unexpected errors reading/parsing, check age as fallback
+            logger.debug("[Lock] Error checking lock staleness: %s", exc)
+            try:
+                stat_info = self._owner_file.stat()
+                lock_age = time.time() - stat_info.st_mtime
+                stale_threshold = max(60.0, self._timeout_s * 2.0)
+                return lock_age >= stale_threshold
+            except Exception:
+                # Can't determine staleness reliably, assume not stale to be safe
+                return False
+
+    def _remove_stale_lock(self) -> bool:
+        """
+        Attempt to remove a stale lock directory and owner file.
+        Returns True if removal succeeded, False otherwise.
+        Uses try/except to guard against races with live lockers.
+        """
+        try:
+            # Try to remove owner file first
+            if self._owner_file.exists():
+                self._owner_file.unlink()
+            # Then remove the lock directory
+            if self._lock_dir.exists():
+                self._lock_dir.rmdir()
+            logger.debug("[Lock] Successfully removed stale lock at %s", self._lock_dir)
+            return True
+        except FileNotFoundError:
+            # Lock already removed by another process
+            return True
+        except OSError as exc:
+            # Directory not empty or permission denied - another process may have claimed it
+            logger.debug("[Lock] Could not remove stale lock: %s", exc)
+            return False
+        except Exception as exc:
+            logger.debug("[Lock] Unexpected error removing stale lock: %s", exc)
+            return False
+
     def __enter__(self) -> "_ManifestProcessFileLock":
         deadline = time.monotonic() + max(0.0, float(self._timeout_s))
+        stale_check_attempted = False
+
         while True:
             try:
                 self._lock_dir.mkdir(parents=False, exist_ok=False)
@@ -195,6 +307,21 @@ class _ManifestProcessFileLock:
                 )
                 return self
             except FileExistsError:
+                # Before waiting, check if the existing lock is stale
+                # Only attempt stale cleanup once to avoid repeated overhead
+                if not stale_check_attempted:
+                    stale_check_attempted = True
+                    if self._is_lock_stale():
+                        logger.info(
+                            "[Lock] Detected stale lock at %s, attempting cleanup",
+                            self._lock_dir
+                        )
+                        if self._remove_stale_lock():
+                            # Successfully removed stale lock, retry acquisition immediately
+                            stale_check_attempted = False  # Allow another check on next collision
+                            continue
+
+                # Check timeout
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for manifest lock {self._lock_dir}"
@@ -207,6 +334,10 @@ class _ManifestProcessFileLock:
                 self._owner_file.unlink()
             self._lock_dir.rmdir()
         except FileNotFoundError:
+            # Lock already removed - tolerate missing files
+            pass
+        except Exception:
+            # Tolerate other errors during cleanup
             pass
 
 
