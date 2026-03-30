@@ -156,7 +156,8 @@ def configure_data_cache(
             dotenv_path = candidate
             cache_dir = None
     load_dotenv_safe(dotenv_path)
-    resolved_cache_dir = cache_dir or _DEFAULT_CACHE_DIR
+    # After load_dotenv_safe, honor DATA_CACHE_DIR from .env if set
+    resolved_cache_dir = cache_dir or os.environ.get("DATA_CACHE_DIR") or _DEFAULT_CACHE_DIR
     CACHE_DIR = Path(resolved_cache_dir)
     MANIFEST_FILE = CACHE_DIR / "_manifest.json"
     _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
@@ -227,26 +228,19 @@ class _ManifestProcessFileLock:
             # If we can't parse the PID, check file age only
             if pid is None:
                 logger.debug("[Lock] Could not parse PID from owner file, checking age only")
+                # Fall through to age-based check below
             else:
                 # Check if the owning process is still alive
                 if self._is_process_alive(pid):
-                    # Process is alive, now check if lock is unreasonably old
-                    # (possible deadlock or hung process)
-                    stat_info = self._owner_file.stat()
-                    lock_age = time.time() - stat_info.st_mtime
-                    # Stale threshold: 2x the configured timeout
-                    stale_threshold = max(60.0, self._timeout_s * 2.0)
-                    if lock_age < stale_threshold:
-                        # Process alive and lock is fresh
-                        return False
-                    logger.debug(
-                        "[Lock] Lock held by live PID %d but age %.1fs exceeds stale threshold %.1fs",
-                        pid, lock_age, stale_threshold
-                    )
+                    # Process is alive - lock is NOT stale regardless of age
+                    logger.debug("[Lock] Owner PID %d is alive, lock is valid", pid)
+                    return False
                 else:
+                    # Process is dead - lock IS stale regardless of age
                     logger.debug("[Lock] Owner PID %d is dead, lock is stale", pid)
+                    return True
 
-            # Additional check: file age as final arbiter
+            # Fallback: if PID couldn't be parsed, use file age as safety net
             stat_info = self._owner_file.stat()
             lock_age = time.time() - stat_info.st_mtime
             stale_threshold = max(60.0, self._timeout_s * 2.0)
@@ -336,9 +330,21 @@ class _ManifestProcessFileLock:
         except FileNotFoundError:
             # Lock already removed - tolerate missing files
             pass
-        except Exception:
-            # Tolerate other errors during cleanup
-            pass
+        except OSError as os_exc:
+            # Tolerate benign OS errors (directory not empty, permission issues)
+            logger.debug(
+                "[Lock] Non-fatal error releasing lock %s: %s",
+                self._lock_dir,
+                os_exc,
+            )
+        except Exception as cleanup_exc:
+            # Log unexpected errors during cleanup to avoid hiding programming errors
+            logger.error(
+                "[Lock] Unexpected error releasing lock %s: %s",
+                self._lock_dir,
+                cleanup_exc,
+                exc_info=True,
+            )
 
 
 class DataProvider(ABC):
@@ -1431,9 +1437,17 @@ def _process_chunk(
                 continue
 
             parquet_path = CACHE_DIR / f"{ticker}.parquet"
-            tmp_path = parquet_path.with_suffix(".parquet.tmp")
-            df.to_parquet(tmp_path)
-            tmp_path.replace(parquet_path)
+            # Use unique temp file per writer to avoid race conditions
+            tmp_path = CACHE_DIR / f"{ticker}.parquet.tmp.{uuid.uuid4().hex}"
+            try:
+                df.to_parquet(tmp_path)
+                # Atomically replace the final parquet file
+                tmp_path.replace(parquet_path)
+            except Exception:
+                # Clean up temp file on failure
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise
 
             gap_series   = df.index.to_series().diff().dt.days
             max_gap      = gap_series.max()
