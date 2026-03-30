@@ -771,6 +771,13 @@ def apply_halt_simulation(market_data: dict) -> dict:
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
 
+def _deduplicate_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Removes duplicate index entries, keeping the last one."""
+    if not df.index.is_unique:
+        return df[~df.index.duplicated(keep="last")]
+    return df
+
+
 def build_precomputed_matrices(
     market_data: dict,
     cfg: Optional[UltimateConfig] = None,
@@ -816,32 +823,16 @@ def build_precomputed_matrices(
     if not close_d:
         return {}
 
-    close = pd.DataFrame(close_d).sort_index()
-    if not close.index.is_unique:
-        close = close[~close.index.duplicated(keep="last")]
+    close = _deduplicate_index(pd.DataFrame(close_d).sort_index())
     close = close.dropna(how="all")
     shared_index = close.index
-    close_adj = pd.DataFrame(close_adj_d).sort_index()
-    open_df = pd.DataFrame(open_d).sort_index()
-    high_df = pd.DataFrame(high_d).sort_index()
-    low_df = pd.DataFrame(low_d).sort_index()
-    dividends_df = pd.DataFrame(div_d).sort_index()
-    splits_df = pd.DataFrame(split_d).sort_index()
-    volume_df = pd.DataFrame(volume_d).sort_index()
-    if not close_adj.index.is_unique:
-        close_adj = close_adj[~close_adj.index.duplicated(keep="last")]
-    if not open_df.index.is_unique:
-        open_df = open_df[~open_df.index.duplicated(keep="last")]
-    if not high_df.index.is_unique:
-        high_df = high_df[~high_df.index.duplicated(keep="last")]
-    if not low_df.index.is_unique:
-        low_df = low_df[~low_df.index.duplicated(keep="last")]
-    if not dividends_df.index.is_unique:
-        dividends_df = dividends_df[~dividends_df.index.duplicated(keep="last")]
-    if not splits_df.index.is_unique:
-        splits_df = splits_df[~splits_df.index.duplicated(keep="last")]
-    if not volume_df.index.is_unique:
-        volume_df = volume_df[~volume_df.index.duplicated(keep="last")]
+    close_adj = _deduplicate_index(pd.DataFrame(close_adj_d).sort_index())
+    open_df = _deduplicate_index(pd.DataFrame(open_d).sort_index())
+    high_df = _deduplicate_index(pd.DataFrame(high_d).sort_index())
+    low_df = _deduplicate_index(pd.DataFrame(low_d).sort_index())
+    dividends_df = _deduplicate_index(pd.DataFrame(div_d).sort_index())
+    splits_df = _deduplicate_index(pd.DataFrame(split_d).sort_index())
+    volume_df = _deduplicate_index(pd.DataFrame(volume_d).sort_index())
     close_adj = close_adj.reindex(shared_index)
     open_df = open_df.reindex(shared_index)
     high_df = high_df.reindex(shared_index)
