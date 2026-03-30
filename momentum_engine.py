@@ -1135,27 +1135,11 @@ def execute_rebalance(
         if sym not in new_shares:
             del new_entry_prices[sym]
 
-    corrected_slip_reserve = 0.0
-    for i, sym in enumerate(active_symbols):
-        old_s = state.shares.get(sym, 0)
-        new_s = new_shares.get(sym, 0)
-        if new_s <= old_s:
-            continue
-        px = max(float(local_prices[i]), 1e-6)
-        delta_notional = (new_s - old_s) * px
-        slip_rate = compute_one_way_slip_rate(
-            cfg=cfg,
-            portfolio_value=pv_exec,
-            adv_notional=float(adv_shares[i]) if adv_shares is not None and i < len(adv_shares) else None,
-            trade_notional=delta_notional,
-        )
-        corrected_slip_reserve += delta_notional * slip_rate
-
     state.weights      = new_weights
     state.shares       = new_shares
     state.entry_prices = new_entry_prices
     # FIX-MB-CASH-FLOOR: Validate cash doesn't go negative
-    raw_cash = pv_exec - actual_notional - max(total_slippage, corrected_slip_reserve)
+    raw_cash = pv_exec - actual_notional - total_slippage
     # FIX-BUG-4: use raw_cash in round() rather than re-evaluating the expression.
     # The original code computed pv_exec - actual_notional - total_slippage twice —
     # raw_cash was computed but then ignored in favour of a duplicate inline expression.

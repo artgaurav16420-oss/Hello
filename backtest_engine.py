@@ -496,16 +496,16 @@ class BacktestEngine:
                 active_symbols, date, active_prices, open_px, high_px, low_px, return_open_fallback_mask=True
             )
             if open_fallback_mask.any():
-                first_day_mask = np.zeros(len(active_symbols), dtype=bool)
-                for i_sym, sym in enumerate(active_symbols):
-                    if not open_fallback_mask[i_sym]:
-                        continue
-                    if signal_date in close.index and sym in close.columns:
-                        sig_px = close.at[signal_date, sym]
-                        cur_px = close.at[date, sym]
-                        first_day_mask[i_sym] = pd.notna(sig_px) and pd.notna(cur_px) and float(sig_px) == float(cur_px)
+                sig_px_arr = close.values[prev_idx, active_col_indices]
+                cur_px_arr = close.values[date_pos, active_col_indices]
+                first_day_mask = (
+                    open_fallback_mask
+                    & np.isfinite(sig_px_arr)
+                    & np.isfinite(cur_px_arr)
+                    & (sig_px_arr == cur_px_arr)
+                )
                 if first_day_mask.any():
-                    skipped_syms = [sym for sym, bad in zip(active_symbols, first_day_mask) if bad]
+                    skipped_syms = [sym for sym, bad in zip(active_symbols, first_day_mask, strict=True) if bad]
                     logger.warning(
                         "[Backtest] Skipping first-day symbols with NaN open fallback on %s: %s",
                         date,
@@ -723,7 +723,7 @@ def _execution_prices(
         opens = open_px.loc[date].reindex(symbols).values.astype(float)
         open_fallback_mask = ~np.isfinite(opens)
         if open_fallback_mask.any():
-            bad_syms = [sym for sym, bad in zip(symbols, open_fallback_mask) if bad]
+            bad_syms = [sym for sym, bad in zip(symbols, open_fallback_mask, strict=True) if bad]
             logger.warning(
                 "[Backtest] Non-finite open prices on %s for %s; falling back to close prices.",
                 date,
