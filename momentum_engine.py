@@ -55,10 +55,12 @@ import osqp
 
 import hashlib
 import logging
+import threading
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import ClassVar, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -173,9 +175,9 @@ class _ConstraintBuilder:
 
     def build(self) -> Tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
         A = sp.vstack(self.A_parts, format="csc")
-        l = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
-        u = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
-        return A, l, u
+        lower = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
+        upper = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
+        return A, lower, upper
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -310,14 +312,20 @@ class PortfolioState:
     consecutive_failures: int              = 0
     # Presence-aware optional fields: None means "missing from persisted state",
     # allowing callers to apply UltimateConfig defaults only when absent.
-    equity_hist_cap:      Optional[int]    = None  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+    equity_hist_cap:      int              = field(default_factory=lambda: max(500, int(UltimateConfig().CVAR_LOOKBACK * 2)))
     max_absent_periods:   Optional[int]    = None
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
     last_known_volatility:Dict[str, float] = field(default_factory=dict)
+    vol_hist:             Dict[str, deque] = field(default_factory=dict)
     decay_rounds:         int              = 0
     dividend_ledger:      Dict[str, str]   = field(default_factory=dict)
     last_rebalance_date:  str              = ""
+
+    def __post_init__(self) -> None:
+        self._initial_cash = float(self.cash)
+        self._initial_exposure_multiplier = float(self.exposure_multiplier)
+        self._equity_hist_cap = int(self.equity_hist_cap)
 
     def update_exposure(
         self,
@@ -380,6 +388,11 @@ class PortfolioState:
         )
 
     def realised_cvar(self, min_obs: int = 30) -> float:
+        """Return realised portfolio CVaR from recent equity history.
+
+        CVaR is computed over a rolling window capped at `equity_hist_cap` bars.
+        History older than this cap is discarded.
+        """
         n = len(self.equity_hist)
         if n < min_obs:
             if n > 1:
@@ -424,15 +437,42 @@ class PortfolioState:
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        cap = self.equity_hist_cap if self.equity_hist_cap is not None else DEFAULT_EQUITY_HIST_CAP
-        if cap > 0 and len(self.equity_hist) > cap:
-            self.equity_hist = self.equity_hist[-cap:]
+        self._equity_hist_cap = int(self.equity_hist_cap)
+        if self._equity_hist_cap > 0 and len(self.equity_hist) > self._equity_hist_cap:
+            self.equity_hist = self.equity_hist[-self._equity_hist_cap:]
+
+    def record_volatility(self, current_date: pd.Timestamp, vol_by_symbol: Dict[str, float], cap: int) -> None:
+        for sym, vol in vol_by_symbol.items():
+            vol_value = float(vol)
+            self.last_known_volatility[sym] = vol_value
+            hist = self.vol_hist.setdefault(sym, deque(maxlen=int(cap)))
+            hist.append((pd.Timestamp(current_date), vol_value))
+
+    def reset(self) -> None:
+        initial_cash = float(getattr(self, "_initial_cash", self.cash))
+        self.shares = {}
+        self.cash = initial_cash
+        self.equity_hist = []
+        self.weights = {}
+        self.entry_prices = {}
+        self.last_known_prices = {}
+        self.last_known_volatility = {}
+        self.vol_hist = {}
+        self.absent_periods = {}
+        self.exposure_multiplier = float(getattr(self, "_initial_exposure_multiplier", 1.0))
+        self.override_active = False
+        self.override_cooldown = 0
+        self.consecutive_failures = 0
+        self.decay_rounds = 0
 
     def to_dict(self) -> dict:
         def _r(v):
-            if isinstance(v, float): return round(v, 10)
-            if isinstance(v, dict):  return {k: _r(val) for k, val in sorted(v.items())}
-            if isinstance(v, list):  return [_r(x) for x in v]
+            if isinstance(v, float):
+                return round(v, 10)
+            if isinstance(v, dict):
+                return {k: _r(val) for k, val in sorted(v.items())}
+            if isinstance(v, list):
+                return [_r(x) for x in v]
             return v
         return {
             "weights":              _r(self.weights),
@@ -450,6 +490,10 @@ class PortfolioState:
             "absent_periods":       dict(sorted(self.absent_periods.items())),
             "last_known_prices":    _r(self.last_known_prices),
             "last_known_volatility":_r(self.last_known_volatility),
+            "vol_hist":             {
+                k: [(pd.Timestamp(d).strftime("%Y-%m-%d"), float(v)) for d, v in vals]
+                for k, vals in sorted(self.vol_hist.items())
+            },
             "decay_rounds":         self.decay_rounds,
             "dividend_ledger":      dict(sorted(self.dividend_ledger.items())),
             "last_rebalance_date":  self.last_rebalance_date,
@@ -482,6 +526,11 @@ class PortfolioState:
             if parsed < 0:
                 raise ValueError(f"value must be non-negative, got {parsed}")
             return parsed
+
+        def _as_nonneg_int_or_default(value) -> int:
+            if value is None:
+                return max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
+            return _as_nonneg_int(value)
 
         def _as_optional_nonneg_int(value) -> Optional[int]:
             if value is None:
@@ -517,14 +566,27 @@ class PortfolioState:
         ps.override_active      = _get("override_active",      _as_bool,                                        False)
         ps.override_cooldown    = _get("override_cooldown",    _as_nonneg_int,                                 0)
         ps.consecutive_failures = _get("consecutive_failures", _as_nonneg_int,                                 0)
-        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_optional_nonneg_int,                        None)  # Aligns with UltimateConfig.EQUITY_HIST_CAP when absent.
+        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_nonneg_int_or_default,                      max(500, int(UltimateConfig().CVAR_LOOKBACK * 2)))
         ps.max_absent_periods   = _get("max_absent_periods",   _as_optional_nonneg_int,                        None)
         ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
         ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
         ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
+        ps.vol_hist             = _get(
+            "vol_hist",
+            lambda v: {
+                str(k): deque(
+                    ((pd.Timestamp(d), float(vol)) for d, vol in vals),
+                    maxlen=int(UltimateConfig().CVAR_LOOKBACK),
+                )
+                for k, vals in v.items()
+            },
+            {},
+        )
         ps.decay_rounds         = _get("decay_rounds",         _as_nonneg_int,                                 0)
         ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
         ps.last_rebalance_date  = _get("last_rebalance_date",  str,                                             "")
+        ps._initial_cash = float(ps.cash)
+        ps._equity_hist_cap = int(ps.equity_hist_cap)
 
         if errors:
             logger.error(
@@ -588,6 +650,23 @@ def compute_one_way_slip_rate(
             adv_notional,
         )
     return max(base_rate, min(0.05, impact_rate))
+
+
+def _compute_one_way_slip_rate_vectorized(
+    cfg: UltimateConfig,
+    portfolio_value: float,
+    adv_notional: np.ndarray,
+    trade_notional: np.ndarray,
+) -> np.ndarray:
+    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    adv_arr = np.asarray(adv_notional, dtype=float)
+    trade_arr = np.asarray(trade_notional, dtype=float)
+    numerator = np.where(np.isfinite(trade_arr) & (trade_arr > 0), trade_arr, float(portfolio_value))
+    valid_adv = np.isfinite(adv_arr) & (adv_arr > 0)
+    impact = np.zeros_like(numerator, dtype=float)
+    impact[valid_adv] = cfg.IMPACT_COEFF * numerator[valid_adv] / adv_arr[valid_adv]
+    impact = np.clip(impact, 0.0, 0.05)
+    return np.where(valid_adv, np.maximum(base_rate, impact), base_rate)
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────
@@ -660,6 +739,10 @@ def _compute_desired_shares(
             if adv_notional > 0:
                 max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
                 s = min(s, max_adv_shares)
+                current_weight = current_notional / max(pv_exec, 1.0)
+                target_weight = w
+                if s < old_s and target_weight >= current_weight:
+                    s = old_s
 
         desired_shares[sym] = s
         if s > 0:
@@ -943,7 +1026,7 @@ def execute_rebalance(
 
             for sym, data in eligible.items():
                 price = data["price"]
-                i     = data["i"]
+                i = int(data["i"])
                 w_i   = data["w"]
                 cash_entitlement = (w_i / total_eligible_w) * residual_cash
                 slip_rate = compute_one_way_slip_rate(
@@ -1161,9 +1244,11 @@ def compute_book_cvar(
         # FIX-MB-VOL: write only under the canonical key as it appears in
         # state.shares; do not write aliased bare/.NS keys to avoid overwriting
         # frozen vol for absent ghost symbols.
-        for sym_key, vol in rolling_vol.items():
-            vol_value = float(max(vol, 1e-4))
-            state.last_known_volatility[str(sym_key)] = vol_value
+        state.record_volatility(
+            current_date=pd.Timestamp(hist_log_rets.index[-1]),
+            vol_by_symbol={str(sym_key): float(max(vol, 1e-4)) for sym_key, vol in rolling_vol.items()},
+            cap=cfg.CVAR_LOOKBACK,
+        )
 
     ghost_mask = np.array([
         (s not in active_idx) or (s in rets.columns and rets[s].isna().all())
@@ -1173,9 +1258,6 @@ def compute_book_cvar(
         ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
 
         for sym in ghost_cols:
-            vol = float(state.last_known_volatility.get(sym, cfg.GHOST_VOL_FALLBACK))
-            vol = max(vol, cfg.GHOST_VOL_FALLBACK)
-            daily_vol   = vol
             daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
 
             sym_base_seed = _ghost_seed_for(sym)
@@ -1201,10 +1283,26 @@ def compute_book_cvar(
                 np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
             ).astype(np.int64)
 
-            synth_rets = np.array(
-                [np.random.default_rng(int(seed)).normal(daily_drift, daily_vol) for seed in row_seeds],
+            vol_series = np.full(len(row_seeds), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
+            sym_hist = list(state.vol_hist.get(sym, deque()))
+            if sym_hist:
+                hist_dates = [pd.Timestamp(d) for d, _ in sym_hist]
+                hist_vals = [float(v) for _, v in sym_hist]
+                for idx_row, row_date in enumerate(pd.DatetimeIndex(rets.index)):
+                    nearest = None
+                    for j, d_hist in enumerate(hist_dates):
+                        if d_hist <= row_date:
+                            nearest = j
+                        else:
+                            break
+                    if nearest is not None:
+                        vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
+
+            raw = np.array(
+                [np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds],
                 dtype=float,
             )
+            synth_rets = daily_drift + vol_series * raw
             rets.loc[:, sym] = synth_rets
 
     rets = rets.fillna(0.0)
@@ -1246,6 +1344,8 @@ def compute_decay_targets(
             continue
 
         if use_mtm:
+            assert current_prices is not None
+            assert pv is not None
             shares = state.shares.get(sym, 0)
             price = max(float(current_prices[i]), 1e-6)
             pre_decay_weight = (shares * price) / max(float(pv), 1.0)
@@ -1261,13 +1361,15 @@ def compute_decay_targets(
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 
 class InstitutionalRiskEngine:
+    # NOT thread-safe across optimize() calls without _solver_lock.
     def __init__(self, cfg: UltimateConfig):
         self.cfg:       UltimateConfig              = cfg
         self.last_diag: Optional[SolverDiagnostics] = None
-        self._solver:       Optional[object] = None
+        self._solver:       Optional[Any] = None
         self._solver_shape: Optional[tuple]  = None
         self._solver_nnz:   Optional[tuple]  = None
         self._solver_struct: Optional[tuple] = None
+        self._solver_lock = threading.Lock()
 
     def optimize(
         self,
@@ -1516,19 +1618,11 @@ class InstitutionalRiskEngine:
         scaled_target_weight_hint = target_weight_hint * float(u_gamma)
         trade_estimate_notionals = np.abs(scaled_target_weight_hint - prev_w_arr) * float(portfolio_value)
 
-        turnover_costs = np.array(
-            [
-                # Keep optimizer friction scaling consistent with FIX-MB-ME-02 in
-                # execute_rebalance: use per-name trade delta notional, not full PV.
-                compute_one_way_slip_rate(
-                    self.cfg,
-                    portfolio_value,
-                    float(adv),
-                    trade_notional=float(trade_estimate_notionals[i]),
-                )
-                for i, adv in enumerate(adv_shares)
-            ],
-            dtype=float,
+        turnover_costs = _compute_one_way_slip_rate_vectorized(
+            cfg=self.cfg,
+            portfolio_value=portfolio_value,
+            adv_notional=np.asarray(adv_shares, dtype=float),
+            trade_notional=np.asarray(trade_estimate_notionals, dtype=float),
         )
 
         q        = np.zeros(n_vars)
@@ -1583,100 +1677,128 @@ class InstitutionalRiskEngine:
 
         tc = sp.lil_matrix((2 * m, n_vars))
         for i in range(m):
-            tc[2*i,   i] =  1.0; tc[2*i,   m+i] = -1.0
-            tc[2*i+1, i] = -1.0; tc[2*i+1, m+i] = -1.0
+            tc[2 * i, i] = 1.0
+            tc[2 * i, m + i] = -1.0
+            tc[2 * i + 1, i] = -1.0
+            tc[2 * i + 1, m + i] = -1.0
 
         tc_u = []
         for p in prev_w_arr:
             tc_u.extend([p, -p])
         builder.add_constraint(tc.tocsc(), [-np.inf] * (2 * m), tc_u)
 
-        A, l, u = builder.build()
+        A, lower, upper = builder.build()
 
         P_upper = sp.triu(P, format="csc")
         current_shape = (m, T_cvar)
         current_nnz   = (P_upper.nnz, A.nnz)
 
-        is_same_structure = False
-        if (self._solver is not None
-                and self._solver_shape == current_shape
-                and self._solver_nnz == current_nnz
-                and self._solver_struct is not None):
-            P_ind, P_ptr, A_ind, A_ptr = self._solver_struct
-            is_same_structure = (
-                np.array_equal(P_upper.indices, P_ind)
-                and np.array_equal(P_upper.indptr, P_ptr)
-                and np.array_equal(A.indices, A_ind)
-                and np.array_equal(A.indptr, A_ptr)
-            )
+        with self._solver_lock:
+            is_same_structure = False
+            if (self._solver is not None
+                    and self._solver_shape == current_shape
+                    and self._solver_nnz == current_nnz
+                    and self._solver_struct is not None):
+                P_ind, P_ptr, A_ind, A_ptr = self._solver_struct
+                is_same_structure = (
+                    np.array_equal(P_upper.indices, P_ind)
+                    and np.array_equal(P_upper.indptr, P_ptr)
+                    and np.array_equal(A.indices, A_ind)
+                    and np.array_equal(A.indptr, A_ptr)
+                )
 
-        if not is_same_structure:
-            self._solver = osqp.OSQP()
-            setup_kwargs = dict(
-                verbose=False,
-                eps_abs=1e-4,
-                eps_rel=1e-4,
-                adaptive_rho=True,
-                max_iter=50000,
-            )
+            if not is_same_structure:
+                self._solver = osqp.OSQP()
+                setup_kwargs = dict(
+                    verbose=False,
+                    eps_abs=1e-4,
+                    eps_rel=1e-4,
+                    adaptive_rho=True,
+                    max_iter=50000,
+                )
+                try:
+                    self._solver.setup(
+                        P_upper, q, A, lower, upper,
+                        polishing=True,
+                        warm_starting=True,
+                        **setup_kwargs,
+                    )
+                except TypeError as exc:
+                    msg = str(exc)
+                    if ("polishing" not in msg) and ("warm_starting" not in msg):
+                        raise
+                    self._solver.setup(
+                        P_upper, q, A, lower, upper,
+                        polish=True,
+                        warm_start=True,
+                        **setup_kwargs,
+                    )
+                self._solver_shape = current_shape
+                self._solver_nnz = current_nnz
+                self._solver_struct = (
+                    P_upper.indices.copy(), P_upper.indptr.copy(),
+                    A.indices.copy(), A.indptr.copy(),
+                )
+            else:
+                assert self._solver is not None
+                self._solver.update(
+                    q=q, l=lower, u=upper,
+                    Px=P_upper.data, Ax=A.data,
+                )
+
             try:
-                self._solver.setup(
-                    P_upper, q, A, l, u,
-                    polishing=True,
-                    warm_starting=True,
-                    **setup_kwargs,
+                assert self._solver is not None
+                res = self._solver.solve()
+            except Exception as exc:
+                logger.error(
+                    "[Optimizer] OSQP solve() raised an exception: %s — "
+                    "invalidating solver cache to force fresh setup on next call.", exc
                 )
-            except TypeError as exc:
-                # OSQP keyword differs across versions:
-                # - newer python package expects `polishing` + `warm_starting`
-                # - older python package expects `polish` + `warm_start`
-                msg = str(exc)
-                if ("polishing" not in msg) and ("warm_starting" not in msg):
-                    raise
-                self._solver.setup(
-                    P_upper, q, A, l, u,
-                    polish=True,
-                    warm_start=True,
-                    **setup_kwargs,
-                )
-            self._solver_shape = current_shape
-            self._solver_nnz   = current_nnz
-            self._solver_struct = (
-                P_upper.indices.copy(), P_upper.indptr.copy(),
-                A.indices.copy(), A.indptr.copy(),
-            )
-        else:
-            self._solver.update(
-                q=q, l=l, u=u,
-                Px=P_upper.data, Ax=A.data,
-            )
+                self._solver = None
+                self._solver_shape = None
+                self._solver_nnz = None
+                self._solver_struct = None
+                raise OptimizationError(
+                    f"OSQP solve() failed with exception: {exc}",
+                    OptimizationErrorType.NUMERICAL,
+                ) from exc
+            if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
+                self._solver = None
+                self._solver_shape = None
+                self._solver_nnz = None
+                self._solver_struct = None
+                raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
 
-        # FIX-MB-OSQP: invalidate solver cache on any exception so the next
-        # call gets a fresh setup rather than reusing a broken solver state.
-        try:
-            res = self._solver.solve()
-        except Exception as exc:
-            logger.error(
-                "[Optimizer] OSQP solve() raised an exception: %s — "
-                "invalidating solver cache to force fresh setup on next call.", exc
+            w_opt = np.maximum(res.x[:m], 0.0)
+            actual_deltas = np.abs(w_opt - prev_w_arr) * float(portfolio_value)
+            turnover_costs = _compute_one_way_slip_rate_vectorized(
+                cfg=self.cfg,
+                portfolio_value=portfolio_value,
+                adv_notional=np.asarray(adv_shares, dtype=float),
+                trade_notional=np.asarray(actual_deltas, dtype=float),
             )
-            self._solver        = None
-            self._solver_shape  = None
-            self._solver_nnz    = None
-            self._solver_struct = None
-            raise OptimizationError(
-                f"OSQP solve() failed with exception: {exc}",
-                OptimizationErrorType.NUMERICAL,
-            ) from exc
+            q[m:2*m] = turnover_costs
 
-        if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
-            self._solver        = None
-            self._solver_shape  = None
-            self._solver_nnz    = None
-            self._solver_struct = None
-            raise OptimizationError(
-                f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL
-            )
+            assert self._solver is not None
+            self._solver.update(q=q)
+            self._solver.warm_start(x=res.x)
+            try:
+                res = self._solver.solve()
+            except Exception as exc:
+                self._solver = None
+                self._solver_shape = None
+                self._solver_nnz = None
+                self._solver_struct = None
+                raise OptimizationError(
+                    f"OSQP second-pass solve() failed with exception: {exc}",
+                    OptimizationErrorType.NUMERICAL,
+                ) from exc
+            if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
+                self._solver = None
+                self._solver_shape = None
+                self._solver_nnz = None
+                self._solver_struct = None
+                raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
 
         if res.info.status in ("solved inaccurate", "solved_inaccurate"):
             logger.warning(
@@ -1686,18 +1808,6 @@ class InstitutionalRiskEngine:
             )
 
         w_opt = np.maximum(res.x[:m], 0.0)
-
-        if res.info.status in ("solved inaccurate", "solved_inaccurate"):
-            logger.warning(
-                "[Optimizer] OSQP returned '%s'. Normalizing weights to γ=%.4f.",
-                res.info.status, gamma,
-            )
-            w_sum = float(np.sum(w_opt))
-            if w_sum > 1e-9:
-                w_opt = np.minimum(w_opt, adv_limit)
-                clipped_sum = float(np.sum(w_opt))
-                if clipped_sum > 1e-9:
-                    w_opt = w_opt * min(gamma / clipped_sum, 1.0)
 
         portfolio_losses  = losses @ w_opt
         sorted_losses     = np.sort(portfolio_losses)

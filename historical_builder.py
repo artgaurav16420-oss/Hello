@@ -28,11 +28,9 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import time
 from datetime import date
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import requests
@@ -65,6 +63,7 @@ _REBALANCE_MONTHS = {3, 9}   # March and September effective dates
 
 # Fallback: all NSE-listed tickers for yfinance approximation
 _FALLBACK_APPROX_N = 500
+DELISTED_TICKERS_FILE = DATA_DIR / "nse_delisted_historical.csv"
 
 _HEADERS = {
     "User-Agent": (
@@ -288,7 +287,6 @@ def _get_rebalance_dates(start_year: int = 2015, end_year: int | None = None) ->
     Generate approximate semi-annual rebalance dates: last Friday of March and
     September for each year from start_year to end_year (inclusive).
     """
-    import numpy as np
     end_year = end_year or pd.Timestamp.today().year + 1
     dates = []
     for y in range(start_year, end_year + 1):
@@ -374,6 +372,8 @@ def _build_pit_csv_from_yfinance_approx(
 
     This is a best-effort approximation. Expected member overlap with true Nifty 500:
     ~90-93% (i.e. ~35-50 stocks different from truth at each date).
+    For survivorship-bias-free output, DELISTED_TICKERS_FILE must contain
+    historical Nifty 500 members that delisted and are absent from current lists.
     """
     try:
         import yfinance as yf
@@ -409,6 +409,20 @@ def _build_pit_csv_from_yfinance_approx(
     # For a broader candidate pool, add some well-known tickers that may have
     # dropped out (these are supplemental — not required for correctness)
     candidate_tickers = list(dict.fromkeys(current_n500))   # deduplicated
+    try:
+        delisted = pd.read_csv(DELISTED_TICKERS_FILE)["ticker"].tolist()
+        candidate_tickers = list(dict.fromkeys(candidate_tickers + delisted))
+    except (FileNotFoundError, KeyError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Delisted tickers file unavailable/invalid (%s); survivorship bias not corrected.",
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error reading delisted tickers (%s); survivorship bias not corrected.",
+            exc,
+            exc_info=True,
+        )
 
     # Step 2: Download price data
     rebalance_dates = _get_rebalance_dates(start_year=start_year)
@@ -551,7 +565,7 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
     # Group by snapshot date → sorted unique ticker list
     rows = (
         df.groupby(df["date"].dt.normalize())["ticker"]
-        .apply(lambda x: sorted(list(set(x))))
+        .agg(lambda x: sorted(x.unique().tolist()))
     )
     out_df = pd.DataFrame({"tickers": rows})
     out_df.index = pd.DatetimeIndex(out_df.index, name="date")
