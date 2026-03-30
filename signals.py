@@ -71,6 +71,7 @@ def compute_regime_score(
 
     High score -> Risk-on (upward trend, low volatility)
     Low score -> Risk-off (downward trend, high volatility)
+    idx_hist must contain only fully completed trading sessions. It must NOT include any partial intraday bar.
 
     WARM-UP NOTE (FIX-MB-REGIMEWARMUP): The long-term EWMA volatility baseline
     uses min_periods=252 to prevent cold-start false precision. For the first
@@ -85,11 +86,15 @@ def compute_regime_score(
         logger.debug("[Signals] Missing index history for regime. Defaulting to 0.5")
         return 0.5
 
-    close_series = idx_hist["Close"]
+    close_series = (
+        idx_hist["Close"].iloc[:-1]
+        if idx_hist.index[-1].date() == pd.Timestamp.today().date()
+        else idx_hist["Close"]
+    )
 
     sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50
-    min_sma_periods = 20
+    min_sma_periods = max(20, int(sma_window * 0.8))
     min_fast_periods = max(10, min_sma_periods // 2)
 
     if len(close_series) >= sma_window:
@@ -121,7 +126,8 @@ def compute_regime_score(
     vol_component = 0.5
     if len(all_returns) >= 5:
         ewma_var = all_returns.ewm(span=ewma_span, adjust=False).var()
-        vol_ewma = float(ewma_var.iloc[-1] ** 0.5 * np.sqrt(252)) if pd.notna(ewma_var.iloc[-1]) else 0.0
+        _raw_var = ewma_var.iloc[-1]
+        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else 0.0
 
         vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
         vol_mult = float(cfg.REGIME_VOL_MULTIPLIER) if cfg else 1.5
@@ -170,7 +176,7 @@ def compute_regime_score(
         else:
             _hist = universe_close_hist[equity_cols]
             if len(_hist) >= _sma_win:
-                recent = _hist.iloc[-_sma_win:]
+                recent = _hist.iloc[-(_sma_win + 1):-1]  # exclude current bar from SMA to avoid look-ahead
                 min_obs = max(1, int(np.ceil(_sma_win * 0.8)))
                 obs_count = recent.notna().sum()
                 last = _hist.iloc[-1]
@@ -179,7 +185,7 @@ def compute_regime_score(
                     recent_valid = recent.loc[:, valid]
                     sma_vals = recent_valid.mean()
                     last_valid = _hist.iloc[-1][valid]
-                    breadth_component = float((last_valid > sma_vals[last_valid.index]).mean())
+                    breadth_component = float((last_valid > sma_vals.reindex(last_valid.index, fill_value=np.nan)).mean())
                 else:
                     # S-02: symmetric DEBUG log for full-history path when no
                     # symbols pass the validity filter (mirrors FIX-MB-L-02 for
@@ -201,13 +207,13 @@ def compute_regime_score(
                     breadth_component = float((last[valid] > sma_vals[valid]).mean())
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
-    base_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
+    regime_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
 
     crash_override = _check_market_crash(universe_close_hist, cfg)
     if crash_override is not None:
-        return min(base_score, crash_override) if crash_override == 0.5 else crash_override
+        return min(regime_score, crash_override) if crash_override == 0.5 else crash_override
 
-    return base_score
+    return regime_score
 
 
 def _check_market_crash(
@@ -227,7 +233,8 @@ def _check_market_crash(
         return None
 
     px_slice = close_hist.loc[:, equity_cols].tail(65)
-    rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().tail(15)
+    px_slice_hist = px_slice.iloc[:-1]
+    rolling_sma50 = px_slice_hist.rolling(window=50, min_periods=20).mean().tail(15)
 
     # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
     # history during warmup), breadth_flags.mean() would return 0.0,
@@ -318,6 +325,7 @@ def compute_adv(
 
     notional_df = pd.DataFrame(notional_cols)
     if target_date is not None:
+        notional_df = notional_df.sort_index()
         notional_df = notional_df.loc[:pd.Timestamp(target_date)]
 
     if notional_df.empty:
@@ -415,29 +423,19 @@ def generate_signals(
     if np.all(np.isnan(raw_daily_momentum)):
         return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
 
-    history_pass = np.zeros(len(active_symbols), dtype=bool)
-    liquidity_pass = np.zeros(len(active_symbols), dtype=bool)
-    for i, sym in enumerate(active_symbols):
-        # BUG-FIX-HISTORY-GATE: count valid rows only in the most recent
-        # HISTORY_GATE-length tail, not across the entire history.
-        # Counting the total collapses the distinction between a stock with
-        # 200 old bars + a 100-bar listing gap + 10 new bars (total=210, gate
-        # passes) and one with 90 uninterrupted recent bars (also passes).
-        # The EWM halflife decay means old bars beyond the gap contribute
-        # negligibly to momentum, so the gate must verify that recent,
-        # contiguous history is sufficient.
-        # FIX-BUG-6: use signal_log_rets (lag-truncated) not log_rets (full).
-        # When SIGNAL_LAG_DAYS > 0, log_rets is longer than signal_log_rets by
-        # signal_lag_days rows. A symbol could pass the gate based on the tail of
-        # log_rets that is excluded from signal computation, causing EWM to be
-        # evaluated on a series with fewer valid rows than HISTORY_GATE requires.
-        history_pass[i]   = int(signal_log_rets[sym].tail(cfg.HISTORY_GATE).notna().sum()) >= cfg.HISTORY_GATE
-        liquidity_pass[i] = bool(np.isfinite(adv_arr[i]) and adv_arr[i] > 0)
+    history_pass = (signal_log_rets[active_symbols].tail(cfg.HISTORY_GATE).notna().sum(axis=0) >= cfg.HISTORY_GATE).values
+    liquidity_pass = np.isfinite(adv_arr) & (adv_arr > 0)
     gate_pass_mask = history_pass & liquidity_pass
 
     norm_src = raw_daily_momentum[gate_pass_mask] if gate_pass_mask.any() else raw_daily_momentum
     if norm_src.size == 0 or not np.isfinite(norm_src).any():
-        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
+        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {
+            "total": len(active_symbols),
+            "history_failed": int(np.sum(~history_pass)),
+            "adv_failed": int(np.sum(history_pass & ~liquidity_pass)),
+            "knife_failed": 0,
+            "selected": 0,
+        }
     mu_cross = np.nanmean(norm_src)
     # FIX-MB-H-03: when gate_pass_mask is all-False, norm_src is the full
     # unfiltered pool (illiquid + thin-history symbols), producing an
@@ -480,11 +478,12 @@ def generate_signals(
     # SIGNAL_LAG_DAYS=21), allowing the strategy to avoid stocks that were
     # crashing AFTER the signal date — a form of clairvoyance that inflates
     # Sortino ratios for any trial using the lag parameter.
-    if len(signal_log_rets) >= cfg.KNIFE_WINDOW:
+    if cfg.KNIFE_WINDOW > 0 and len(signal_log_rets) >= cfg.KNIFE_WINDOW:
         recent_simple = np.expm1(signal_log_rets.iloc[-cfg.KNIFE_WINDOW:])
+        _knife_min_count = max(1, cfg.KNIFE_WINDOW // 2)
         recent_cumulative_returns = (
             (1.0 + recent_simple)
-            .prod(skipna=True, min_count=1)
+            .prod(skipna=True, min_count=_knife_min_count)
             - 1.0
         ).values
 
@@ -492,14 +491,16 @@ def generate_signals(
         _signal_date_vols = signal_log_rets.iloc[-recent_lookback:].std()
         _full_daily_vols = _signal_date_vols.values
 
-        for i, cumulative_ret in enumerate(recent_cumulative_returns):
-            if not np.isfinite(cumulative_ret):
-                continue
-            asset_vol = float(_full_daily_vols[i]) if np.isfinite(_full_daily_vols[i]) and _full_daily_vols[i] > 0 else _baseline_daily_vol
-            vol_scalar = float(np.clip(asset_vol / _baseline_daily_vol, 0.5, 2.0))
-            vol_adj_threshold = cfg.KNIFE_THRESHOLD * vol_scalar
-            if cumulative_ret < vol_adj_threshold:
-                adj_scores[i] = -np.inf
+        safe_vols = np.where(
+            np.isfinite(_full_daily_vols) & (_full_daily_vols > 0),
+            _full_daily_vols,
+            _baseline_daily_vol
+        )
+        vol_scalars = np.clip(safe_vols / _baseline_daily_vol, 0.5, 2.0)
+        thresholds = cfg.KNIFE_THRESHOLD * vol_scalars
+        finite_mask = np.isfinite(recent_cumulative_returns)
+        knife_hard_mask = gate_pass_mask & finite_mask & (recent_cumulative_returns < thresholds)
+        adj_scores = np.where(knife_hard_mask, -np.inf, adj_scores)
 
     # Continuity Bonus
     valid_mask = np.isfinite(adj_scores)
@@ -543,20 +544,20 @@ def generate_signals(
             for i, cumulative_ret in enumerate(recent_cumulative_returns):
                 if not np.isfinite(cumulative_ret):
                     continue
-                _av = float(_full_daily_vols[i]) if np.isfinite(_full_daily_vols[i]) and _full_daily_vols[i] > 0 else _baseline_daily_vol
-                _vs = float(np.clip(_av / _baseline_daily_vol, 0.5, 2.0))
-                _threshold = cfg.KNIFE_THRESHOLD * _vs
-                if cumulative_ret < _threshold * 0.5:
+                vol_adj_threshold = thresholds[i]
+                if cumulative_ret < vol_adj_threshold * 0.5:
                     knife_pre_bonus_suppress[i] = True
 
+        _max_win = max(activity_window, stale_sessions)
+        _recent_window_df = signal_log_rets[active_symbols].tail(_max_win)
         for i, sym in enumerate(active_symbols):
             prev_w = float(prev_weights.get(sym, 0.0))
             if valid_mask[i] and prev_w > 0.001 and not knife_pre_bonus_suppress[i]:
-                recent_rets = signal_log_rets[sym].tail(activity_window)  # FIX-LAG-CONT
+                recent_rets = _recent_window_df[sym].iloc[-activity_window:]  # FIX-LAG-CONT
                 nonzero_days = int((recent_rets.abs() > flat_ret_eps).sum()) if len(recent_rets) else 0
                 has_recent_activity = nonzero_days >= min_nonzero_days
 
-                stale_rets = signal_log_rets[sym].tail(stale_sessions)  # FIX-LAG-CONT
+                stale_rets = _recent_window_df[sym].iloc[-stale_sessions:]  # FIX-LAG-CONT
                 is_stale = (
                     len(stale_rets) == stale_sessions
                     and stale_rets.notna().all()
@@ -588,6 +589,8 @@ def generate_signals(
                 liquidity_denied,
             )
 
+    _adj_scores_post_knife = adj_scores.copy()
+
     # FIX-NAN-ARGSORT: replace any residual NaN in adj_scores with -inf before
     # sorting.  NumPy places NaN at the END of an argsort result (highest indices),
     # so NaN values would occupy top-N slots and be silently dropped by the
@@ -600,7 +603,8 @@ def generate_signals(
     # counted enough valid bars across the full tail window.
     adj_scores = np.where(np.isnan(adj_scores), -np.inf, adj_scores)
     sorted_indices = np.argsort(adj_scores)
-    top_n_indices = sorted_indices[-cfg.MAX_POSITIONS:]
+    _n_pos = max(int(cfg.MAX_POSITIONS), 1)
+    top_n_indices = sorted_indices[-_n_pos:]
 
     selected_indices = [
         int(idx) for idx in top_n_indices
@@ -620,7 +624,7 @@ def generate_signals(
     # gate_pass_mask & (adj_scores == -inf) which would absorb history/ADV
     # failures that also happen to share the -inf sentinel value.
     knife_hard_mask = np.isfinite(_adj_scores_pre_knife) & (adj_scores == -np.inf)
-    knife_soft_mask = gate_pass_mask & knife_pre_bonus_suppress & np.isfinite(adj_scores)
+    knife_soft_mask = gate_pass_mask & knife_pre_bonus_suppress & np.isfinite(_adj_scores_post_knife)
     n_knife_fail = int(np.sum(knife_hard_mask | knife_soft_mask))
     n_selected   = len(selected_indices)
 
