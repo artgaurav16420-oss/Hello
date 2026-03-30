@@ -63,7 +63,7 @@ _REBALANCE_MONTHS = {3, 9}   # March and September effective dates
 
 # Fallback: all NSE-listed tickers for yfinance approximation
 _FALLBACK_APPROX_N = 500
-DELISTED_TICKERS_FILE = "data/nse_delisted_historical.csv"
+DELISTED_TICKERS_FILE = DATA_DIR / "nse_delisted_historical.csv"
 
 _HEADERS = {
     "User-Agent": (
@@ -412,8 +412,17 @@ def _build_pit_csv_from_yfinance_approx(
     try:
         delisted = pd.read_csv(DELISTED_TICKERS_FILE)["ticker"].tolist()
         candidate_tickers = list(dict.fromkeys(candidate_tickers + delisted))
-    except FileNotFoundError:
-        logging.warning("Delisted tickers file not found; survivorship bias not corrected.")
+    except (FileNotFoundError, KeyError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        logger.warning(
+            "Delisted tickers file unavailable/invalid (%s); survivorship bias not corrected.",
+            exc,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error reading delisted tickers (%s); survivorship bias not corrected.",
+            exc,
+            exc_info=True,
+        )
 
     # Step 2: Download price data
     rebalance_dates = _get_rebalance_dates(start_year=start_year)

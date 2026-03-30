@@ -324,6 +324,7 @@ class PortfolioState:
 
     def __post_init__(self) -> None:
         self._initial_cash = float(self.cash)
+        self._initial_exposure_multiplier = float(self.exposure_multiplier)
         self._equity_hist_cap = int(self.equity_hist_cap)
 
     def update_exposure(
@@ -458,6 +459,7 @@ class PortfolioState:
         self.last_known_volatility = {}
         self.vol_hist = {}
         self.absent_periods = {}
+        self.exposure_multiplier = float(getattr(self, "_initial_exposure_multiplier", 1.0))
         self.override_active = False
         self.override_cooldown = 0
         self.consecutive_failures = 0
@@ -1281,10 +1283,6 @@ def compute_book_cvar(
                 np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
             ).astype(np.int64)
 
-            rng = np.random.default_rng(int(row_seeds[0]))
-            raw = rng.standard_normal(len(row_seeds))
-            offsets = (row_seeds - row_seeds[0]).astype(float) * 1e-10
-
             vol_series = np.full(len(row_seeds), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
             sym_hist = list(state.vol_hist.get(sym, deque()))
             if sym_hist:
@@ -1300,7 +1298,11 @@ def compute_book_cvar(
                     if nearest is not None:
                         vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
 
-            synth_rets = daily_drift + vol_series * (raw + offsets)
+            raw = np.array(
+                [np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds],
+                dtype=float,
+            )
+            synth_rets = daily_drift + vol_series * raw
             rets.loc[:, sym] = synth_rets
 
     rets = rets.fillna(0.0)
@@ -1760,26 +1762,23 @@ class InstitutionalRiskEngine:
                     f"OSQP solve() failed with exception: {exc}",
                     OptimizationErrorType.NUMERICAL,
                 ) from exc
-
-        if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
-            with self._solver_lock:
+            if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
                 self._solver = None
                 self._solver_shape = None
                 self._solver_nnz = None
                 self._solver_struct = None
-            raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
+                raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
 
-        w_opt = np.maximum(res.x[:m], 0.0)
-        actual_deltas = np.abs(w_opt - prev_w_arr) * float(portfolio_value)
-        turnover_costs = _compute_one_way_slip_rate_vectorized(
-            cfg=self.cfg,
-            portfolio_value=portfolio_value,
-            adv_notional=np.asarray(adv_shares, dtype=float),
-            trade_notional=np.asarray(actual_deltas, dtype=float),
-        )
-        q[m:2*m] = turnover_costs
+            w_opt = np.maximum(res.x[:m], 0.0)
+            actual_deltas = np.abs(w_opt - prev_w_arr) * float(portfolio_value)
+            turnover_costs = _compute_one_way_slip_rate_vectorized(
+                cfg=self.cfg,
+                portfolio_value=portfolio_value,
+                adv_notional=np.asarray(adv_shares, dtype=float),
+                trade_notional=np.asarray(actual_deltas, dtype=float),
+            )
+            q[m:2*m] = turnover_costs
 
-        with self._solver_lock:
             assert self._solver is not None
             self._solver.update(q=q)
             self._solver.warm_start(x=res.x)
@@ -1794,14 +1793,12 @@ class InstitutionalRiskEngine:
                     f"OSQP second-pass solve() failed with exception: {exc}",
                     OptimizationErrorType.NUMERICAL,
                 ) from exc
-
-        if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
-            with self._solver_lock:
+            if res.info.status not in ("solved", "solved inaccurate", "solved_inaccurate"):
                 self._solver = None
                 self._solver_shape = None
                 self._solver_nnz = None
                 self._solver_struct = None
-            raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
+                raise OptimizationError(f"OSQP status: {res.info.status}", OptimizationErrorType.NUMERICAL)
 
         if res.info.status in ("solved inaccurate", "solved_inaccurate"):
             logger.warning(

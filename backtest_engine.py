@@ -823,13 +823,34 @@ def build_precomputed_matrices(
         close = close[~close.index.duplicated(keep="last")]
     close = close.dropna(how="all")
     shared_index = close.index
-    close_adj = pd.DataFrame(close_adj_d).reindex(shared_index)
-    open_df = pd.DataFrame(open_d).reindex(shared_index)
-    high_df = pd.DataFrame(high_d).reindex(shared_index)
-    low_df = pd.DataFrame(low_d).reindex(shared_index)
-    dividends_df = pd.DataFrame(div_d).reindex(shared_index).fillna(0.0)
-    splits_df = pd.DataFrame(split_d).reindex(shared_index).fillna(0.0)
-    volume_df = pd.DataFrame(volume_d).reindex(shared_index)
+    close_adj = pd.DataFrame(close_adj_d).sort_index()
+    open_df = pd.DataFrame(open_d).sort_index()
+    high_df = pd.DataFrame(high_d).sort_index()
+    low_df = pd.DataFrame(low_d).sort_index()
+    dividends_df = pd.DataFrame(div_d).sort_index()
+    splits_df = pd.DataFrame(split_d).sort_index()
+    volume_df = pd.DataFrame(volume_d).sort_index()
+    if not close_adj.index.is_unique:
+        close_adj = close_adj[~close_adj.index.duplicated(keep="last")]
+    if not open_df.index.is_unique:
+        open_df = open_df[~open_df.index.duplicated(keep="last")]
+    if not high_df.index.is_unique:
+        high_df = high_df[~high_df.index.duplicated(keep="last")]
+    if not low_df.index.is_unique:
+        low_df = low_df[~low_df.index.duplicated(keep="last")]
+    if not dividends_df.index.is_unique:
+        dividends_df = dividends_df[~dividends_df.index.duplicated(keep="last")]
+    if not splits_df.index.is_unique:
+        splits_df = splits_df[~splits_df.index.duplicated(keep="last")]
+    if not volume_df.index.is_unique:
+        volume_df = volume_df[~volume_df.index.duplicated(keep="last")]
+    close_adj = close_adj.reindex(shared_index)
+    open_df = open_df.reindex(shared_index)
+    high_df = high_df.reindex(shared_index)
+    low_df = low_df.reindex(shared_index)
+    dividends_df = dividends_df.reindex(shared_index).fillna(0.0)
+    splits_df = splits_df.reindex(shared_index).fillna(0.0)
+    volume_df = volume_df.reindex(shared_index)
 
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
@@ -1004,10 +1025,7 @@ def run_backtest(
         dividends = _select_with_universe_labels(_clip(matrices["dividends"]))
         splits    = _select_with_universe_labels(_clip(matrices["splits"]))
         volume    = _select_with_universe_labels(_clip(matrices["volume"]))
-        returns_raw = _clip(matrices["returns"])
-        clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
-        safe_start = returns_raw.index[max(int(clip_start_iloc), 1)]
-        returns = _select_with_universe_labels(returns_raw.loc[safe_start:pd.Timestamp(end_date)])
+        returns = _select_with_universe_labels(_clip(matrices["returns"]))
     else:
         # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
         # which kept almost every DataFrame (any series starting before warmup_start
@@ -1034,8 +1052,13 @@ def run_backtest(
         returns = matrices["returns"]
 
     returns_raw = returns
+    if returns_raw.empty:
+        raise RuntimeError("Backtest aborted: returns matrix is empty after clipping.")
     clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
-    safe_start = returns_raw.index[max(int(clip_start_iloc), 1)]
+    if clip_start_iloc < 0:
+        clip_start_iloc = 0
+    min_start_iloc = 1 if len(returns_raw.index) >= 2 else 0
+    safe_start = returns_raw.index[max(int(clip_start_iloc), min_start_iloc)]
     returns = returns_raw.loc[safe_start:pd.Timestamp(end_date)]
 
     if close.empty:
