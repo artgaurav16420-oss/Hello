@@ -92,8 +92,6 @@ class BacktestEngine:
     def __init__(self, engine: InstitutionalRiskEngine, initial_cash: float = 1_000_000):
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
-        self._initial_cash       = float(initial_cash)
-        self.state._initial_cash = self._initial_cash
         self.state.equity_hist_cap = engine.cfg.EQUITY_HIST_CAP
         self.state.max_absent_periods = engine.cfg.MAX_ABSENT_PERIODS
         self.trades:  List[Trade]  = []
@@ -623,7 +621,7 @@ def _build_adv_vector(
             reason_counts,
             reason_samples,
         )
-    adv_out = np.array(adv, dtype=float)
+    adv_out = adv
     if return_notional:
         return adv_out, close_notional
     return adv_out
