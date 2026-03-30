@@ -23,7 +23,10 @@ import argparse
 import io
 import logging
 import os
+import tempfile
+import threading
 import time
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -110,6 +113,9 @@ NIFTY50_CORE = [
     "LT", "HDFC",
 ]
 
+_NSE_SESSION: "requests.Session | None" = None  # FIX-10
+_NSE_SESSION_LOCK = threading.Lock()
+
 
 # FIX-MB-DUPNS: Single canonical definition of _ns(). The original module had
 # two definitions; the second shadowed the first. Removed the duplicate.
@@ -119,29 +125,51 @@ def _ns(sym: str) -> str:
     return s if s.endswith(".NS") or s.startswith("^") else f"{s}.NS"
 
 
+def _get_nse_session() -> requests.Session:
+    """Create and warm a singleton session for NSE requests."""
+    global _NSE_SESSION
+    with _NSE_SESSION_LOCK:
+        if _NSE_SESSION is None:  # FIX-10
+            _NSE_SESSION = requests.Session()  # FIX-10
+            try:
+                _NSE_SESSION.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)  # FIX-10
+                time.sleep(0.5)  # FIX-10
+            except Exception:
+                pass
+    return _NSE_SESSION
+
+
+def _invalidate_nse_session() -> None:
+    """Close and invalidate the singleton session on connection failures."""
+    global _NSE_SESSION
+    with _NSE_SESSION_LOCK:
+        if _NSE_SESSION is not None:
+            try:
+                _NSE_SESSION.close()
+            except Exception:
+                pass
+            _NSE_SESSION = None
+
+
 def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optional[requests.Response]:
     """GET with exponential backoff. Returns Response or None on failure."""
-    session = requests.Session()
-    try:
+    session = _get_nse_session()  # FIX-10
+    for attempt in range(retries):
         try:
-            session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
-            time.sleep(0.5)
-        except Exception:
-            pass
-
-        for attempt in range(retries):
-            try:
-                resp = session.get(url, headers=NSE_HEADERS, timeout=20)
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    return resp
-                logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
-            except Exception as exc:
-                logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
+            resp = session.get(url, headers=NSE_HEADERS, timeout=20)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                return resp
+            logger.warning("  [%s] HTTP %d, attempt %d/%d", url[:60], resp.status_code, attempt + 1, retries)
+        except requests.ConnectionError as exc:
+            logger.warning("  [%s] ConnectionError, invalidating session, attempt %d/%d", url[:60], attempt + 1, retries, exc_info=True)
+            _invalidate_nse_session()
             if attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-        return None
-    finally:
-        session.close()
+                session = _get_nse_session()
+        except Exception as exc:
+            logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
+        if attempt < retries - 1:
+            time.sleep(delay * (2 ** attempt) + random.uniform(0, 0.5))  # FIX-2
+    return None
 
 
 # ─── Wayback Machine PIT fetch ───────────────────────────────────────────────
@@ -171,22 +199,40 @@ def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
             "filter": "statuscode:200",
             "from": str(start_year),
             "limit": "5000",
+            "showResumeKey": "true",  # FIX-6
         }
         try:
-            resp = requests.get(
-                _WBM_CDX_URL, params=params,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            rows = resp.json()
-            for row in rows[1:]:
-                if len(row) >= 2 and row[1] == "200":
-                    ts = str(row[0]).strip()
-                    if len(ts) >= 8 and ts[:4].isdigit():
-                        collected.add(ts)
+            while True:  # FIX-6
+                resp = requests.get(
+                    _WBM_CDX_URL, params=params,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                resume_key = None  # FIX-6
+                for row in rows[1:]:  # FIX-6
+                    if len(row) == 1:  # FIX-6
+                        candidate = str(row[0]).strip()
+                        # Validate: not empty, not a timestamp (e.g., "20210131120000")
+                        if candidate and len(candidate) > 0:
+                            # Reject if it looks like a timestamp (8+ chars, first 4 are digits)
+                            if len(candidate) >= 8 and candidate[:4].isdigit():
+                                # This looks like a timestamp, not a resume key
+                                continue
+                            # Accept as resume key
+                            resume_key = candidate
+                        continue
+                    if len(row) >= 2 and row[1] == "200":  # FIX-6
+                        ts = str(row[0]).strip()
+                        if len(ts) >= 8 and ts[:4].isdigit():
+                            collected.add(ts)
+                if not resume_key:  # FIX-6
+                    break
+                params["resumeKey"] = resume_key  # FIX-6
         except Exception as exc:
             logger.debug("[Wayback] CDX query failed for %s: %s", query_url, exc)
+        _time_mod.sleep(_WBM_SLEEP_SECS)   # rate-limit between scheme variants  # FIX-9
 
     month_to_ts: dict[str, str] = {}
     for ts in sorted(collected):
@@ -201,23 +247,27 @@ def _wbm_cdx_timestamps(nse_url: str, start_year: int = 2015) -> list[str]:
     return ts_list
 
 
-def _wbm_fetch_csv(timestamp: str, original_url: str) -> pd.DataFrame | None:
+def _wbm_fetch_csv(timestamp: str, original_url: str, retries: int = 3) -> pd.DataFrame | None:
     """Fetch a single Wayback snapshot and parse as CSV. Returns None on failure."""
     url = _WBM_FETCH_TPL.format(ts=timestamp, url=original_url)
-    try:
-        resp = requests.get(
-            url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30
-        )
-        resp.raise_for_status()
-        for enc in ("utf-8", "latin-1", "cp1252"):
-            try:
-                df = pd.read_csv(_io_mod.BytesIO(resp.content), encoding=enc)
-                if not df.empty and len(df.columns) >= 3:
-                    return df
-            except Exception:
-                continue
-    except Exception as exc:
-        logger.debug("[Wayback] fetch failed (ts=%s): %s", timestamp, exc)
+    for attempt in range(retries):  # FIX-3
+        try:
+            resp = requests.get(
+                url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30
+            )
+            resp.raise_for_status()
+            for enc in ("utf-8", "latin-1", "cp1252"):  # FIX-3
+                try:
+                    df = pd.read_csv(_io_mod.BytesIO(resp.content), encoding=enc)
+                    if not df.empty and len(df.columns) >= 3:  # FIX-3
+                        return df
+                except Exception:
+                    continue
+            raise ValueError("No valid CSV decoding produced usable dataframe")  # FIX-3
+        except Exception as exc:
+            logger.debug("[Wayback] fetch failed (ts=%s attempt=%d/%d): %s", timestamp, attempt + 1, retries, exc)  # FIX-3
+            if attempt < retries - 1:
+                _time_mod.sleep(2.0 * (2 ** attempt))  # FIX-3
     return None
 
 
@@ -232,15 +282,20 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
             tickers = [_ns(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")]
             if tickers:
                 return sorted(set(tickers))
-    pattern = re.compile(r"^[A-Z][A-Z0-9&\-]{1,14}$")
-    found: set[str] = set()
+    logger.warning("[Wayback] Fallback regex parsing path entered; CSV columns: %s", list(df.columns))  # FIX-12
+    pattern = re.compile(r"^[A-Z][A-Z0-9&\-]{2,14}$")  # FIX-12
+    counts: dict[str, int] = {}
+    MIN_TICKER_OCCURRENCES = 2  # FIX-12
     skip = {"SERIES", "ISIN", "INDUSTRY", "NAME", "SYMBOL", "TICKER"}
     for col in df.columns:
         for val in df[col].dropna().astype(str):
             v = val.strip().upper()
             if pattern.match(v) and v not in skip:
-                found.add(_ns(v))
-    return sorted(found)
+                counts[v] = counts.get(v, 0) + 1  # FIX-12
+    found = sorted(_ns(sym) for sym, cnt in counts.items() if cnt >= MIN_TICKER_OCCURRENCES)  # FIX-12
+    if len(found) < 10:
+        logger.warning("[Wayback] Fallback regex parser yielded fewer than 10 tickers (%d).", len(found))  # FIX-12
+    return found
 
 
 def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list[str]]], bool]:
@@ -299,9 +354,9 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
     return snapshots, success
 
 
-def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
+def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     """
-    Write *df* to *path* as a Parquet file, pinning ``engine='pyarrow'``.
+    Write *df* to *path* as a Parquet file using atomic write with unique temp file.
 
     FIX-BUG-16: all four ``to_parquet`` calls in this module previously used
     the default engine.  ``universe_manager._load_historical_universe_df``
@@ -314,31 +369,128 @@ def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
     ``universe_manager``.  Pinning the same engine on both sides of the
     parquet channel ensures deterministic list round-trips regardless of
     which engines are installed.
+
+    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
+    collisions across concurrent writers.
     """
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
+    tmp = Path(tmp_path)
     try:
-        df.to_parquet(path, engine="pyarrow")
+        os.close(fd)
+        df.to_parquet(tmp, engine="pyarrow")
+        os.replace(tmp, path)
     except Exception:
-        # pyarrow unavailable — fall back to default engine with a warning so
-        # operators know list round-trips may be unreliable.
-        logger.warning(
-            "[BHF] pyarrow not available; writing %s with default parquet engine. "
-            "List-valued 'tickers' column may not round-trip correctly on read.",
-            path,
+        tmp.unlink(missing_ok=True)
+        fd2 = None
+        tmp2 = None
+        try:
+            fd2, tmp_path2 = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
+            tmp2 = Path(tmp_path2)
+            os.close(fd2)
+            df.to_parquet(tmp2)
+            os.replace(tmp2, path)
+            logger.warning(
+                "[BHF] pyarrow not available; writing %s with default parquet engine. "
+                "List-valued 'tickers' column may not round-trip correctly on read.",
+                path,
+            )
+        except Exception:
+            if tmp2 is not None and tmp2.exists():
+                tmp2.unlink(missing_ok=True)
+            raise
+
+
+def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
+    """
+    Write *df* to *path* as a CSV file using atomic write with unique temp file.
+
+    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
+    collisions across concurrent writers.
+    """
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.csv", prefix=".tmp_")
+    tmp = Path(tmp_path)
+    try:
+        os.close(fd)
+        df.to_csv(tmp, **kwargs)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# Backward compatibility alias
+def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
+    """Backward compatibility wrapper for _atomic_write_parquet."""
+    _atomic_write_parquet(df, path)
+
+
+def _compute_vol_gate_snapshots(
+    valid_trading_days: "pd.DataFrame",
+    history_gate: int,
+    start_date: str,
+    snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
+) -> "pd.DataFrame":
+    """
+    Build volume-gated snapshots aligned to actual trading days.
+
+    FIX-SNAPSHOT-ALIGN: Maps each calendar snapshot date to the last trading day <= d
+    to ensure consistent PIT timestamps across parquet and CSV outputs.
+    """
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
         )
-        df.to_parquet(path)
+    calendar_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
+    trading_days_index = pd.DatetimeIndex(valid_trading_days.index)
+
+    aligned_dates = []
+    rows = []
+    for d in calendar_dates:
+        # Map to last trading day <= d
+        past_trading = trading_days_index[trading_days_index <= d]
+        if past_trading.empty:
+            continue
+        snapshot_date = past_trading[-1]
+
+        # Get eligible tickers as of that snapshot date
+        past = valid_trading_days[valid_trading_days.index <= snapshot_date]
+        eligible = (
+            [] if past.empty
+            else past.iloc[-1][past.iloc[-1] >= history_gate].index.tolist()
+        )
+        aligned_dates.append(snapshot_date)
+        rows.append(eligible)
+
+    return pd.DataFrame(
+        {"tickers": rows},
+        index=pd.DatetimeIndex(aligned_dates, name="date"),
+    )  # FIX-15
 
 
 def build_parquet_from_wayback(
     universe_type: str,
     snapshots: list[tuple[str, list[str]]],
 ) -> Path:
-    """Write a PIT parquet from Wayback-sourced snapshots."""
+    """
+    Write a PIT parquet from Wayback-sourced snapshots.
+
+    FIX-CSV-FILTERED: CSV is now built from the filtered rows dict (not raw snapshots)
+    to ensure malformed date entries don't leak into the CSV output.
+    """
     output_path = DATA_DIR / f"historical_{universe_type}.parquet"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     rows: dict[pd.Timestamp, list[str]] = {}
     for date_str, tickers in snapshots:
-        ts = pd.Timestamp(date_str)
+        try:
+            ts = pd.Timestamp(date_str)  # FIX-14
+        except Exception as exc:
+            logger.warning("[BHF] Skipping malformed snapshot date %r: %s", date_str, exc)  # FIX-14
+            continue
         existing = rows.get(ts, [])
         rows[ts] = sorted(set(existing) | set(tickers))
 
@@ -347,12 +499,13 @@ def build_parquet_from_wayback(
     out_df = pd.DataFrame({"tickers": series})
     _to_parquet_pyarrow(out_df, output_path)
 
+    # FIX-CSV-FILTERED: Build CSV from filtered rows instead of raw snapshots
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     csv_rows = []
-    for date_str, tickers in snapshots:
-        for tkr in tickers:
-            csv_rows.append({"date": date_str, "ticker": tkr})
-    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+    for ts in idx:
+        for tkr in rows[ts]:
+            csv_rows.append({"date": ts.strftime("%Y-%m-%d"), "ticker": tkr})
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info(
         "[Wayback] Wrote %d TRUE PIT snapshots → %s  (+ companion CSV)",
@@ -440,11 +593,17 @@ def build_parquet(
     history_gate: int,
     start_date: str = "2015-01-01",
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> Path:
     """
     Create a PIT parquet from valid_trading_days by backfilling quarterly
     snapshots from start_date to today.
     """
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     assert all(
         s.endswith(".NS") or s.startswith("^") for s in valid_trading_days.columns
     ), "MB-15: all columns in valid_trading_days must be .NS-suffixed or index tickers"
@@ -453,28 +612,39 @@ def build_parquet(
 
     # BHF-02: use UTC-normalised date instead of local today() to ensure consistency
     # with the rest of the engine's TZ-naive UTC timestamps.
-    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
+    snapshot_df = _compute_vol_gate_snapshots(  # FIX-15
+        valid_trading_days=valid_trading_days,
+        history_gate=history_gate,
+        start_date=start_date,
+        snap_freq=snap_freq,
+        end_date=end_date,  # FIX-4
+    )
+    snapshot_dates = pd.DatetimeIndex(snapshot_df.index)
+    trading_days = pd.DatetimeIndex(valid_trading_days.index)  # FIX-8
+    aligned = []  # FIX-8
+    for d in snapshot_dates:  # FIX-8
+        prior = trading_days[trading_days <= d]
+        if not prior.empty:
+            aligned.append(prior[-1])
+    snapshot_dates = pd.DatetimeIndex(sorted(set(aligned)), name="date")  # FIX-8
     if snapshot_dates.empty:
-        snapshot_dates = pd.DatetimeIndex([today_utc])
+        fallback_end = end_date if end_date is not None else pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        snapshot_dates = pd.DatetimeIndex([fallback_end], name="date")  # FIX-4
+
+    rows = []
+    for d in snapshot_dates:
+        past_data = valid_trading_days[valid_trading_days.index <= d]
+        status_on_date = past_data.iloc[-1] if not past_data.empty else pd.Series(dtype=float)
+        eligible = status_on_date[status_on_date >= history_gate].index.tolist() if not status_on_date.empty else []
+        rows.append(eligible)
+
+    out_df = pd.DataFrame({"tickers": rows}, index=snapshot_dates)
 
     logger.info(
         "  Building %d volume-gated snapshots from %s → today for %d symbols.",
-        len(snapshot_dates), start_date, len(valid_trading_days.columns),
+        len(out_df), start_date, len(valid_trading_days.columns),
     )
 
-    rows: list[list[str]] = []
-    for d in snapshot_dates:
-        past_data = valid_trading_days[valid_trading_days.index <= d]
-        if past_data.empty:
-            rows.append([])
-            continue
-
-        status_on_date = past_data.iloc[-1]
-        eligible = status_on_date[status_on_date >= history_gate].index.tolist()
-        rows.append(eligible)
-
-    out_df = pd.DataFrame({"tickers": rows}, index=pd.DatetimeIndex(snapshot_dates, name="date"))
     _to_parquet_pyarrow(out_df, output_path)
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(out_df))
     return output_path
@@ -486,24 +656,46 @@ def build_csv_from_symbols(
     history_gate: int,
     start_date: str = "2015-01-01",
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> Path:
     """Write the companion CSV incorporating strict volume existence gates."""
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
-    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
+    snapshot_df = _compute_vol_gate_snapshots(  # FIX-15
+        valid_trading_days=valid_trading_days,
+        history_gate=history_gate,
+        start_date=start_date,
+        snap_freq=snap_freq,
+        end_date=end_date,  # FIX-4
+    )
+
+    # FIX-EMPTY-CSV: When snapshot_df is empty (no valid snapshots),
+    # apply the same fallback logic as build_parquet to ensure both
+    # artifacts describe the same build with consistent snapshot dates.
+    if snapshot_df.empty:
+        fallback_end = end_date if end_date is not None else pd.Timestamp.now("UTC").tz_convert(None).normalize()
+        # Create a fallback snapshot with the fabricated date and empty ticker list.
+        # In CSV format, this is represented as a single row with the date and no ticker.
+        snapshot_df = pd.DataFrame(
+            {"tickers": [[]]},
+            index=pd.DatetimeIndex([fallback_end], name="date")
+        )
 
     csv_rows = []
-    for d in snapshot_dates:
-        past_data = valid_trading_days[valid_trading_days.index <= d]
-        if past_data.empty:
-            continue
+    for d, tickers in snapshot_df["tickers"].items():
+        if not tickers:
+            # Empty ticker list: emit one row with date and empty ticker field
+            # to indicate the snapshot date exists but has no members
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
+        else:
+            for sym in tickers:
+                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
 
-        status_on_date = past_data.iloc[-1]
-        eligible = status_on_date[status_on_date >= history_gate].index.tolist()
-        for sym in eligible:
-            csv_rows.append({"date": d.strftime("%Y-%m-%d"), "ticker": sym})
-
-    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
     return csv_path
 
@@ -515,10 +707,15 @@ def _build_adnv_ranked_snapshots(
     lookback_days: int = 126,
     min_trading_days: int = 60,
     snap_freq: str = "QS",
+    end_date: "pd.Timestamp | None" = None,
 ) -> pd.DataFrame:
     """Build quarterly PIT rows using ADNV ranking over available candidate symbols."""
-    today_utc = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=today_utc, freq=snap_freq)
+    if end_date is None:
+        raise ValueError(
+            "end_date is required and must not be None. "
+            "Caller should pass run()-scoped TODAY_UTC for consistency."
+        )
+    snapshot_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
     rows: list[list[str]] = []
 
     for d in snapshot_dates:
@@ -528,6 +725,9 @@ def _build_adnv_ranked_snapshots(
             if df is None or df.empty or "Close" not in df.columns or "Volume" not in df.columns:
                 continue
             try:
+                if getattr(df.index, "tz", None) is not None:
+                    df = df.copy()
+                    df.index = df.index.tz_convert(None)  # FIX-5
                 hist = df.loc[:ref].tail(lookback_days)
                 if len(hist) < min_trading_days:
                     continue
@@ -537,7 +737,8 @@ def _build_adnv_ranked_snapshots(
                 if pd.isna(adnv) or adnv <= 0:
                     continue
                 scores[sym] = adnv
-            except Exception:
+            except Exception as exc:
+                logger.warning("[ADNV] Skipping %s at %s: %s", sym, ref.date(), exc)  # FIX-5
                 continue
 
         ranked = sorted(scores, key=lambda x: scores[x], reverse=True)[:top_n]
@@ -558,7 +759,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     for d, tickers in snapshot_df["tickers"].items():
         for tkr in (tickers if isinstance(tickers, list) else list(tickers)):
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
-    pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
@@ -568,6 +769,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
 def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
+    TODAY_UTC = pd.Timestamp.now("UTC").tz_convert(None).normalize()  # FIX-4
     want_nifty500  = universe_arg in ("both", "nifty500")
     want_nse_total = universe_arg in ("both", "nse_total")
 
@@ -601,20 +803,35 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             symbols = [_ns(s) for s in NIFTY50_CORE]
 
         market_data = load_or_fetch(
-            symbols, start_date, pd.Timestamp.today().strftime("%Y-%m-%d"), cfg=cfg
+            symbols, start_date, TODAY_UTC.strftime("%Y-%m-%d"), cfg=cfg
         )
         vol_dict = {}
+        skipped_none, skipped_empty, skipped_no_vol = [], [], []  # FIX-11
         for sym, df in market_data.items():
-            if df is not None and not df.empty and "Volume" in df.columns:
-                vol_dict[sym] = df["Volume"].replace(0, np.nan)
+            if df is None:
+                skipped_none.append(sym)
+                continue
+            if df.empty:
+                skipped_empty.append(sym)
+                continue
+            if "Volume" not in df.columns:
+                skipped_no_vol.append(sym)
+                continue
+            vol_dict[sym] = df["Volume"].replace(0, np.nan)
+        logger.info(
+            "[VolGate] Skipped — None: %d, empty: %d, no-Volume: %d. Included: %d.",
+            len(skipped_none), len(skipped_empty), len(skipped_no_vol), len(vol_dict),
+        )
+        if skipped_none:
+            logger.warning("[VolGate] None symbols (delisting or fetch failure): %s", skipped_none[:20])
         vol_matrix = pd.DataFrame(vol_dict).sort_index()
         valid_trading_days = vol_matrix.notna().cumsum()
 
         parquet_path = build_parquet(
-            "nifty500", valid_trading_days, history_gate, start_date
+            "nifty500", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
         build_csv_from_symbols(
-            "nifty500", valid_trading_days, history_gate, start_date
+            "nifty500", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
 
         if snapshots:
@@ -683,7 +900,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             for d, tickers in zip(all_dates, merged_tickers):
                 for tkr in tickers:
                     csv_rows.append({"date": d.strftime("%Y-%m-%d"), "ticker": tkr})
-            pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
+            _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
             logger.info(
                 # FIX-MB2-WBMMERGE: Previously used len(df_existing) for the
@@ -703,6 +920,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
                 market_data=market_data,
                 start_date=start_date,
                 top_n=500,
+                end_date=TODAY_UTC,  # FIX-4
             )
             non_empty = int(sum(bool(x) for x in adnv_df["tickers"]))
             if non_empty > 0:
@@ -733,7 +951,22 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         print()
         print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-non-empty-snapshot")
 
-        late_joiners = {"ZOMATO.NS", "NYKAA.NS", "PAYTM.NS", "IREDA.NS"}
+        # FIX-13: Default IPO_DATES now includes POLICYBAZAAR.NS
+        ipo_dates: dict = getattr(cfg, "IPO_DATES", {
+            "ZOMATO.NS": "2021-07-23",
+            "NYKAA.NS":  "2021-11-10",
+            "PAYTM.NS":  "2021-11-18",
+            "POLICYBAZAAR.NS": "2021-11-15",
+            "IREDA.NS":  "2023-11-29",
+        })
+        # FIX-DEFENSIVE-PARSE: Defensive late_joiners construction with malformed date handling
+        late_joiners = set()
+        for sym, dt in ipo_dates.items():
+            try:
+                if pd.Timestamp(dt) >= pd.Timestamp("2021-07-01"):
+                    late_joiners.add(sym)
+            except Exception as exc:
+                logger.warning("[Verify] Skipping malformed IPO_DATES entry for %s=%r: %s", sym, dt, exc)
         pre_2021 = df_check[df_check.index < pd.Timestamp("2021-07-01")]
         if not pre_2021.empty:
             pre_members: set = set()
@@ -768,23 +1001,49 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             logger.warning("NSE Total fetch failed — using Nifty 50 hard-floor.")
 
         logger.info("Fetching market data for volume-gate PIT construction...")
-        market_data = load_or_fetch(
-            symbols, start_date, pd.Timestamp.today().strftime("%Y-%m-%d"), cfg=cfg
-        )
+        CHUNK_SIZE = 200
+        all_market_data: dict = {}
+        for i in range(0, len(symbols), CHUNK_SIZE):
+            chunk = symbols[i: i + CHUNK_SIZE]
+            all_market_data.update(
+                load_or_fetch(chunk, start_date, TODAY_UTC.strftime("%Y-%m-%d"), cfg=cfg)
+            )
+            logger.info(
+                "[NSE Total] Loaded chunk %d/%d (%d symbols)",
+                i // CHUNK_SIZE + 1,
+                -(-len(symbols) // CHUNK_SIZE),
+                len(chunk),
+            )
+        market_data = all_market_data  # FIX-7
 
         vol_dict = {}
+        skipped_none, skipped_empty, skipped_no_vol = [], [], []  # FIX-11
         for sym, df in market_data.items():
-            if df is not None and not df.empty and "Volume" in df.columns:
-                vol_dict[sym] = df["Volume"].replace(0, np.nan)
+            if df is None:
+                skipped_none.append(sym)
+                continue
+            if df.empty:
+                skipped_empty.append(sym)
+                continue
+            if "Volume" not in df.columns:
+                skipped_no_vol.append(sym)
+                continue
+            vol_dict[sym] = df["Volume"].replace(0, np.nan)
+        logger.info(
+            "[VolGate] Skipped — None: %d, empty: %d, no-Volume: %d. Included: %d.",
+            len(skipped_none), len(skipped_empty), len(skipped_no_vol), len(vol_dict),
+        )
+        if skipped_none:
+            logger.warning("[VolGate] None symbols (delisting or fetch failure): %s", skipped_none[:20])
 
         vol_matrix = pd.DataFrame(vol_dict).sort_index()
         valid_trading_days = vol_matrix.notna().cumsum()
 
         parquet_path = build_parquet(
-            "nse_total", valid_trading_days, history_gate, start_date
+            "nse_total", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
         build_csv_from_symbols(
-            "nse_total", valid_trading_days, history_gate, start_date
+            "nse_total", valid_trading_days, history_gate, start_date, end_date=TODAY_UTC  # FIX-4
         )
 
         df_check = pd.read_parquet(parquet_path)
@@ -817,3 +1076,20 @@ def _parse_args(argv=None):
 if __name__ == "__main__":
     args = _parse_args()
     run(universe_arg=args.universe, start_date=args.start)
+
+# VERIFICATION CHECKLIST
+# FIX-1  : grep '_to_parquet_pyarrow\|to_csv' — every write uses .tmp + os.replace
+# FIX-2  : grep 'time.sleep' in _fetch_with_retry — uses 2**attempt
+# FIX-3  : grep '_wbm_fetch_csv' — has for-attempt loop with exponential sleep
+# FIX-4  : grep 'Timestamp.today' — zero occurrences; TODAY_UTC defined in run()
+# FIX-5  : grep 'tz_convert(None)' in _build_adnv_ranked_snapshots — present
+# FIX-6  : grep 'resumeKey' — pagination loop present in _wbm_cdx_timestamps
+# FIX-7  : grep 'CHUNK_SIZE' — chunked loop in NSE-Total block of run()
+# FIX-8  : grep 'aligned_dates\|trading_days' in build_parquet — present
+# FIX-9  : grep '_WBM_SLEEP_SECS' after each scheme-variant query — present
+# FIX-10 : grep '_NSE_SESSION\|_get_nse_session' — singleton helper present
+# FIX-11 : grep 'skipped_none\|skipped_empty\|skipped_no_vol' — present in run()
+# FIX-12 : grep 'MIN_TICKER_OCCURRENCES\|{2,14}' — present in _symbols_from_nse_csv
+# FIX-13 : grep 'IPO_DATES\|ipo_dates' — dynamic derivation in run()
+# FIX-14 : grep 'malformed snapshot date' — guarded in build_parquet_from_wayback
+# FIX-15 : grep '_compute_vol_gate_snapshots' — helper extracted and called
