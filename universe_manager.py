@@ -143,9 +143,10 @@ def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[
     tickers = subset.loc[subset[date_col] == last_d, tick_col].dropna().astype(str).str.strip()
     return sorted({t for t in tickers if t})
 
-_MISSING_PARQUET_WARNED: Dict[str, bool] = {}
-_NO_RECORD_WARNED: Dict[str, bool] = {}
-_SECTOR_MAP_CACHE_LOCK = threading.Lock()
+_WARNED_LOCK = threading.Lock()
+_MISSING_PARQUET_WARNED: set[str] = set()
+_NO_RECORD_WARNED: set[str] = set()
+_UNIVERSE_CACHE_FILE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE_LOCK = threading.Lock()
 _UNIVERSE_LOOKUP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
@@ -162,8 +163,9 @@ def _clear_all_caches() -> None:
     Register any future module-level caches here so reset behavior stays
     centralized for tests and runtime diagnostics.
     """
-    _MISSING_PARQUET_WARNED.clear()
-    _NO_RECORD_WARNED.clear()
+    with _WARNED_LOCK:
+        _MISSING_PARQUET_WARNED.clear()
+        _NO_RECORD_WARNED.clear()
     # Keep lock acquisition order aligned with _clear_historical_universe_caches:
     # 1) _HISTORICAL_UNIVERSE_DF_CACHE_LOCK, 2) _UNIVERSE_LOOKUP_CACHE_LOCK.
     with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
@@ -219,7 +221,7 @@ def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACH
     except TypeError:
         # Defensive migration path for legacy cache rows that may mix naive and
         # aware timestamps. Normalize both to UTC-naive to avoid crashes.
-        logger.debug(
+        logger.warning(
             "[Universe] Mixed naive/aware cache timestamp detected; using "
             "defensive freshness fallback (fetched_at=%s, ttl_hours=%s).",
             fetched_time,
@@ -320,65 +322,76 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     hist_file = DATA_DIR / f"historical_{universe_type}.parquet"
 
     if not hist_file.exists():
-        if not _MISSING_PARQUET_WARNED.get(universe_type):
+        should_warn = False
+        with _WARNED_LOCK:
+            if universe_type not in _MISSING_PARQUET_WARNED:
+                _MISSING_PARQUET_WARNED.add(universe_type)
+                should_warn = True
+        if should_warn:
             logger.error(
                 "HISTORICAL PARQUET MISSING: %s — attempting point-in-time CSV fallback "
                 "for %s. Run historical_builder.py to regenerate parquet snapshots.",
                 hist_file, universe_type,
             )
-            _MISSING_PARQUET_WARNED[universe_type] = True
     else:
         try:
             lookup_date = pd.Timestamp(date).normalize()
             df = _load_historical_universe_df(hist_file)
-            with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
-                available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
-            if available_dates is None:
-                available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
+            has_tickers_column = "tickers" in df.columns
+            if not has_tickers_column:
+                logger.error(
+                    "[Universe] %s parquet is missing the 'tickers' column (found columns: %s). "
+                    "Run historical_builder.py to rebuild.",
+                    hist_file, list(df.columns),
+                )
+            else:
                 with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
-                    _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
+                    available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
+                    if available_dates is None:
+                        available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
+                        _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
 
-            target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
+                target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
 
-            if target_pos >= 0:
-                target_date = pd.Timestamp(available_dates[target_pos])
-                cache_key = (universe_type, target_date)
-                with _UNIVERSE_LOOKUP_CACHE_LOCK:
-                    cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
-                if cached_members is not None:
-                    return cached_members
+                if target_pos >= 0:
+                    target_date = pd.Timestamp(available_dates[target_pos])
+                    cache_key = (universe_type, target_date)
+                    with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                        cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
+                    if cached_members is not None:
+                        return cached_members
 
-                constituents = df.loc[target_date, "tickers"]
+                    constituents = df.loc[target_date, "tickers"]
 
-                if isinstance(constituents, pd.Series):
-                    # FIX-MB-UM-02: warn about duplicate-index parquet so operators
-                    # can investigate and rebuild if necessary.
-                    logger.warning(
-                        "[Universe] %s parquet has duplicate index rows for date %s "
-                        "(constituents returned as Series). This indicates a structural "
-                        "issue — run verify_parquet() and consider rebuilding. "
-                        "Merging all rows for this date.",
-                        universe_type, target_date.date(),
-                    )
-                    merged: List[str] = []
-                    for cell in constituents.values:
-                        merged.extend(_coerce_historical_members(cell))
-                    result = _normalize_historical_members(merged)
-                else:
-                    result = _normalize_historical_members(_coerce_historical_members(constituents))
+                    if isinstance(constituents, pd.Series):
+                        # FIX-MB-UM-02: warn about duplicate-index parquet so operators
+                        # can investigate and rebuild if necessary.
+                        logger.warning(
+                            "[Universe] %s parquet has duplicate index rows for date %s "
+                            "(constituents returned as Series). This indicates a structural "
+                            "issue — run verify_parquet() and consider rebuilding. "
+                            "Merging all rows for this date.",
+                            universe_type, target_date.date(),
+                        )
+                        merged: List[str] = []
+                        for cell in constituents.values:
+                            merged.extend(_coerce_historical_members(cell))
+                        result = _normalize_historical_members(merged)
+                    else:
+                        result = _normalize_historical_members(_coerce_historical_members(constituents))
 
-                # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
-                with _UNIVERSE_LOOKUP_CACHE_LOCK:
-                    if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
-                        oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
-                        del _UNIVERSE_LOOKUP_CACHE[oldest_key]
-                    _UNIVERSE_LOOKUP_CACHE[cache_key] = result
-                return result
+                    # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
+                    with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                        if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
+                            oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
+                            del _UNIVERSE_LOOKUP_CACHE[oldest_key]
+                        _UNIVERSE_LOOKUP_CACHE[cache_key] = result
+                    return result
 
-            logger.warning(
-                "[Universe] No historical data prior to %s found in %s.",
-                lookup_date.strftime("%Y-%m-%d"), hist_file
-            )
+                logger.warning(
+                    "[Universe] No historical data prior to %s found in %s.",
+                    lookup_date.strftime("%Y-%m-%d"), hist_file
+                )
         except Exception as exc:
             logger.error(
                 "[Universe] Historical load failed for %s on %s: %s",
@@ -389,13 +402,17 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     if csv_members:
         return csv_members
 
-    if not _NO_RECORD_WARNED.get(universe_type):
+    should_warn = False
+    with _WARNED_LOCK:
+        if universe_type not in _NO_RECORD_WARNED:
+            _NO_RECORD_WARNED.add(universe_type)
+            should_warn = True
+    if should_warn:
         logger.error(
             "[Universe] %s: No point-in-time historical record found in parquet/CSV. "
             "Returning empty universe (survivorship bias risk if caller falls back).",
             universe_type,
         )
-        _NO_RECORD_WARNED[universe_type] = True
     return []
 
 # ─── Cache Management ─────────────────────────────────────────────────────────
@@ -443,8 +460,11 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     if cfg is None:
         cfg = UltimateConfig()
 
+    adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
+    lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
+
     end_date   = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=max(150, int(cfg.ADV_LOOKBACK) * 2))).strftime("%Y-%m-%d")
+    start_date = (datetime.today() - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 
     chunk_size  = _ADV_CHUNK_SIZE
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
@@ -497,7 +517,6 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                     frame = data[ns_sym]
                     if "Close" in frame.columns and "Volume" in frame.columns:
                         notional = (frame["Close"] * frame["Volume"]).clip(lower=0)
-                        lookback = int(getattr(cfg, "ADV_LOOKBACK", 20))
                         adv = float(notional.tail(lookback).mean()) if notional.notna().any() else 0.0
                     else:
                         adv = 0.0
@@ -527,9 +546,13 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             for symbol in (failure["symbols"] if isinstance(failure["symbols"], list) else [failure["symbols"]])[:3]
         ][:6]
         preview_txt = ", ".join(failed_symbol_preview) if failed_symbol_preview else "n/a"
+        error_summary = "; ".join(
+            f"chunk {failure['chunk_index']}: {failure['error']}"
+            for failure in chunk_failures[:3]
+        )
         raise UniverseFetchError(
             "ADV filter failed for "
-            f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}"
+            f"{len(chunk_failures)} chunk(s); sample symbols: {preview_txt}; errors: {error_summary}"
         )
 
     return list(dict.fromkeys(filtered_tickers))
@@ -548,8 +571,9 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    cache = _load_universe_cache()
-    entry = cache.get("total_equity", {})
+    with _UNIVERSE_CACHE_FILE_LOCK:
+        cache = _load_universe_cache()
+        entry = cache.get("total_equity", {})
 
     if entry:
         if _is_cache_entry_fresh(entry.get("fetched_at")):
@@ -566,26 +590,32 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
             tickers = _apply_adv_filter(tickers, cfg=cfg)
 
         logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
-        cache["total_equity"] = {
-            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-            "tickers":    tickers,
-        }
-        _save_universe_cache(cache)
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            cache["total_equity"] = {
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "tickers":    tickers,
+            }
+            _save_universe_cache(cache)
         return tickers
 
     except Exception as exc:
         logger.error("[Universe] NSE master fetch failed: %s", exc)
         if entry:
-            logger.warning("[Universe] Using stale cache for NSE Total Equity.")
+            logger.warning(
+                "[Universe] Using stale cache for NSE Total Equity (fetched_at=%s).",
+                entry.get("fetched_at", "unknown"),
+            )
             return entry["tickers"]
 
         error = UniverseFetchError("Failed to fetch NSE Total Equity from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error
+        raise error from exc
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    cache = _load_universe_cache()
-    entry = cache.get("nifty500", {})
+    with _UNIVERSE_CACHE_FILE_LOCK:
+        cache = _load_universe_cache()
+        entry = cache.get("nifty500", {})
 
     if entry:
         if _is_cache_entry_fresh(entry.get("fetched_at")):
@@ -600,22 +630,27 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
         if apply_adv_filter:
             tickers = _apply_adv_filter(tickers, cfg=cfg)
 
-        cache["nifty500"] = {
-            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-            "tickers": tickers
-        }
-        _save_universe_cache(cache)
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            cache["nifty500"] = {
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "tickers": tickers
+            }
+            _save_universe_cache(cache)
         return tickers
 
     except Exception as exc:
         logger.error("[Universe] Nifty 500 fetch failed: %s", exc)
         if entry:
-            logger.warning("[Universe] Using stale cache for Nifty 500.")
+            logger.warning(
+                "[Universe] Using stale cache for Nifty 500 (fetched_at=%s).",
+                entry.get("fetched_at", "unknown"),
+            )
             return entry["tickers"]
 
         error = UniverseFetchError("Failed to fetch Nifty 500 from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error
+        raise error from exc
 
 def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict[str, str]:
     """
@@ -645,138 +680,149 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                 return t[: -len(sfx)]
         return t
 
-    if True:
-        resolved_map = {}
-        missing_tickers = []
+    resolved_map = {}
+    missing_tickers = []
 
-        for ticker in tickers:
-            bare_ticker = _bare(ticker)
-            if bare_ticker in STATIC_NSE_SECTORS:
-                resolved_map[bare_ticker] = STATIC_NSE_SECTORS[bare_ticker]
-            else:
-                missing_tickers.append(bare_ticker)
+    for ticker in tickers:
+        bare_ticker = _bare(ticker)
+        if bare_ticker in STATIC_NSE_SECTORS:
+            resolved_map[bare_ticker] = STATIC_NSE_SECTORS[bare_ticker]
+        else:
+            missing_tickers.append(bare_ticker)
 
-        if missing_tickers and use_cache:
-            cache = _load_universe_cache()
-            sector_map_cache = cache.get("sector_map", {})
-            sector_cache = sector_map_cache.get("sectors", {})
-            sector_cache_fetched_at = sector_map_cache.get("fetched_at")
+    if missing_tickers and use_cache:
+        cache = _load_universe_cache()
+        sector_map_cache = cache.get("sector_map", {})
+        sector_cache = sector_map_cache.get("sectors", {})
+        sector_cache_fetched_at = sector_map_cache.get("fetched_at")
 
-            still_missing = []
-            for bare_ticker in missing_tickers:
-                if bare_ticker in sector_cache:
-                    cached_sector, fetched_at = _normalize_sector_cache_entry(
-                        sector_cache[bare_ticker],
-                        fallback_fetched_at=sector_cache_fetched_at,
-                    )
-                    if cached_sector is not None and _is_cache_entry_fresh(fetched_at):
-                        resolved_map[bare_ticker] = cached_sector
-                        continue
-                still_missing.append(bare_ticker)
-            missing_tickers = still_missing
+        still_missing = []
+        for bare_ticker in missing_tickers:
+            if bare_ticker in sector_cache:
+                cached_sector, fetched_at = _normalize_sector_cache_entry(
+                    sector_cache[bare_ticker],
+                    fallback_fetched_at=sector_cache_fetched_at,
+                )
+                if cached_sector is not None and _is_cache_entry_fresh(fetched_at):
+                    resolved_map[bare_ticker] = cached_sector
+                    continue
+            still_missing.append(bare_ticker)
+        missing_tickers = still_missing
 
-        if missing_tickers:
-            logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
-            import yfinance as yf
+    if missing_tickers:
+        logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
+        import yfinance as yf
 
-            try:
-                batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
-                batch = yf.Tickers(batch_symbols)
-                ticker_objs = getattr(batch, "tickers", {}) or {}
-                for bare_sym in missing_tickers:
-                    ns_sym = f"{bare_sym}.NS"
-                    ticker_obj = ticker_objs.get(ns_sym)
-                    if ticker_obj is None:
-                        ticker_obj = yf.Ticker(ns_sym)
-                    try:
-                        info = getattr(ticker_obj, "info", {}) or {}
-                        # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
-                        # a rate limit or the symbol is delisted.  Log at DEBUG so
-                        # operators can correlate missing sector data with provider
-                        # throttling without flooding production logs.
-                        if not info:
-                            logger.debug(
-                                "[Universe] Empty info dict for %s — "
-                                "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
-                                bare_sym,
-                            )
-                        sector = str(info.get("sector", "Unknown") or "Unknown")
-                        resolved_map[bare_sym] = sector
-                    except Exception as e:
-                        logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
-            except Exception as exc:
-                logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
+        try:
+            batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
+            batch = yf.Tickers(batch_symbols)
+            ticker_objs = getattr(batch, "tickers", {}) or {}
+            for bare_sym in missing_tickers:
+                ns_sym = f"{bare_sym}.NS"
+                ticker_obj = ticker_objs.get(ns_sym)
+                if ticker_obj is None:
+                    ticker_obj = yf.Ticker(ns_sym)
+                try:
+                    info = getattr(ticker_obj, "info", {}) or {}
+                    # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
+                    # a rate limit or the symbol is delisted.  Log at DEBUG so
+                    # operators can correlate missing sector data with provider
+                    # throttling without flooding production logs.
+                    if not info:
+                        logger.debug(
+                            "[Universe] Empty info dict for %s — "
+                            "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
+                            bare_sym,
+                        )
+                    sector = str(info.get("sector", "Unknown") or "Unknown")
+                    resolved_map[bare_sym] = sector
+                except Exception as e:
+                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
+        except Exception as exc:
+            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
 
-                # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
-                # to prevent indefinite hangs (previously no timeout was set, allowing
-                # up to 30s per symbol × 8 workers = 240s total wall-time hang).
-                def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
-                    # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
-                    # (SIGALRM) inside this worker function.  Python's signal module
-                    # strictly requires that signals are set and handled only in the
-                    # main thread.  Calling signal.signal() or signal.alarm() from a
-                    # ThreadPoolExecutor worker raises ValueError instantly, crashing
-                    # the entire fallback sector fetch.
-                    #
-                    # Fix: attach a requests.Session with a socket-level timeout to
-                    # the yfinance Ticker object.  The timeout is enforced by the
-                    # urllib3 socket layer and works correctly in any thread.
-                    try:
-                        # requests is already imported at module level;
-                        # use it directly rather than re-importing inside the worker.
-                        _timeout = max(1.0, float(sector_timeout))
-                        # BUG-FIX-SESSION-LEAK: use context manager so the
-                        # urllib3 connection pool and underlying sockets are
-                        # released immediately when the function returns.
-                        # Without this, 100 missing tickers = 100 Sessions =
-                        # ~200 sockets abandoned to the GC in TIME_WAIT state.
-                        with requests.Session() as _session:
-                            # Wrap Session.request so every call carries the timeout,
-                            # regardless of which yfinance code path invokes it.
-                            _orig_request = _session.request
-                            _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
-                                method, url,
-                                timeout=kwargs.pop("timeout", _timeout),
-                                **kwargs,
-                            )
-                            ticker_obj = yf.Ticker(sym + ".NS", session=_session)
-                            info = (ticker_obj.info) or {}
-                            result_sector = str(info.get("sector", "Unknown") or "Unknown")
-                        return sym, result_sector
-                    except Exception as e:
-                        logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
-                        return sym, None
+            # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
+            # to prevent indefinite hangs (previously no timeout was set, allowing
+            # up to 30s per symbol × 8 workers = 240s total wall-time hang).
+            def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
+                # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
+                # (SIGALRM) inside this worker function.  Python's signal module
+                # strictly requires that signals are set and handled only in the
+                # main thread.  Calling signal.signal() or signal.alarm() from a
+                # ThreadPoolExecutor worker raises ValueError instantly, crashing
+                # the entire fallback sector fetch.
+                #
+                # Fix: attach a requests.Session with a socket-level timeout to
+                # the yfinance Ticker object.  The timeout is enforced by the
+                # urllib3 socket layer and works correctly in any thread.
+                try:
+                    # requests is already imported at module level;
+                    # use it directly rather than re-importing inside the worker.
+                    _timeout = max(1.0, float(sector_timeout))
+                    # BUG-FIX-SESSION-LEAK: use context manager so the
+                    # urllib3 connection pool and underlying sockets are
+                    # released immediately when the function returns.
+                    # Without this, 100 missing tickers = 100 Sessions =
+                    # ~200 sockets abandoned to the GC in TIME_WAIT state.
+                    with requests.Session() as _session:
+                        # Wrap Session.request so every call carries the timeout,
+                        # regardless of which yfinance code path invokes it.
+                        _orig_request = _session.request
+                        _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
+                            method, url,
+                            timeout=kwargs.pop("timeout", _timeout),
+                            **kwargs,
+                        )
+                        ticker_obj = yf.Ticker(sym + ".NS", session=_session)
+                        info = (ticker_obj.info) or {}
+                        result_sector = str(info.get("sector", "Unknown") or "Unknown")
+                    return sym, result_sector
+                except Exception as e:
+                    logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
+                    return sym, None
 
-                with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
-                    for sym, sector in pool.map(_fetch_single_sector, missing_tickers):  # type: ignore[assignment]
-                        if sector is not None:
-                            resolved_map[sym] = str(sector)
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
+                for sym, sector in pool.map(_fetch_single_sector, missing_tickers):  # type: ignore[assignment]
+                    if sector is not None:
+                        resolved_map[sym] = str(sector)
+
+            resolved_in_fallback = sum(1 for sym in missing_tickers if sym in resolved_map)
+            if resolved_in_fallback == 0 and missing_tickers:
+                logger.warning(
+                    "[Universe] Sector fallback resolved 0/%d symbols. All individual yfinance fetches failed — possible network partition or rate limit.",
+                    len(missing_tickers),
+                )
+            elif resolved_in_fallback < len(missing_tickers):
+                logger.info(
+                    "[Universe] Sector fallback resolved %d/%d symbols.",
+                    resolved_in_fallback, len(missing_tickers),
+                )
 
         # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
-            if use_cache:
-                with _SECTOR_MAP_CACHE_LOCK:
-                    current_cache = _load_universe_cache()
-                    existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
-                    fetched_at = datetime.now(tz=timezone.utc).isoformat()
-                    existing_sector_cache.update(
-                        {
-                            sym: {
-                                "sector": resolved_map[sym],
-                                "fetched_at": fetched_at,
-                            }
-                            for sym in missing_tickers
-                            if sym in resolved_map
+        if use_cache:
+            with _UNIVERSE_CACHE_FILE_LOCK:
+                current_cache = _load_universe_cache()
+                existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
+                fetched_at = datetime.now(tz=timezone.utc).isoformat()
+                existing_sector_cache.update(
+                    {
+                        sym: {
+                            "sector": resolved_map[sym],
+                            "fetched_at": fetched_at,
                         }
-                    )
-
-                    current_cache["sector_map"] = {
-                        "fetched_at": fetched_at,
-                        "sectors": existing_sector_cache,
+                        for sym in missing_tickers
+                        if sym in resolved_map
                     }
-                    _save_universe_cache(current_cache)
+                )
 
-        final_map = {}
-        for ticker in tickers:
-            bare_ticker = _bare(ticker)
-            final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
-        return final_map
+                current_cache["sector_map"] = {
+                    "fetched_at": fetched_at,
+                    "sectors": existing_sector_cache,
+                }
+                _save_universe_cache(current_cache)
+
+    final_map = {}
+    for ticker in tickers:
+        bare_ticker = _bare(ticker)
+        final_map[ticker] = resolved_map.get(bare_ticker, "Unknown")
+    return final_map
