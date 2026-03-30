@@ -337,60 +337,61 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
         try:
             lookup_date = pd.Timestamp(date).normalize()
             df = _load_historical_universe_df(hist_file)
-            if "tickers" not in df.columns:
+            has_tickers_column = "tickers" in df.columns
+            if not has_tickers_column:
                 logger.error(
                     "[Universe] %s parquet is missing the 'tickers' column (found columns: %s). "
                     "Run historical_builder.py to rebuild.",
                     hist_file, list(df.columns),
                 )
-                raise KeyError("missing 'tickers' column")
-            with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
-                available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
-                if available_dates is None:
-                    available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
-                    _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
+            else:
+                with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+                    available_dates = _HISTORICAL_UNIVERSE_DATES_CACHE.get(hist_file)
+                    if available_dates is None:
+                        available_dates = pd.DatetimeIndex(df.index.unique()).sort_values()
+                        _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = available_dates
 
-            target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
+                target_pos = available_dates.searchsorted(lookup_date, side="right") - 1
 
-            if target_pos >= 0:
-                target_date = pd.Timestamp(available_dates[target_pos])
-                cache_key = (universe_type, target_date)
-                with _UNIVERSE_LOOKUP_CACHE_LOCK:
-                    cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
-                if cached_members is not None:
-                    return cached_members
+                if target_pos >= 0:
+                    target_date = pd.Timestamp(available_dates[target_pos])
+                    cache_key = (universe_type, target_date)
+                    with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                        cached_members = _UNIVERSE_LOOKUP_CACHE.get(cache_key)
+                    if cached_members is not None:
+                        return cached_members
 
-                constituents = df.loc[target_date, "tickers"]
+                    constituents = df.loc[target_date, "tickers"]
 
-                if isinstance(constituents, pd.Series):
-                    # FIX-MB-UM-02: warn about duplicate-index parquet so operators
-                    # can investigate and rebuild if necessary.
-                    logger.warning(
-                        "[Universe] %s parquet has duplicate index rows for date %s "
-                        "(constituents returned as Series). This indicates a structural "
-                        "issue — run verify_parquet() and consider rebuilding. "
-                        "Merging all rows for this date.",
-                        universe_type, target_date.date(),
-                    )
-                    merged: List[str] = []
-                    for cell in constituents.values:
-                        merged.extend(_coerce_historical_members(cell))
-                    result = _normalize_historical_members(merged)
-                else:
-                    result = _normalize_historical_members(_coerce_historical_members(constituents))
+                    if isinstance(constituents, pd.Series):
+                        # FIX-MB-UM-02: warn about duplicate-index parquet so operators
+                        # can investigate and rebuild if necessary.
+                        logger.warning(
+                            "[Universe] %s parquet has duplicate index rows for date %s "
+                            "(constituents returned as Series). This indicates a structural "
+                            "issue — run verify_parquet() and consider rebuilding. "
+                            "Merging all rows for this date.",
+                            universe_type, target_date.date(),
+                        )
+                        merged: List[str] = []
+                        for cell in constituents.values:
+                            merged.extend(_coerce_historical_members(cell))
+                        result = _normalize_historical_members(merged)
+                    else:
+                        result = _normalize_historical_members(_coerce_historical_members(constituents))
 
-                # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
-                with _UNIVERSE_LOOKUP_CACHE_LOCK:
-                    if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
-                        oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
-                        del _UNIVERSE_LOOKUP_CACHE[oldest_key]
-                    _UNIVERSE_LOOKUP_CACHE[cache_key] = result
-                return result
+                    # BUG-UM-02: evict the oldest entry (FIFO) when cache reaches max size.
+                    with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                        if len(_UNIVERSE_LOOKUP_CACHE) >= _UNIVERSE_LOOKUP_CACHE_MAXSIZE:
+                            oldest_key = next(iter(_UNIVERSE_LOOKUP_CACHE))
+                            del _UNIVERSE_LOOKUP_CACHE[oldest_key]
+                        _UNIVERSE_LOOKUP_CACHE[cache_key] = result
+                    return result
 
-            logger.warning(
-                "[Universe] No historical data prior to %s found in %s.",
-                lookup_date.strftime("%Y-%m-%d"), hist_file
-            )
+                logger.warning(
+                    "[Universe] No historical data prior to %s found in %s.",
+                    lookup_date.strftime("%Y-%m-%d"), hist_file
+                )
         except Exception as exc:
             logger.error(
                 "[Universe] Historical load failed for %s on %s: %s",
@@ -609,7 +610,7 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
 
         error = UniverseFetchError("Failed to fetch NSE Total Equity from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error
+        raise error from exc
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     with _UNIVERSE_CACHE_FILE_LOCK:
@@ -649,7 +650,7 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
 
         error = UniverseFetchError("Failed to fetch Nifty 500 from origin.")
         error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error
+        raise error from exc
 
 def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict[str, str]:
     """

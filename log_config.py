@@ -306,9 +306,14 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
                     value = value[1:-1]
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
-                hash_pos = value.find("#")
-                if hash_pos > 0:
-                    value = value[:hash_pos].rstrip()
+                # Per dotenv convention, inline comments must be preceded by
+                # whitespace so bare '#' in values (e.g., URL fragments) are
+                # preserved unless the value is quoted.
+                for sep in (" #", "\t#"):
+                    idx = value.find(sep)
+                    if idx != -1:
+                        value = value[:idx].rstrip()
+                        break
 
             os.environ.setdefault(key, value)
     except (OSError, UnicodeDecodeError, ValueError, TypeError, IndexError, AttributeError) as exc:
