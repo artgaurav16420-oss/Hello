@@ -901,8 +901,14 @@ def _error_triage_callback_factory() -> callable:
             try:
                 if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
                     study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(
+                    "Failed to set trial user attribute 'error_class'=%r for trial %s: %s (storage=%s)",
+                    error_class,
+                    getattr(trial, "_trial_id", "unknown"),
+                    e,
+                    getattr(study, "_storage", "unknown"),
+                )
             if consecutive_failures["count"] > int(N_TRIALS * 0.30):
                 study.stop()
                 raise RuntimeError(
@@ -1126,11 +1132,19 @@ def run_optimization(
     journal_path = _oos_journal_path(effective_study_name)  # ARCH-FIX-9
     completed_trial_ids: dict[int, dict] = {}
     if journal_path.exists():
-        for line in journal_path.read_text(encoding="utf-8").splitlines():
+        for line_idx, line in enumerate(journal_path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
-            rec = json.loads(line)
-            completed_trial_ids[rec["trial_number"]] = rec
+            try:
+                rec = json.loads(line)
+                trial_number = rec["trial_number"]
+                completed_trial_ids[trial_number] = rec
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                logger.warning(
+                    "Skipping corrupt/truncated journal line %d in %s: %s (line: %r)",
+                    line_idx, journal_path, e, line[:100]
+                )
+                continue
 
     for rank, trial_candidate in enumerate(top_k_trials, 1):
         if trial_candidate.number in completed_trial_ids:

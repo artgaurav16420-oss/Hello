@@ -220,10 +220,57 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
     os.makedirs("data", exist_ok=True)
     claim_path = _pending_claim_path(name)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+
+    # Try creating the claim file with exclusive flags
     try:
         fd = os.open(str(claim_path), flags)
     except FileExistsError:
-        return False
+        # Claim file exists — check if it's stale
+        try:
+            stat_result = claim_path.stat()
+            mtime = datetime.fromtimestamp(stat_result.st_mtime)
+
+            # Try to read the existing claim to check its date
+            try:
+                existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                claim_date_str = existing_claim.get("date", "")
+            except (json.JSONDecodeError, OSError):
+                # Corrupted or unreadable claim — treat as stale
+                claim_date_str = ""
+
+            # Consider the claim stale if:
+            # 1. The stored date differs from the requested date_str, OR
+            # 2. The file modification time is more than 24 hours old
+            is_stale = (
+                claim_date_str != date_str or
+                (datetime.now() - mtime).total_seconds() > 86400
+            )
+
+            if is_stale:
+                logger.warning(
+                    "Stale claim file detected for %s (claim_date=%s, requested=%s, age=%.1fh). Removing and retrying.",
+                    name, claim_date_str, date_str, (datetime.now() - mtime).total_seconds() / 3600
+                )
+                try:
+                    claim_path.unlink()
+                except OSError as e:
+                    logger.error("Failed to remove stale claim file %s: %s", claim_path, e)
+                    return False
+
+                # Retry the claim once after removing stale file
+                try:
+                    fd = os.open(str(claim_path), flags)
+                except FileExistsError:
+                    # Another process claimed it in the race window
+                    return False
+            else:
+                # Not stale — another process holds a valid claim
+                return False
+        except OSError as e:
+            logger.error("Failed to check claim file staleness for %s: %s", claim_path, e)
+            return False
+
+    # Successfully created the claim file (either first try or after removing stale)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"token": token, "date": date_str}))
