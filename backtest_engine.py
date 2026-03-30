@@ -1046,7 +1046,13 @@ def run_backtest(
     clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
     if clip_start_iloc < 0:
         clip_start_iloc = 0
-    min_start_iloc = 1 if len(returns_raw.index) >= 2 else 0
+    # Skip the first row only when it is all-NaN (the artefact of pct_change on
+    # unclipped data).  In the custom-universe branch _clip() already starts
+    # returns at warmup_start, so the first row is valid; unconditionally
+    # advancing by 1 there would cause a double-advance and silently drop a
+    # real bar.
+    first_row_all_nan = returns_raw.iloc[0].isna().all()
+    min_start_iloc = 1 if (first_row_all_nan and len(returns_raw.index) >= 2) else 0
     safe_start = returns_raw.index[max(int(clip_start_iloc), min_start_iloc)]
     returns = returns_raw.loc[safe_start:pd.Timestamp(end_date)]
 
