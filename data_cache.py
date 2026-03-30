@@ -41,6 +41,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from abc import ABC, abstractmethod
@@ -64,7 +65,14 @@ _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
 _MAX_RATE_LIMIT_RETRIES = 5
-_MANIFEST_WRITE_LOCK = threading.Lock()
+_MANIFEST_LOCK_POLL_SEC = 0.1
+_MANIFEST_LOCK_TIMEOUT_SEC = 30.0
+_SUSPENSION_GAP_DAYS = 7
+
+_DEFAULT_CACHE_DIR = Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
+CACHE_DIR: Path | None = _DEFAULT_CACHE_DIR
+MANIFEST_FILE: Path | None = _DEFAULT_CACHE_DIR / "_manifest.json"
+_MANIFEST_LOCK_DIR: Path | None = _DEFAULT_CACHE_DIR / "_manifest.lock"
 
 
 def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -125,10 +133,6 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
         )
     return data
 
-
-
-CACHE_DIR     = Path("data/cache")
-MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 # Large multi-ticker yfinance requests are brittle for mixed universes that
 # include newly listed/suspended symbols. Smaller chunks reduce the chance that
 # one malformed ticker poisons the whole batch and improves completion rates on
@@ -136,13 +140,26 @@ MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 25
 
 
-def configure_data_cache(dotenv_path: Optional[Path] = None) -> None:
+def configure_data_cache(
+    cache_dir: Optional[Path] = None,
+    dotenv_path: Optional[Path] = None,
+) -> None:
     """Initialize data-cache environment and filesystem paths.
 
     Callers must invoke configure_data_cache() once before using module
     functions so cache paths and optional local env vars are initialized.
     """
+    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR
+    if dotenv_path is None and cache_dir is not None:
+        candidate = Path(cache_dir)
+        if candidate.name == ".env" or (candidate.exists() and candidate.is_file()):
+            dotenv_path = candidate
+            cache_dir = None
     load_dotenv_safe(dotenv_path)
+    resolved_cache_dir = cache_dir or Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
+    CACHE_DIR = Path(resolved_cache_dir)
+    MANIFEST_FILE = CACHE_DIR / "_manifest.json"
+    _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -153,8 +170,44 @@ _GROWW_CHUNK_DAYS         = 1080
 _GROWW_INDEX_PREFIXES     = ("^",)
 
 
-class DataFetchError(RuntimeError):
-    """Raised when one or more requested ticker chunks cannot be fetched."""
+def _ensure_cache_paths_configured() -> None:
+    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR
+    if CACHE_DIR is None or MANIFEST_FILE is None or _MANIFEST_LOCK_DIR is None:
+        configure_data_cache()
+
+
+class _ManifestProcessFileLock:
+    """Cross-process lock implemented using an atomic lock directory."""
+
+    def __init__(self, lock_dir: Path, timeout_s: float = _MANIFEST_LOCK_TIMEOUT_SEC) -> None:
+        self._lock_dir = lock_dir
+        self._timeout_s = timeout_s
+        self._owner_file = lock_dir / "owner"
+
+    def __enter__(self) -> "_ManifestProcessFileLock":
+        deadline = time.monotonic() + max(0.0, float(self._timeout_s))
+        while True:
+            try:
+                self._lock_dir.mkdir(parents=False, exist_ok=False)
+                self._owner_file.write_text(
+                    f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
+                    encoding="utf-8",
+                )
+                return self
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for manifest lock {self._lock_dir}"
+                    )
+                time.sleep(_MANIFEST_LOCK_POLL_SEC)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._owner_file.exists():
+                self._owner_file.unlink()
+            self._lock_dir.rmdir()
+        except FileNotFoundError:
+            pass
 
 
 class DataProvider(ABC):
@@ -545,7 +598,11 @@ class YFinanceProvider(DataProvider):
         if result.empty:
             return result
         if len(tickers) > 1 and not isinstance(result.columns, pd.MultiIndex):
-            return None
+            logger.warning(
+                "[Cache] Batch yfinance response for %d tickers had flat columns; retrying individually.",
+                len(tickers),
+            )
+            return self._download_individual(tickers, start, end)
         return result
 
     def _download_batch(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
@@ -789,13 +846,18 @@ def _download_with_timeout(
 
 
 def _load_manifest() -> dict:
+    _ensure_cache_paths_configured()
     default_manifest = {"schema_version": 1, "entries": {}}
+    assert MANIFEST_FILE is not None
     if not MANIFEST_FILE.exists():
         return default_manifest
 
     try:
         with MANIFEST_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
+            if not isinstance(data, dict):
+                logger.warning("[Cache] Manifest root must be a JSON object; starting fresh.")
+                return default_manifest
             if "schema_version" in data:
                 return data
             else:
@@ -806,6 +868,8 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(manifest_data: dict) -> None:
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None and MANIFEST_FILE is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     temp_file = MANIFEST_FILE.with_name(MANIFEST_FILE.name + ".tmp")
     try:
@@ -823,6 +887,8 @@ def _save_manifest(manifest_data: dict) -> None:
 
 
 def invalidate_cache() -> None:
+    _ensure_cache_paths_configured()
+    assert MANIFEST_FILE is not None
     if MANIFEST_FILE.exists():
         try:
             MANIFEST_FILE.unlink()
@@ -960,6 +1026,8 @@ def load_or_fetch(
     force_refresh: bool = False,
     cfg=None,
 ) -> Dict[str, pd.DataFrame]:
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest()
     entries  = manifest["entries"]
@@ -1020,7 +1088,7 @@ def load_or_fetch(
                 df = _normalize_history_index(pd.read_parquet(parquet_path))
                 market_data[ticker] = df
             except Exception as exc:
-                logger.debug("[Cache] Corrupted parquet for %s: %s", ticker, exc)
+                logger.warning("[Cache] Corrupted parquet for %s: %s", ticker, exc)
                 tickers_to_download.append(ticker)
 
     if not tickers_to_download:
@@ -1146,7 +1214,8 @@ def load_or_fetch(
             # Note: _save_manifest is intentionally called only on download/recovery
             # paths. Any future code path that mutates `entries` without downloading
             # must explicitly call _save_manifest() to keep manifest state in sync.
-            with _MANIFEST_WRITE_LOCK:
+            assert _MANIFEST_LOCK_DIR is not None
+            with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
                 live_manifest = _load_manifest()
                 live_entries = live_manifest.setdefault("entries", {})
                 live_entries.update(manifest.get("entries", {}))
@@ -1192,6 +1261,8 @@ def _process_chunk(
     valid data was actually saved.  Returning the validated set here lets the
     caller use ground-truth instead of inferred membership.
     """
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     manifest_entries = entries
     saved_tickers: set = set()
 
@@ -1229,18 +1300,19 @@ def _process_chunk(
                 continue
 
             parquet_path = CACHE_DIR / f"{ticker}.parquet"
-            df.to_parquet(parquet_path)
+            tmp_path = parquet_path.with_suffix(".parquet.tmp")
+            df.to_parquet(tmp_path)
+            tmp_path.replace(parquet_path)
 
             gap_series   = df.index.to_series().diff().dt.days
             max_gap      = gap_series.max()
             max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
-            expected_gap = 7
 
             manifest_entries[ticker] = {
                 "fetched_at":    pd.Timestamp.now(tz=_IST_TZ).isoformat(),
                 "rows":          len(df),
                 "last_date":     df.index[-1].strftime("%Y-%m-%d"),
-                "suspended":     max_gap_days > expected_gap,
+                "suspended":     max_gap_days > _SUSPENSION_GAP_DAYS,
                 "max_gap_days":  max_gap_days,
             }
             market_data[ticker] = df
@@ -1268,6 +1340,8 @@ def _recover_from_stale_cache(
     accurately reflects that the data is stale and will be refreshed when the
     provider recovers.
     """
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     recovered = 0
     recovered_symbols: List[str] = []
     for ticker in chunk:

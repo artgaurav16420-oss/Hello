@@ -34,15 +34,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
+from data_cache import CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR             = Path("data")
-CACHE_DIR            = DATA_DIR / "cache"
 UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
@@ -203,7 +204,15 @@ def _coerce_historical_members(value) -> List[str]:
 
 
 def _normalize_historical_members(values) -> List[str]:
-    return sorted({str(t).strip() for t in values if str(t).strip()})
+    normalized: set[str] = set()
+    for t in values:
+        if t is None:
+            continue
+        cleaned = str(t).strip()
+        if not cleaned or cleaned == "None":
+            continue
+        normalized.add(cleaned)
+    return sorted(normalized)
 
 
 def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
@@ -248,9 +257,9 @@ def _normalize_sector_cache_entry(
 
 def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     """Load historical universe parquet with mtime-based in-memory caching."""
-    mtime = hist_file.stat().st_mtime
     stale_universe_type: str | None = None
     with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        mtime = hist_file.stat().st_mtime
         cached = _HISTORICAL_UNIVERSE_DF_CACHE.get(hist_file)
         if cached is not None and cached[0] == mtime:
             return cached[1]
@@ -278,10 +287,11 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
     # default engine with a warning so the problem is surfaced at import time.
     try:
         df = pd.read_parquet(hist_file, engine="pyarrow")
-    except Exception:
+    except Exception as exc:
         logger.warning(
             "[Universe] pyarrow not available or failed; falling back to default "
-            "parquet engine.  List-valued tickers column may not round-trip correctly."
+            "parquet engine.  List-valued tickers column may not round-trip correctly. (%s)",
+            exc,
         )
         df = pd.read_parquet(hist_file)
     # FIX-MB-UM-03: FIFO eviction — mirror the pattern used for
@@ -463,8 +473,9 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
     lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
 
-    end_date   = datetime.today().strftime("%Y-%m-%d")
-    start_date = (datetime.today() - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
+    now_ist = datetime.now(tz=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+    end_date = now_ist.strftime("%Y-%m-%d")
+    start_date = (now_ist - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 
     chunk_size  = _ADV_CHUNK_SIZE
     chunks      = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
@@ -580,6 +591,11 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
             return entry["tickers"]
 
     try:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            fresh_entry = cache.get("total_equity", {})
+            if fresh_entry and _is_cache_entry_fresh(fresh_entry.get("fetched_at")):
+                return fresh_entry["tickers"]
         logger.info("[Universe] Fetching fresh NSE total equity master...")
         df = _fetch_csv_with_headers("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
         df.columns = [col.strip().upper() for col in df.columns]
@@ -622,6 +638,11 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
             return entry["tickers"]
 
     try:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            fresh_entry = cache.get("nifty500", {})
+            if fresh_entry and _is_cache_entry_fresh(fresh_entry.get("fetched_at")):
+                return fresh_entry["tickers"]
         logger.info("[Universe] Fetching fresh Nifty 500 constituents...")
         df = _fetch_csv_with_headers("https://archives.nseindia.com/content/indices/ind_nifty500list.csv")
         df.columns = [col.strip().upper() for col in df.columns]
@@ -691,10 +712,11 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             missing_tickers.append(bare_ticker)
 
     if missing_tickers and use_cache:
-        cache = _load_universe_cache()
-        sector_map_cache = cache.get("sector_map", {})
-        sector_cache = sector_map_cache.get("sectors", {})
-        sector_cache_fetched_at = sector_map_cache.get("fetched_at")
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            sector_map_cache = cache.get("sector_map", {})
+            sector_cache = sector_map_cache.get("sectors", {})
+            sector_cache_fetched_at = sector_map_cache.get("fetched_at")
 
         still_missing = []
         for bare_ticker in missing_tickers:
@@ -715,29 +737,43 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
 
         try:
             batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
-            batch = yf.Tickers(batch_symbols)
-            ticker_objs = getattr(batch, "tickers", {}) or {}
-            for bare_sym in missing_tickers:
-                ns_sym = f"{bare_sym}.NS"
-                ticker_obj = ticker_objs.get(ns_sym)
-                if ticker_obj is None:
-                    ticker_obj = yf.Ticker(ns_sym)
+            _timeout = max(1.0, float(sector_timeout))
+            with requests.Session() as _session:
+                _orig_request = _session.request
+                _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
+                    method, url,
+                    timeout=kwargs.pop("timeout", _timeout),
+                    **kwargs,
+                )
                 try:
-                    info = getattr(ticker_obj, "info", {}) or {}
-                    # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
-                    # a rate limit or the symbol is delisted.  Log at DEBUG so
-                    # operators can correlate missing sector data with provider
-                    # throttling without flooding production logs.
-                    if not info:
-                        logger.debug(
-                            "[Universe] Empty info dict for %s — "
-                            "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
-                            bare_sym,
-                        )
-                    sector = str(info.get("sector", "Unknown") or "Unknown")
-                    resolved_map[bare_sym] = sector
-                except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
+                    batch = yf.Tickers(batch_symbols, session=_session)
+                except TypeError:
+                    batch = yf.Tickers(batch_symbols)
+                ticker_objs = getattr(batch, "tickers", {}) or {}
+                for bare_sym in missing_tickers:
+                    ns_sym = f"{bare_sym}.NS"
+                    ticker_obj = ticker_objs.get(ns_sym)
+                    if ticker_obj is None:
+                        try:
+                            ticker_obj = yf.Ticker(ns_sym, session=_session)
+                        except TypeError:
+                            ticker_obj = yf.Ticker(ns_sym)
+                    try:
+                        info = getattr(ticker_obj, "info", {}) or {}
+                        # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
+                        # a rate limit or the symbol is delisted.  Log at DEBUG so
+                        # operators can correlate missing sector data with provider
+                        # throttling without flooding production logs.
+                        if not info:
+                            logger.debug(
+                                "[Universe] Empty info dict for %s — "
+                                "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
+                                bare_sym,
+                            )
+                        sector = str(info.get("sector", "Unknown") or "Unknown")
+                        resolved_map[bare_sym] = sector
+                    except Exception as e:
+                        logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
         except Exception as exc:
             logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
 
