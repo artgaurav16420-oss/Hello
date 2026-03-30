@@ -148,6 +148,7 @@ _WARNED_LOCK = threading.Lock()
 _MISSING_PARQUET_WARNED: set[str] = set()
 _NO_RECORD_WARNED: set[str] = set()
 _UNIVERSE_CACHE_FILE_LOCK = threading.Lock()
+_SECTOR_FETCH_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE_LOCK = threading.Lock()
 _UNIVERSE_LOOKUP_CACHE_LOCK = threading.Lock()
 _HISTORICAL_UNIVERSE_DF_CACHE: Dict[Path, Tuple[float, pd.DataFrame]] = {}
@@ -732,130 +733,157 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         missing_tickers = still_missing
 
     if missing_tickers:
-        logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
-        import yfinance as yf
+        with _SECTOR_FETCH_LOCK:
+            # Double-check under cache lock: another thread may have filled some/all
+            # sector entries while this thread was waiting on _SECTOR_FETCH_LOCK.
+            if use_cache and missing_tickers:
+                with _UNIVERSE_CACHE_FILE_LOCK:
+                    cache = _load_universe_cache()
+                    sector_map_cache = cache.get("sector_map", {})
+                    sector_cache = sector_map_cache.get("sectors", {})
+                    sector_cache_fetched_at = sector_map_cache.get("fetched_at")
 
-        try:
-            batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
-            _timeout = max(1.0, float(sector_timeout))
-            with requests.Session() as _session:
-                _orig_request = _session.request
-                _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
-                    method, url,
-                    timeout=kwargs.pop("timeout", _timeout),
-                    **kwargs,
-                )
-                try:
-                    batch = yf.Tickers(batch_symbols, session=_session)
-                except TypeError:
-                    batch = yf.Tickers(batch_symbols)
-                ticker_objs = getattr(batch, "tickers", {}) or {}
-                for bare_sym in missing_tickers:
-                    ns_sym = f"{bare_sym}.NS"
-                    ticker_obj = ticker_objs.get(ns_sym)
-                    if ticker_obj is None:
-                        try:
-                            ticker_obj = yf.Ticker(ns_sym, session=_session)
-                        except TypeError:
-                            ticker_obj = yf.Ticker(ns_sym)
-                    try:
-                        info = getattr(ticker_obj, "info", {}) or {}
-                        # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
-                        # a rate limit or the symbol is delisted.  Log at DEBUG so
-                        # operators can correlate missing sector data with provider
-                        # throttling without flooding production logs.
-                        if not info:
-                            logger.debug(
-                                "[Universe] Empty info dict for %s — "
-                                "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
-                                bare_sym,
-                            )
-                        sector = str(info.get("sector", "Unknown") or "Unknown")
-                        resolved_map[bare_sym] = sector
-                    except Exception as e:
-                        logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
-        except Exception as exc:
-            logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
+                still_missing = []
+                for bare_ticker in missing_tickers:
+                    if bare_ticker in sector_cache:
+                        cached_sector, fetched_at = _normalize_sector_cache_entry(
+                            sector_cache[bare_ticker],
+                            fallback_fetched_at=sector_cache_fetched_at,
+                        )
+                        if cached_sector is not None and _is_cache_entry_fresh(fetched_at):
+                            resolved_map[bare_ticker] = cached_sector
+                            continue
+                    still_missing.append(bare_ticker)
+                missing_tickers = still_missing
 
-            # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
-            # to prevent indefinite hangs (previously no timeout was set, allowing
-            # up to 30s per symbol × 8 workers = 240s total wall-time hang).
-            def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
-                # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
-                # (SIGALRM) inside this worker function.  Python's signal module
-                # strictly requires that signals are set and handled only in the
-                # main thread.  Calling signal.signal() or signal.alarm() from a
-                # ThreadPoolExecutor worker raises ValueError instantly, crashing
-                # the entire fallback sector fetch.
-                #
-                # Fix: attach a requests.Session with a socket-level timeout to
-                # the yfinance Ticker object.  The timeout is enforced by the
-                # urllib3 socket layer and works correctly in any thread.
+            if missing_tickers:
+                logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))
+                import yfinance as yf
+
+                fetched_this_round: Dict[str, str] = {}
                 try:
-                    # requests is already imported at module level;
-                    # use it directly rather than re-importing inside the worker.
+                    batch_symbols = " ".join(f"{sym}.NS" for sym in missing_tickers)
                     _timeout = max(1.0, float(sector_timeout))
-                    # BUG-FIX-SESSION-LEAK: use context manager so the
-                    # urllib3 connection pool and underlying sockets are
-                    # released immediately when the function returns.
-                    # Without this, 100 missing tickers = 100 Sessions =
-                    # ~200 sockets abandoned to the GC in TIME_WAIT state.
                     with requests.Session() as _session:
-                        # Wrap Session.request so every call carries the timeout,
-                        # regardless of which yfinance code path invokes it.
                         _orig_request = _session.request
                         _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
                             method, url,
                             timeout=kwargs.pop("timeout", _timeout),
                             **kwargs,
                         )
-                        ticker_obj = yf.Ticker(sym + ".NS", session=_session)
-                        info = (ticker_obj.info) or {}
-                        result_sector = str(info.get("sector", "Unknown") or "Unknown")
-                    return sym, result_sector
-                except Exception as e:
-                    logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
-                    return sym, None
+                        try:
+                            batch = yf.Tickers(batch_symbols, session=_session)
+                        except TypeError:
+                            batch = yf.Tickers(batch_symbols)
+                        ticker_objs = getattr(batch, "tickers", {}) or {}
+                        for bare_sym in missing_tickers:
+                            ns_sym = f"{bare_sym}.NS"
+                            ticker_obj = ticker_objs.get(ns_sym)
+                            if ticker_obj is None:
+                                try:
+                                    ticker_obj = yf.Ticker(ns_sym, session=_session)
+                                except TypeError:
+                                    ticker_obj = yf.Ticker(ns_sym)
+                            try:
+                                info = getattr(ticker_obj, "info", {}) or {}
+                                # FIX-NEW-UM-03: an empty info dict usually means yfinance hit
+                                # a rate limit or the symbol is delisted.  Log at DEBUG so
+                                # operators can correlate missing sector data with provider
+                                # throttling without flooding production logs.
+                                if not info:
+                                    logger.debug(
+                                        "[Universe] Empty info dict for %s — "
+                                        "possible rate limit or delisted symbol; defaulting to 'Unknown'.",
+                                        bare_sym,
+                                    )
+                                sector = str(info.get("sector", "Unknown") or "Unknown")
+                                resolved_map[bare_sym] = sector
+                                fetched_this_round[bare_sym] = sector
+                            except Exception as e:
+                                logger.debug("Failed to fetch sector for %s: %s", bare_sym, e, exc_info=True)
+                except Exception as exc:
+                    logger.warning("[Universe] Batch sector fetch failed (%s). Falling back to threaded lookup.", exc, exc_info=True)
 
-            with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
-                for sym, sector in pool.map(_fetch_single_sector, missing_tickers):  # type: ignore[assignment]
-                    if sector is not None:
-                        resolved_map[sym] = str(sector)
+                    # FIX-MB-UM-01: pass sector_timeout to each individual yfinance call
+                    # to prevent indefinite hangs (previously no timeout was set, allowing
+                    # up to 30s per symbol × 8 workers = 240s total wall-time hang).
+                    def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
+                        # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
+                        # (SIGALRM) inside this worker function.  Python's signal module
+                        # strictly requires that signals are set and handled only in the
+                        # main thread.  Calling signal.signal() or signal.alarm() from a
+                        # ThreadPoolExecutor worker raises ValueError instantly, crashing
+                        # the entire fallback sector fetch.
+                        #
+                        # Fix: attach a requests.Session with a socket-level timeout to
+                        # the yfinance Ticker object.  The timeout is enforced by the
+                        # urllib3 socket layer and works correctly in any thread.
+                        try:
+                            # requests is already imported at module level;
+                            # use it directly rather than re-importing inside the worker.
+                            _timeout = max(1.0, float(sector_timeout))
+                            # BUG-FIX-SESSION-LEAK: use context manager so the
+                            # urllib3 connection pool and underlying sockets are
+                            # released immediately when the function returns.
+                            # Without this, 100 missing tickers = 100 Sessions =
+                            # ~200 sockets abandoned to the GC in TIME_WAIT state.
+                            with requests.Session() as _session:
+                                # Wrap Session.request so every call carries the timeout,
+                                # regardless of which yfinance code path invokes it.
+                                _orig_request = _session.request
+                                _session.request = lambda method, url, **kwargs: _orig_request(  # type: ignore[method-assign]
+                                    method, url,
+                                    timeout=kwargs.pop("timeout", _timeout),
+                                    **kwargs,
+                                )
+                                ticker_obj = yf.Ticker(sym + ".NS", session=_session)
+                                info = (ticker_obj.info) or {}
+                                result_sector = str(info.get("sector", "Unknown") or "Unknown")
+                            return sym, result_sector
+                        except Exception as e:
+                            logger.debug("Failed to fetch sector for %s: %s", sym, e, exc_info=True)
+                            return sym, None
 
-            resolved_in_fallback = sum(1 for sym in missing_tickers if sym in resolved_map)
-            if resolved_in_fallback == 0 and missing_tickers:
-                logger.warning(
-                    "[Universe] Sector fallback resolved 0/%d symbols. All individual yfinance fetches failed — possible network partition or rate limit.",
-                    len(missing_tickers),
-                )
-            elif resolved_in_fallback < len(missing_tickers):
-                logger.info(
-                    "[Universe] Sector fallback resolved %d/%d symbols.",
-                    resolved_in_fallback, len(missing_tickers),
-                )
+                    with ThreadPoolExecutor(max_workers=min(8, max(1, len(missing_tickers)))) as pool:
+                        for sym, sector in pool.map(_fetch_single_sector, missing_tickers):  # type: ignore[assignment]
+                            if sector is not None:
+                                sector_str = str(sector)
+                                resolved_map[sym] = sector_str
+                                fetched_this_round[sym] = sector_str
 
-        # FIX-MB-SECTORTOCTOU: read cache INSIDE lock before merging results.
-        if use_cache:
-            with _UNIVERSE_CACHE_FILE_LOCK:
-                current_cache = _load_universe_cache()
-                existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
-                fetched_at = datetime.now(tz=timezone.utc).isoformat()
-                existing_sector_cache.update(
-                    {
-                        sym: {
-                            "sector": resolved_map[sym],
+                    resolved_in_fallback = sum(1 for sym in missing_tickers if sym in resolved_map)
+                    if resolved_in_fallback == 0 and missing_tickers:
+                        logger.warning(
+                            "[Universe] Sector fallback resolved 0/%d symbols. All individual yfinance fetches failed — possible network partition or rate limit.",
+                            len(missing_tickers),
+                        )
+                    elif resolved_in_fallback < len(missing_tickers):
+                        logger.info(
+                            "[Universe] Sector fallback resolved %d/%d symbols.",
+                            resolved_in_fallback, len(missing_tickers),
+                        )
+
+                # Final brief cache write after network work is complete.
+                if use_cache and fetched_this_round:
+                    with _UNIVERSE_CACHE_FILE_LOCK:
+                        current_cache = _load_universe_cache()
+                        existing_sector_cache = dict(current_cache.get("sector_map", {}).get("sectors", {}))
+                        fetched_at = datetime.now(tz=timezone.utc).isoformat()
+                        existing_sector_cache.update(
+                            {
+                                sym: {
+                                    "sector": sector,
+                                    "fetched_at": fetched_at,
+                                }
+                                for sym, sector in fetched_this_round.items()
+                            }
+                        )
+
+                        current_cache["sector_map"] = {
                             "fetched_at": fetched_at,
+                            "sectors": existing_sector_cache,
                         }
-                        for sym in missing_tickers
-                        if sym in resolved_map
-                    }
-                )
-
-                current_cache["sector_map"] = {
-                    "fetched_at": fetched_at,
-                    "sectors": existing_sector_cache,
-                }
-                _save_universe_cache(current_cache)
+                        _save_universe_cache(current_cache)
 
     final_map = {}
     for ticker in tickers:
