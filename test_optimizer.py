@@ -1424,3 +1424,18 @@ def test_run_optimization_sets_sqlite_wal_mode(tmp_path: Path, monkeypatch):
     with sqlite3.connect(db_path) as conn:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert str(mode).lower() == "wal"
+
+
+def test_oos_journal_path_sanitizes_study_name():
+    path = optimizer._oos_journal_path("../bad/name with spaces")
+    assert ".." not in path.name
+    assert "/" not in path.name
+    assert "\\" not in path.name
+
+
+def test_fitness_calmar_uses_drawdown_floor():
+    _, calmar, _ = optimizer._fitness_from_metrics(
+        {"cagr": 10.0, "max_dd": 0.0, "turnover": 0.0},
+        pd.DataFrame(),
+    )
+    assert calmar == pytest.approx(10.0 / optimizer.DRAWDOWN_FLOOR)

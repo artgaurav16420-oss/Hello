@@ -160,8 +160,12 @@ class CircuitBreaker:
         try:
             if json_path.exists():
                 self.count = int(json.loads(json_path.read_text(encoding="utf-8")).get("consecutive_empty", 0))
-        except Exception:
-            self.count = 0
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to parse circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+            self.count = 1 if lock_path.exists() else 0
+        except OSError as exc:
+            logger.warning("Failed to read circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+            self.count = 1 if lock_path.exists() else 0
 
     def save(self, path: str) -> None:
         """Persist count to disk; log error on failure, write lock sentinel."""
@@ -212,10 +216,6 @@ def _load_pending_sentinel(name: str) -> dict | None:
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
-
-_circuit_breaker = CircuitBreaker()
-_circuit_breaker.load(_CIRCUIT_BREAKER_FILE)
-
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
 class C:
@@ -235,6 +235,8 @@ class C:
         BLU = CYN = GRN = YLW = RED = GRY = RST = BLD = B_CYN = B_GRN = B_RED = ""
 
 logger = logging.getLogger(__name__)
+_circuit_breaker = CircuitBreaker()
+_circuit_breaker.load(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
 
 _DEFAULT_SCREENER_URL = os.environ.get(
     "SCREENER_URL",
@@ -680,6 +682,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                     os.remove(tmp)
                 except OSError:
                     pass
+        _clear_pending_sentinel(name)  # ARCH-FIX-3
         return
 
     os.makedirs("data", exist_ok=True)
@@ -1329,7 +1332,6 @@ def _run_scan(
             if _exhaust_decay:
                 state.decay_rounds = 0
                 state.consecutive_failures = 0
-            _clear_pending_sentinel(name=name)  # ARCH-FIX-3
     
         _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
     

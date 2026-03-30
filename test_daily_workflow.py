@@ -797,3 +797,13 @@ def test_run_scan_skips_rebalance_when_pending_sentinel_exists_for_today(monkeyp
     state = PortfolioState(cash=10_000.0)
     dw._run_scan(["ABC"], state, "TEST", cfg_override=UltimateConfig(), name="nifty")
     assert called["rebalance"] == 0
+
+
+def test_save_portfolio_state_clears_pending_sentinel_in_paper_mode(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dw, "PAPER_MODE", True)
+    state = PortfolioState()
+    dw._write_pending_sentinel("nifty", "tok", "2026-03-30")
+    assert dw._load_pending_sentinel("nifty") is not None
+    dw.save_portfolio_state(state, "nifty")
+    assert dw._load_pending_sentinel("nifty") is None

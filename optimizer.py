@@ -139,6 +139,7 @@ MAX_REASONABLE_CAGR_PCT       = 300.0
 MAX_REASONABLE_FINAL_MULTIPLE = 8.0
 BASE_INITIAL_CAPITAL          = UltimateConfig().INITIAL_CAPITAL
 OOS_TOURNAMENT_JOURNAL_DIR    = Path("data")
+DRAWDOWN_FLOOR                = 1.0  # keep consistent with backtest_engine Calmar denominator
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
@@ -308,7 +309,7 @@ def _fitness_from_metrics(
             "raw_score": round(raw, 6), "score": round(score, 6),
             "ceiling_hit": False, "dd_gate_hit": True, "anomaly_hit": False,
         }
-        calmar_score = cagr_net / max(abs(max_dd), 1e-6)  # ARCH-FIX-2
+        calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
         return score, calmar_score, diag
 
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
@@ -377,7 +378,7 @@ def _fitness_from_metrics(
         "dd_gate_hit":         dd_gate_hit,
         "anomaly_hit":         anomaly_hit,
     }
-    calmar_score = cagr_net / max(abs(max_dd), 1e-6)  # ARCH-FIX-2
+    calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
     return score, calmar_score, diag
 
 
@@ -858,7 +859,29 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
 
 def _oos_journal_path(study_name: str) -> Path:
     # ARCH-FIX-9
-    return OOS_TOURNAMENT_JOURNAL_DIR / f"oos_tournament_{study_name}.jsonl"
+    cleaned = re.sub(r"[\\/]+", "_", (study_name or "").strip())
+    cleaned = cleaned.replace("..", "_")
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "study"
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80]
+    return OOS_TOURNAMENT_JOURNAL_DIR / f"oos_tournament_{cleaned}.jsonl"
+
+
+def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
+    normalized: list[float] = []
+    for direction, value in zip(study.directions, trial.values or []):
+        if direction == optuna.study.StudyDirection.MINIMIZE:
+            normalized.append(-float(value))
+        else:
+            normalized.append(float(value))
+    normalized.append(-float(trial.number))
+    return tuple(normalized)
+
+
+def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
+    return sorted(study.best_trials, key=lambda t: _pareto_sort_key(study, t), reverse=True)
 
 
 def _error_triage_callback_factory() -> callable:
@@ -965,9 +988,10 @@ def run_optimization(
     def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
-        if not study.best_trials:
+        ranked_best = _deterministic_best_trials(study)
+        if not ranked_best:
             return
-        if study.best_trials[0].number != trial.number:
+        if ranked_best[0].number != trial.number:
             return
         diags = trial.user_attrs.get("slice_diags", [])
         hdr = (
@@ -1030,7 +1054,7 @@ def run_optimization(
         )
 
     try:
-        best_trial = study.best_trials[0]
+        best_trial = _deterministic_best_trials(study)[0]
     except ValueError as exc:
         raise RuntimeError(
             f"Optimization finished but no best trial available "
@@ -1081,7 +1105,7 @@ def run_optimization(
     print(f"\033[90mPASS   = Calmar > 0.5  AND  MaxDD <= {OOS_MAX_DD_CAP:.0f}%\033[0m")
     print(f"\033[90mNEAR   = Calmar > 0.5  AND  MaxDD <= {OOS_SOFT_MAX_DD_CAP:.0f}%  (diagnostic only)\033[0m\n")
 
-    top_k_trials = list(study.best_trials)[:OOS_TOP_K]  # ARCH-FIX-2 Pareto-front seeding
+    top_k_trials = _deterministic_best_trials(study)[:OOS_TOP_K]  # ARCH-FIX-2 Pareto-front seeding
 
     if not top_k_trials:
         logger.warning("No completed trials for OOS validation; skipping tournament.")
@@ -1109,7 +1133,8 @@ def run_optimization(
     for rank, trial_candidate in enumerate(top_k_trials, 1):
         if trial_candidate.number in completed_trial_ids:
             rec = completed_trial_ids[trial_candidate.number]
-            oos_results_list.append((rec["oos_calmar"], trial_candidate, trial_candidate.params, rec["metrics"]))
+            if rec.get("status") == "PASS":
+                oos_results_list.append((rec["oos_calmar"], trial_candidate, trial_candidate.params, rec["metrics"]))
             continue
         oos_cfg      = UltimateConfig()
         resolved_cfg = trial_candidate.user_attrs.get("resolved_cfg", {})
@@ -1145,10 +1170,13 @@ def run_optimization(
 
             if passes:
                 status = "\033[32mPASS\033[0m"
+                status_tag = "PASS"
             elif near:
                 status = "\033[33mNEAR\033[0m"
+                status_tag = "NEAR"
             else:
                 status = "\033[31mFAIL\033[0m"
+                status_tag = "FAIL"
 
             print(
                 f"  {rank:>4}  #{trial_candidate.number:>5}  "
@@ -1159,13 +1187,18 @@ def run_optimization(
                 f"{status}"
             )
 
+            oos_result_dict = {
+                "trial_number": trial_candidate.number,
+                "oos_calmar": oos_calmar,
+                "metrics": m,
+                "status": status_tag,
+            }
+            with journal_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(oos_result_dict) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             if passes:
                 oos_results_list.append((oos_calmar, trial_candidate, trial_candidate.params, m))
-                oos_result_dict = {"oos_calmar": oos_calmar, "metrics": m}
-                with journal_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({**oos_result_dict, "trial_number": trial_candidate.number}) + "\n")
-                    fh.flush()
-                    os.fsync(fh.fileno())
 
         except Exception as exc:
             print(
