@@ -65,12 +65,14 @@ class ScanContext:
 
     def __init__(self, label: str = "", correlation_id: Optional[str] = None):
         self.label = label
-        self.correlation_id = correlation_id or str(uuid.uuid4())[:8]
+        self.correlation_id = str(uuid.uuid4())[:8] if correlation_id is None else correlation_id
         self._prev_id: Optional[str] = None
         self._prev_label: Optional[str] = None
         self.start_time: float = 0.0
 
     def __enter__(self) -> "ScanContext":
+        if self.start_time != 0.0:
+            raise RuntimeError("ScanContext is not reentrant; create a new instance for each scan.")
         self._prev_id    = getattr(_local, "correlation_id", None)
         self._prev_label = getattr(_local, "scan_label", None)
         _local.correlation_id = self.correlation_id
@@ -127,23 +129,31 @@ class DeadLetterTracker:
     """
 
     def __init__(self, threshold: int = 10):
+        if threshold <= 0:
+            raise ValueError(f"threshold must be > 0, got {threshold}")
         self.threshold = threshold
         self._entries: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
 
     def add(self, symbol: str, reason: str, detail: str = "") -> None:
-        self._entries.append({
-            "symbol": symbol,
-            "reason": reason,
-            "detail": detail,
-        })
+        with self._lock:
+            self._entries.append({
+                "symbol": symbol,
+                "reason": reason,
+                "detail": detail,
+            })
 
     def flush(self, logger_name: str = "dead_letter") -> None:
-        if not self._entries:
+        with self._lock:
+            entries_snapshot = list(self._entries)
+            self._entries.clear()
+
+        if not entries_snapshot:
             return
         log = logging.getLogger(logger_name)
-        n   = len(self._entries)
-        sample = [e["symbol"] for e in self._entries[:10]]
-        reasons = list({e["reason"] for e in self._entries})
+        n   = len(entries_snapshot)
+        sample = [e["symbol"] for e in entries_snapshot[:10]]
+        reasons = list({e["reason"] for e in entries_snapshot})
         extra = {
             "event":          "dead_letter_flush",
             "n_affected":     n,
@@ -165,7 +175,6 @@ class DeadLetterTracker:
                 n, sample,
                 extra=extra,
             )
-        self._entries.clear()
 
 
 # ─── JSON formatter ───────────────────────────────────────────────────────────
@@ -297,10 +306,9 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
                     value = value[1:-1]
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
-                for sep in (" #", "\t#"):
-                    if sep in value:
-                        value = value[:value.index(sep)].rstrip()
-                        break
+                hash_pos = value.find("#")
+                if hash_pos > 0:
+                    value = value[:hash_pos].rstrip()
 
             os.environ.setdefault(key, value)
     except (OSError, UnicodeDecodeError, ValueError, TypeError, IndexError, AttributeError) as exc:
@@ -364,9 +372,10 @@ def configure_logging(
 
     # optional rotating file handler (always JSON)
     if log_file:
-        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        log_path = Path(log_file).resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = RotatingFileHandler(
-            log_file,
+            str(log_path),
             maxBytes=max_bytes,
             backupCount=backup_count,
             encoding="utf-8",

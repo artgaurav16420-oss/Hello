@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -63,6 +64,7 @@ _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
 _MAX_RATE_LIMIT_RETRIES = 5
+_MANIFEST_WRITE_LOCK = threading.Lock()
 
 
 def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -297,6 +299,7 @@ class GrowwProvider(DataProvider):
                     return None
 
                 backoff = min(5.0 * (2 ** (consecutive_rate_limits - 1)), 60.0)
+                backoff += random.uniform(0, backoff * 0.2)
                 logger.warning(
                     "[Groww] Rate limit hit #%d for %s — backing off %.0fs.",
                     consecutive_rate_limits, groww_symbol, backoff,
@@ -777,7 +780,9 @@ def _download_with_timeout(
             logger.debug("[Cache] Download attempt %d failed: %s", attempt + 1, exc)
             if attempt == max_retries - 1:
                 logger.error("[Cache] Provider failed after %d retries.", max_retries, exc_info=True)
-                raise errors[-1] from errors[0]
+                if len(errors) > 1:
+                    raise errors[-1] from errors[0]
+                raise errors[-1]
             time.sleep((2 ** attempt) + random.random())
 
     return None
@@ -827,7 +832,7 @@ def invalidate_cache() -> None:
 
 
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
-    min_rows = int(getattr(cfg, "HISTORY_GATE", 5)) if cfg is not None else 5
+    min_rows = int(getattr(cfg, "HISTORY_GATE", None) or 5) if cfg is not None else 5
     if df is None or df.empty or len(df) < min_rows:
         return False
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -928,17 +933,16 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
     groww_token = os.getenv("GROWW_API_TOKEN", "").strip()
     if groww_token:
         chain.append(GrowwProvider(api_token=groww_token))
-        logger.debug("[Cache] GrowwProvider enabled as primary data source.")
+        logger.info("[Cache] GrowwProvider enabled as primary data source.")
     else:
-        logger.debug(
-            "[Cache] GROWW_API_TOKEN not set — using YFinanceProvider only."
-        )
+        logger.info("[Cache] GROWW_API_TOKEN not set — YFinanceProvider is primary.")
 
     chain.append(YFinanceProvider())
 
     provider = SecondaryProvider()
     if provider.api_key:
         chain.append(provider)
+        logger.info("[Cache] SecondaryProvider enabled as tertiary fallback.")
     else:
         logger.info("[Cache] SecondaryProvider disabled (FALLBACK_API_KEY not set).")
 
@@ -957,7 +961,11 @@ def load_or_fetch(
     entries  = manifest["entries"]
 
     def _clean_ticker(t: str) -> str:
+        if t is None:
+            raise ValueError("ticker list contains None")
         t_str = str(t).strip()
+        if not t_str:
+            raise ValueError("ticker list contains empty string")
         if t_str.startswith("^"):
             return t_str
         upper_t = t_str.upper()
@@ -973,6 +981,8 @@ def load_or_fetch(
 
     if not required_start:
         raise ValueError("required_start must be provided")
+    if not required_end:
+        raise ValueError("required_end must be provided")
 
     cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
     dynamic_padding_days = max(400, cfg_lookback * 2)
@@ -1009,6 +1019,12 @@ def load_or_fetch(
                 logger.debug("[Cache] Corrupted parquet for %s: %s", ticker, exc)
                 tickers_to_download.append(ticker)
 
+    if not tickers_to_download:
+        logger.debug(
+            "[Cache] All %d requested symbols served from cache (no downloads needed).",
+            len(standardized_tickers),
+        )
+
     providers = _build_provider_chain(cfg)
     try:
         def _retry_unresolved_individually(unresolved: List[str]) -> List[str]:
@@ -1044,7 +1060,14 @@ def load_or_fetch(
                     if raw_single is None or raw_single.empty:
                         continue
 
-                    saved = _process_chunk([ticker], raw_single, entries, market_data, cfg)
+                    saved = _process_chunk(
+                        [ticker],
+                        raw_single,
+                        entries,
+                        market_data,
+                        cfg,
+                        provider_name=type(provider).__name__,
+                    )
                     if ticker in saved:
                         resolved = True
                         break
@@ -1079,7 +1102,14 @@ def load_or_fetch(
                         # appear in raw column names but fail _is_valid_dataframe
                         # and never be saved.  Using column names would mark it as
                         # "served" and block the SecondaryProvider fallback.
-                        saved = _process_chunk(chunk, raw_data, entries, market_data, cfg)
+                        saved = _process_chunk(
+                            chunk,
+                            raw_data,
+                            entries,
+                            market_data,
+                            cfg,
+                            provider_name=type(provider).__name__,
+                        )
                         missing_from_provider = [t for t in chunk if t not in saved]
 
                         if not missing_from_provider:
@@ -1112,7 +1142,11 @@ def load_or_fetch(
             # Note: _save_manifest is intentionally called only on download/recovery
             # paths. Any future code path that mutates `entries` without downloading
             # must explicitly call _save_manifest() to keep manifest state in sync.
-            _save_manifest(manifest)
+            with _MANIFEST_WRITE_LOCK:
+                live_manifest = _load_manifest()
+                live_entries = live_manifest.setdefault("entries", {})
+                live_entries.update(manifest.get("entries", {}))
+                _save_manifest(live_manifest)
     finally:
         for provider in providers:
             close_fn = getattr(provider, "close", None)
@@ -1142,6 +1176,8 @@ def _process_chunk(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
     cfg,
+    *,
+    provider_name: str = "unknown",
 ) -> set:
     """Process a downloaded chunk and return the set of successfully saved tickers.
 
@@ -1170,9 +1206,9 @@ def _process_chunk(
                 # provider outages or symbol delisting from logs alone.
                 logger.warning(
                     "[Cache] No usable data extracted for %s "
-                    "(provider returned None or empty frame for this symbol; "
-                    "check symbol name, market hours, or provider status).",
+                    "(provider=%s; check symbol name, market hours, or provider status).",
                     ticker,
+                    provider_name,
                 )
                 continue
 
