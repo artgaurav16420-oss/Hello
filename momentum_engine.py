@@ -878,7 +878,15 @@ def execute_rebalance(
 
     if apply_decay and scenario_losses is not None:
         decay_check_w = np.maximum(target_weights[:len(active_symbols)], 0.0).astype(float)
+        if symbols_to_force_close:
+            force_weights = []
+            for sym in symbols_to_force_close:
+                n_shares = state.shares.get(sym, 0)
+                px = float(state.last_known_prices.get(sym, 0.0))
+                force_weights.append((n_shares * px) / max(pv_exec, 1.0))
         gross_w = float(np.sum(decay_check_w))
+        if symbols_to_force_close and force_weights:
+            gross_w += float(np.sum(force_weights))
 
         if gross_w > 1e-6 and scenario_losses.shape[1] == len(active_symbols):
             # FIX-NEW-ME-05: normalise decay_check_w to unit sum before computing
@@ -973,38 +981,7 @@ def execute_rebalance(
         for i, sym in enumerate(active_symbols)
     )
 
-    # FIX-SLIP-RESERVE: pre-estimate the slippage cost of base trades and
-    # subtract it from the residual budget before the allocation loop starts.
-    # Without this reserve, the residual loop spends cash that is already
-    # committed to paying the broker for base-trade slippage.  The final
-    # settlement (state.cash = pv_exec - actual_notional - total_slippage)
-    # then goes slightly negative, silently absorbed by the max(0.0,...) floor
-    # as phantom margin money.  At the default 0.1% slip the leakage is small
-    # (~0.08% of portfolio per rebalance) but compounds over many rebalances
-    # and grows proportionally with illiquidity-driven impact costs.
-    # FIX-BUG-1: only reserve slippage for net buys (new or increased positions).
-    # The old condition `if _s > 0 or _old_s > 0` also fired for full sells
-    # (_s=0, _old_s>0), double-counting their slippage — sell proceeds and
-    # sell-side slip are already settled in the final
-    # `state.cash = pv_exec - actual_notional - total_slippage` expression.
-    # Over-reservation shrinks residual_cash and under-allocates the residual
-    # buy pass after large portfolio rotations.
-    _base_slip_reserve = 0.0
-    for _i, _sym in enumerate(active_symbols):
-        _old_s = state.shares.get(_sym, 0)
-        _s = desired_shares.get(_sym, 0)
-        if _s > _old_s:
-            _px = max(float(local_prices[_i]), 1e-6)
-            _delta_not = (_s - _old_s) * _px
-            _sr = compute_one_way_slip_rate(
-                cfg=cfg,
-                portfolio_value=pv_exec,
-                adv_notional=float(adv_shares[_i]) if adv_shares is not None and _i < len(adv_shares) else None,
-                trade_notional=_delta_not,
-            )
-            _base_slip_reserve += _delta_not * _sr
-
-    residual_cash = max(0.0, pv_exec - base_notional - _base_slip_reserve)
+    residual_cash = max(0.0, pv_exec - base_notional)
     # Canonical implementation: keep residual-cash allocation inline so
     # ADV caps, concentration limits, and multi-pass budget tracking stay in
     # one place with execution-time state.
@@ -1023,70 +1000,45 @@ def execute_rebalance(
 
             shares_bought_this_pass = 0
             to_remove = []
+            eligible_syms = list(eligible.keys())
+            prices_arr = np.array([eligible[s]["price"] for s in eligible_syms], dtype=float)
+            weights_arr = np.array([eligible[s]["w"] for s in eligible_syms], dtype=float)
+            idx_arr = np.array([int(eligible[s]["i"]) for s in eligible_syms], dtype=int)
+            cash_entitlements = (weights_arr / total_eligible_w) * residual_cash
+            adv_limits_arr = np.full(len(eligible_syms), np.iinfo(np.int64).max, dtype=np.int64)
+            if adv_shares is not None:
+                adv_notional_arr = adv_shares[idx_arr].astype(float)
+            else:
+                adv_notional_arr = np.full(len(eligible_syms), np.nan, dtype=float)
+            slip_rates = _compute_one_way_slip_rate_vectorized(
+                cfg=cfg,
+                portfolio_value=pv_exec,
+                adv_notional=adv_notional_arr,
+                trade_notional=cash_entitlements,
+            )
+            effective_prices = prices_arr * (1.0 + slip_rates)
+            extra_shares = np.floor(cash_entitlements / np.maximum(effective_prices, 1e-9)).astype(int)
+            current_shares_arr = np.array([desired_shares[s] for s in eligible_syms], dtype=int)
+            headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_exec - current_shares_arr * prices_arr
+            headroom_arr = np.maximum(0, np.floor(headroom_notional / np.maximum(effective_prices, 1e-9)).astype(int))
+            if adv_shares is not None:
+                valid_adv_mask = np.isfinite(adv_notional_arr) & (adv_notional_arr > 0)
+                max_adv_total = np.zeros(len(eligible_syms), dtype=int)
+                max_adv_total[valid_adv_mask] = np.floor(
+                    (adv_notional_arr[valid_adv_mask] * cfg.MAX_ADV_PCT) / np.maximum(effective_prices[valid_adv_mask], 1e-9)
+                ).astype(int)
+                adv_limits_arr = np.maximum(0, max_adv_total - current_shares_arr)
+            capped_extra = np.minimum(extra_shares, np.minimum(headroom_arr, adv_limits_arr))
+            capped_extra = np.maximum(capped_extra, 0)
 
-            for sym, data in eligible.items():
-                price = data["price"]
-                i = int(data["i"])
-                w_i   = data["w"]
-                cash_entitlement = (w_i / total_eligible_w) * residual_cash
-                slip_rate = compute_one_way_slip_rate(
-                    cfg=cfg,
-                    portfolio_value=pv_exec,
-                    adv_notional=float(adv_shares[i]) if adv_shares is not None else None,
-                    trade_notional=cash_entitlement,
-                )
-                effective_buy_price = price * (1.0 + slip_rate)
-
-                extra = int(cash_entitlement // max(effective_buy_price, 1e-9))
-
-                if extra <= 0:
-                    if effective_buy_price > residual_cash:
-                        to_remove.append(sym)
-                    continue
-
-                headroom_notional = cfg.MAX_SINGLE_NAME_WEIGHT * pv_exec - desired_shares[sym] * price
-                max_extra_weight  = max(0, int(headroom_notional // max(effective_buy_price, 1e-9)))
-
-                max_extra_adv = extra
-                if adv_shares is not None and i < len(adv_shares):
-                    adv_notional = float(adv_shares[i])
-                    if adv_notional > 0:
-                        max_adv_total = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / max(effective_buy_price, 1e-9)))
-                        max_extra_adv = max(0, max_adv_total - desired_shares[sym])
-
-                cap_limit    = min(max_extra_weight, max_extra_adv)
-                actual_extra = min(extra, cap_limit)
-
+            for pos, sym in enumerate(eligible_syms):
+                actual_extra = int(capped_extra[pos])
+                eff_px = float(effective_prices[pos])
                 if actual_extra > 0:
                     desired_shares[sym] += actual_extra
-                    # FIX-RESIDUAL-BUDGET: deduct the EFFECTIVE (slipped) cost
-                    # from the residual_cash spending budget.
-                    #
-                    # The previous FIX-NEW-ME-01 comment claimed raw deduction
-                    # was necessary to avoid double-charging slippage.  That
-                    # reasoning was wrong: residual_cash is a LOCAL loop budget
-                    # only — it is never used in the final cash settlement.  The
-                    # final accounting always computes:
-                    #   state.cash = pv_exec - actual_notional - total_slippage
-                    # where actual_notional = sum(shares * raw_price) and
-                    # total_slippage = sum(|delta| * raw_price * slip_rate).
-                    # Neither term reads residual_cash, so there is no
-                    # double-deduction regardless of what we subtract here.
-                    #
-                    # What raw deduction DID cause: when slip_rate is large
-                    # (e.g. 5% market-impact cap on an illiquid small-cap),
-                    # the loop could authorise more shares than the portfolio
-                    # can actually afford.  The final settlement would then
-                    # drive state.cash negative, silently covered by the
-                    # max(0.0, ...) floor — phantom margin money.
-                    #
-                    # Correct fix: deduct effective_buy_price so the budget
-                    # reflects the true all-in cost of each purchase, keeping
-                    # total authorised spending within the available residual.
-                    residual_cash       -= actual_extra * effective_buy_price
+                    residual_cash -= actual_extra * eff_px
                     shares_bought_this_pass += actual_extra
-
-                if actual_extra >= cap_limit or effective_buy_price > residual_cash:
+                if actual_extra >= int(min(headroom_arr[pos], adv_limits_arr[pos])) or eff_px > residual_cash:
                     to_remove.append(sym)
 
             for sym in to_remove:
@@ -1272,8 +1224,12 @@ def compute_book_cvar(
             #    independent RNG seed. That breaks strict per-row replay.
             #    Correct approach is one Generator per row via default_rng(int(seed)).
             if hasattr(rets.index, 'asi8'):
-                # DatetimeIndex: convert ns timestamps to integer day numbers
-                days_since_epoch = (rets.index.asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
+                if rets.index.tz is None:
+                    idx_utc = rets.index.tz_localize("UTC")
+                else:
+                    idx_utc = rets.index.tz_convert("UTC")
+                # Normalize to UTC midnight for cross-environment reproducibility.
+                days_since_epoch = (idx_utc.normalize().asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
             else:
                 # Fallback for non-datetime index: use positional integers
                 days_since_epoch = np.arange(len(rets), dtype=np.int64)
@@ -1281,7 +1237,7 @@ def compute_book_cvar(
             # FIX-MB-ME-05: XOR in uint64 space to prevent signed overflow.
             row_seeds = (
                 np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
-            ).astype(np.int64)
+            )
 
             vol_series = np.full(len(row_seeds), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
             sym_hist = list(state.vol_hist.get(sym, deque()))
@@ -1299,8 +1255,7 @@ def compute_book_cvar(
                         vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
 
             # AFTER — one Generator per ghost symbol; draws all rows in a single vectorized call
-            rng = np.random.default_rng(int(sym_base_seed))
-            raw = rng.standard_normal(len(row_seeds))
+            raw = np.array([np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds], dtype=float)
             synth_rets = daily_drift + vol_series * raw
             rets.loc[:, sym] = synth_rets
 
@@ -1360,6 +1315,11 @@ def compute_decay_targets(
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 
 class InstitutionalRiskEngine:
+    """Risk optimizer wrapper with reusable solver cache.
+
+    When reusing an instance across backtests with different date ranges,
+    call reset_solver() between runs to clear cached solver state.
+    """
     # NOT thread-safe across optimize() calls without _solver_lock.
     def __init__(self, cfg: UltimateConfig):
         self.cfg:       UltimateConfig              = cfg
@@ -1369,6 +1329,13 @@ class InstitutionalRiskEngine:
         self._solver_nnz:   Optional[tuple]  = None
         self._solver_struct: Optional[tuple] = None
         self._solver_lock = threading.Lock()
+
+    def reset_solver(self) -> None:
+        with self._solver_lock:
+            self._solver = None
+            self._solver_shape = None
+            self._solver_nnz = None
+            self._solver_struct = None
 
     def optimize(
         self,

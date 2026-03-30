@@ -101,6 +101,7 @@ class BacktestEngine:
 
     def _reset_run_state(self) -> None:
         self.state.reset()
+        self.engine.reset_solver()
         self._eq_dates = []
         self._eq_vals = []
         self._rebal_rows = []
@@ -122,43 +123,67 @@ class BacktestEngine:
         dividends:       Optional[pd.DataFrame] = None,
         splits:          Optional[pd.DataFrame] = None,
         universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
+        log_rets_arr:    Optional[np.ndarray] = None,
     ) -> pd.DataFrame:
         # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
         # runs; without clearing per-run buffers, equity/trade/rebalance state
         # accumulates and contaminates subsequent outputs.
         self._reset_run_state()
+        # Guard against stale values left by a prior state.from_dict()
+        # deserialization when reusing the same BacktestEngine instance.
+        self.state.equity_hist_cap = self.engine.cfg.EQUITY_HIST_CAP
+        self.state.max_absent_periods = self.engine.cfg.MAX_ABSENT_PERIODS
 
         if close.empty:
             logger.warning("[Backtest] Received empty close dataframe; skipping run.")
             return pd.DataFrame({"equity": pd.Series(dtype=float)})
+        if log_rets_arr is None:
+            log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
 
         start_dt = pd.Timestamp(start_date)
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
-        symbols  = list(close.columns)
+        symbols  = close.columns.tolist()
+        close_arr = close.values
+        date_to_pos = {d: i for i, d in enumerate(close.index)}
 
         rebal_set  = set(rebalance_dates)
         active_idx = {sym: i for i, sym in enumerate(symbols)}
+        pending_splits: Dict[str, float] = {}
 
         for date in close.index:
             if date < start_dt or date > end_dt:
                 continue
 
-            close_t  = close.loc[date]
-            prices_t = close_t.values.astype(float)
+            date_pos = date_to_pos[date]
+            close_t = close_arr[date_pos]
+            prices_t = close_t.astype(float)
 
-            if splits is not None and date in splits.index and not self.engine.cfg.AUTO_ADJUST_PRICES:
-                split_row = splits.loc[date]
+            if splits is not None and not self.engine.cfg.AUTO_ADJUST_PRICES and (date in splits.index or pending_splits):
+                if date in splits.index:
+                    split_row = splits.loc[date]
+                    for sym in split_row.index:
+                        split_val = split_row[sym]
+                        if pd.notna(split_val) and float(split_val) > 0:
+                            pending_splits[sym] = float(split_val)
                 for sym, old_shares in list(self.state.shares.items()):
-                    if old_shares <= 0 or sym not in split_row.index:
+                    if old_shares <= 0 or sym not in pending_splits:
                         continue
-                    split_ratio = float(split_row[sym]) if pd.notna(split_row[sym]) else 0.0
+                    split_ratio = float(pending_splits[sym])
                     if split_ratio <= 0:
                         continue
 
                     theoretical_new = old_shares * split_ratio
                     new_shares = int(np.floor(theoretical_new + 1e-12))
                     fractional_shares = max(0.0, theoretical_new - new_shares)
-                    price_now = float(close_t[sym]) if sym in close_t.index and pd.notna(close_t[sym]) else 0.0
+                    sym_idx = active_idx.get(sym)
+                    sym_px = close_t[sym_idx] if sym_idx is not None else np.nan
+                    price_now = float(sym_px) if pd.notna(sym_px) else 0.0
+                    if price_now <= 0:
+                        logger.warning(
+                            "[Backtest] Split adjustment deferred for %s on %s due to invalid price %.4f.",
+                            sym, date, price_now,
+                        )
+                        continue
                     if price_now > 0 and fractional_shares > 0:
                         # BUG-FIX-FRAC-SLIP: deduct one-way slippage on the
                         # fractional-share liquidation.  Previously the cash
@@ -171,6 +196,7 @@ class BacktestEngine:
                     self.state.shares[sym] = new_shares
                     old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
                     self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
+                    pending_splits.pop(sym, None)
 
             # BUG-BE-06: Rebalance runs before dividend sweep so T+0 reinvestment
             # is prevented. Dividends are credited to cash before record_eod, so
@@ -180,6 +206,7 @@ class BacktestEngine:
                     date, close, volume, returns, symbols, prices_t,
                     idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
                     member_universe=(universe_by_rebalance_date or {}).get(pd.Timestamp(date)),
+                    date_pos=date_pos, log_rets_arr=log_rets_arr,
                 )
 
             if (
@@ -196,8 +223,7 @@ class BacktestEngine:
                     if pd.notna(div_val) and float(div_val) > 0:
                         self.state.cash = round(self.state.cash + float(div_val) * shares, 10)
 
-            close_vals = close_t.values
-            valid_mask = np.isfinite(close_vals)
+            valid_mask = np.isfinite(close_t)
             valid_syms = [s for s, v in zip(symbols, valid_mask) if v]
             price_dict = {s: prices_t[active_idx[s]] for s in valid_syms}
             self.state.record_eod(price_dict)
@@ -222,6 +248,8 @@ class BacktestEngine:
         high_px:    Optional[pd.DataFrame] = None,
         low_px:     Optional[pd.DataFrame] = None,
         member_universe: Optional[set[str]] = None,
+        date_pos: Optional[int] = None,
+        log_rets_arr: Optional[np.ndarray] = None,
     ) -> None:
         cfg = self.engine.cfg
 
@@ -238,19 +266,26 @@ class BacktestEngine:
             active_positions = [sym_to_global_idx[sym] for sym in active_symbols]
             active_prices = prices_t[active_positions]
 
-        _loc = close.index.get_loc(date)
-        assert isinstance(_loc, (int, np.integer)), (
-            f"Duplicate timestamp {date} detected in close index. "
-            "Deduplicate the index in build_precomputed_matrices before running backtest."
-        )
-        prev_idx = _loc - 1
+        if date_pos is None:
+            _loc = close.index.get_loc(date)
+            assert isinstance(_loc, (int, np.integer)), (
+                f"Duplicate timestamp {date} detected in close index. "
+                "Deduplicate the index in build_precomputed_matrices before running backtest."
+            )
+            date_pos = int(_loc)
+        if log_rets_arr is None:
+            log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
+
+        col_to_idx = {sym: i for i, sym in enumerate(close.columns)}
+        prev_idx = date_pos - 1
         if prev_idx < 0:
             return
         signal_date = close.index[prev_idx]
-
-        hist_log_rets = (
-            np.log1p(returns.loc[:signal_date, active_symbols])
-            .replace([np.inf, -np.inf], np.nan)
+        active_col_indices = np.array([col_to_idx[sym] for sym in active_symbols], dtype=int)
+        hist_log_rets = pd.DataFrame(
+            log_rets_arr[:prev_idx + 1, active_col_indices],
+            index=returns.index[:prev_idx + 1],
+            columns=active_symbols,
         )
 
         adv_vector, close_notional = _build_adv_vector(
@@ -457,7 +492,26 @@ class BacktestEngine:
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
 
-            exec_prices = _execution_prices(active_symbols, date, active_prices, open_px, high_px, low_px)
+            exec_prices, open_fallback_mask = _execution_prices(
+                active_symbols, date, active_prices, open_px, high_px, low_px, return_open_fallback_mask=True
+            )
+            if open_fallback_mask.any():
+                sig_px_arr = close.values[prev_idx, active_col_indices]
+                cur_px_arr = close.values[date_pos, active_col_indices]
+                first_day_mask = (
+                    open_fallback_mask
+                    & np.isfinite(sig_px_arr)
+                    & np.isfinite(cur_px_arr)
+                    & (sig_px_arr == cur_px_arr)
+                )
+                if first_day_mask.any():
+                    skipped_syms = [sym for sym, bad in zip(active_symbols, first_day_mask, strict=True) if bad]
+                    logger.warning(
+                        "[Backtest] Skipping first-day symbols with NaN open fallback on %s: %s",
+                        date,
+                        skipped_syms,
+                    )
+                    target_weights[first_day_mask] = 0.0
 
             execute_rebalance(
                 self.state, target_weights, exec_prices, active_symbols, cfg,
@@ -596,13 +650,19 @@ def _build_adv_vector(
         volume_sub = volume.loc[:signal_date]
         common_cols = [s for s in symbols if s in close_sub.columns and s in volume_sub.columns]
         if common_cols:
-            close_notional = (close_sub[common_cols] * volume_sub[common_cols]).clip(lower=0)
+            close_slice = close_sub[common_cols]
+            volume_aligned = volume_sub[common_cols].reindex(close_slice.index)
+            close_notional = (close_slice * volume_aligned).clip(lower=0)
             adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
-            adv_vector = close_notional.iloc[-adv_lookback:].mean(axis=0)
+            adv_vector = close_notional.iloc[-adv_lookback:].mean(axis=0, skipna=True)
+            adv_fallback = float(getattr(cfg, "ADV_FALLBACK", 0.0)) if cfg is not None else 0.0
             for i, sym in enumerate(symbols):
                 if sym in adv_vector.index:
                     val = float(adv_vector[sym])
-                    if np.isfinite(val):
+                    all_volume_nan = bool(volume_aligned[sym].isna().all())
+                    if all_volume_nan and adv_fallback > 0:
+                        adv[i] = adv_fallback
+                    elif np.isfinite(val):
                         adv[i] = val
                     else:
                         adv_zero_reasons["nonfinite_mean"].append(sym)
@@ -654,13 +714,25 @@ def _execution_prices(
     open_px: Optional[pd.DataFrame],
     high_px: Optional[pd.DataFrame],
     low_px: Optional[pd.DataFrame],
-) -> np.ndarray:
+    return_open_fallback_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     exec_px = close_prices.copy()
+    open_fallback_mask = np.zeros(len(symbols), dtype=bool)
 
     if open_px is not None and date in open_px.index:
         opens = open_px.loc[date].reindex(symbols).values.astype(float)
+        open_fallback_mask = ~np.isfinite(opens)
+        if open_fallback_mask.any():
+            bad_syms = [sym for sym, bad in zip(symbols, open_fallback_mask, strict=True) if bad]
+            logger.warning(
+                "[Backtest] Non-finite open prices on %s for %s; falling back to close prices.",
+                date,
+                bad_syms,
+            )
         exec_px = np.where(np.isfinite(opens) & (opens > 0), opens, exec_px)
 
+    if return_open_fallback_mask:
+        return exec_px, open_fallback_mask
     return exec_px
 
 
@@ -845,15 +917,18 @@ def build_precomputed_matrices(
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
     returns = returns_base.pct_change(fill_method=None).clip(lower=-0.99)
+    common_idx = returns.index.intersection(close.index)
+    close = close.reindex(common_idx)
+    close_adj = close_adj.reindex(common_idx)
+    open_df = open_df.reindex(common_idx)
+    high_df = high_df.reindex(common_idx)
+    low_df = low_df.reindex(common_idx)
+    dividends_df = dividends_df.reindex(common_idx).fillna(0.0)
+    splits_df = splits_df.reindex(common_idx).fillna(0.0)
+    volume_df = volume_df.reindex(common_idx)
+    returns = returns.reindex(common_idx)
     assert (close.index == volume_df.index).all(), "close and volume index mismatch"
-    returns_matches = (
-        (len(returns.index) == len(close.index) and (close.index == returns.index).all())
-        or (
-            len(returns.index) == len(close.index) + 1
-            and (close.index == returns.index[1:]).all()
-        )
-    )
-    assert returns_matches, "close and returns index mismatch after clipping"
+    assert (close.index == returns.index).all(), "close and returns index mismatch after alignment"
 
     return {
         "close": close,
@@ -887,6 +962,8 @@ def run_backtest(
     warmup_start = _compute_warmup_start(start_date, cfg)
 
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
+    if len(all_target_dates) == 0:
+        all_target_dates = pd.DatetimeIndex([pd.Timestamp(end_date)])
 
     union_universe = set(universe or [])
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
@@ -1014,7 +1091,7 @@ def run_backtest(
         dividends = _select_with_universe_labels(_clip(matrices["dividends"]))
         splits    = _select_with_universe_labels(_clip(matrices["splits"]))
         volume    = _select_with_universe_labels(_clip(matrices["volume"]))
-        returns = _select_with_universe_labels(_clip(matrices["returns"]))
+        returns   = _select_with_universe_labels(_clip(matrices["returns"]))
     else:
         # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
         # which kept almost every DataFrame (any series starting before warmup_start
@@ -1040,16 +1117,20 @@ def run_backtest(
         volume = matrices["volume"]
         returns = matrices["returns"]
 
-    returns_raw = returns
-    if returns_raw.empty:
+    common_idx = close.index.intersection(returns.index)
+    close = close.reindex(common_idx)
+    open_px = open_px.reindex(common_idx)
+    high_px = high_px.reindex(common_idx)
+    low_px = low_px.reindex(common_idx)
+    dividends = dividends.reindex(common_idx).fillna(0.0)
+    splits = splits.reindex(common_idx).fillna(0.0)
+    volume = volume.reindex(common_idx)
+    returns = returns.reindex(common_idx)
+
+    if returns.empty:
         raise RuntimeError("Backtest aborted: returns matrix is empty after clipping.")
-    clip_start_iloc = returns_raw.index.get_indexer([pd.Timestamp(warmup_start)], method="bfill")[0]
-    if clip_start_iloc < 0:
-        clip_start_iloc = 0
-    first_row_all_nan = returns_raw.iloc[0].isna().all()
-    min_start_iloc = 1 if (first_row_all_nan and len(returns_raw.index) >= 2) else 0
-    safe_start = returns_raw.index[max(int(clip_start_iloc), min_start_iloc)]
-    returns = returns_raw.loc[safe_start:pd.Timestamp(end_date)]
+    log_rets = np.log1p(returns).replace([np.inf, -np.inf], np.nan)
+    log_rets_arr = log_rets.values
 
     if close.empty:
         raise RuntimeError(
@@ -1125,6 +1206,7 @@ def run_backtest(
         open_px=open_px, high_px=high_px, low_px=low_px,
         dividends=dividends, splits=splits,
         universe_by_rebalance_date=universe_by_rebalance_date,
+        log_rets_arr=log_rets_arr,
     )
 
     eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
