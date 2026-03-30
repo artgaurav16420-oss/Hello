@@ -204,7 +204,9 @@ def compute_regime_score(
                 last = _hist.iloc[-1]
                 valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
                 if valid.any():
-                    breadth_component = float((last[valid] > sma_vals[valid]).mean())
+                    breadth_component = float(
+    (last[valid] > sma_vals.reindex(last[valid].index, fill_value=np.nan)).mean()  # defensive reindex for column-alignment safety
+)
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     regime_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
@@ -421,7 +423,13 @@ def generate_signals(
     raw_daily_momentum = 0.5 * fast_ema + 0.5 * slow_ema
 
     if np.all(np.isnan(raw_daily_momentum)):
-        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {}
+        return raw_daily_momentum, np.full_like(raw_daily_momentum, -np.inf), [], {
+            "total": len(active_symbols),
+            "history_failed": 0,
+            "adv_failed": 0,
+            "knife_failed": 0,
+            "selected": 0,
+        }
 
     history_pass = (signal_log_rets[active_symbols].tail(cfg.HISTORY_GATE).notna().sum(axis=0) >= cfg.HISTORY_GATE).values
     liquidity_pass = np.isfinite(adv_arr) & (adv_arr > 0)
@@ -453,11 +461,7 @@ def generate_signals(
         cfg.Z_SCORE_CLIP
     )
 
-    for i in range(len(active_symbols)):
-        if not history_pass[i]:
-            adj_scores[i] = -np.inf
-        if not liquidity_pass[i]:
-            adj_scores[i] = -np.inf
+    adj_scores[~gate_pass_mask] = -np.inf
 
     # FIX-NEW-SIG-01: snapshot adj_scores here — after history/ADV gates have set
     # their -inf values but BEFORE the knife gate runs.  knife_hard_mask is then
