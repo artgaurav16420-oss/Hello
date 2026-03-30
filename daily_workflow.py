@@ -169,26 +169,32 @@ class CircuitBreaker:
 
     def save(self, path: str) -> None:
         """Persist count to disk; log error on failure, write lock sentinel."""
-        try:
-            os.makedirs("data", exist_ok=True)
-            tmp = f"{path}.tmp"
-            pathlib.Path(tmp).write_text(
-                json.dumps({"consecutive_empty": self.count}),
-                encoding="utf-8",
-            )
-            os.replace(tmp, path)
-            if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
-                pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
-        except Exception as exc:
-            logger.error("Failed to persist circuit breaker count: %s", exc)  # ARCH-FIX-10
+        with self._lock:  # ARCH-FIX-7
             try:
-                pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).touch()
-            except Exception:
-                pass
+                os.makedirs("data", exist_ok=True)
+                snapshot = int(self.count)
+                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+                pathlib.Path(tmp).write_text(
+                    json.dumps({"consecutive_empty": snapshot}),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, path)
+                if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
+                    pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
+            except Exception as exc:
+                logger.error("Failed to persist circuit breaker count: %s", exc)  # ARCH-FIX-10
+                try:
+                    pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).touch()
+                except Exception:
+                    pass
 
 
 def _pending_sentinel_path(name: str) -> pathlib.Path:
     return pathlib.Path(f"data/pending_rebalance_{name}.json")
+
+
+def _pending_claim_path(name: str) -> pathlib.Path:
+    return pathlib.Path(f"data/pending_rebalance_{name}.claim")
 
 
 def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Path:
@@ -196,15 +202,56 @@ def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Pat
     os.makedirs("data", exist_ok=True)
     path = _pending_sentinel_path(name)
     tmp_path = path.with_suffix(f"{path.suffix}.{token}.tmp")
-    tmp_path.write_text(json.dumps({"token": token, "date": date_str}), encoding="utf-8")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"token": token, "date": date_str}))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp_path, path)
+    if os.name == "posix":
+        dir_fd = os.open(str(path.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     return path
+
+
+def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
+    os.makedirs("data", exist_ok=True)
+    claim_path = _pending_claim_path(name)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(str(claim_path), flags)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"token": token, "date": date_str}))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:
+        try:
+            claim_path.unlink()
+        except OSError:
+            pass
+        raise
+    if os.name == "posix":
+        dir_fd = os.open(str(claim_path.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    return True
 
 
 def _clear_pending_sentinel(name: str) -> None:
     # ARCH-FIX-3
     try:
         _pending_sentinel_path(name).unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        _pending_claim_path(name).unlink()
     except FileNotFoundError:
         pass
 
@@ -1308,6 +1355,9 @@ def _run_scan(
                 logger.warning("Rebalance already committed for today, skipping")
                 return state, market_data
             token = str(uuid.uuid4())
+            if not _try_claim_pending_sentinel(name=name, token=token, date_str=today.strftime("%Y-%m-%d")):
+                logger.warning("Rebalance claim already exists for today, skipping")
+                return state, market_data
             _write_pending_sentinel(
                 name=name,
                 token=token,

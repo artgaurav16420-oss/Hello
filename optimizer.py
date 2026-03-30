@@ -870,8 +870,10 @@ def _oos_journal_path(study_name: str) -> Path:
 
 
 def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
+    if trial.values is None:
+        raise ValueError(f"Trial #{trial.number} has no objective values for Pareto sorting.")
     normalized: list[float] = []
-    for direction, value in zip(study.directions, trial.values or []):
+    for direction, value in zip(study.directions, trial.values, strict=True):
         if direction == optuna.study.StudyDirection.MINIMIZE:
             normalized.append(-float(value))
         else:
