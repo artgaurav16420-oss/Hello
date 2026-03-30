@@ -174,11 +174,19 @@ class CircuitBreaker:
                 os.makedirs("data", exist_ok=True)
                 snapshot = int(self.count)
                 tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-                pathlib.Path(tmp).write_text(
-                    json.dumps({"consecutive_empty": snapshot}),
-                    encoding="utf-8",
-                )
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"consecutive_empty": snapshot}))
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(tmp, path)
+                # Fsync parent directory to ensure rename is durable
+                parent_dir = pathlib.Path(path).parent
+                if os.name == "posix":
+                    dir_fd = os.open(str(parent_dir), getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
                 if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
                     pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
             except Exception as exc:
@@ -233,7 +241,11 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
             # Try to read the existing claim to check its date
             try:
                 existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
-                claim_date_str = existing_claim.get("date", "")
+                if isinstance(existing_claim, dict):
+                    claim_date_str = existing_claim.get("date", "")
+                else:
+                    # Malformed claim (not a dict) — treat as stale
+                    claim_date_str = ""
             except (json.JSONDecodeError, OSError):
                 # Corrupted or unreadable claim — treat as stale
                 claim_date_str = ""
@@ -308,7 +320,17 @@ def _load_pending_sentinel(name: str) -> dict | None:
     path = _pending_sentinel_path(name)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+        else:
+            # Malformed sentinel (not a dict) — treat as missing
+            logger.debug("_load_pending_sentinel: malformed sentinel for %s (not a dict), treating as missing", name)
+            return None
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("_load_pending_sentinel: failed to load sentinel for %s: %s", name, e)
+        return None
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -1004,7 +1026,9 @@ def _run_scan(
         if state.max_absent_periods is None:
             state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
-        today = pd.Timestamp(datetime.today().date())
+        # Derive session_date from market timezone to avoid date flip mid-session
+        session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+        today = session_date  # Keep today for backward compatibility with other uses
         next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
         rebalance_allowed = next_due is None or today >= next_due
         if not rebalance_allowed:

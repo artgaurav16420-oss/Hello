@@ -1138,6 +1138,24 @@ def run_optimization(
             try:
                 rec = json.loads(line)
                 trial_number = rec["trial_number"]
+                # Validate the record has required fields and correct status
+                if rec.get("status") != "PASS":
+                    # Skip non-PASS records or store them without validation
+                    completed_trial_ids[trial_number] = rec
+                    continue
+                # For PASS records, validate required keys exist and have expected types
+                if not isinstance(rec.get("oos_calmar"), (int, float)):
+                    logger.warning(
+                        "Skipping journal line %d: PASS record missing valid oos_calmar (got %r)",
+                        line_idx, rec.get("oos_calmar")
+                    )
+                    continue
+                if not isinstance(rec.get("metrics"), dict):
+                    logger.warning(
+                        "Skipping journal line %d: PASS record missing valid metrics dict (got %r)",
+                        line_idx, type(rec.get("metrics")).__name__
+                    )
+                    continue
                 completed_trial_ids[trial_number] = rec
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 logger.warning(
@@ -1163,11 +1181,14 @@ def run_optimization(
 
         try:
             warmup_start = _compute_warmup_start(TEST_START, oos_cfg)  # ARCH-FIX-5
-            clipped_matrices = {
-                k: v.loc[warmup_start:TEST_END]
-                for k, v in (precomputed_matrices or {}).items()
-                if hasattr(v, "loc")
-            }
+            clipped_matrices = {}
+            for k, v in (precomputed_matrices or {}).items():
+                if hasattr(v, "loc"):
+                    # DataFrame: clip to warmup_start:TEST_END
+                    clipped_matrices[k] = v.loc[warmup_start:TEST_END]
+                else:
+                    # Non-DataFrame artifact: keep original value unchanged
+                    clipped_matrices[k] = v
             oos_result = run_backtest(
                 market_data          = market_data,
                 precomputed_matrices = clipped_matrices,
