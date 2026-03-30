@@ -23,6 +23,7 @@ import argparse
 import io
 import logging
 import os
+import tempfile
 import time
 import random
 from pathlib import Path
@@ -325,9 +326,9 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
     return snapshots, success
 
 
-def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
+def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     """
-    Write *df* to *path* as a Parquet file, pinning ``engine='pyarrow'``.
+    Write *df* to *path* as a Parquet file using atomic write with unique temp file.
 
     FIX-BUG-16: all four ``to_parquet`` calls in this module previously used
     the default engine.  ``universe_manager._load_historical_universe_df``
@@ -340,25 +341,59 @@ def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
     ``universe_manager``.  Pinning the same engine on both sides of the
     parquet channel ensures deterministic list round-trips regardless of
     which engines are installed.
+
+    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
+    collisions across concurrent writers.
     """
     path = Path(path)
-    tmp = path.with_suffix(f".tmp{path.suffix}")  # FIX-1
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
+    tmp = Path(tmp_path)
     try:
-        df.to_parquet(tmp, engine="pyarrow")  # FIX-1
-        os.replace(tmp, path)  # FIX-1
+        os.close(fd)
+        df.to_parquet(tmp, engine="pyarrow")
+        os.replace(tmp, path)
     except Exception:
-        tmp.unlink(missing_ok=True)  # FIX-1
+        tmp.unlink(missing_ok=True)
         try:
-            df.to_parquet(tmp)  # FIX-1
-            os.replace(tmp, path)  # FIX-1
+            fd2, tmp_path2 = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
+            tmp2 = Path(tmp_path2)
+            os.close(fd2)
+            df.to_parquet(tmp2)
+            os.replace(tmp2, path)
             logger.warning(
                 "[BHF] pyarrow not available; writing %s with default parquet engine. "
                 "List-valued 'tickers' column may not round-trip correctly on read.",
                 path,
             )
         except Exception:
-            tmp.unlink(missing_ok=True)  # FIX-1
+            if tmp2.exists():
+                tmp2.unlink(missing_ok=True)
             raise
+
+
+def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
+    """
+    Write *df* to *path* as a CSV file using atomic write with unique temp file.
+
+    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
+    collisions across concurrent writers.
+    """
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.csv", prefix=".tmp_")
+    tmp = Path(tmp_path)
+    try:
+        os.close(fd)
+        df.to_csv(tmp, **kwargs)
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# Backward compatibility alias
+def _to_parquet_pyarrow(df: "pd.DataFrame", path) -> None:
+    """Backward compatibility wrapper for _atomic_write_parquet."""
+    _atomic_write_parquet(df, path)
 
 
 def _compute_vol_gate_snapshots(
@@ -368,20 +403,38 @@ def _compute_vol_gate_snapshots(
     snap_freq: str = "QS",
     end_date: "pd.Timestamp | None" = None,
 ) -> "pd.DataFrame":
+    """
+    Build volume-gated snapshots aligned to actual trading days.
+
+    FIX-SNAPSHOT-ALIGN: Maps each calendar snapshot date to the last trading day <= d
+    to ensure consistent PIT timestamps across parquet and CSV outputs.
+    """
     if end_date is None:
         end_date = pd.Timestamp.now("UTC").tz_convert(None).normalize()
-    snapshot_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
+    calendar_dates = pd.date_range(start=start_date, end=end_date, freq=snap_freq)
+    trading_days_index = pd.DatetimeIndex(valid_trading_days.index)
+
+    aligned_dates = []
     rows = []
-    for d in snapshot_dates:
-        past = valid_trading_days[valid_trading_days.index <= d]
+    for d in calendar_dates:
+        # Map to last trading day <= d
+        past_trading = trading_days_index[trading_days_index <= d]
+        if past_trading.empty:
+            continue
+        snapshot_date = past_trading[-1]
+
+        # Get eligible tickers as of that snapshot date
+        past = valid_trading_days[valid_trading_days.index <= snapshot_date]
         eligible = (
             [] if past.empty
             else past.iloc[-1][past.iloc[-1] >= history_gate].index.tolist()
         )
+        aligned_dates.append(snapshot_date)
         rows.append(eligible)
+
     return pd.DataFrame(
         {"tickers": rows},
-        index=pd.DatetimeIndex(snapshot_dates, name="date"),
+        index=pd.DatetimeIndex(aligned_dates, name="date"),
     )  # FIX-15
 
 
@@ -389,7 +442,12 @@ def build_parquet_from_wayback(
     universe_type: str,
     snapshots: list[tuple[str, list[str]]],
 ) -> Path:
-    """Write a PIT parquet from Wayback-sourced snapshots."""
+    """
+    Write a PIT parquet from Wayback-sourced snapshots.
+
+    FIX-CSV-FILTERED: CSV is now built from the filtered rows dict (not raw snapshots)
+    to ensure malformed date entries don't leak into the CSV output.
+    """
     output_path = DATA_DIR / f"historical_{universe_type}.parquet"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -408,18 +466,13 @@ def build_parquet_from_wayback(
     out_df = pd.DataFrame({"tickers": series})
     _to_parquet_pyarrow(out_df, output_path)
 
+    # FIX-CSV-FILTERED: Build CSV from filtered rows instead of raw snapshots
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     csv_rows = []
-    for date_str, tickers in snapshots:
-        for tkr in tickers:
-            csv_rows.append({"date": date_str, "ticker": tkr})
-    tmp_csv = csv_path.with_suffix(".tmp.csv")  # FIX-1
-    try:
-        pd.DataFrame(csv_rows).to_csv(tmp_csv, index=False)  # FIX-1
-        os.replace(tmp_csv, csv_path)  # FIX-1
-    except Exception:
-        tmp_csv.unlink(missing_ok=True)  # FIX-1
-        raise
+    for ts in idx:
+        for tkr in rows[ts]:
+            csv_rows.append({"date": ts.strftime("%Y-%m-%d"), "ticker": tkr})
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info(
         "[Wayback] Wrote %d TRUE PIT snapshots → %s  (+ companion CSV)",
@@ -582,13 +635,7 @@ def build_csv_from_symbols(
         for sym in tickers:
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
 
-    tmp_csv = csv_path.with_suffix(".tmp.csv")  # FIX-1
-    try:
-        pd.DataFrame(csv_rows).to_csv(tmp_csv, index=False)  # FIX-1
-        os.replace(tmp_csv, csv_path)  # FIX-1
-    except Exception:
-        tmp_csv.unlink(missing_ok=True)  # FIX-1
-        raise
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
     return csv_path
 
@@ -649,13 +696,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     for d, tickers in snapshot_df["tickers"].items():
         for tkr in (tickers if isinstance(tickers, list) else list(tickers)):
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
-    tmp_csv = csv_path.with_suffix(".tmp.csv")  # FIX-1
-    try:
-        pd.DataFrame(csv_rows).to_csv(tmp_csv, index=False)  # FIX-1
-        os.replace(tmp_csv, csv_path)  # FIX-1
-    except Exception:
-        tmp_csv.unlink(missing_ok=True)  # FIX-1
-        raise
+    _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
@@ -796,13 +837,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             for d, tickers in zip(all_dates, merged_tickers):
                 for tkr in tickers:
                     csv_rows.append({"date": d.strftime("%Y-%m-%d"), "ticker": tkr})
-            tmp_csv = csv_path.with_suffix(".tmp.csv")  # FIX-1
-            try:
-                pd.DataFrame(csv_rows).to_csv(tmp_csv, index=False)  # FIX-1
-                os.replace(tmp_csv, csv_path)  # FIX-1
-            except Exception:
-                tmp_csv.unlink(missing_ok=True)  # FIX-1
-                raise
+            _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
             logger.info(
                 # FIX-MB2-WBMMERGE: Previously used len(df_existing) for the
@@ -853,16 +888,22 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         print()
         print(f"  ✓ {parquet_path}  |  {n_snaps} snapshots  |  ~{n_syms} symbols/first-non-empty-snapshot")
 
+        # FIX-13: Default IPO_DATES now includes POLICYBAZAAR.NS
         ipo_dates: dict = getattr(cfg, "IPO_DATES", {
             "ZOMATO.NS": "2021-07-23",
             "NYKAA.NS":  "2021-11-10",
             "PAYTM.NS":  "2021-11-18",
+            "POLICYBAZAAR.NS": "2021-11-15",
             "IREDA.NS":  "2023-11-29",
-        })  # FIX-13
-        late_joiners = {
-            sym for sym, dt in ipo_dates.items()
-            if pd.Timestamp(dt) >= pd.Timestamp("2021-07-01")
-        }  # FIX-13
+        })
+        # FIX-DEFENSIVE-PARSE: Defensive late_joiners construction with malformed date handling
+        late_joiners = set()
+        for sym, dt in ipo_dates.items():
+            try:
+                if pd.Timestamp(dt) >= pd.Timestamp("2021-07-01"):
+                    late_joiners.add(sym)
+            except Exception as exc:
+                logger.warning("[Verify] Skipping malformed IPO_DATES entry for %s=%r: %s", sym, dt, exc)
         pre_2021 = df_check[df_check.index < pd.Timestamp("2021-07-01")]
         if not pre_2021.empty:
             pre_members: set = set()
