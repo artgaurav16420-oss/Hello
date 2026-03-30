@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import pathlib
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -712,3 +715,85 @@ def test_detect_and_apply_splits_fractional_cash_applies_one_way_slippage():
     assert adjusted == ["ABC"]
     assert state.shares["ABC"] == 1
     assert state.cash == pytest.approx(99.95)
+
+
+def test_pending_sentinel_helpers_roundtrip(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    token = "tok-1"
+    date_str = "2026-03-30"
+    path = dw._write_pending_sentinel("nifty", token, date_str)
+    assert path.exists()
+    payload = dw._load_pending_sentinel("nifty")
+    assert payload == {"token": token, "date": date_str}
+    dw._clear_pending_sentinel("nifty")
+    assert dw._load_pending_sentinel("nifty") is None
+
+
+def test_circuit_breaker_concurrent_increment_and_reset():
+    breaker = dw.CircuitBreaker()
+
+    def _worker():
+        for _ in range(200):
+            breaker.increment()
+
+    threads = [threading.Thread(target=_worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert breaker.count == 1000
+    breaker.reset()
+    assert breaker.count == 0
+
+
+def test_circuit_breaker_save_logs_error_and_load_lock_fallback(tmp_path: Path, monkeypatch, caplog):
+    monkeypatch.chdir(tmp_path)
+    breaker = dw.CircuitBreaker(count=3)
+    monkeypatch.setattr(pathlib.Path, "write_text", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk fail")))
+    with caplog.at_level(logging.ERROR):
+        breaker.save("data/circuit_breaker.json")
+    assert "Failed to persist circuit breaker count" in caplog.text
+    assert Path("data/circuit_breaker.lock").exists()
+
+    loader = dw.CircuitBreaker()
+    loader.load("data/circuit_breaker.json")
+    assert loader.count == 1
+
+
+def test_run_scan_skips_rebalance_when_pending_sentinel_exists_for_today(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=6)
+    md = {
+        "ABC.NS": pd.DataFrame({"Close": [100.0] * 6, "Dividends": [0.0] * 6}, index=idx),
+        "^NSEI": pd.DataFrame({"Close": [100.0] * 6}, index=idx),
+        "^CRSLDX": pd.DataFrame({"Close": [100.0] * 6}, index=idx),
+    }
+    monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
+    monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9]))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+    monkeypatch.setattr(dw, "generate_signals", lambda *_a, **_k: (np.array([0.01]), np.array([0.0]), [0], {"total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1}))
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda name: {"token": "x", "date": datetime.today().strftime("%Y-%m-%d")})
+
+    called = {"rebalance": 0}
+
+    class _Engine:
+        def __init__(self, _cfg):
+            pass
+
+        def optimize(self, **_kwargs):
+            return np.array([1.0])
+
+    monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
+
+    def _count_rebalance(*_args, **_kwargs):
+        called["rebalance"] += 1
+        return 0.0
+
+    monkeypatch.setattr(dw, "execute_rebalance", _count_rebalance)
+
+    state = PortfolioState(cash=10_000.0)
+    dw._run_scan(["ABC"], state, "TEST", cfg_override=UltimateConfig(), name="nifty")
+    assert called["rebalance"] == 0

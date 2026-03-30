@@ -74,7 +74,10 @@ import os
 import pathlib
 import shutil
 import sys
+import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -128,34 +131,90 @@ DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
 # running indefinitely with no positions.
 _EMPTY_UNIVERSE_HALT_AFTER: int = int(os.environ.get("EMPTY_UNIVERSE_HALT_AFTER", "3"))
 _CIRCUIT_BREAKER_FILE = "data/circuit_breaker.json"
+_CIRCUIT_BREAKER_LOCK_FILE = "data/circuit_breaker.lock"
 
 
-def _load_circuit_breaker_count() -> int:
-    """Read the persisted empty-universe counter from disk. Returns 0 if absent."""
+@dataclass
+class CircuitBreaker:
+    # ARCH-FIX-7
+    count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def increment(self) -> int:
+        with self._lock:
+            self.count += 1
+            return self.count
+
+    def reset(self) -> None:
+        with self._lock:
+            self.count = 0
+
+    def load(self, path: str) -> None:
+        """Load persisted count from disk; silently ignore missing file."""
+        json_path = pathlib.Path(path)
+        lock_path = pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE)
+        if not json_path.exists() and lock_path.exists():
+            logger.warning("circuit_breaker.lock found without JSON; treating count as 1")  # ARCH-FIX-10
+            self.count = 1
+            return
+        try:
+            if json_path.exists():
+                self.count = int(json.loads(json_path.read_text(encoding="utf-8")).get("consecutive_empty", 0))
+        except Exception:
+            self.count = 0
+
+    def save(self, path: str) -> None:
+        """Persist count to disk; log error on failure, write lock sentinel."""
+        try:
+            os.makedirs("data", exist_ok=True)
+            tmp = f"{path}.tmp"
+            pathlib.Path(tmp).write_text(
+                json.dumps({"consecutive_empty": self.count}),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+            if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
+                pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
+        except Exception as exc:
+            logger.error("Failed to persist circuit breaker count: %s", exc)  # ARCH-FIX-10
+            try:
+                pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).touch()
+            except Exception:
+                pass
+
+
+def _pending_sentinel_path(name: str) -> pathlib.Path:
+    return pathlib.Path(f"data/pending_rebalance_{name}.json")
+
+
+def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Path:
+    # ARCH-FIX-3
+    os.makedirs("data", exist_ok=True)
+    path = _pending_sentinel_path(name)
+    tmp_path = path.with_suffix(f"{path.suffix}.{token}.tmp")
+    tmp_path.write_text(json.dumps({"token": token, "date": date_str}), encoding="utf-8")
+    os.replace(tmp_path, path)
+    return path
+
+
+def _clear_pending_sentinel(name: str) -> None:
+    # ARCH-FIX-3
     try:
-        p = pathlib.Path(_CIRCUIT_BREAKER_FILE)
-        if p.exists():
-            return int(json.loads(p.read_text(encoding="utf-8")).get("consecutive_empty", 0))
-    except Exception:
+        _pending_sentinel_path(name).unlink()
+    except FileNotFoundError:
         pass
-    return 0
 
 
-def _save_circuit_breaker_count(n: int) -> None:
-    """Persist the empty-universe counter so restarts do not reset it."""
-    try:
-        os.makedirs("data", exist_ok=True)
-        tmp = _CIRCUIT_BREAKER_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"consecutive_empty": n}))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _CIRCUIT_BREAKER_FILE)
-    except Exception as _exc:
-        logger.warning("Could not persist circuit breaker count: %s", _exc)
+def _load_pending_sentinel(name: str) -> dict | None:
+    # ARCH-FIX-3
+    path = _pending_sentinel_path(name)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-_CONSECUTIVE_EMPTY_SCANS: int = _load_circuit_breaker_count()
+_circuit_breaker = CircuitBreaker()
+_circuit_breaker.load(_CIRCUIT_BREAKER_FILE)
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -693,6 +752,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 os.remove(risk_file)
             except OSError as exc:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
+        _clear_pending_sentinel(name)  # ARCH-FIX-3
 
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
@@ -820,6 +880,8 @@ def _run_scan(
     state:    PortfolioState,
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
+    circuit_breaker: CircuitBreaker = _circuit_breaker,
+    name: str = "scan",
 ) -> tuple:
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
@@ -836,7 +898,6 @@ def _run_scan(
     _dead_letter = DeadLetterTracker(threshold=10)
 
     def _scan_body(cfg: UltimateConfig) -> tuple:
-        global _CONSECUTIVE_EMPTY_SCANS
         engine = InstitutionalRiskEngine(cfg)
         # FIX-MB2-EQUITYCAP: apply cfg defaults only when these fields were absent
         # in persisted state (represented as None by PortfolioState.from_dict).
@@ -892,16 +953,16 @@ def _run_scan(
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
-            _CONSECUTIVE_EMPTY_SCANS += 1
-            _save_circuit_breaker_count(_CONSECUTIVE_EMPTY_SCANS)  # persist across restarts
+            cb_count = circuit_breaker.increment()  # ARCH-FIX-7
+            circuit_breaker.save(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
             logger.warning(
                 "[Scan] No data available for any universe symbol "
                 "(consecutive empty scans: %d / halt threshold: %d).",
-                _CONSECUTIVE_EMPTY_SCANS, _EMPTY_UNIVERSE_HALT_AFTER,
+                cb_count, _EMPTY_UNIVERSE_HALT_AFTER,
             )
-            if _CONSECUTIVE_EMPTY_SCANS >= _EMPTY_UNIVERSE_HALT_AFTER:
+            if cb_count >= _EMPTY_UNIVERSE_HALT_AFTER:
                 raise RuntimeError(
-                    f"[Scan] CIRCUIT BREAKER TRIPPED: {_CONSECUTIVE_EMPTY_SCANS} consecutive "
+                    f"[Scan] CIRCUIT BREAKER TRIPPED: {cb_count} consecutive "
                     f"scans returned an empty universe (threshold={_EMPTY_UNIVERSE_HALT_AFTER}). "
                     "Possible data provider outage or misconfigured universe.  "
                     "Halting to prevent unintended full-cash drift.  "
@@ -913,8 +974,8 @@ def _run_scan(
             return state, market_data
     
         # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
-        _CONSECUTIVE_EMPTY_SCANS = 0
-        _save_circuit_breaker_count(0)  # persist reset so restarts start clean
+        circuit_breaker.reset()  # ARCH-FIX-7
+        circuit_breaker.save(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
     
         _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
     
@@ -1239,6 +1300,16 @@ def _run_scan(
                         weights[_s_idx] = _mtm_w
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
+            pending = _load_pending_sentinel(name=name)  # ARCH-FIX-3
+            if pending and pending.get("date") == today.strftime("%Y-%m-%d"):
+                logger.warning("Rebalance already committed for today, skipping")
+                return state, market_data
+            token = str(uuid.uuid4())
+            _write_pending_sentinel(
+                name=name,
+                token=token,
+                date_str=today.strftime("%Y-%m-%d"),
+            )
             _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
             _scenario_losses = -(
                 log_rets.iloc[-_T_cvar:]
@@ -1258,6 +1329,7 @@ def _run_scan(
             if _exhaust_decay:
                 state.decay_rounds = 0
                 state.consecutive_failures = 0
+            _clear_pending_sentinel(name=name)  # ARCH-FIX-3
     
         _print_stage_status("Analysis", 0.85, "Applying rebalance decisions and updating portfolio marks...")
     
@@ -1544,7 +1616,7 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg)
+            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg, name="nse_total")
             mkt_cache["nse_total"] = mkt
             _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
@@ -1569,7 +1641,7 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nifty"])
-            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg)
+            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg, name="nifty")
             mkt_cache["nifty"] = mkt
             _print_status(preview, "PREVIEW — NIFTY 500", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
@@ -1596,7 +1668,7 @@ def main_menu() -> None:
                 custom_cfg.MAX_POSITIONS = 8
 
             preview      = copy.deepcopy(states["custom"])
-            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg)
+            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg, name="custom")
             mkt_cache["custom"] = mkt
             _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":

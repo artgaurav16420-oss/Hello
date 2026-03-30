@@ -100,7 +100,9 @@ def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
         }
     )
 
-    assert objective(trial) == 0.0
+    score, calmar = objective(trial)
+    assert score == 0.0
+    assert calmar == 0.0
 
 
 def test_objective_propagates_optimization_error(monkeypatch):
@@ -174,7 +176,9 @@ def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch
         }
     )
 
-    assert isinstance(objective(trial), numbers.Real)
+    out = objective(trial)
+    assert isinstance(out, tuple)
+    assert len(out) == 2
 
 
 def test_fitness_penalizes_explicit_forced_cash_events():
@@ -189,8 +193,8 @@ def test_fitness_penalizes_explicit_forced_cash_events():
     )
     forced_rebal = base_rebal.assign(forced_to_cash=[False, True, False, True])
 
-    base_score, base_diag = optimizer._fitness_from_metrics(metrics, base_rebal)
-    forced_score, forced_diag = optimizer._fitness_from_metrics(metrics, forced_rebal)
+    base_score, _, base_diag = optimizer._fitness_from_metrics(metrics, base_rebal)
+    forced_score, _, forced_diag = optimizer._fitness_from_metrics(metrics, forced_rebal)
 
     assert base_diag["forced_cash_penalty"] == 0.0
     assert forced_diag["forced_cash_penalty"] == 0.0
@@ -208,7 +212,7 @@ def test_fitness_falls_back_to_decay_and_zero_positions_when_forced_cash_flag_mi
         }
     )
 
-    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+    score, _, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
 
     assert diag["forced_cash_penalty"] == 0.0
     assert isinstance(score, float)
@@ -226,7 +230,7 @@ def test_fitness_marks_reachable_score_plateaus_as_ceiling_hits():
         }
     )
 
-    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+    score, _, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
 
     assert score > 2.0
     assert diag["anomaly_hit"] is False
@@ -244,7 +248,7 @@ def test_fitness_applies_nonlinear_turnover_drag_above_18x():
         }
     )
 
-    score, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
+    score, _, diag = optimizer._fitness_from_metrics(metrics, rebal_log)
 
     assert diag["cagr_net"] == pytest.approx(14.2)
     assert diag["forced_cash_penalty"] == 0.0
@@ -587,8 +591,9 @@ def test_objective_uses_configurable_search_space(monkeypatch):
     # raw = (cagr / ((max_dd + 1) * concentration_mult)) * sortino_quality - exposure_penalty
     #     = (10 / ((5 + 1) * 2.8)) * 0.5 - 0.5
     expected_raw = (10.0 / ((5.0 + 1.0) * 2.8)) * 0.5 - 0.5
-    expected = expected_raw
-    assert round(objective(trial), 6) == round(expected, 6)
+    expected = np.copysign(np.log1p(abs(expected_raw)), expected_raw)
+    score, _ = objective(trial)
+    assert round(score, 6) == round(expected, 6)
 
 
 def test_objective_accepts_halflife_bounds_with_step(monkeypatch):
@@ -618,7 +623,7 @@ def test_objective_accepts_halflife_bounds_with_step(monkeypatch):
         }
     )
 
-    assert isinstance(objective(trial), numbers.Real)
+    assert isinstance(objective(trial), tuple)
 
 
 def test_run_optimization_forces_single_job(monkeypatch):
@@ -642,7 +647,6 @@ def test_run_optimization_forces_single_job(monkeypatch):
             "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
-        best_value = 1.23
         best_trial = optuna.trial.create_trial(
             params=best_params,
             distributions={
@@ -652,7 +656,7 @@ def test_run_optimization_forces_single_job(monkeypatch):
                 "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
                 "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
             },
-            value=1.23,
+            values=[1.23, 0.5],
             user_attrs={},
         )
         best_trials = [best_trial]
@@ -692,7 +696,6 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
             "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
-        best_value = 1.23
         best_trial = optuna.trial.create_trial(
             params=best_params,
             distributions={
@@ -702,7 +705,7 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
                 "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
                 "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
             },
-            value=1.23,
+            values=[1.23, 0.5],
             user_attrs={},
         )
         best_trials = [best_trial]
@@ -747,7 +750,6 @@ def test_run_optimization_normalizes_unknown_universe(monkeypatch):
             "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
-        best_value = 1.23
         best_trial = optuna.trial.create_trial(
             params=best_params,
             distributions={
@@ -757,7 +759,7 @@ def test_run_optimization_normalizes_unknown_universe(monkeypatch):
                 "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0, step=0.5),
                 "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06, step=0.005),
             },
-            value=1.23,
+            values=[1.23, 0.5],
             user_attrs={},
         )
         best_trials = [best_trial]
@@ -814,7 +816,6 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
             "RISK_AVERSION": 12.0,
             "CVAR_DAILY_LIMIT": 0.04,
         }
-        best_value = 1.23
         best_trial = optuna.trial.create_trial(
             params=best_params,
             distributions={
@@ -824,7 +825,7 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
                 "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
                 "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
             },
-            value=1.23,
+            values=[1.23, 0.5],
             user_attrs={},
         )
         best_trials = [best_trial]
@@ -865,7 +866,8 @@ def test_objective_allows_equal_halflife_values(monkeypatch):
         }
     )
 
-    assert objective(trial) != 0.0
+    score, _ = objective(trial)
+    assert score != 0.0
 
 
 def test_stdout_supports_rupee_with_utf8_stream():
@@ -1190,6 +1192,7 @@ def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch):
 def _objective_diag(*, score, dd_gate_hit=False, anomaly_hit=False):
     return (
         score,
+        score,
         {
             "cagr": 0.0,
             "max_dd": 0.0,
@@ -1246,7 +1249,7 @@ def test_objective_does_not_count_floor_score_as_gate_hit(monkeypatch):
         }
     )
 
-    score = objective(trial)
+    score, _ = objective(trial)
 
     assert score == pytest.approx((-2.0 - 2.0 + 0.5) / 3)
 
@@ -1289,3 +1292,135 @@ def test_objective_prunes_after_third_structural_gate_hit(monkeypatch):
 
     with pytest.raises(optuna.TrialPruned):
         objective(trial)
+
+
+def test_fitness_uses_symmetric_log_modulus_transform():
+    rebal_log = pd.DataFrame({"n_positions": [8], "exposure_multiplier": [1.0], "realised_cvar": [0.01]})
+
+    def _score_for_cagr(cagr: float) -> float:
+        score, _, _ = optimizer._fitness_from_metrics(
+            {"cagr": cagr, "max_dd": 10.0, "turnover": 0.0, "sortino": 1.0},
+            rebal_log,
+        )
+        return score
+
+    assert _score_for_cagr(-0.01) < _score_for_cagr(0.0) < _score_for_cagr(0.01)
+
+    xs = np.linspace(-10.0, 10.0, 21)
+    vals = [_score_for_cagr(x) for x in xs]
+    assert all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
+
+    for x in [0.1, 1.0, 5.0]:
+        assert abs(_score_for_cagr(-x)) == pytest.approx(abs(_score_for_cagr(x)), rel=1e-6, abs=1e-6)
+
+
+def test_error_triage_callback_records_runtimeerror_class():
+    callback = optimizer._error_triage_callback_factory()
+    captured = {}
+
+    class _Storage:
+        def get_trial(self, _trial_id):
+            return type("T", (), {"state": optuna.trial.TrialState.FAIL})()
+
+        def set_trial_user_attr(self, _trial_id, key, value):
+            captured[key] = value
+
+    class _Study:
+        _storage = _Storage()
+
+        def stop(self):
+            pass
+
+    trial = type(
+        "Trial",
+        (),
+        {
+            "state": optuna.trial.TrialState.FAIL,
+            "system_attrs": {"fail_reason": "RuntimeError: boom"},
+            "_trial_id": 1,
+        },
+    )()
+
+    callback(_Study(), trial)
+    assert captured["error_class"] == "RuntimeError"
+
+
+def test_error_triage_watchdog_stops_study(monkeypatch):
+    callback = optimizer._error_triage_callback_factory()
+    stopped = {"value": False}
+
+    class _Storage:
+        def get_trial(self, _trial_id):
+            return type("T", (), {"state": optuna.trial.TrialState.FAIL})()
+
+        def set_trial_user_attr(self, _trial_id, key, value):
+            pass
+
+    class _Study:
+        _storage = _Storage()
+
+        def stop(self):
+            stopped["value"] = True
+
+    trial = type(
+        "Trial",
+        (),
+        {
+            "state": optuna.trial.TrialState.FAIL,
+            "system_attrs": {"fail_reason": "RuntimeError: boom"},
+            "_trial_id": 1,
+        },
+    )()
+
+    monkeypatch.setattr(optimizer, "N_TRIALS", 10)
+    with pytest.raises(RuntimeError, match="consecutive trial failures"):
+        for _ in range(4):
+            callback(_Study(), trial)
+    assert stopped["value"] is True
+
+
+def test_run_optimization_sets_sqlite_wal_mode(tmp_path: Path, monkeypatch):
+    db_path = tmp_path / "optuna.db"
+    monkeypatch.setattr(optimizer, "OPTUNA_STORAGE", f"sqlite:///{db_path}?timeout=30")
+    monkeypatch.setattr(optimizer, "N_TRIALS", 1)
+    monkeypatch.setattr(optimizer, "pre_load_data", lambda universe_type: {})
+    monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
+
+    class _Result:
+        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.0, "sharpe": 1.0}
+
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+
+    trial = optuna.trial.create_trial(
+        params={
+            "HALFLIFE_FAST": 21,
+            "HALFLIFE_SLOW": 65,
+            "CONTINUITY_BONUS": 0.15,
+            "RISK_AVERSION": 12.0,
+            "CVAR_DAILY_LIMIT": 0.04,
+        },
+        distributions={
+            "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
+            "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
+            "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
+            "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
+            "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
+        },
+        values=[1.23, 0.5],
+        user_attrs={"resolved_cfg": {}},
+    )
+
+    class _Study:
+        best_trials = [trial]
+        trials = [trial]
+
+        def optimize(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: _Study())
+    optimizer.run_optimization()
+
+    import sqlite3
+    with sqlite3.connect(db_path) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert str(mode).lower() == "wal"
