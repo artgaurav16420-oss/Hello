@@ -502,6 +502,8 @@ def _scrape_screener(base_url: str) -> List[str]:
 
             soup = BeautifulSoup(resp.text, 'html.parser')
             links = soup.find_all('a', href=re.compile(r'^/company/[^/]+/(?:consolidated/)?$'))
+            if links is None:
+                links = []
 
             before_count = len(symbols)
             for link in links:

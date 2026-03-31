@@ -324,6 +324,9 @@ def _fitness_from_metrics(
         or final_multiple > MAX_REASONABLE_FINAL_MULTIPLE
     )
 
+    cagr_is_near_zero = math.isfinite(cagr) and math.isclose(cagr, 0.0, rel_tol=1e-9, abs_tol=1e-12)
+    max_dd_is_near_zero = math.isfinite(max_dd) and math.isclose(max_dd, 0.0, rel_tol=1e-9, abs_tol=1e-12)
+
     if anomaly_hit:
         raw         = -(
             max(cagr - MAX_REASONABLE_CAGR_PCT, 0.0) / 50.0
@@ -332,7 +335,7 @@ def _fitness_from_metrics(
         score       = max(raw, -2.0)
         ceiling_hit = False
         dd_gate_hit = False
-    elif abs(cagr) < 1e-12 and max_dd == 0.0:
+    elif cagr_is_near_zero and max_dd_is_near_zero:
         raw         = 0.0
         score       = 0.0
         ceiling_hit = False
@@ -372,7 +375,7 @@ def _fitness_from_metrics(
         "exposure_penalty":    round(exposure_penalty, 4),
         "dd_penalty":          round(dd_penalty,      4),
         "forced_cash_penalty": round(forced_cash_penalty, 4),
-        "raw_score":           round(raw, 6) if not (abs(cagr) < 1e-12 and max_dd == 0.0) else 0.0,
+        "raw_score":           round(raw, 6) if not (cagr_is_near_zero and max_dd_is_near_zero) else 0.0,
         "score":               round(score, 6),
         "ceiling_hit":         ceiling_hit,
         "dd_gate_hit":         dd_gate_hit,
