@@ -674,7 +674,7 @@ class GrowwProvider(DataProvider):
         """
         try:
             adj_yf     = self._extract_batch_series(yf_raw, COLUMN_ADJ_CLOSE, ns_ticker)
-            raw_yf_cls = self._extract_batch_series(yf_raw, "Close",     ns_ticker)
+            raw_yf_cls = self._extract_batch_series(yf_raw, COLUMN_CLOSE,     ns_ticker)
 
             if adj_yf is None or raw_yf_cls is None:
                 return raw_close
