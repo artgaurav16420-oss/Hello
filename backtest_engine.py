@@ -820,8 +820,8 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         walk_returns = np.cumprod(1.0 + noise_rets)
 
         synth = pd.DataFrame(index=synth_idx)
-        close_anchor = float(df.loc[gap_start, "Close"])
-        synth["Close"] = close_anchor * walk_returns
+        close_anchor = float(df.loc[gap_start, COLUMN_CLOSE])
+        synth[COLUMN_CLOSE] = close_anchor * walk_returns
 
         if COLUMN_ADJ_CLOSE in df.columns:
             adj_anchor = df.loc[gap_start, COLUMN_ADJ_CLOSE]
