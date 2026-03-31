@@ -200,7 +200,7 @@ def compute_regime_score(
                 # FIX-MB2-BREADTHNONE: proportional floor, min 5 rows.
                 min_obs = max(5, int(np.ceil(len(_hist) * 0.8)))
                 obs_count = _hist.notna().sum()
-                sma_vals = _hist.expanding(min_periods=min_obs).mean().iloc[-1]
+                sma_vals = _hist.iloc[:-1].expanding(min_periods=min_obs).mean().iloc[-1]  # exclude current bar to match long-history branch (no look-ahead)
                 last = _hist.iloc[-1]
                 valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
                 if valid.any():
@@ -235,8 +235,7 @@ def _check_market_crash(
         return None
 
     px_slice = close_hist.loc[:, equity_cols].tail(65)
-    px_slice_hist = px_slice.iloc[:-1]
-    rolling_sma50 = px_slice_hist.rolling(window=50, min_periods=20).mean().tail(15)
+    rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().shift(1).tail(15)
 
     # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
     # history during warmup), breadth_flags.mean() would return 0.0,
@@ -483,12 +482,10 @@ def generate_signals(
     # crashing AFTER the signal date — a form of clairvoyance that inflates
     # Sortino ratios for any trial using the lag parameter.
     if cfg.KNIFE_WINDOW > 0 and len(signal_log_rets) >= cfg.KNIFE_WINDOW:
-        recent_simple = np.expm1(signal_log_rets.iloc[-cfg.KNIFE_WINDOW:])
         _knife_min_count = max(1, cfg.KNIFE_WINDOW // 2)
-        recent_cumulative_returns = (
-            (1.0 + recent_simple)
-            .prod(skipna=True, min_count=_knife_min_count)
-            - 1.0
+        recent_cumulative_returns = np.expm1(
+            signal_log_rets.iloc[-cfg.KNIFE_WINDOW:]
+            .sum(skipna=True, min_count=_knife_min_count)
         ).values
 
         recent_lookback = min(len(signal_log_rets), 126)
@@ -554,37 +551,37 @@ def generate_signals(
 
         _max_win = max(activity_window, stale_sessions)
         _recent_window_df = signal_log_rets[active_symbols].tail(_max_win)
-        for i, sym in enumerate(active_symbols):
-            prev_w = float(prev_weights.get(sym, 0.0))
-            if valid_mask[i] and prev_w > 0.001 and not knife_pre_bonus_suppress[i]:
-                recent_rets = _recent_window_df[sym].iloc[-activity_window:]  # FIX-LAG-CONT
-                nonzero_days = int((recent_rets.abs() > flat_ret_eps).sum()) if len(recent_rets) else 0
-                has_recent_activity = nonzero_days >= min_nonzero_days
+        # --- Vectorized continuity bonus (replaces serial for-loop) ---
+        recent_rets_full = _recent_window_df.tail(activity_window)
+        has_recent_activity = (recent_rets_full.abs() > flat_ret_eps).sum(axis=0).values >= min_nonzero_days  # noqa: F841 (retained for future use)
 
-                stale_rets = _recent_window_df[sym].iloc[-stale_sessions:]  # FIX-LAG-CONT
-                is_stale = (
-                    len(stale_rets) == stale_sessions
-                    and stale_rets.notna().all()
-                    and bool((stale_rets.abs() <= flat_ret_eps).all())
-                )
+        stale_rets_full = _recent_window_df.tail(stale_sessions)
+        # is_stale: all stale_sessions rows are present, non-NaN, and flat
+        if len(stale_rets_full) == stale_sessions:
+            is_stale = (
+                stale_rets_full.notna().all(axis=0)
+                & (stale_rets_full.abs() <= flat_ret_eps).all(axis=0)
+            ).values
+        else:
+            is_stale = np.zeros(len(active_symbols), dtype=bool)
 
-                passes_continuity_liquidity = np.isfinite(adv_arr[i]) and adv_arr[i] >= continuity_min_adv
+        passes_continuity_liquidity = np.isfinite(adv_arr) & (adv_arr >= continuity_min_adv)
 
-                # S-04: removed the `or not continuity_eligible` clause. The variable
-                # `continuity_eligible = has_recent_activity or passes_continuity_liquidity`
-                # was dead code: `not continuity_eligible` fires only when BOTH
-                # has_recent_activity=False AND passes_continuity_liquidity=False, but
-                # `not passes_continuity_liquidity` already covers that superset.
-                # Policy: skip if stale (halted data) OR illiquid (ADV gate).
-                if is_stale:
-                    stale_denied += 1
-                if not passes_continuity_liquidity:
-                    liquidity_denied += 1
-                if is_stale or not passes_continuity_liquidity:
-                    continue
+        prev_w_arr = np.array(
+            [float(prev_weights.get(sym, 0.0)) for sym in active_symbols], dtype=float
+        )
 
-                decay = float(np.clip(prev_w / max(cfg.CONTINUITY_MAX_HOLD_WEIGHT, 1e-6), 0.25, 1.0))
-                adj_scores[i] += base_bonus * decay
+        candidate_mask = valid_mask & (prev_w_arr > 0.001) & ~knife_pre_bonus_suppress
+
+        stale_denied    = int(np.sum(candidate_mask & is_stale))
+        liquidity_denied = int(np.sum(candidate_mask & ~passes_continuity_liquidity))
+
+        bonus_mask = candidate_mask & ~is_stale & passes_continuity_liquidity
+        decay = np.clip(
+            prev_w_arr / max(cfg.CONTINUITY_MAX_HOLD_WEIGHT, 1e-6), 0.25, 1.0
+        )
+        adj_scores[bonus_mask] += base_bonus * decay[bonus_mask]
+        # --- End vectorized continuity bonus ---
 
         if stale_denied or liquidity_denied:
             logger.debug(
