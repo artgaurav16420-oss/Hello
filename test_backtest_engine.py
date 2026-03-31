@@ -6,6 +6,22 @@ import backtest_engine as be
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 
+def _run_single_rebalance(bt, close, volume, returns):
+    bt._run_rebalance(
+        pd.Timestamp("2020-01-02"),
+        close,
+        volume,
+        returns,
+        ["AAA"],
+        close.loc[pd.Timestamp("2020-01-02")].values.astype(float),
+        idx_df=None,
+        sector_map=None,
+        open_px=close,
+        high_px=close,
+        low_px=close,
+    )
+
+
 def test_rebalance_values_portfolio_from_previous_close(monkeypatch):
     cfg = UltimateConfig(CVAR_MIN_HISTORY=9999)
     engine = InstitutionalRiskEngine(cfg)
@@ -33,19 +49,7 @@ def test_rebalance_values_portfolio_from_previous_close(monkeypatch):
     monkeypatch.setattr(be, "execute_rebalance", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(engine, "optimize", _fake_optimize)
 
-    bt._run_rebalance(
-        pd.Timestamp("2020-01-02"),
-        close,
-        volume,
-        returns,
-        ["AAA"],
-        close.loc[pd.Timestamp("2020-01-02")].values.astype(float),
-        idx_df=None,
-        sector_map=None,
-        open_px=close,
-        high_px=close,
-        low_px=close,
-    )
+    _run_single_rebalance(bt, close, volume, returns)
 
     # cash (100) + shares (10) * previous close (10)
     assert captured["pv"] == 200.0
@@ -65,7 +69,11 @@ def test_run_rebalance_passes_adv_vector_to_execute_rebalance(monkeypatch):
     monkeypatch.setattr(be, "generate_signals", lambda *_args, **_kwargs: (np.array([0.01]), np.array([0.01]), [0], {}))
     monkeypatch.setattr(be, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(be, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(be, "_build_adv_vector", lambda *_args, **_kwargs: np.array([12345.0]))
+    monkeypatch.setattr(
+        be,
+        "_build_adv_vector",
+        lambda *_args, **_kwargs: (np.array([12345.0]), pd.DataFrame()),
+    )
     monkeypatch.setattr(engine, "optimize", lambda **_kwargs: np.array([1.0]))
 
     def _fake_execute_rebalance(*_args, **kwargs):
@@ -74,19 +82,7 @@ def test_run_rebalance_passes_adv_vector_to_execute_rebalance(monkeypatch):
 
     monkeypatch.setattr(be, "execute_rebalance", _fake_execute_rebalance)
 
-    bt._run_rebalance(
-        pd.Timestamp("2020-01-02"),
-        close,
-        volume,
-        returns,
-        ["AAA"],
-        close.loc[pd.Timestamp("2020-01-02")].values.astype(float),
-        idx_df=None,
-        sector_map=None,
-        open_px=close,
-        high_px=close,
-        low_px=close,
-    )
+    _run_single_rebalance(bt, close, volume, returns)
 
     assert np.array_equal(captured["adv_shares"], np.array([12345.0]))
 

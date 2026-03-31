@@ -508,7 +508,7 @@ def _scrape_screener(base_url: str) -> List[str]:
                 print(f"  {C.GRY}Verify the screen is marked Public at:{C.RST}")
                 print(f"  {C.GRY}screener.in → Your Screen → Edit → Visibility: Public{C.RST}\n")
                 break
-            elif resp.status_code != 200:
+            if resp.status_code != 200:
                 break
 
             soup = BeautifulSoup(resp.text, 'html.parser')
@@ -534,17 +534,9 @@ def _scrape_screener(base_url: str) -> List[str]:
     return list(symbols)
 
 def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
-    filtered: List[str] = []
-    invalid_count = 0
-
-    for raw in tickers:
-        sym = raw.strip().upper()
-        if not sym:
-            continue
-        if sym.isdigit():
-            invalid_count += 1
-            continue
-        filtered.append(sym)
+    normalized = [raw.strip().upper() for raw in tickers]
+    filtered = [sym for sym in normalized if sym and not sym.isdigit()]
+    invalid_count = sum(1 for sym in normalized if sym.isdigit())
 
     if invalid_count:
         logger.warning(
@@ -581,9 +573,8 @@ def _get_custom_universe() -> List[str]:
                         confirm = input(f"  {C.CYN}Proceed with local data? (y/n): {C.RST}").strip().lower()
                         if confirm == "y":
                             return tickers
-                        else:
-                            print(f"  {C.GRY}Cancelled. Returning empty universe.{C.RST}")
-                            return []
+                        print(f"  {C.GRY}Cancelled. Returning empty universe.{C.RST}")
+                        return []
             except Exception as e:
                 logger.error("[Screener] Failed to read %s: %s", f, e)
     return []
@@ -611,6 +602,31 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
     """
     adjusted: List[str] = []
 
+    def _sweep_dividends(sym: str, row: pd.DataFrame) -> None:
+        if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
+            return
+        if getattr(cfg, "AUTO_ADJUST_PRICES", True):
+            return
+        dividends = row["Dividends"][row["Dividends"] > 0]
+        if dividends.empty:
+            return
+        shares_held = state.shares.get(sym, 0)
+        if shares_held <= 0:
+            return
+        last_event_id = state.dividend_ledger.get(sym, "")
+        last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
+        for div_date, div_val in dividends.items():
+            div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
+            if div_date_str <= last_event_date:
+                continue
+            div_val_float = float(div_val)
+            state.cash = round(state.cash + (div_val_float * shares_held), 10)
+            state.dividend_ledger[sym] = f"{div_date_str}:{div_val_float:.8f}"
+            logger.info(
+                "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares) on %s. Added to cash.",
+                sym, div_val_float, shares_held, div_date_str
+            )
+
     for sym in list(state.shares.keys()):
         ns = to_ns(sym)
         row = market_data.get(ns)
@@ -619,24 +635,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
 
-        if getattr(cfg, "DIVIDEND_SWEEP", True) and "Dividends" in row.columns and not getattr(cfg, "AUTO_ADJUST_PRICES", True):
-            dividends = row["Dividends"][row["Dividends"] > 0]
-            if not dividends.empty:
-                shares_held = state.shares.get(sym, 0)
-                if shares_held > 0:
-                    last_event_id = state.dividend_ledger.get(sym, "")
-                    last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
-
-                    for div_date, div_val in dividends.items():
-                        div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
-                        if div_date_str > last_event_date:
-                            div_val_float = float(div_val)
-                            state.cash = round(state.cash + (div_val_float * shares_held), 10)
-                            state.dividend_ledger[sym] = f"{div_date_str}:{div_val_float:.8f}"
-                            logger.info(
-                                "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares) on %s. Added to cash.",
-                                sym, div_val_float, shares_held, div_date_str
-                            )
+        _sweep_dividends(sym, row)
 
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
@@ -770,7 +769,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         state.last_known_prices[sym] = current_price
         adjusted.append(sym)
 
-    return adjusted
+    return list(dict.fromkeys(adjusted))
 
 # ─── State persistence ────────────────────────────────────────────────────────
 
@@ -1030,6 +1029,16 @@ def _run_scan(
     _dead_letter = DeadLetterTracker(threshold=10)
 
     def _scan_body(cfg: UltimateConfig) -> tuple:
+        def _build_close_series(universe_symbols: list[str], mkt_data: dict, use_adjusted: bool) -> Dict[str, pd.Series]:
+            close_map: Dict[str, pd.Series] = {}
+            for sym in universe_symbols:
+                ns = to_ns(sym)
+                if ns not in mkt_data:
+                    continue
+                col = "Adj Close" if use_adjusted and "Adj Close" in mkt_data[ns].columns else "Close"
+                close_map[to_bare(ns)] = mkt_data[ns][col]
+            return close_map
+
         engine = InstitutionalRiskEngine(cfg)
         # FIX-MB2-EQUITYCAP: apply cfg defaults only when these fields were absent
         # in persisted state (represented as None by PortfolioState.from_dict).
@@ -1078,12 +1087,7 @@ def _run_scan(
 
         use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
 
-        close_d: Dict[str, pd.Series] = {}
-        for sym in universe:
-            ns = to_ns(sym)
-            if ns in market_data:
-                col = "Adj Close" if use_adj and "Adj Close" in market_data[ns].columns else "Close"
-                close_d[to_bare(ns)] = market_data[ns][col]
+        close_d = _build_close_series(universe, market_data, use_adj)
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
@@ -1724,6 +1728,31 @@ def _preserve_risk_metadata(source: PortfolioState, target: PortfolioState) -> N
     target.absent_periods       = copy.deepcopy(source.absent_periods)
 
 
+def _preview_scan_and_maybe_save(
+    states: dict,
+    mkt_cache: dict,
+    portfolio_key: str,
+    label: str,
+    universe: List[str],
+    cfg: UltimateConfig,
+) -> None:
+    preview = copy.deepcopy(states[portfolio_key])
+    preview, mkt = _run_scan(universe, preview, f"{label} SCAN", cfg, name=portfolio_key)
+    mkt_cache[portfolio_key] = mkt
+    _print_status(preview, f"PREVIEW — {label}", mkt, cfg=cfg)
+    if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
+        states[portfolio_key] = preview
+        save_portfolio_state(preview, portfolio_key)
+        print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
+        return
+
+    # Intentional behavior: even when trade edits are discarded, the latest
+    # risk-state remains authoritative.
+    _preserve_risk_metadata(source=preview, target=states[portfolio_key])
+    save_portfolio_state(states[portfolio_key], portfolio_key)
+    print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
+
+
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main_menu() -> None:
@@ -1751,23 +1780,9 @@ def main_menu() -> None:
                 _universe = _prompt_survival_mode(e, "NSE Total")
                 if _universe is None:
                     continue
-            preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(
-                _universe, preview, f"{LABEL_NSE_TOTAL} SCAN", cfg, name="nse_total"
+            _preview_scan_and_maybe_save(
+                states, mkt_cache, "nse_total", LABEL_NSE_TOTAL, _universe, cfg
             )
-            mkt_cache["nse_total"] = mkt
-            _print_status(preview, f"PREVIEW — {LABEL_NSE_TOTAL}", mkt, cfg=cfg)
-            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
-                states["nse_total"] = preview
-                save_portfolio_state(preview, "nse_total")
-                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
-            else:
-                # Intentional behavior: even when trade edits are discarded, the
-                # risk-state emitted by the latest scan (failure counters, decay,
-                # cooldowns, absent symbols) remains authoritative.
-                _preserve_risk_metadata(source=preview, target=states["nse_total"])
-                save_portfolio_state(states["nse_total"], "nse_total")
-                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "2":
             _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
@@ -1778,20 +1793,7 @@ def main_menu() -> None:
                 _universe = _prompt_survival_mode(e, "Nifty 500")
                 if _universe is None:
                     continue
-            preview      = copy.deepcopy(states["nifty"])
-            preview, mkt = _run_scan(
-                _universe, preview, f"{LABEL_NIFTY_500} SCAN", cfg, name="nifty"
-            )
-            mkt_cache["nifty"] = mkt
-            _print_status(preview, f"PREVIEW — {LABEL_NIFTY_500}", mkt, cfg=cfg)
-            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
-                states["nifty"] = preview
-                save_portfolio_state(preview, "nifty")
-                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
-            else:
-                _preserve_risk_metadata(source=preview, target=states["nifty"])
-                save_portfolio_state(states["nifty"], "nifty")
-                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
+            _preview_scan_and_maybe_save(states, mkt_cache, "nifty", LABEL_NIFTY_500, _universe, cfg)
 
         elif c == "3":
             universe = _get_custom_universe()
@@ -1807,18 +1809,9 @@ def main_menu() -> None:
             if len(universe) < 100:
                 custom_cfg.MAX_POSITIONS = 8
 
-            preview      = copy.deepcopy(states["custom"])
-            preview, mkt = _run_scan(universe, preview, f"{LABEL_CUSTOM_SCREENER} SCAN", custom_cfg, name="custom")
-            mkt_cache["custom"] = mkt
-            _print_status(preview, f"PREVIEW — {LABEL_CUSTOM_SCREENER}", mkt, cfg=custom_cfg)
-            if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
-                states["custom"] = preview
-                save_portfolio_state(preview, "custom")
-                print(f"  {C.GRN}[+] Saved permanently.{C.RST}")
-            else:
-                _preserve_risk_metadata(source=preview, target=states["custom"])
-                save_portfolio_state(states["custom"], "custom")
-                print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
+            _preview_scan_and_maybe_save(
+                states, mkt_cache, "custom", LABEL_CUSTOM_SCREENER, universe, custom_cfg
+            )
 
         elif c == "4":
             print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")

@@ -127,14 +127,13 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
             logger_obj.propagate = propagate
             logger_obj.disabled = disabled
 
-    noisy_lines: list[str] = []
-    for text in (out_buf.getvalue(), err_buf.getvalue()):
-        if not text:
-            continue
-        noisy_lines.extend(
-            ln.strip() for ln in text.splitlines()
-            if ln.strip()
-        )
+    noisy_lines = [
+        ln.strip()
+        for text in (out_buf.getvalue(), err_buf.getvalue())
+        if text
+        for ln in text.splitlines()
+        if ln.strip()
+    ]
 
     if noisy_lines:
         logger.debug(
@@ -217,12 +216,11 @@ class _ManifestProcessFileLock:
             if e.errno == errno.ESRCH:
                 # Process doesn't exist
                 return False
-            elif e.errno == errno.EPERM:
+            if e.errno == errno.EPERM:
                 # Process exists but can't be signaled
                 return True
-            else:
-                # Other OS errors - assume process might be alive to be safe
-                return True
+            # Other OS errors - assume process might be alive to be safe
+            return True
         except Exception:
             # Fallback: assume process might be alive on unexpected errors
             return True
@@ -300,10 +298,9 @@ class _ManifestProcessFileLock:
                     # Process is alive - lock is NOT stale regardless of age
                     logger.debug("[Lock] Owner PID %d is alive, lock is valid", pid)
                     return False
-                else:
-                    # Process is dead - lock IS stale regardless of age
-                    logger.debug("[Lock] Owner PID %d is dead, lock is stale", pid)
-                    return True
+                # Process is dead - lock IS stale regardless of age
+                logger.debug("[Lock] Owner PID %d is dead, lock is stale", pid)
+                return True
 
             # Fallback: if PID couldn't be parsed, use file age as safety net
             stat_info = self._owner_file.stat()
@@ -1097,8 +1094,7 @@ def _load_manifest() -> dict:
                 return default_manifest
             if "schema_version" in data:
                 return data
-            else:
-                return {"schema_version": 1, "entries": data}
+            return {"schema_version": 1, "entries": data}
     except Exception as exc:
         logger.warning("[Cache] Manifest corrupted or unreadable. Starting fresh. Error: %s", exc)
         return default_manifest
@@ -1187,11 +1183,10 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = _coerce_numeric_series(out[col])
 
-    if COLUMN_ADJ_CLOSE not in out.columns:
-        if "Close" in out.columns:
+    if "Close" in out.columns:
+        if COLUMN_ADJ_CLOSE not in out.columns:
             out[COLUMN_ADJ_CLOSE] = out["Close"]
-    else:
-        if "Close" in out.columns:
+        else:
             out[COLUMN_ADJ_CLOSE] = out[COLUMN_ADJ_CLOSE].fillna(out["Close"])
 
     for col in ["Dividends", COLUMN_STOCK_SPLITS]:
