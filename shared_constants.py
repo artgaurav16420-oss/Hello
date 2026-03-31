@@ -1,6 +1,12 @@
 """Shared string constants used across engines and workflows."""
 
+COLUMN_OPEN = "Open"
+COLUMN_HIGH = "High"
+COLUMN_LOW = "Low"
+COLUMN_CLOSE = "Close"
 COLUMN_ADJ_CLOSE = "Adj Close"
+COLUMN_VOLUME = "Volume"
+COLUMN_DIVIDENDS = "Dividends"
 COLUMN_STOCK_SPLITS = "Stock Splits"
 TIMEZONE_IST = "Asia/Kolkata"
 
