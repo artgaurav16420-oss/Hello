@@ -74,7 +74,10 @@ import os
 import pathlib
 import shutil
 import sys
+import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -128,34 +131,206 @@ DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
 # running indefinitely with no positions.
 _EMPTY_UNIVERSE_HALT_AFTER: int = int(os.environ.get("EMPTY_UNIVERSE_HALT_AFTER", "3"))
 _CIRCUIT_BREAKER_FILE = "data/circuit_breaker.json"
+_CIRCUIT_BREAKER_LOCK_FILE = "data/circuit_breaker.lock"
 
 
-def _load_circuit_breaker_count() -> int:
-    """Read the persisted empty-universe counter from disk. Returns 0 if absent."""
+@dataclass
+class CircuitBreaker:
+    # ARCH-FIX-7
+    count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def increment(self) -> int:
+        with self._lock:
+            self.count += 1
+            return self.count
+
+    def reset(self) -> None:
+        with self._lock:
+            self.count = 0
+
+    def load(self, path: str) -> None:
+        """Load persisted count from disk; silently ignore missing file."""
+        json_path = pathlib.Path(path)
+        lock_path = pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE)
+        if not json_path.exists() and lock_path.exists():
+            logger.warning("circuit_breaker.lock found without JSON; treating count as 1")  # ARCH-FIX-10
+            self.count = 1
+            return
+        try:
+            if json_path.exists():
+                self.count = int(json.loads(json_path.read_text(encoding="utf-8")).get("consecutive_empty", 0))
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to parse circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+            self.count = 1 if lock_path.exists() else 0
+        except OSError as exc:
+            logger.warning("Failed to read circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+            self.count = 1 if lock_path.exists() else 0
+
+    def save(self, path: str) -> None:
+        """Persist count to disk; log error on failure, write lock sentinel."""
+        with self._lock:  # ARCH-FIX-7
+            try:
+                os.makedirs("data", exist_ok=True)
+                snapshot = int(self.count)
+                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"consecutive_empty": snapshot}))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                # Fsync parent directory to ensure rename is durable
+                parent_dir = pathlib.Path(path).parent
+                if os.name == "posix":
+                    dir_fd = os.open(str(parent_dir), getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
+                    pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
+            except Exception as exc:
+                logger.error("Failed to persist circuit breaker count: %s", exc)  # ARCH-FIX-10
+                try:
+                    pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).touch()
+                except Exception:
+                    pass
+
+
+def _pending_sentinel_path(name: str) -> pathlib.Path:
+    return pathlib.Path(f"data/pending_rebalance_{name}.json")
+
+
+def _pending_claim_path(name: str) -> pathlib.Path:
+    return pathlib.Path(f"data/pending_rebalance_{name}.claim")
+
+
+def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Path:
+    # ARCH-FIX-3
+    os.makedirs("data", exist_ok=True)
+    path = _pending_sentinel_path(name)
+    tmp_path = path.with_suffix(f"{path.suffix}.{token}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"token": token, "date": date_str}))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, path)
+    if os.name == "posix":
+        dir_fd = os.open(str(path.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    return path
+
+
+def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
+    os.makedirs("data", exist_ok=True)
+    claim_path = _pending_claim_path(name)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+
+    # Try creating the claim file with exclusive flags
     try:
-        p = pathlib.Path(_CIRCUIT_BREAKER_FILE)
-        if p.exists():
-            return int(json.loads(p.read_text(encoding="utf-8")).get("consecutive_empty", 0))
+        fd = os.open(str(claim_path), flags)
+    except FileExistsError:
+        # Claim file exists — check if it's stale
+        try:
+            stat_result = claim_path.stat()
+            mtime = datetime.fromtimestamp(stat_result.st_mtime)
+
+            # Try to read the existing claim to check its date
+            try:
+                existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                if isinstance(existing_claim, dict):
+                    claim_date_str = existing_claim.get("date", "")
+                else:
+                    # Malformed claim (not a dict) — treat as stale
+                    claim_date_str = ""
+            except (json.JSONDecodeError, OSError):
+                # Corrupted or unreadable claim — treat as stale
+                claim_date_str = ""
+
+            # Consider the claim stale if:
+            # 1. The stored date differs from the requested date_str, OR
+            # 2. The file modification time is more than 24 hours old
+            is_stale = (
+                claim_date_str != date_str or
+                (datetime.now() - mtime).total_seconds() > 86400
+            )
+
+            if is_stale:
+                logger.warning(
+                    "Stale claim file detected for %s (claim_date=%s, requested=%s, age=%.1fh). Removing and retrying.",
+                    name, claim_date_str, date_str, (datetime.now() - mtime).total_seconds() / 3600
+                )
+                try:
+                    claim_path.unlink()
+                except OSError as e:
+                    logger.error("Failed to remove stale claim file %s: %s", claim_path, e)
+                    return False
+
+                # Retry the claim once after removing stale file
+                try:
+                    fd = os.open(str(claim_path), flags)
+                except FileExistsError:
+                    # Another process claimed it in the race window
+                    return False
+            else:
+                # Not stale — another process holds a valid claim
+                return False
+        except OSError as e:
+            logger.error("Failed to check claim file staleness for %s: %s", claim_path, e)
+            return False
+
+    # Successfully created the claim file (either first try or after removing stale)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"token": token, "date": date_str}))
+            fh.flush()
+            os.fsync(fh.fileno())
     except Exception:
-        pass
-    return 0
+        try:
+            claim_path.unlink()
+        except OSError:
+            pass
+        raise
+    if os.name == "posix":
+        dir_fd = os.open(str(claim_path.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    return True
 
 
-def _save_circuit_breaker_count(n: int) -> None:
-    """Persist the empty-universe counter so restarts do not reset it."""
+def _clear_pending_sentinel(name: str) -> None:
+    # ARCH-FIX-3
     try:
-        os.makedirs("data", exist_ok=True)
-        tmp = _CIRCUIT_BREAKER_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"consecutive_empty": n}))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, _CIRCUIT_BREAKER_FILE)
-    except Exception as _exc:
-        logger.warning("Could not persist circuit breaker count: %s", _exc)
+        _pending_sentinel_path(name).unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        _pending_claim_path(name).unlink()
+    except FileNotFoundError:
+        pass
 
 
-_CONSECUTIVE_EMPTY_SCANS: int = _load_circuit_breaker_count()
+def _load_pending_sentinel(name: str) -> dict | None:
+    # ARCH-FIX-3
+    path = _pending_sentinel_path(name)
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+        else:
+            # Malformed sentinel (not a dict) — treat as missing
+            logger.debug("_load_pending_sentinel: malformed sentinel for %s (not a dict), treating as missing", name)
+            return None
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("_load_pending_sentinel: failed to load sentinel for %s: %s", name, e)
+        return None
 
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
@@ -176,6 +351,8 @@ class C:
         BLU = CYN = GRN = YLW = RED = GRY = RST = BLD = B_CYN = B_GRN = B_RED = ""
 
 logger = logging.getLogger(__name__)
+_circuit_breaker = CircuitBreaker()
+_circuit_breaker.load(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
 
 _DEFAULT_SCREENER_URL = os.environ.get(
     "SCREENER_URL",
@@ -621,6 +798,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                     os.remove(tmp)
                 except OSError:
                     pass
+        _clear_pending_sentinel(name)  # ARCH-FIX-3
         return
 
     os.makedirs("data", exist_ok=True)
@@ -693,6 +871,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 os.remove(risk_file)
             except OSError as exc:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
+        _clear_pending_sentinel(name)  # ARCH-FIX-3
 
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
@@ -820,6 +999,8 @@ def _run_scan(
     state:    PortfolioState,
     label:    str,
     cfg_override: Optional[UltimateConfig] = None,
+    circuit_breaker: CircuitBreaker = _circuit_breaker,
+    name: str = "scan",
 ) -> tuple:
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
@@ -836,7 +1017,6 @@ def _run_scan(
     _dead_letter = DeadLetterTracker(threshold=10)
 
     def _scan_body(cfg: UltimateConfig) -> tuple:
-        global _CONSECUTIVE_EMPTY_SCANS
         engine = InstitutionalRiskEngine(cfg)
         # FIX-MB2-EQUITYCAP: apply cfg defaults only when these fields were absent
         # in persisted state (represented as None by PortfolioState.from_dict).
@@ -846,7 +1026,9 @@ def _run_scan(
         if state.max_absent_periods is None:
             state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
-        today = pd.Timestamp(datetime.today().date())
+        # Derive session_date from market timezone to avoid date flip mid-session
+        session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+        today = session_date  # Keep today for backward compatibility with other uses
         next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
         rebalance_allowed = next_due is None or today >= next_due
         if not rebalance_allowed:
@@ -892,16 +1074,16 @@ def _run_scan(
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
-            _CONSECUTIVE_EMPTY_SCANS += 1
-            _save_circuit_breaker_count(_CONSECUTIVE_EMPTY_SCANS)  # persist across restarts
+            cb_count = circuit_breaker.increment()  # ARCH-FIX-7
+            circuit_breaker.save(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
             logger.warning(
                 "[Scan] No data available for any universe symbol "
                 "(consecutive empty scans: %d / halt threshold: %d).",
-                _CONSECUTIVE_EMPTY_SCANS, _EMPTY_UNIVERSE_HALT_AFTER,
+                cb_count, _EMPTY_UNIVERSE_HALT_AFTER,
             )
-            if _CONSECUTIVE_EMPTY_SCANS >= _EMPTY_UNIVERSE_HALT_AFTER:
+            if cb_count >= _EMPTY_UNIVERSE_HALT_AFTER:
                 raise RuntimeError(
-                    f"[Scan] CIRCUIT BREAKER TRIPPED: {_CONSECUTIVE_EMPTY_SCANS} consecutive "
+                    f"[Scan] CIRCUIT BREAKER TRIPPED: {cb_count} consecutive "
                     f"scans returned an empty universe (threshold={_EMPTY_UNIVERSE_HALT_AFTER}). "
                     "Possible data provider outage or misconfigured universe.  "
                     "Halting to prevent unintended full-cash drift.  "
@@ -913,8 +1095,8 @@ def _run_scan(
             return state, market_data
     
         # PROD-FIX-3: Reset empty-universe circuit breaker — we have data.
-        _CONSECUTIVE_EMPTY_SCANS = 0
-        _save_circuit_breaker_count(0)  # persist reset so restarts start clean
+        circuit_breaker.reset()  # ARCH-FIX-7
+        circuit_breaker.save(_CIRCUIT_BREAKER_FILE)  # ARCH-FIX-7
     
         _print_stage_status("Analysis", 0.35, f"Built close-price matrix for {len(close_d):,} active symbols.")
     
@@ -1239,6 +1421,19 @@ def _run_scan(
                         weights[_s_idx] = _mtm_w
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
+            pending = _load_pending_sentinel(name=name)  # ARCH-FIX-3
+            if pending and pending.get("date") == today.strftime("%Y-%m-%d"):
+                logger.warning("Rebalance already committed for today, skipping")
+                return state, market_data
+            token = str(uuid.uuid4())
+            if not _try_claim_pending_sentinel(name=name, token=token, date_str=today.strftime("%Y-%m-%d")):
+                logger.warning("Rebalance claim already exists for today, skipping")
+                return state, market_data
+            _write_pending_sentinel(
+                name=name,
+                token=token,
+                date_str=today.strftime("%Y-%m-%d"),
+            )
             _T_cvar = min(len(log_rets), cfg.CVAR_LOOKBACK)
             _scenario_losses = -(
                 log_rets.iloc[-_T_cvar:]
@@ -1544,7 +1739,7 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg)
+            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg, name="nse_total")
             mkt_cache["nse_total"] = mkt
             _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
@@ -1569,7 +1764,7 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nifty"])
-            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg)
+            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg, name="nifty")
             mkt_cache["nifty"] = mkt
             _print_status(preview, "PREVIEW — NIFTY 500", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
@@ -1596,7 +1791,7 @@ def main_menu() -> None:
                 custom_cfg.MAX_POSITIONS = 8
 
             preview      = copy.deepcopy(states["custom"])
-            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg)
+            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg, name="custom")
             mkt_cache["custom"] = mkt
             _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":

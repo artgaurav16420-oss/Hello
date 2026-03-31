@@ -23,10 +23,14 @@ CHANGES:
 import argparse
 import json
 import logging
+import math
 import os
+import re
+import sqlite3
 import sys
 import tempfile
 import warnings
+from pathlib import Path
 
 # OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
 # a silent ABI crash (exit code 0xC0000005). momentum_engine imports osqp,
@@ -125,7 +129,8 @@ SEARCH_SPACE_BOUNDS = {
 
 N_JOBS         = int(os.getenv("OPTUNA_N_JOBS", "1"))
 OPTUNA_SEED    = os.getenv("OPTUNA_SEED")
-OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db")
+# ARCH-FIX-4: SQLite is suitable for ≤4 parallel workers; use PostgreSQL for larger runs.
+OPTUNA_STORAGE = os.getenv("OPTUNA_STORAGE", "sqlite:///data/optuna_study.db?timeout=30")
 
 OBJECTIVE_VERSION  = "fitness_v11_58"
 DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
@@ -133,6 +138,8 @@ DEFAULT_STUDY_NAME = f"Momentum_Risk_Parity_{OBJECTIVE_VERSION}"
 MAX_REASONABLE_CAGR_PCT       = 300.0
 MAX_REASONABLE_FINAL_MULTIPLE = 8.0
 BASE_INITIAL_CAPITAL          = UltimateConfig().INITIAL_CAPITAL
+OOS_TOURNAMENT_JOURNAL_DIR    = Path("data")
+DRAWDOWN_FLOOR                = 1.0  # keep consistent with backtest_engine Calmar denominator
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
@@ -218,7 +225,7 @@ def _iter_wfo_slices(train_start: str, train_end: str):
 def _fitness_from_metrics(
     metrics: dict,
     rebal_log: pd.DataFrame,
-) -> tuple[float, dict]:
+) -> tuple[float, float, dict]:
     """
     Compute a scalar fitness score plus a diagnostics dict for logging.
 
@@ -302,7 +309,8 @@ def _fitness_from_metrics(
             "raw_score": round(raw, 6), "score": round(score, 6),
             "ceiling_hit": False, "dd_gate_hit": True, "anomaly_hit": False,
         }
-        return score, diag
+        calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
+        return score, calmar_score, diag
 
     dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
     dd_penalty = (dd_excess ** 2) / 100.0
@@ -335,13 +343,9 @@ def _fitness_from_metrics(
             - exposure_penalty
             - dd_penalty
         )
-        import math as _math_inner
-        if raw > 0.0:
-            score       = _math_inner.log1p(raw)
-            ceiling_hit = False
-        else:
-            score       = raw
-            ceiling_hit = False
+        # ARCH-FIX-6: symmetric log-modulus transform removes the raw>0 discontinuity.
+        score = math.copysign(math.log1p(abs(raw)), raw)
+        ceiling_hit = False
         score = max(score, -2.0)
         dd_gate_hit = False
 
@@ -374,7 +378,8 @@ def _fitness_from_metrics(
         "dd_gate_hit":         dd_gate_hit,
         "anomaly_hit":         anomaly_hit,
     }
-    return score, diag
+    calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
+    return score, calmar_score, diag
 
 
 class MomentumObjective:
@@ -390,7 +395,7 @@ class MomentumObjective:
         self.search_space         = search_space or SEARCH_SPACE_BOUNDS
         self.precomputed_matrices = precomputed_matrices
 
-    def __call__(self, trial: optuna.Trial) -> float:
+    def __call__(self, trial: optuna.Trial) -> tuple[float, float]:
         cfg = UltimateConfig()
 
         halflife_fast_bounds = self.search_space["HALFLIFE_FAST"]
@@ -490,6 +495,7 @@ class MomentumObjective:
             trial.set_user_attr("resolved_cfg", dict(vars(cfg)))
 
         scores:      list[float] = []
+        calmar_scores: list[float] = []
         slice_diags: list[dict]  = []
         trial_id    = getattr(trial, "number", 0)
         n_gate_hits = 0
@@ -528,7 +534,7 @@ class MomentumObjective:
                 cfg                  = cfg,
             )
             m = oos.metrics
-            score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
+            score, calmar_score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
 
             diag["year"]     = oos_year
             diag["eq_start"] = wf_oos_start
@@ -558,12 +564,15 @@ class MomentumObjective:
 
             if not pd.notna(score):
                 raise optuna.TrialPruned()
+            if not pd.notna(calmar_score):
+                raise optuna.TrialPruned()
 
             is_structural_gate_hit = diag.get("dd_gate_hit") or diag.get("anomaly_hit")
             diag["excluded"] = is_structural_gate_hit
             if is_structural_gate_hit:
                 n_gate_hits += 1
                 scores.append(float(score))
+                calmar_scores.append(float(calmar_score))
                 if n_gate_hits > 2:
                     raise optuna.TrialPruned()
                 logger.debug(
@@ -575,11 +584,13 @@ class MomentumObjective:
                 continue
 
             scores.append(float(score))
+            calmar_scores.append(float(calmar_score))
 
         if not scores:
             raise optuna.TrialPruned()
 
         aggregate = float(sum(scores) / len(scores))
+        aggregate_calmar = float(sum(calmar_scores) / len(calmar_scores))
 
         avg_cagr       = sum(d["cagr"]       for d in slice_diags) / len(slice_diags)
         avg_dd         = sum(abs(d["max_dd"]) for d in slice_diags) / len(slice_diags)
@@ -598,12 +609,13 @@ class MomentumObjective:
         if hasattr(trial, "set_user_attr"):
             trial.set_user_attr("slice_diags",     slice_diags)
             trial.set_user_attr("aggregate_score", round(aggregate, 6))
+            trial.set_user_attr("aggregate_calmar", round(aggregate_calmar, 6))  # ARCH-FIX-2
             trial.set_user_attr("avg_cagr",        round(avg_cagr, 2))
             trial.set_user_attr("avg_dd",          round(-avg_dd,  2))
             trial.set_user_attr("ceiling_hits",    ceiling_slices)
             trial.set_user_attr("ddgate_hits",     ddgate_slices)
 
-        return aggregate
+        return aggregate, aggregate_calmar
 
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
@@ -845,6 +857,69 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
     logger.info("Saved optimal parameters to %s", filepath)
 
 
+def _oos_journal_path(study_name: str) -> Path:
+    # ARCH-FIX-9
+    cleaned = re.sub(r"[\\/]+", "_", (study_name or "").strip())
+    cleaned = cleaned.replace("..", "_")
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "study"
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80]
+    return OOS_TOURNAMENT_JOURNAL_DIR / f"oos_tournament_{cleaned}.jsonl"
+
+
+def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
+    if trial.values is None:
+        raise ValueError(f"Trial #{trial.number} has no objective values for Pareto sorting.")
+    normalized: list[float] = []
+    for direction, value in zip(study.directions, trial.values, strict=True):
+        if direction == optuna.study.StudyDirection.MINIMIZE:
+            normalized.append(-float(value))
+        else:
+            normalized.append(float(value))
+    normalized.append(-float(trial.number))
+    return tuple(normalized)
+
+
+def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
+    return sorted(study.best_trials, key=lambda t: _pareto_sort_key(study, t), reverse=True)
+
+
+def _error_triage_callback_factory() -> callable:
+    # ARCH-FIX-8
+    consecutive_failures = {"count": 0}
+
+    def _error_triage_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state == optuna.trial.TrialState.FAIL:
+            consecutive_failures["count"] += 1
+            fail_reason = trial.system_attrs.get("fail_reason")
+            if fail_reason:
+                error_class = fail_reason.split(":", 1)[0]
+            else:
+                error_class = "Unknown"
+            try:
+                if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
+                    study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
+            except Exception as e:
+                logger.error(
+                    "Failed to set trial user attribute 'error_class'=%r for trial %s: %s (storage=%s)",
+                    error_class,
+                    getattr(trial, "_trial_id", "unknown"),
+                    e,
+                    getattr(study, "_storage", "unknown"),
+                )
+            if consecutive_failures["count"] > int(N_TRIALS * 0.30):
+                study.stop()
+                raise RuntimeError(
+                    f"Aborting: {consecutive_failures['count']} consecutive trial failures"
+                )
+        else:
+            consecutive_failures["count"] = 0
+
+    return _error_triage_callback
+
+
 def run_optimization(
     universe_type: str       = "nifty500",
     in_memory:     bool      = False,
@@ -898,11 +973,16 @@ def run_optimization(
 
     study = optuna.create_study(
         study_name     = effective_study_name,
-        direction      = "maximize",
+        directions     = ["maximize", "maximize"],  # ARCH-FIX-2 [composite, calmar]
         sampler        = _build_sampler(),
         storage        = effective_storage,
         load_if_exists = True,
     )
+    if isinstance(effective_storage, str) and effective_storage.startswith("sqlite:///"):
+        # ARCH-FIX-4: enable WAL mode for better multi-process write concurrency.
+        db_path = re.sub(r"^sqlite:///", "", effective_storage.split("?")[0])
+        with sqlite3.connect(db_path, timeout=30) as _conn:
+            _conn.execute("PRAGMA journal_mode=WAL")
 
 
     objective = MomentumObjective(
@@ -916,13 +996,16 @@ def run_optimization(
     def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
-        if study.best_trial.number != trial.number:
+        ranked_best = _deterministic_best_trials(study)
+        if not ranked_best:
+            return
+        if ranked_best[0].number != trial.number:
             return
         diags = trial.user_attrs.get("slice_diags", [])
         hdr = (
             f"\n\033[1;33m{'─'*72}\033[0m"
             f"\n\033[1;33m  NEW BEST  Trial #{trial.number}  "
-            f"Aggregate={trial.value:.4f}\033[0m"
+            f"Aggregate={trial.values[0]:.4f} Calmar={trial.values[1]:.4f}\033[0m"
             f"\n\033[1;33m{'─'*72}\033[0m"
         )
         logger.info(hdr)
@@ -966,7 +1049,7 @@ def run_optimization(
             show_progress_bar = True,
             n_jobs            = effective_n_jobs,
             catch             = (Exception,),
-            callbacks         = [_best_trial_callback],
+            callbacks         = [_error_triage_callback_factory(), _best_trial_callback],
         )
     except Exception:
         logger.exception("Optimization aborted due to unexpected internal error.")
@@ -979,7 +1062,7 @@ def run_optimization(
         )
 
     try:
-        best_trial = study.best_trial
+        best_trial = _deterministic_best_trials(study)[0]
     except ValueError as exc:
         raise RuntimeError(
             f"Optimization finished but no best trial available "
@@ -987,7 +1070,7 @@ def run_optimization(
         ) from exc
 
     best_params     = best_trial.params
-    best_is_fitness = study.best_value
+    best_is_fitness = best_trial.values[0]
 
     print("\n\033[1;32m=== OPTIMIZATION COMPLETE ===\033[0m")
     print(f"\033[1mBest Fitness Score (IS):\033[0m {best_is_fitness:.4f}")
@@ -998,7 +1081,7 @@ def run_optimization(
     trials    = list(getattr(study, "trials", []))
     completed = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
     if completed:
-        top10 = sorted(completed, key=lambda t: t.value if t.value is not None else -999, reverse=True)[:10]
+        top10 = sorted(completed, key=lambda t: t.values[0] if t.values else -999, reverse=True)[:10]
         print("\n\033[1;36m=== TOP-10 TRIALS DIAGNOSTIC SUMMARY ===\033[0m")
         print(f"\033[90m{'Trial':>6}  {'Score':>7}  {'AvgCAGR':>8}  {'AvgDD':>7}  {'CeilHits':>9}  {'DDGate':>7}\033[0m")
         print(f"\033[90m{'─'*58}\033[0m")
@@ -1012,7 +1095,7 @@ def run_optimization(
             dg_str   = f"{dg_hits}/{scored_n}" if isinstance(dg_hits, int) else "?"
             cagr_s   = f"{avg_c:+.1f}%" if isinstance(avg_c, float) else str(avg_c)
             dd_s     = f"{abs(avg_d):.1f}%" if isinstance(avg_d, float) else str(avg_d)
-            print(f"  #{t.number:>4}  {t.value:>7.4f}  {cagr_s:>8}  {dd_s:>7}  {c_str:>9}  {dg_str:>7}")
+            print(f"  #{t.number:>4}  {t.values[0]:>7.4f}  {cagr_s:>8}  {dd_s:>7}  {c_str:>9}  {dg_str:>7}")
         print(f"\033[90m{'─'*58}\033[0m")
         print()
 
@@ -1030,7 +1113,7 @@ def run_optimization(
     print(f"\033[90mPASS   = Calmar > 0.5  AND  MaxDD <= {OOS_MAX_DD_CAP:.0f}%\033[0m")
     print(f"\033[90mNEAR   = Calmar > 0.5  AND  MaxDD <= {OOS_SOFT_MAX_DD_CAP:.0f}%  (diagnostic only)\033[0m\n")
 
-    top_k_trials = sorted(completed, key=lambda t: t.value if t.value is not None else -999, reverse=True)[:OOS_TOP_K]
+    top_k_trials = _deterministic_best_trials(study)[:OOS_TOP_K]  # ARCH-FIX-2 Pareto-front seeding
 
     if not top_k_trials:
         logger.warning("No completed trials for OOS validation; skipping tournament.")
@@ -1046,8 +1129,47 @@ def run_optimization(
     print(f"  {'─'*79}")
 
     oos_results_list = []
+    journal_path = _oos_journal_path(effective_study_name)  # ARCH-FIX-9
+    completed_trial_ids: dict[int, dict] = {}
+    if journal_path.exists():
+        for line_idx, line in enumerate(journal_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                trial_number = rec["trial_number"]
+                # Validate the record has required fields and correct status
+                if rec.get("status") != "PASS":
+                    # Skip non-PASS records or store them without validation
+                    completed_trial_ids[trial_number] = rec
+                    continue
+                # For PASS records, validate required keys exist and have expected types
+                if not isinstance(rec.get("oos_calmar"), (int, float)):
+                    logger.warning(
+                        "Skipping journal line %d: PASS record missing valid oos_calmar (got %r)",
+                        line_idx, rec.get("oos_calmar")
+                    )
+                    continue
+                if not isinstance(rec.get("metrics"), dict):
+                    logger.warning(
+                        "Skipping journal line %d: PASS record missing valid metrics dict (got %r)",
+                        line_idx, type(rec.get("metrics")).__name__
+                    )
+                    continue
+                completed_trial_ids[trial_number] = rec
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                logger.warning(
+                    "Skipping corrupt/truncated journal line %d in %s: %s (line: %r)",
+                    line_idx, journal_path, e, line[:100]
+                )
+                continue
 
     for rank, trial_candidate in enumerate(top_k_trials, 1):
+        if trial_candidate.number in completed_trial_ids:
+            rec = completed_trial_ids[trial_candidate.number]
+            if rec.get("status") == "PASS":
+                oos_results_list.append((rec["oos_calmar"], trial_candidate, trial_candidate.params, rec["metrics"]))
+            continue
         oos_cfg      = UltimateConfig()
         resolved_cfg = trial_candidate.user_attrs.get("resolved_cfg", {})
         for k, v in resolved_cfg.items():
@@ -1058,9 +1180,18 @@ def run_optimization(
                 setattr(oos_cfg, k, v)
 
         try:
+            warmup_start = _compute_warmup_start(TEST_START, oos_cfg)  # ARCH-FIX-5
+            clipped_matrices = {}
+            for k, v in (precomputed_matrices or {}).items():
+                if hasattr(v, "loc"):
+                    # DataFrame: clip to warmup_start:TEST_END
+                    clipped_matrices[k] = v.loc[warmup_start:TEST_END]
+                else:
+                    # Non-DataFrame artifact: keep original value unchanged
+                    clipped_matrices[k] = v
             oos_result = run_backtest(
                 market_data          = market_data,
-                precomputed_matrices = precomputed_matrices,
+                precomputed_matrices = clipped_matrices,
                 universe_type        = universe_type,
                 start_date           = TEST_START,
                 end_date             = TEST_END,
@@ -1076,27 +1207,40 @@ def run_optimization(
 
             if passes:
                 status = "\033[32mPASS\033[0m"
+                status_tag = "PASS"
             elif near:
                 status = "\033[33mNEAR\033[0m"
+                status_tag = "NEAR"
             else:
                 status = "\033[31mFAIL\033[0m"
+                status_tag = "FAIL"
 
             print(
                 f"  {rank:>4}  #{trial_candidate.number:>5}  "
-                f"{trial_candidate.value:>9.4f}  "
+                f"{trial_candidate.values[0]:>9.4f}  "
                 f"{oos_cagr:>+8.1f}%  "
                 f"{abs(oos_maxdd):>8.1f}%  "
                 f"{oos_calmar:>10.2f}  "
                 f"{status}"
             )
 
+            oos_result_dict = {
+                "trial_number": trial_candidate.number,
+                "oos_calmar": oos_calmar,
+                "metrics": m,
+                "status": status_tag,
+            }
+            with journal_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(oos_result_dict) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             if passes:
                 oos_results_list.append((oos_calmar, trial_candidate, trial_candidate.params, m))
 
         except Exception as exc:
             print(
                 f"  {rank:>4}  #{trial_candidate.number:>5}  "
-                f"{trial_candidate.value:>9.4f}  "
+                f"{trial_candidate.values[0]:>9.4f}  "
                 f"{'ERROR':>9}  {'—':>9}  {'—':>10}  \033[31mERROR: {exc}\033[0m"
             )
 
@@ -1126,7 +1270,7 @@ def run_optimization(
     print("\n\033[1;32m=== OOS TOURNAMENT WINNER (SINGLE PERIOD) ===\033[0m")
     print(
         f"  Trial      : #{best_oos_trial.number}  "
-        f"(IS score {best_oos_trial.value:.4f})"
+        f"(IS score {best_oos_trial.values[0]:.4f})"
     )
     print(f"  OOS Calmar : {best_p1_calmar:.2f}")
     print(f"  OOS CAGR   : {best_oos_metrics.get('cagr', 0):.2f}%")
@@ -1137,6 +1281,8 @@ def run_optimization(
         print(f"    {k}: \033[33m{v}\033[0m")
 
     save_optimal_config(final_oos_params)
+    if journal_path.exists():  # ARCH-FIX-9
+        journal_path.unlink()
     print(
         "\n\033[1;32m[PASS]\033[0m OOS tournament complete "
         "(single-period) parameters saved."
