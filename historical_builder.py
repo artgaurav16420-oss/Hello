@@ -83,10 +83,9 @@ def _ns_ticker(sym: str) -> str:
     if sym.startswith("^"):
         return sym
     # Remove any existing .NS / .BO / .BSE suffix
-    suffixes = [sfx for sfx in (".NS", ".BO", ".BSE") if sym.endswith(sfx)]
-    if suffixes:
-        sfx = max(suffixes, key=len)
-        sym = sym[: -len(sfx)]
+    for sfx in (".NS", ".BO", ".BSE"):
+        if sym.endswith(sfx):
+            sym = sym[: -len(sfx)]
     return sym + ".NS"
 
 
