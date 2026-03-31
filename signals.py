@@ -200,7 +200,11 @@ def compute_regime_score(
                 # FIX-MB2-BREADTHNONE: proportional floor, min 5 rows.
                 min_obs = max(5, int(np.ceil(len(_hist) * 0.8)))
                 obs_count = _hist.notna().sum()
-                sma_vals = _hist.iloc[:-1].expanding(min_periods=min_obs).mean().iloc[-1]  # exclude current bar to match long-history branch (no look-ahead)
+                # Guard: if _hist has <=1 row, iloc[:-1] is empty and .iloc[-1] raises IndexError.
+                if len(_hist) > 1:
+                    sma_vals = _hist.iloc[:-1].expanding(min_periods=min_obs).mean().iloc[-1]  # exclude current bar (no look-ahead)
+                else:
+                    sma_vals = pd.Series(np.nan, index=_hist.columns)
                 last = _hist.iloc[-1]
                 valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
                 if valid.any():
@@ -552,9 +556,6 @@ def generate_signals(
         _max_win = max(activity_window, stale_sessions)
         _recent_window_df = signal_log_rets[active_symbols].tail(_max_win)
         # --- Vectorized continuity bonus (replaces serial for-loop) ---
-        recent_rets_full = _recent_window_df.tail(activity_window)
-        has_recent_activity = (recent_rets_full.abs() > flat_ret_eps).sum(axis=0).values >= min_nonzero_days  # noqa: F841 (retained for future use)
-
         stale_rets_full = _recent_window_df.tail(stale_sessions)
         # is_stale: all stale_sessions rows are present, non-NaN, and flat
         if len(stale_rets_full) == stale_sessions:
@@ -574,7 +575,7 @@ def generate_signals(
         candidate_mask = valid_mask & (prev_w_arr > 0.001) & ~knife_pre_bonus_suppress
 
         stale_denied    = int(np.sum(candidate_mask & is_stale))
-        liquidity_denied = int(np.sum(candidate_mask & ~is_stale & ~passes_continuity_liquidity))
+        liquidity_denied = int(np.sum(candidate_mask & ~passes_continuity_liquidity))
 
         bonus_mask = candidate_mask & ~is_stale & passes_continuity_liquidity
         decay = np.clip(
