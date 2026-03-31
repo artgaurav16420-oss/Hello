@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 
+# Default historical NIFTY500 parquet filename used by bootstrap_historical_parquet().
+NIFTY500_PARQUET_FILENAME = "historical_nifty500.parquet"
+
 # Remote master archives used by main() bootstrapping flow.
 REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
     "nifty500": [],
@@ -585,7 +588,7 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
 
 
 def bootstrap_historical_parquet(
-    output_path: str = str(DATA_DIR / "historical_nifty500.parquet"),
+    output_path: str = str(DATA_DIR / NIFTY500_PARQUET_FILENAME),
     default_tickers: list[str] | None = None,
 ) -> Path:
     """
@@ -929,7 +932,7 @@ def main() -> None:
     )
 
     csv_path     = DATA_DIR / "historical_nifty500.csv"
-    parquet_path = DATA_DIR / "historical_nifty500.parquet"
+    parquet_path = DATA_DIR / NIFTY500_PARQUET_FILENAME
 
     print("\n" + "=" * 60)
     print("  HISTORICAL BUILDER — PIT Universe Construction")
@@ -983,7 +986,7 @@ if __name__ == "__main__":
     # Support --verify flag for quick inspection without rebuilding
     if "--verify" in sys.argv:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
-        parquet_path = DATA_DIR / "historical_nifty500.parquet"
+        parquet_path = DATA_DIR / NIFTY500_PARQUET_FILENAME
         verify_parquet(str(parquet_path))
         sys.exit(0)
 

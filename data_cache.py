@@ -48,6 +48,17 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from log_config import load_dotenv_safe
+from shared_constants import (
+    COLUMN_OPEN,
+    COLUMN_HIGH,
+    COLUMN_LOW,
+    COLUMN_CLOSE,
+    COLUMN_ADJ_CLOSE,
+    COLUMN_VOLUME,
+    COLUMN_DIVIDENDS,
+    COLUMN_STOCK_SPLITS,
+    TIMEZONE_IST,
+)
 
 import requests
 from datetime import datetime, timedelta
@@ -58,7 +69,6 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
-_IST_TZ = "Asia/Kolkata"
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()
@@ -644,7 +654,7 @@ class GrowwProvider(DataProvider):
             return None
 
         if hasattr(series.index, "tz") and series.index.tz is not None:
-            series.index = series.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            series.index = series.index.tz_convert(TIMEZONE_IST).tz_localize(None)
         series.index = pd.DatetimeIndex(series.index).normalize()
         return pd.to_numeric(series, errors="coerce")
 
@@ -663,8 +673,8 @@ class GrowwProvider(DataProvider):
         backward across holiday gaps (look-ahead contamination).
         """
         try:
-            adj_yf     = self._extract_batch_series(yf_raw, "Adj Close", ns_ticker)
-            raw_yf_cls = self._extract_batch_series(yf_raw, "Close",     ns_ticker)
+            adj_yf     = self._extract_batch_series(yf_raw, COLUMN_ADJ_CLOSE, ns_ticker)
+            raw_yf_cls = self._extract_batch_series(yf_raw, COLUMN_CLOSE,     ns_ticker)
 
             if adj_yf is None or raw_yf_cls is None:
                 return raw_close
@@ -729,8 +739,8 @@ class GrowwProvider(DataProvider):
         ns_ticker: str,
         yf_raw: pd.DataFrame,
     ) -> tuple[pd.Series, pd.Series]:
-        dividends = self._extract_batch_series(yf_raw, "Dividends", ns_ticker)
-        splits = self._extract_batch_series(yf_raw, "Stock Splits", ns_ticker)
+        dividends = self._extract_batch_series(yf_raw, COLUMN_DIVIDENDS, ns_ticker)
+        splits = self._extract_batch_series(yf_raw, COLUMN_STOCK_SPLITS, ns_ticker)
 
         div_series = pd.Series(0.0, index=index, dtype=float)
         split_series = pd.Series(0.0, index=index, dtype=float)
@@ -787,11 +797,11 @@ class GrowwProvider(DataProvider):
                 continue
 
             adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_raw)
-            raw_df["Adj Close"] = adj_close
+            raw_df[COLUMN_ADJ_CLOSE] = adj_close
 
             dividends, splits = self._extract_actions_from_batches(raw_df.index, ns_ticker, yf_raw)
-            raw_df["Dividends"] = dividends
-            raw_df["Stock Splits"] = splits
+            raw_df[COLUMN_DIVIDENDS] = dividends
+            raw_df[COLUMN_STOCK_SPLITS] = splits
 
             frames[ns_ticker] = raw_df
 
@@ -963,8 +973,8 @@ class SecondaryProvider(DataProvider):
                 "High":      float(item.get("2. high",             np.nan)),
                 "Low":       float(item.get("3. low",              np.nan)),
                 "Close":     float(item.get("4. close",            np.nan)),
-                "Adj Close": float(item.get("5. adjusted close",   np.nan)),
-                "Volume":    float(item.get("6. volume",           np.nan)),
+                COLUMN_ADJ_CLOSE: float(item.get("5. adjusted close",   np.nan)),
+                COLUMN_VOLUME:    float(item.get("6. volume",           np.nan)),
             })
 
         if not rows:
@@ -996,7 +1006,7 @@ def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
 
     if isinstance(out.index, pd.DatetimeIndex):
         if out.index.tz is not None:
-            out.index = out.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            out.index = out.index.tz_convert(TIMEZONE_IST).tz_localize(None)
         out.index = out.index.normalize()
 
         if out.index.duplicated().any():
@@ -1142,7 +1152,7 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
     if "Close" not in df.columns or df["Close"].isnull().all():
         return False
 
-    if "Adj Close" not in df.columns or df["Adj Close"].isnull().all():
+    if COLUMN_ADJ_CLOSE not in df.columns or df[COLUMN_ADJ_CLOSE].isnull().all():
         return False
 
     is_index_ticker = bool(ticker) and str(ticker).startswith("^")
@@ -1157,8 +1167,8 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.loc[:, out.columns.notna()]
 
     numeric_cols = [
-        "Open", "High", "Low", "Close", "Adj Close",
-        "Volume", "Dividends", "Stock Splits",
+        COLUMN_OPEN, COLUMN_HIGH, COLUMN_LOW, COLUMN_CLOSE, COLUMN_ADJ_CLOSE,
+        COLUMN_VOLUME, COLUMN_DIVIDENDS, COLUMN_STOCK_SPLITS,
     ]
 
     def _coerce_numeric_series(series: pd.Series) -> pd.Series:
@@ -1177,20 +1187,35 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = _coerce_numeric_series(out[col])
 
-    if "Adj Close" not in out.columns:
+    if COLUMN_ADJ_CLOSE not in out.columns:
         if "Close" in out.columns:
-            out["Adj Close"] = out["Close"]
+            out[COLUMN_ADJ_CLOSE] = out["Close"]
     else:
         if "Close" in out.columns:
-            out["Adj Close"] = out["Adj Close"].fillna(out["Close"])
+            out[COLUMN_ADJ_CLOSE] = out[COLUMN_ADJ_CLOSE].fillna(out["Close"])
 
-    for col in ["Dividends", "Stock Splits"]:
+    for col in ["Dividends", COLUMN_STOCK_SPLITS]:
         if col not in out.columns:
             out[col] = 0.0
         else:
             out[col] = out[col].fillna(0.0)
 
     return out
+
+
+def _load_cached_frame(parquet_path: Path, ticker: str, cfg=None) -> pd.DataFrame:
+    """
+    Load and normalize a cached parquet frame so legacy cache files remain usable.
+
+    Older cached/provider frames may miss Adj Close or action columns. We pass all
+    cache reads through _ensure_price_columns before validation to avoid
+    unnecessary re-downloads when Close-only history is otherwise valid.
+    """
+    cached_df = pd.read_parquet(parquet_path)
+    normalized = _ensure_price_columns(_normalize_history_index(cached_df))
+    if not _is_valid_dataframe(normalized, ticker=ticker, cfg=cfg):
+        raise ValueError(f"cached frame failed validation for {ticker}")
+    return normalized
 
 
 def _latest_business_day() -> str:
@@ -1201,7 +1226,7 @@ def _latest_business_day() -> str:
     holidays (not just Mon–Fri weekdays). Falls back to pandas BDay logic on
     any calendar import/runtime failure.
     """
-    today = pd.Timestamp.now(tz=_IST_TZ).normalize()
+    today = pd.Timestamp.now(tz=TIMEZONE_IST).normalize()
     try:
         import pandas_market_calendars as mcal
 
@@ -1213,9 +1238,9 @@ def _latest_business_day() -> str:
         if len(valid_days) > 0:
             last_valid = pd.Timestamp(valid_days[-1])
             if last_valid.tzinfo is None:
-                last_valid = last_valid.tz_localize(_IST_TZ)
+                last_valid = last_valid.tz_localize(TIMEZONE_IST)
             else:
-                last_valid = last_valid.tz_convert(_IST_TZ)
+                last_valid = last_valid.tz_convert(TIMEZONE_IST)
             return last_valid.strftime("%Y-%m-%d")
     except Exception as exc:
         logger.debug("Falling back to BDay due to NSE calendar error: %s", exc, exc_info=True)
@@ -1312,7 +1337,7 @@ def load_or_fetch(
             tickers_to_download.append(ticker)
         else:
             try:
-                df = _normalize_history_index(pd.read_parquet(parquet_path))
+                df = _load_cached_frame(parquet_path, ticker=ticker, cfg=cfg)
                 market_data[ticker] = df
             except Exception as exc:
                 logger.warning("[Cache] Corrupted parquet for %s: %s", ticker, exc)
@@ -1547,7 +1572,7 @@ def _process_chunk(
             max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
 
             manifest_entries[ticker] = {
-                "fetched_at":    pd.Timestamp.now(tz=_IST_TZ).isoformat(),
+                "fetched_at":    pd.Timestamp.now(tz=TIMEZONE_IST).isoformat(),
                 "rows":          len(df),
                 "last_date":     df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":     max_gap_days > _SUSPENSION_GAP_DAYS,
@@ -1587,14 +1612,7 @@ def _recover_from_stale_cache(
         if not parquet_path.exists():
             continue
         try:
-            fallback_df = _normalize_history_index(pd.read_parquet(parquet_path))
-            if fallback_df is None or fallback_df.empty:
-                continue
-            # Recovery must enforce the same structural/row-count thresholds as
-            # the primary download path; otherwise very short stale frames can
-            # sneak in and poison downstream signals.
-            if not _is_valid_dataframe(fallback_df, ticker=ticker, cfg=cfg):
-                continue
+            fallback_df = _load_cached_frame(parquet_path, ticker=ticker, cfg=cfg)
             market_data[ticker] = fallback_df
             recovered += 1
             recovered_symbols.append(ticker)
@@ -1611,9 +1629,9 @@ def _recover_from_stale_cache(
             # retry_after acts as a cooldown: we do not attempt a re-download
             # until at least the next business day.  last_date is preserved
             # accurately so callers know the true data freshness.
-            _tomorrow = (pd.Timestamp.now(tz=_IST_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+            _tomorrow = (pd.Timestamp.now(tz=TIMEZONE_IST) + timedelta(days=1)).strftime("%Y-%m-%d")
             entries[ticker] = {
-                "fetched_at":   existing.get("fetched_at", pd.Timestamp.now(tz=_IST_TZ).isoformat()),
+                "fetched_at":   existing.get("fetched_at", pd.Timestamp.now(tz=TIMEZONE_IST).isoformat()),
                 "rows":         len(fallback_df),
                 "last_date":    fallback_df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":    existing.get("suspended", False),

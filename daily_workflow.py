@@ -116,12 +116,23 @@ from data_cache import load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 from log_config import ScanContext, DeadLetterTracker
+from shared_constants import (
+    COLUMN_STOCK_SPLITS,
+    TIMEZONE_IST,
+    MARKET_INDEX_NSEI,
+    MARKET_INDEX_CRSLDX,
+    LABEL_CUSTOM_SCREENER,
+    LABEL_NSE_TOTAL,
+    LABEL_NIFTY_500,
+)
 
 __version__ = "11.48"
 
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
 DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
+
+
 
 # PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
 # empty universe (provider outage / all symbols filtered).  Reset to zero on
@@ -644,8 +655,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             # yfinance data) to detect split events and adjust shares/entry
             # accordingly.  Guard against double-application via the
             # dividend_ledger marker keyed by date:ratio.
-            if "Stock Splits" in row.columns:
-                split_series = row["Stock Splits"].fillna(0.0)
+            if COLUMN_STOCK_SPLITS in row.columns:
+                split_series = row[COLUMN_STOCK_SPLITS].fillna(0.0)
                 positive_splits = split_series[split_series > 0]
                 if not positive_splits.empty and sym in state.shares:
                     # Determine which splits are new (not yet applied)
@@ -682,8 +693,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             continue
 
         split_ratio = 0.0
-        if "Stock Splits" in row.columns and not row["Stock Splits"].empty:
-            split_series = row["Stock Splits"].fillna(0.0)
+        if COLUMN_STOCK_SPLITS in row.columns and not row[COLUMN_STOCK_SPLITS].empty:
+            split_series = row[COLUMN_STOCK_SPLITS].fillna(0.0)
             split_start_date = None
             if state.last_rebalance_date:
                 try:
@@ -1029,7 +1040,7 @@ def _run_scan(
             state.max_absent_periods = cfg.MAX_ABSENT_PERIODS
 
         # Derive session_date from market timezone to avoid date flip mid-session
-        session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+        session_date = pd.Timestamp.now(tz=TIMEZONE_IST).normalize().tz_localize(None)
         today = session_date  # Keep today for backward compatibility with other uses
         next_due = _next_rebalance_due(state.last_rebalance_date, cfg.REBALANCE_FREQ)
         rebalance_allowed = next_due is None or today >= next_due
@@ -1045,7 +1056,7 @@ def _run_scan(
         start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
 
         held_syms  = {to_ns(s) for s in state.shares.keys()}
-        all_syms   = list({to_ns(t) for t in universe} | held_syms | {"^NSEI", "^CRSLDX"})
+        all_syms   = list({to_ns(t) for t in universe} | held_syms | {MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX})
         _print_stage_status(
             "Download",
             0.35,
@@ -1055,9 +1066,9 @@ def _run_scan(
         _print_stage_status("Download", 1.0, f"Data ready. Starting iteration and signal analysis for {label}.")
         _print_stage_status("Analysis", 0.10, "Normalizing market snapshots and benchmark regime inputs...")
 
-        idx_df = market_data.get("^CRSLDX")
+        idx_df = market_data.get(MARKET_INDEX_CRSLDX)
         if idx_df is None or idx_df.empty:
-            idx_df = market_data.get("^NSEI")
+            idx_df = market_data.get(MARKET_INDEX_NSEI)
 
         idx_slice    = idx_df.iloc[:-1] if idx_df is not None and not idx_df.empty else None
 
@@ -1338,7 +1349,7 @@ def _run_scan(
         _rebalance_stale_held: list = []
         if rebalance_allowed and (optimization_succeeded or apply_decay) and not _force_full_cash:
             valid_days = None
-            expected_session_date = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+            expected_session_date = pd.Timestamp.now(tz=TIMEZONE_IST).normalize()
             calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).tz_localize(None)
             try:
                 import pandas_market_calendars as mcal
@@ -1349,7 +1360,7 @@ def _run_scan(
                     end_date=expected_session_date,
                 )
                 if len(valid_days) > 0:
-                    expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert("Asia/Kolkata").tz_localize(None).normalize()
+                    expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert(TIMEZONE_IST).tz_localize(None).normalize()
                 else:
                     expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
             except Exception:
@@ -1359,7 +1370,7 @@ def _run_scan(
             if valid_days is not None and len(valid_days) > 0:
                 trusted_close_index = pd.DatetimeIndex(valid_days)
                 if trusted_close_index.tz is not None:
-                    trusted_close_index = trusted_close_index.tz_convert("Asia/Kolkata").tz_localize(None)
+                    trusted_close_index = trusted_close_index.tz_convert(TIMEZONE_IST).tz_localize(None)
                 trusted_close_index = trusted_close_index.normalize()
                 trusted_close_index = trusted_close_index[trusted_close_index <= expected_session_date]
 
@@ -1731,7 +1742,7 @@ def main_menu() -> None:
             continue
 
         if c == "1":
-            _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
+            _check_and_prompt_initial_capital(states["nse_total"], LABEL_NSE_TOTAL, "nse_total")
             cfg = load_optimized_config()
             _universe: list[str] | None
             try:
@@ -1741,9 +1752,11 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg, name="nse_total")
+            preview, mkt = _run_scan(
+                _universe, preview, f"{LABEL_NSE_TOTAL} SCAN", cfg, name="nse_total"
+            )
             mkt_cache["nse_total"] = mkt
-            _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
+            _print_status(preview, f"PREVIEW — {LABEL_NSE_TOTAL}", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nse_total"] = preview
                 save_portfolio_state(preview, "nse_total")
@@ -1757,7 +1770,7 @@ def main_menu() -> None:
                 print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "2":
-            _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
+            _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
             cfg = load_optimized_config()
             try:
                 _universe = get_nifty500()
@@ -1766,9 +1779,11 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nifty"])
-            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg, name="nifty")
+            preview, mkt = _run_scan(
+                _universe, preview, f"{LABEL_NIFTY_500} SCAN", cfg, name="nifty"
+            )
             mkt_cache["nifty"] = mkt
-            _print_status(preview, "PREVIEW — NIFTY 500", mkt, cfg=cfg)
+            _print_status(preview, f"PREVIEW — {LABEL_NIFTY_500}", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nifty"] = preview
                 save_portfolio_state(preview, "nifty")
@@ -1786,16 +1801,16 @@ def main_menu() -> None:
                 continue
 
             logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
-            _check_and_prompt_initial_capital(states["custom"], "CUSTOM SCREENER", "custom")
+            _check_and_prompt_initial_capital(states["custom"], LABEL_CUSTOM_SCREENER, "custom")
 
             custom_cfg = load_optimized_config()
             if len(universe) < 100:
                 custom_cfg.MAX_POSITIONS = 8
 
             preview      = copy.deepcopy(states["custom"])
-            preview, mkt = _run_scan(universe, preview, "CUSTOM SCREENER", custom_cfg, name="custom")
+            preview, mkt = _run_scan(universe, preview, f"{LABEL_CUSTOM_SCREENER} SCAN", custom_cfg, name="custom")
             mkt_cache["custom"] = mkt
-            _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt, cfg=custom_cfg)
+            _print_status(preview, f"PREVIEW — {LABEL_CUSTOM_SCREENER}", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["custom"] = preview
                 save_portfolio_state(preview, "custom")
@@ -1848,7 +1863,7 @@ def main_menu() -> None:
                     continue
 
                 historical_union = set(custom_syms)
-                data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
+                data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
 
                 try:
                     print_backtest_results(
@@ -1873,7 +1888,7 @@ def main_menu() -> None:
                     print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
                     continue
 
-                data = load_or_fetch(list(historical_union) + ["^NSEI", "^CRSLDX"], start, end, cfg=bt_cfg)
+                data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
 
                 try:
                     print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
@@ -1887,7 +1902,11 @@ def main_menu() -> None:
 
         elif c == "5":
             status_cfg = load_optimized_config()
-            for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", "CUSTOM SCREENER")]:
+            for name, label in [
+                ("nse_total", LABEL_NSE_TOTAL),
+                ("nifty", LABEL_NIFTY_500),
+                ("custom", LABEL_CUSTOM_SCREENER),
+            ]:
                 has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
                 if has_activity:
                     mkt = mkt_cache.get(name) or {}

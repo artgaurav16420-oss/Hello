@@ -71,10 +71,20 @@ from signals import (
     SignalGenerationError,
 )
 from universe_manager import get_historical_universe
+from shared_constants import (
+    COLUMN_OPEN,
+    COLUMN_HIGH,
+    COLUMN_LOW,
+    COLUMN_CLOSE,
+    COLUMN_ADJ_CLOSE,
+    COLUMN_VOLUME,
+    COLUMN_STOCK_SPLITS,
+)
 
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
 _SUSPENSION_GAP_DAYS = 30
+
 
 # ─── Results container ────────────────────────────────────────────────────────
 
@@ -810,11 +820,11 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         walk_returns = np.cumprod(1.0 + noise_rets)
 
         synth = pd.DataFrame(index=synth_idx)
-        close_anchor = float(df.loc[gap_start, "Close"])
-        synth["Close"] = close_anchor * walk_returns
+        close_anchor = float(df.loc[gap_start, COLUMN_CLOSE])
+        synth[COLUMN_CLOSE] = close_anchor * walk_returns
 
-        if "Adj Close" in df.columns:
-            adj_anchor = df.loc[gap_start, "Adj Close"]
+        if COLUMN_ADJ_CLOSE in df.columns:
+            adj_anchor = df.loc[gap_start, COLUMN_ADJ_CLOSE]
             if pd.isna(adj_anchor):
                 adj_anchor = close_anchor
             # FIX-NEW-BE-03: preserve the pre-gap Adj Close / Close ratio.
@@ -823,10 +833,10 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             # is violated, this synthetic fill is still acceptable because such
             # in-gap events are rare and the simulation is a robustness fallback.
             adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
-            synth["Adj Close"] = synth["Close"] * adj_close_ratio
+            synth[COLUMN_ADJ_CLOSE] = synth["Close"] * adj_close_ratio
 
-        if "Volume" in df.columns:
-            synth["Volume"] = 0.0
+        if COLUMN_VOLUME in df.columns:
+            synth[COLUMN_VOLUME] = 0.0
 
         synth_frames.append(synth)
 
@@ -882,9 +892,9 @@ def build_precomputed_matrices(
         # When AUTO_ADJUST_PRICES=True this is Adj Close (same as before).
         # When AUTO_ADJUST_PRICES=False this is raw Close — previously returns
         # was always computed from Adj Close regardless, creating a mismatch.
-        valuation_series = row.get("Adj Close", row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        valuation_series = row.get(COLUMN_ADJ_CLOSE, row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
         close_d[sym] = valuation_series.ffill(limit=max_absent_periods)
-        close_adj_d[sym] = row.get("Adj Close", row["Close"]).ffill(limit=max_absent_periods)
+        close_adj_d[sym] = row.get(COLUMN_ADJ_CLOSE, row["Close"]).ffill(limit=max_absent_periods)
         open_d[sym] = row.get("Open", row["Close"]).ffill(limit=max_absent_periods)
         high_d[sym] = row.get("High", row["Close"]).ffill(limit=max_absent_periods)
         low_d[sym] = row.get("Low", row["Close"]).ffill(limit=max_absent_periods)

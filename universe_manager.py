@@ -55,6 +55,18 @@ _ADV_MAX_WORKERS     = 1  # Reserved for future parallel ADV fetching. Currently
 # Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.
 _DEFAULT_SECTOR_FETCH_TIMEOUT = 8.0
 
+SECTOR_FINANCIAL_SERVICES = "Financial Services"
+SECTOR_AUTOMOBILE_AUTO_COMPONENTS = "Automobile and Auto Components"
+SECTOR_INFORMATION_TECHNOLOGY = "Information Technology"
+SECTOR_METALS_MINING = "Metals & Mining"
+
+SECTOR_ENERGY = "Energy"
+SECTOR_FMCG = "FMCG"
+SECTOR_HEALTHCARE = "Healthcare"
+SECTOR_POWER = "Power"
+SECTOR_CONSUMER_DURABLES = "Consumer Durables"
+SECTOR_CONSTRUCTION_MATERIALS = "Construction Materials"
+
 class UniverseFetchError(RuntimeError):
     """Raised when primary and secondary universe data sources fail."""
     def __init__(self, message: str):
@@ -73,54 +85,54 @@ _HARD_FLOOR_UNIVERSE = [
 ]
 
 STATIC_NSE_SECTORS: Dict[str, str] = {
-    "RELIANCE": "Energy",
-    "TCS": "Information Technology",
-    "HDFCBANK": "Financial Services",
-    "ICICIBANK": "Financial Services",
-    "INFY": "Information Technology",
+    "RELIANCE": SECTOR_ENERGY,
+    "TCS": SECTOR_INFORMATION_TECHNOLOGY,
+    "HDFCBANK": SECTOR_FINANCIAL_SERVICES,
+    "ICICIBANK": SECTOR_FINANCIAL_SERVICES,
+    "INFY": SECTOR_INFORMATION_TECHNOLOGY,
     "BHARTIARTL": "Telecommunications",
-    "HINDUNILVR": "FMCG",
-    "ITC": "FMCG",
-    "SBIN": "Financial Services",
-    "LTIM": "Information Technology",
-    "BAJFINANCE": "Financial Services",
-    "HCLTECH": "Information Technology",
-    "MARUTI": "Automobile and Auto Components",
-    "SUNPHARMA": "Healthcare",
+    "HINDUNILVR": SECTOR_FMCG,
+    "ITC": SECTOR_FMCG,
+    "SBIN": SECTOR_FINANCIAL_SERVICES,
+    "LTIM": SECTOR_INFORMATION_TECHNOLOGY,
+    "BAJFINANCE": SECTOR_FINANCIAL_SERVICES,
+    "HCLTECH": SECTOR_INFORMATION_TECHNOLOGY,
+    "MARUTI": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "SUNPHARMA": SECTOR_HEALTHCARE,
     "ADANIENT": "Industrials",
-    "KOTAKBANK": "Financial Services",
-    "TITAN": "Consumer Durables",
-    "ONGC": "Energy",
-    "TATAMOTORS": "Automobile and Auto Components",
-    "NTPC": "Power",
-    "AXISBANK": "Financial Services",
+    "KOTAKBANK": SECTOR_FINANCIAL_SERVICES,
+    "TITAN": SECTOR_CONSUMER_DURABLES,
+    "ONGC": SECTOR_ENERGY,
+    "TATAMOTORS": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "NTPC": SECTOR_POWER,
+    "AXISBANK": SECTOR_FINANCIAL_SERVICES,
     "ADANIPORTS": "Services",
-    "ASIANPAINT": "Consumer Durables",
-    "COALINDIA": "Energy",
-    "BAJAJFINSV": "Financial Services",
-    "JSWSTEEL": "Metals & Mining",
-    "M&M": "Automobile and Auto Components",
-    "POWERGRID": "Power",
-    "TATASTEEL": "Metals & Mining",
-    "ULTRACEMCO": "Construction Materials",
-    "GRASIM": "Construction Materials",
-    "HINDALCO": "Metals & Mining",
-    "NESTLEIND": "FMCG",
-    "INDUSINDBK": "Financial Services",
-    "TECHM": "Information Technology",
-    "WIPRO": "Information Technology",
-    "CIPLA": "Healthcare",
-    "HDFCLIFE": "Financial Services",
-    "SBILIFE": "Financial Services",
-    "DRREDDY": "Healthcare",
-    "HEROMOTOCO": "Automobile and Auto Components",
-    "EICHERMOT": "Automobile and Auto Components",
-    "BPCL": "Energy",
-    "BAJAJ-AUTO": "Automobile and Auto Components",
-    "BRITANNIA": "FMCG",
-    "APOLLOHOSP": "Healthcare",
-    "DIVISLAB": "Healthcare",
-    "TATACONSUM": "FMCG",
+    "ASIANPAINT": SECTOR_CONSUMER_DURABLES,
+    "COALINDIA": SECTOR_ENERGY,
+    "BAJAJFINSV": SECTOR_FINANCIAL_SERVICES,
+    "JSWSTEEL": SECTOR_METALS_MINING,
+    "M&M": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "POWERGRID": SECTOR_POWER,
+    "TATASTEEL": SECTOR_METALS_MINING,
+    "ULTRACEMCO": SECTOR_CONSTRUCTION_MATERIALS,
+    "GRASIM": SECTOR_CONSTRUCTION_MATERIALS,
+    "HINDALCO": SECTOR_METALS_MINING,
+    "NESTLEIND": SECTOR_FMCG,
+    "INDUSINDBK": SECTOR_FINANCIAL_SERVICES,
+    "TECHM": SECTOR_INFORMATION_TECHNOLOGY,
+    "WIPRO": SECTOR_INFORMATION_TECHNOLOGY,
+    "CIPLA": SECTOR_HEALTHCARE,
+    "HDFCLIFE": SECTOR_FINANCIAL_SERVICES,
+    "SBILIFE": SECTOR_FINANCIAL_SERVICES,
+    "DRREDDY": SECTOR_HEALTHCARE,
+    "HEROMOTOCO": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "EICHERMOT": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "BPCL": SECTOR_ENERGY,
+    "BAJAJ-AUTO": SECTOR_AUTOMOBILE_AUTO_COMPONENTS,
+    "BRITANNIA": SECTOR_FMCG,
+    "APOLLOHOSP": SECTOR_HEALTHCARE,
+    "DIVISLAB": SECTOR_HEALTHCARE,
+    "TATACONSUM": SECTOR_FMCG,
 }
 
 # ─── Historical Universe Logic ────────────────────────────────────────────────
