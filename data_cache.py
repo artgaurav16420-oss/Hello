@@ -73,6 +73,7 @@ _DEFAULT_CACHE_DIR = Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
 CACHE_DIR: Path | None = _DEFAULT_CACHE_DIR
 MANIFEST_FILE: Path | None = _DEFAULT_CACHE_DIR / "_manifest.json"
 _MANIFEST_LOCK_DIR: Path | None = _DEFAULT_CACHE_DIR / "_manifest.lock"
+_CACHE_CONFIGURED = False
 
 
 def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -149,7 +150,7 @@ def configure_data_cache(
     Callers must invoke configure_data_cache() once before using module
     functions so cache paths and optional local env vars are initialized.
     """
-    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR
+    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR, _CACHE_CONFIGURED
     if dotenv_path is None and cache_dir is not None:
         candidate = Path(cache_dir)
         if candidate.name == ".env" or (candidate.exists() and candidate.is_file()):
@@ -162,6 +163,7 @@ def configure_data_cache(
     MANIFEST_FILE = CACHE_DIR / "_manifest.json"
     _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _CACHE_CONFIGURED = True
 
 
 _GROWW_BASE_URL           = "https://api.groww.in/v1"
@@ -172,8 +174,8 @@ _GROWW_INDEX_PREFIXES     = ("^",)
 
 
 def _ensure_cache_paths_configured() -> None:
-    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR
-    if CACHE_DIR is None or MANIFEST_FILE is None or _MANIFEST_LOCK_DIR is None:
+    global _CACHE_CONFIGURED
+    if not _CACHE_CONFIGURED:
         configure_data_cache()
 
 
@@ -324,12 +326,27 @@ class _ManifestProcessFileLock:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
-            if self._owner_file.exists():
-                self._owner_file.unlink()
-            self._lock_dir.rmdir()
-        except FileNotFoundError:
-            # Lock already removed - tolerate missing files
-            pass
+            # Atomically rename the lock directory to prevent race conditions
+            # where waiters see a missing owner file before the directory is removed
+            released_dir = self._lock_dir.parent / f"{self._lock_dir.name}_released"
+            try:
+                self._lock_dir.rename(released_dir)
+            except FileNotFoundError:
+                # Lock already removed by another process
+                return
+
+            # Now clean up the renamed directory and owner file
+            renamed_owner_file = released_dir / "owner"
+            try:
+                if renamed_owner_file.exists():
+                    renamed_owner_file.unlink()
+            except FileNotFoundError:
+                pass
+
+            try:
+                released_dir.rmdir()
+            except FileNotFoundError:
+                pass
         except OSError as os_exc:
             # Tolerate benign OS errors (directory not empty, permission issues)
             logger.debug(
