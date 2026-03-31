@@ -6,7 +6,7 @@ osqp==0.6.7.post3
 optuna==4.1.0
 yfinance==0.2.50
 pyarrow==18.1.0
-requests==2.32.3
+requests==2.33.0
 python-dotenv==1.0.1
 beautifulsoup4==4.12.3
 pandas_market_calendars==4.4.1
