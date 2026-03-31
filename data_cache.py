@@ -1603,8 +1603,6 @@ def _recover_from_stale_cache(
             continue
         try:
             fallback_df = _load_cached_frame(parquet_path, ticker=ticker, cfg=cfg)
-            if fallback_df is None or fallback_df.empty:
-                continue
             market_data[ticker] = fallback_df
             recovered += 1
             recovered_symbols.append(ticker)
