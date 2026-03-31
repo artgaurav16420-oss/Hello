@@ -729,7 +729,7 @@ class GrowwProvider(DataProvider):
         ns_ticker: str,
         yf_raw: pd.DataFrame,
     ) -> tuple[pd.Series, pd.Series]:
-        dividends = self._extract_batch_series(yf_raw, "Dividends", ns_ticker)
+        dividends = self._extract_batch_series(yf_raw, COLUMN_DIVIDENDS, ns_ticker)
         splits = self._extract_batch_series(yf_raw, COLUMN_STOCK_SPLITS, ns_ticker)
 
         div_series = pd.Series(0.0, index=index, dtype=float)
