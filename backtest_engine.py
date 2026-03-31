@@ -836,7 +836,7 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             synth[COLUMN_ADJ_CLOSE] = synth["Close"] * adj_close_ratio
 
         if "Volume" in df.columns:
-            synth["Volume"] = 0.0
+            synth[COLUMN_VOLUME] = 0.0
 
         synth_frames.append(synth)
 
