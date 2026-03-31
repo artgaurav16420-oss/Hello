@@ -1157,8 +1157,8 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.loc[:, out.columns.notna()]
 
     numeric_cols = [
-        "Open", "High", "Low", "Close", COLUMN_ADJ_CLOSE,
-        "Volume", "Dividends", COLUMN_STOCK_SPLITS,
+        COLUMN_OPEN, COLUMN_HIGH, COLUMN_LOW, COLUMN_CLOSE, COLUMN_ADJ_CLOSE,
+        COLUMN_VOLUME, COLUMN_DIVIDENDS, COLUMN_STOCK_SPLITS,
     ]
 
     def _coerce_numeric_series(series: pd.Series) -> pd.Series:
