@@ -14,22 +14,24 @@ from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 
 class _StaticResult:
-    metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
-    rebal_log = None
+    def __init__(self):
+        self.metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
+        self.rebal_log = None
 
 
 class _TrackingTrial:
-    params = {}
-
     def __init__(self):
+        self.params = {}
         self.suggested = []
 
     def suggest_int(self, name, low, high, step=1):
         self.suggested.append(name)
+        self.params[name] = low
         return low
 
     def suggest_float(self, name, low, high, step=None):
         self.suggested.append(name)
+        self.params[name] = low
         return low
 
 

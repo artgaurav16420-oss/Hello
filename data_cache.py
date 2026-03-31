@@ -48,6 +48,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from log_config import load_dotenv_safe
+from shared_constants import COLUMN_ADJ_CLOSE, COLUMN_STOCK_SPLITS, TIMEZONE_IST
 
 import requests
 from datetime import datetime, timedelta
@@ -58,9 +59,7 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
-_IST_TZ = "Asia/Kolkata"
-COLUMN_ADJ_CLOSE = "Adj Close"
-COLUMN_STOCK_SPLITS = "Stock Splits"
+_IST_TZ = TIMEZONE_IST
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()

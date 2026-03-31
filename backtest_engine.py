@@ -71,11 +71,11 @@ from signals import (
     SignalGenerationError,
 )
 from universe_manager import get_historical_universe
+from shared_constants import COLUMN_ADJ_CLOSE
 
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
 _SUSPENSION_GAP_DAYS = 30
-COLUMN_ADJ_CLOSE = "Adj Close"
 
 
 # ─── Results container ────────────────────────────────────────────────────────

@@ -1,0 +1,12 @@
+"""Shared string constants used across engines and workflows."""
+
+COLUMN_ADJ_CLOSE = "Adj Close"
+COLUMN_STOCK_SPLITS = "Stock Splits"
+TIMEZONE_IST = "Asia/Kolkata"
+
+MARKET_INDEX_ANSEI = "^NSEI"
+MARKET_INDEX_ACRSLDX = "^CRSLDX"
+
+LABEL_NSE_TOTAL = "NSE TOTAL"
+LABEL_NIFTY_500 = "NIFTY 500"
+LABEL_CUSTOM_SCREENER = "CUSTOM SCREENER"

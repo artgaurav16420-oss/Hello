@@ -116,6 +116,15 @@ from data_cache import load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 from log_config import ScanContext, DeadLetterTracker
+from shared_constants import (
+    COLUMN_STOCK_SPLITS,
+    TIMEZONE_IST,
+    MARKET_INDEX_ANSEI,
+    MARKET_INDEX_ACRSLDX,
+    LABEL_CUSTOM_SCREENER,
+    LABEL_NSE_TOTAL,
+    LABEL_NIFTY_500,
+)
 
 __version__ = "11.48"
 
@@ -123,11 +132,9 @@ BACKUP_GENERATIONS = 3
 PAPER_MODE = False
 DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
 
-COLUMN_STOCK_SPLITS = "Stock Splits"
-TIMEZONE_IST = "Asia/Kolkata"
-MARKET_INDEX_ANSEI = "^NSEI"
-MARKET_INDEX_ACRSLDX = "^CRSLDX"
-CUSTOM_SCREENER_LABEL = "CUSTOM SCREENER"
+CUSTOM_SCREENER_LABEL = LABEL_CUSTOM_SCREENER
+NSE_TOTAL_LABEL = LABEL_NSE_TOTAL
+NIFTY_500_LABEL = LABEL_NIFTY_500
 
 
 # PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
@@ -1738,7 +1745,7 @@ def main_menu() -> None:
             continue
 
         if c == "1":
-            _check_and_prompt_initial_capital(states["nse_total"], "NSE TOTAL", "nse_total")
+            _check_and_prompt_initial_capital(states["nse_total"], NSE_TOTAL_LABEL, "nse_total")
             cfg = load_optimized_config()
             _universe: list[str] | None
             try:
@@ -1748,9 +1755,11 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nse_total"])
-            preview, mkt = _run_scan(_universe, preview, "NSE TOTAL SCAN", cfg, name="nse_total")
+            preview, mkt = _run_scan(
+                _universe, preview, f"{NSE_TOTAL_LABEL} SCAN", cfg, name="nse_total"
+            )
             mkt_cache["nse_total"] = mkt
-            _print_status(preview, "PREVIEW — NSE TOTAL", mkt, cfg=cfg)
+            _print_status(preview, f"PREVIEW — {NSE_TOTAL_LABEL}", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nse_total"] = preview
                 save_portfolio_state(preview, "nse_total")
@@ -1764,7 +1773,7 @@ def main_menu() -> None:
                 print(f"  {C.GRY}[-] Trade changes discarded; risk metadata saved.{C.RST}")
 
         elif c == "2":
-            _check_and_prompt_initial_capital(states["nifty"], "NIFTY 500", "nifty")
+            _check_and_prompt_initial_capital(states["nifty"], NIFTY_500_LABEL, "nifty")
             cfg = load_optimized_config()
             try:
                 _universe = get_nifty500()
@@ -1773,9 +1782,11 @@ def main_menu() -> None:
                 if _universe is None:
                     continue
             preview      = copy.deepcopy(states["nifty"])
-            preview, mkt = _run_scan(_universe, preview, "NIFTY 500 SCAN", cfg, name="nifty")
+            preview, mkt = _run_scan(
+                _universe, preview, f"{NIFTY_500_LABEL} SCAN", cfg, name="nifty"
+            )
             mkt_cache["nifty"] = mkt
-            _print_status(preview, "PREVIEW — NIFTY 500", mkt, cfg=cfg)
+            _print_status(preview, f"PREVIEW — {NIFTY_500_LABEL}", mkt, cfg=cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["nifty"] = preview
                 save_portfolio_state(preview, "nifty")
@@ -1802,7 +1813,7 @@ def main_menu() -> None:
             preview      = copy.deepcopy(states["custom"])
             preview, mkt = _run_scan(universe, preview, CUSTOM_SCREENER_LABEL, custom_cfg, name="custom")
             mkt_cache["custom"] = mkt
-            _print_status(preview, "PREVIEW — CUSTOM SCREENER", mkt, cfg=custom_cfg)
+            _print_status(preview, f"PREVIEW — {CUSTOM_SCREENER_LABEL}", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
                 states["custom"] = preview
                 save_portfolio_state(preview, "custom")
@@ -1894,7 +1905,11 @@ def main_menu() -> None:
 
         elif c == "5":
             status_cfg = load_optimized_config()
-            for name, label in [("nse_total", "NSE TOTAL"), ("nifty", "NIFTY 500"), ("custom", CUSTOM_SCREENER_LABEL)]:
+            for name, label in [
+                ("nse_total", NSE_TOTAL_LABEL),
+                ("nifty", NIFTY_500_LABEL),
+                ("custom", CUSTOM_SCREENER_LABEL),
+            ]:
                 has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
                 if has_activity:
                     mkt = mkt_cache.get(name) or {}
