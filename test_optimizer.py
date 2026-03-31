@@ -13,6 +13,71 @@ optimizer = pytest.importorskip("optimizer")
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 
+class _StaticResult:
+    metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
+    rebal_log = None
+
+
+class _TrackingTrial:
+    params = {}
+
+    def __init__(self):
+        self.suggested = []
+
+    def suggest_int(self, name, low, high, step=1):
+        self.suggested.append(name)
+        return low
+
+    def suggest_float(self, name, low, high, step=None):
+        self.suggested.append(name)
+        return low
+
+
+def _make_best_trial(step_overrides=None):
+    distributions = {
+        "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
+        "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
+        "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
+        "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
+        "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
+    }
+    if step_overrides:
+        distributions.update(step_overrides)
+    params = {
+        "HALFLIFE_FAST": 21,
+        "HALFLIFE_SLOW": 65,
+        "CONTINUITY_BONUS": 0.15,
+        "RISK_AVERSION": 12.0,
+        "CVAR_DAILY_LIMIT": 0.04,
+    }
+    return optuna.trial.create_trial(
+        params=params,
+        distributions=distributions,
+        values=[1.23, 0.5],
+        user_attrs={},
+    )
+
+
+def _make_study(captured=None, include_trials=False, trial=None):
+    best_trial = trial or _make_best_trial()
+
+    class _Study:
+        best_params = dict(best_trial.params)
+        best_trials = [best_trial]
+        directions = [
+            optuna.study.StudyDirection.MAXIMIZE,
+            optuna.study.StudyDirection.MAXIMIZE,
+        ]
+        if include_trials:
+            trials = [best_trial]
+
+        def optimize(self, objective, **kwargs):
+            if captured is not None:
+                captured.update(kwargs)
+
+    return _Study()
+
+
 def test_save_optimal_config_allows_plain_filename(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
 
@@ -501,28 +566,10 @@ def test_pre_load_data_uses_normalized_fallback_universe_for_history(monkeypatch
 
 
 def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
-    class _Result:
-        metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}
-        rebal_log = None
-
-    class _DummyTrial:
-        params = {}
-
-        def __init__(self):
-            self.suggested = []
-
-        def suggest_int(self, name, low, high, step=1):
-            self.suggested.append(name)
-            return low
-
-        def suggest_float(self, name, low, high, step=None):
-            self.suggested.append(name)
-            return low
-
-    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = _DummyTrial()
+    trial = _TrackingTrial()
 
     objective(trial)
 
@@ -532,28 +579,10 @@ def test_objective_suggests_cvar_lookback_for_non_fixed_trials(monkeypatch):
 
 
 def test_objective_suggests_min_exposure_floor_for_non_fixed_trials(monkeypatch):
-    class _Result:
-        metrics = {"cagr": 10.0, "max_dd": 10.0, "turnover": 0.0}
-        rebal_log = None
-
-    class _DummyTrial:
-        params = {}
-
-        def __init__(self):
-            self.suggested = []
-
-        def suggest_int(self, name, low, high, step=1):
-            self.suggested.append(name)
-            return low
-
-        def suggest_float(self, name, low, high, step=None):
-            self.suggested.append(name)
-            return low
-
-    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = _DummyTrial()
+    trial = _TrackingTrial()
 
     objective(trial)
 
@@ -632,39 +661,12 @@ def test_run_optimization_forces_single_job(monkeypatch):
     monkeypatch.setattr(optimizer, "pre_load_data", lambda universe_type: {})
     monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
 
-    class _Result:
-        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
-
-    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
 
     captured = {}
-
-    class _Study:
-        best_params = {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 65,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 12.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-        best_trial = optuna.trial.create_trial(
-            params=best_params,
-            distributions={
-                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
-                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
-                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
-                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
-                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
-            },
-            values=[1.23, 0.5],
-            user_attrs={},
-        )
-        best_trials = [best_trial]
-
-        def optimize(self, objective, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: _Study())
+    monkeypatch.setattr(
+        optimizer.optuna, "create_study", lambda **kwargs: _make_study(captured=captured)
+    )
 
     optimizer.run_optimization()
 
@@ -683,38 +685,10 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
 
     monkeypatch.setattr(optimizer, "pre_load_data", _fake_pre_load_data)
 
-    class _Result:
-        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
-
-    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
-
-    class _Study:
-        best_params = {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 65,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 12.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-        best_trial = optuna.trial.create_trial(
-            params=best_params,
-            distributions={
-                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
-                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
-                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
-                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
-                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
-            },
-            values=[1.23, 0.5],
-            user_attrs={},
-        )
-        best_trials = [best_trial]
-        trials = [best_trial]
-
-        def optimize(self, objective, **kwargs):
-            pass
-
-    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: _Study())
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
+    monkeypatch.setattr(
+        optimizer.optuna, "create_study", lambda **kwargs: _make_study(include_trials=True)
+    )
 
     optimizer.run_optimization(universe_type="nse_total")
 
@@ -742,33 +716,22 @@ def test_run_optimization_normalizes_unknown_universe(monkeypatch):
 
     monkeypatch.setattr(optimizer, "run_backtest", _fake_run_backtest)
 
-    class _Study:
-        best_params = {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 65,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 12.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-        best_trial = optuna.trial.create_trial(
-            params=best_params,
-            distributions={
-                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 29, step=2),
-                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=5),
-                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.18, step=0.03),
-                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0, step=0.5),
-                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06, step=0.005),
-            },
-            values=[1.23, 0.5],
-            user_attrs={},
-        )
-        best_trials = [best_trial]
-        trials = [best_trial]
-
-        def optimize(self, objective, **kwargs):
-            pass
-
-    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: _Study())
+    monkeypatch.setattr(
+        optimizer.optuna,
+        "create_study",
+        lambda **kwargs: _make_study(
+            include_trials=True,
+            trial=_make_best_trial(
+                {
+                    "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 29, step=2),
+                    "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=5),
+                    "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.18, step=0.03),
+                    "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0, step=0.5),
+                    "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06, step=0.005),
+                }
+            ),
+        ),
+    )
 
     optimizer.run_optimization(universe_type=" typo ")
 
@@ -801,41 +764,13 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
     monkeypatch.setattr(optimizer, "pre_load_data", lambda universe_type: {})
     monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
 
-    class _Result:
-        metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
-
-    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
+    monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
 
     captured = {}
 
-    class _Study:
-        best_params = {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 65,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 12.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-        best_trial = optuna.trial.create_trial(
-            params=best_params,
-            distributions={
-                "HALFLIFE_FAST": optuna.distributions.IntDistribution(15, 30, step=1),
-                "HALFLIFE_SLOW": optuna.distributions.IntDistribution(60, 100, step=1),
-                "CONTINUITY_BONUS": optuna.distributions.FloatDistribution(0.06, 0.20),
-                "RISK_AVERSION": optuna.distributions.FloatDistribution(12.0, 20.0),
-                "CVAR_DAILY_LIMIT": optuna.distributions.FloatDistribution(0.04, 0.06),
-            },
-            values=[1.23, 0.5],
-            user_attrs={},
-        )
-        best_trials = [best_trial]
-
-        def optimize(self, objective, **kwargs):
-            captured.update(kwargs)
-
     def _fake_create_study(**kwargs):
         captured["storage"] = kwargs.get("storage")
-        return _Study()
+        return _make_study(captured=captured)
 
     monkeypatch.setattr(optimizer.optuna, "create_study", _fake_create_study)
     # Ensure OPTUNA_N_JOBS is absent so the default -1 path is exercised

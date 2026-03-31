@@ -59,6 +59,8 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 _IST_TZ = "Asia/Kolkata"
+COLUMN_ADJ_CLOSE = "Adj Close"
+COLUMN_STOCK_SPLITS = "Stock Splits"
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()
@@ -644,7 +646,7 @@ class GrowwProvider(DataProvider):
             return None
 
         if hasattr(series.index, "tz") and series.index.tz is not None:
-            series.index = series.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            series.index = series.index.tz_convert(_IST_TZ).tz_localize(None)
         series.index = pd.DatetimeIndex(series.index).normalize()
         return pd.to_numeric(series, errors="coerce")
 
@@ -663,7 +665,7 @@ class GrowwProvider(DataProvider):
         backward across holiday gaps (look-ahead contamination).
         """
         try:
-            adj_yf     = self._extract_batch_series(yf_raw, "Adj Close", ns_ticker)
+            adj_yf     = self._extract_batch_series(yf_raw, COLUMN_ADJ_CLOSE, ns_ticker)
             raw_yf_cls = self._extract_batch_series(yf_raw, "Close",     ns_ticker)
 
             if adj_yf is None or raw_yf_cls is None:
@@ -730,7 +732,7 @@ class GrowwProvider(DataProvider):
         yf_raw: pd.DataFrame,
     ) -> tuple[pd.Series, pd.Series]:
         dividends = self._extract_batch_series(yf_raw, "Dividends", ns_ticker)
-        splits = self._extract_batch_series(yf_raw, "Stock Splits", ns_ticker)
+        splits = self._extract_batch_series(yf_raw, COLUMN_STOCK_SPLITS, ns_ticker)
 
         div_series = pd.Series(0.0, index=index, dtype=float)
         split_series = pd.Series(0.0, index=index, dtype=float)
@@ -787,11 +789,11 @@ class GrowwProvider(DataProvider):
                 continue
 
             adj_close = self._build_adj_close_from_batches(raw_df["Close"], ns_ticker, yf_raw)
-            raw_df["Adj Close"] = adj_close
+            raw_df[COLUMN_ADJ_CLOSE] = adj_close
 
             dividends, splits = self._extract_actions_from_batches(raw_df.index, ns_ticker, yf_raw)
             raw_df["Dividends"] = dividends
-            raw_df["Stock Splits"] = splits
+            raw_df[COLUMN_STOCK_SPLITS] = splits
 
             frames[ns_ticker] = raw_df
 
@@ -963,7 +965,7 @@ class SecondaryProvider(DataProvider):
                 "High":      float(item.get("2. high",             np.nan)),
                 "Low":       float(item.get("3. low",              np.nan)),
                 "Close":     float(item.get("4. close",            np.nan)),
-                "Adj Close": float(item.get("5. adjusted close",   np.nan)),
+                COLUMN_ADJ_CLOSE: float(item.get("5. adjusted close",   np.nan)),
                 "Volume":    float(item.get("6. volume",           np.nan)),
             })
 
@@ -996,7 +998,7 @@ def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
 
     if isinstance(out.index, pd.DatetimeIndex):
         if out.index.tz is not None:
-            out.index = out.index.tz_convert("Asia/Kolkata").tz_localize(None)
+            out.index = out.index.tz_convert(_IST_TZ).tz_localize(None)
         out.index = out.index.normalize()
 
         if out.index.duplicated().any():
@@ -1142,7 +1144,7 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
     if "Close" not in df.columns or df["Close"].isnull().all():
         return False
 
-    if "Adj Close" not in df.columns or df["Adj Close"].isnull().all():
+    if COLUMN_ADJ_CLOSE not in df.columns or df[COLUMN_ADJ_CLOSE].isnull().all():
         return False
 
     is_index_ticker = bool(ticker) and str(ticker).startswith("^")
@@ -1157,8 +1159,8 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.loc[:, out.columns.notna()]
 
     numeric_cols = [
-        "Open", "High", "Low", "Close", "Adj Close",
-        "Volume", "Dividends", "Stock Splits",
+        "Open", "High", "Low", "Close", COLUMN_ADJ_CLOSE,
+        "Volume", "Dividends", COLUMN_STOCK_SPLITS,
     ]
 
     def _coerce_numeric_series(series: pd.Series) -> pd.Series:
@@ -1177,14 +1179,14 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             out[col] = _coerce_numeric_series(out[col])
 
-    if "Adj Close" not in out.columns:
+    if COLUMN_ADJ_CLOSE not in out.columns:
         if "Close" in out.columns:
-            out["Adj Close"] = out["Close"]
+            out[COLUMN_ADJ_CLOSE] = out["Close"]
     else:
         if "Close" in out.columns:
-            out["Adj Close"] = out["Adj Close"].fillna(out["Close"])
+            out[COLUMN_ADJ_CLOSE] = out[COLUMN_ADJ_CLOSE].fillna(out["Close"])
 
-    for col in ["Dividends", "Stock Splits"]:
+    for col in ["Dividends", COLUMN_STOCK_SPLITS]:
         if col not in out.columns:
             out[col] = 0.0
         else:
