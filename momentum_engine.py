@@ -92,7 +92,7 @@ def _ghost_seed_for(sym: str) -> int:
 def to_ns(sym: str) -> str:
     if sym.startswith("^") or sym.endswith(".NS"):
         return sym
-    return sym + ".NS"
+    return f"{sym}.NS"
 
 
 def to_bare(sym: str) -> str:
@@ -549,6 +549,17 @@ class PortfolioState:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
         def _r(v):
+            """Recursively round float values for stable JSON serialization.
+
+            Args:
+                v: Arbitrary nested value from portfolio state.
+
+            Returns:
+                Any: Value with floats rounded and mappings/lists normalized.
+
+            Raises:
+                Exception: Propagates unexpected recursion/type errors.
+            """
             if isinstance(v, float):
                 return round(v, 10)
             if isinstance(v, dict):
@@ -1029,6 +1040,17 @@ def execute_rebalance(
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
 
     def _refresh_prices_and_absence_marks() -> np.ndarray:
+        """Refresh local prices and clear absence counters for active symbols.
+
+        Args:
+            None.
+
+        Returns:
+            np.ndarray: Active-symbol prices with finite fallbacks applied.
+
+        Raises:
+            Exception: Propagates unexpected runtime or numeric conversion errors.
+        """
         local_prices_out = np.array(prices, dtype=float, copy=True)
         for sym, i in active_idx.items():
             px = float(local_prices_out[i])
@@ -1041,6 +1063,17 @@ def execute_rebalance(
         return local_prices_out
 
     def _collect_force_close_symbols() -> List[str]:
+        """Collect symbols to force-close after prolonged universe absence.
+
+        Args:
+            None.
+
+        Returns:
+            List[str]: Symbols whose absence count reached the configured limit.
+
+        Raises:
+            Exception: Propagates unexpected state access errors.
+        """
         to_close: List[str] = []
         for sym in list(state.shares.keys()):
             if sym in active_idx:

@@ -26,7 +26,6 @@ from momentum_engine import (
     compute_book_cvar,
     compute_decay_targets,
     absent_symbol_effective_price,
-    _ConstraintBuilder,
     _compute_pv_exec,
     _compute_desired_shares,
     _apply_drift_gate,
@@ -1076,7 +1075,6 @@ class TestCVaR:
         close.iloc[100:120] = close.iloc[100:120] * 0.5
         volume  = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
         returns = close.pct_change(fill_method=None).clip(lower=-0.99)
-        symbols = list(close.columns)
     
         cfg        = UltimateConfig(HISTORY_GATE=20, INITIAL_CAPITAL=1_000_000)
         bt_engine  = InstitutionalRiskEngine(cfg)
@@ -1096,7 +1094,7 @@ class TestCVaR:
             INITIAL_CAPITAL=1_000_000,
             MAX_DECAY_ROUNDS=3,
         )
-        n_days, n_syms = 80, 2
+        n_days = 80
         rng   = np.random.default_rng(0)
         rets_a = rng.normal(0.0005, 0.005,  (n_days, 1))
         rets_b = rng.normal(-0.03,  0.04,   (n_days, 1))
@@ -1510,7 +1508,6 @@ class TestWorkflowAndUtilities:
         at the middle of the history array triggers this. Passing execution_date
         at or after the last bar does NOT trigger it (FIX-NEW-ME-04).
         """
-        import pandas as pd
         log_rets = _make_log_rets(120, 4)
         engine   = _make_engine()
     

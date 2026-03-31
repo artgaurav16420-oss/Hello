@@ -1,7 +1,6 @@
 import importlib
 import json
 import logging
-import numbers
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +10,18 @@ import pytest
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
+
+
+def _fixed_trial_params(**overrides):
+    params = {
+        "HALFLIFE_FAST": 21,
+        "HALFLIFE_SLOW": 63,
+        "CONTINUITY_BONUS": 0.15,
+        "RISK_AVERSION": 5.0,
+        "CVAR_DAILY_LIMIT": 0.04,
+    }
+    params.update(overrides)
+    return optuna.trial.FixedTrial(params)
 
 
 class _StaticResult:
@@ -158,15 +169,7 @@ def test_objective_returns_zero_when_max_drawdown_is_zero(monkeypatch):
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = optuna.trial.FixedTrial(
-        {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-    )
+    trial = _fixed_trial_params()
 
     score, calmar = objective(trial)
     assert score == 0.0
@@ -183,15 +186,7 @@ def test_objective_propagates_optimization_error(monkeypatch):
     )
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = optuna.trial.FixedTrial(
-        {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 63,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-    )
+    trial = _fixed_trial_params()
 
     with pytest.raises(optimizer.OptimizationError, match="Solver failed"):
         objective(trial)
@@ -234,15 +229,7 @@ def test_objective_returns_numeric_score_without_hard_drawdown_prune(monkeypatch
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = optuna.trial.FixedTrial(
-        {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 65,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 12.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-    )
+    trial = _fixed_trial_params(HALFLIFE_SLOW=65, RISK_AVERSION=12.0)
 
     out = objective(trial)
     assert isinstance(out, tuple)
@@ -792,15 +779,7 @@ def test_objective_allows_equal_halflife_values(monkeypatch):
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _Result())
 
     objective = optimizer.MomentumObjective(market_data={}, universe_type="nifty500")
-    trial = optuna.trial.FixedTrial(
-        {
-            "HALFLIFE_FAST": 21,
-            "HALFLIFE_SLOW": 21,
-            "CONTINUITY_BONUS": 0.15,
-            "RISK_AVERSION": 5.0,
-            "CVAR_DAILY_LIMIT": 0.04,
-        }
-    )
+    trial = _fixed_trial_params(HALFLIFE_SLOW=21)
 
     score, _ = objective(trial)
     assert score != 0.0
@@ -917,7 +896,7 @@ def test_optimizer_uses_higher_turnover_penalty_for_illiquid_name(monkeypatch):
             self.x = np.zeros(n_vars, dtype=float)
 
     class _FakeOSQP:
-        def setup(self, P, q, A, l, u, **kwargs):
+        def setup(self, P, q, A, lower_bounds, upper_bounds, **kwargs):
             captured["q"] = np.array(q, dtype=float)
             captured["n_vars"] = len(q)
 
@@ -973,7 +952,7 @@ def test_optimizer_turnover_penalty_respects_execution_floor_and_cap(monkeypatch
             self.x = np.zeros(n_vars, dtype=float)
 
     class _FakeOSQP:
-        def setup(self, P, q, A, l, u, **kwargs):
+        def setup(self, P, q, A, lower_bounds, upper_bounds, **kwargs):
             captured["q"] = np.array(q, dtype=float)
             captured["n_vars"] = len(q)
 

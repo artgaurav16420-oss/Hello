@@ -29,12 +29,10 @@ import json
 import logging
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -863,6 +861,19 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
             missing_tickers.append(bare_ticker)
 
     def _resolve_missing_from_sector_cache(candidates: list[str], sector_cache: dict, sector_cache_fetched_at) -> list[str]:
+        """Resolve missing sector labels from cached entries when still fresh.
+
+        Args:
+            candidates (list[str]): Bare tickers missing from static sector map.
+            sector_cache (dict): Cached sector payload keyed by bare ticker.
+            sector_cache_fetched_at: Fallback cache timestamp for legacy entries.
+
+        Returns:
+            list[str]: Candidate tickers still unresolved after cache lookup.
+
+        Raises:
+            Exception: Propagates unexpected cache parsing/runtime failures.
+        """
         still_missing: list[str] = []
         for bare_ticker in candidates:
             if bare_ticker in sector_cache:
