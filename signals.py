@@ -574,7 +574,7 @@ def generate_signals(
         candidate_mask = valid_mask & (prev_w_arr > 0.001) & ~knife_pre_bonus_suppress
 
         stale_denied    = int(np.sum(candidate_mask & is_stale))
-        liquidity_denied = int(np.sum(candidate_mask & ~is_stale & ~passes_continuity_liquidity))
+        liquidity_denied = int(np.sum(candidate_mask & ~passes_continuity_liquidity))
 
         bonus_mask = candidate_mask & ~is_stale & passes_continuity_liquidity
         decay = np.clip(
