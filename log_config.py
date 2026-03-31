@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -71,7 +72,7 @@ class ScanContext:
         self.start_time: float = 0.0
 
     def __enter__(self) -> "ScanContext":
-        if self.start_time != 0.0:
+        if not math.isclose(self.start_time, 0.0, rel_tol=1e-9, abs_tol=1e-12):
             raise RuntimeError("ScanContext is not reentrant; create a new instance for each scan.")
         self._prev_id    = getattr(_local, "correlation_id", None)
         self._prev_label = getattr(_local, "scan_label", None)

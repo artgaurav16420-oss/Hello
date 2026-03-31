@@ -213,7 +213,7 @@ def compute_regime_score(
 
     crash_override = _check_market_crash(universe_close_hist, cfg)
     if crash_override is not None:
-        return min(regime_score, crash_override) if crash_override == 0.5 else crash_override
+        return min(regime_score, crash_override) if np.isclose(float(crash_override), 0.5, rtol=1e-9, atol=1e-12) else crash_override
 
     return regime_score
 

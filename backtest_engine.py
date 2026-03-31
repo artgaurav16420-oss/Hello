@@ -301,7 +301,7 @@ class BacktestEngine:
         # by the absent_periods mechanism, not the ADV gate.
         _adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
         for _adv_i, _adv_sym in enumerate(active_symbols):
-            if adv_vector[_adv_i] == 0.0 and self.state.shares.get(_adv_sym, 0) > 0:
+            if np.isclose(float(adv_vector[_adv_i]), 0.0, rtol=1e-9, atol=1e-12) and self.state.shares.get(_adv_sym, 0) > 0:
                 if _adv_sym in close.columns and _adv_sym in volume.columns:
                     try:
                         _trail = close_notional[_adv_sym].iloc[-_adv_lookback:].clip(lower=0).dropna()
@@ -1145,7 +1145,13 @@ def run_backtest(
             "data for the requested universe/date range."
         )
 
-    trading_index = pd.DatetimeIndex(close.index).sort_values()
+    raw_trading_index = close.index
+    if raw_trading_index is None:
+        raise RuntimeError("Backtest aborted: trading calendar index is missing.")
+    if isinstance(raw_trading_index, (float, np.floating)):
+        raise RuntimeError("Backtest aborted: trading calendar index is invalid (scalar float).")
+
+    trading_index = pd.DatetimeIndex(list(raw_trading_index)).sort_values()
     valid = []
     for target in all_target_dates:
         lower_bound = target - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
