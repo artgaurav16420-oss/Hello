@@ -1145,13 +1145,7 @@ def run_backtest(
             "data for the requested universe/date range."
         )
 
-    raw_trading_index = close.index
-    if raw_trading_index is None:
-        raise RuntimeError("Backtest aborted: trading calendar index is missing.")
-    if isinstance(raw_trading_index, (float, np.floating)):
-        raise RuntimeError("Backtest aborted: trading calendar index is invalid (scalar float).")
-
-    trading_index = pd.DatetimeIndex(list(raw_trading_index)).sort_values()
+    trading_index = pd.to_datetime(close.index)
     valid = []
     for target in all_target_dates:
         lower_bound = target - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
