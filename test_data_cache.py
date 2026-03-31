@@ -21,16 +21,13 @@ def test_load_or_fetch_uses_dynamic_padding_from_cfg(monkeypatch):
     monkeypatch.setattr(data_cache, "_download_with_timeout", _fake_download_with_timeout)
 
     cfg = UltimateConfig(CVAR_LOOKBACK=500)
-    try:
-        data_cache.load_or_fetch(
-            tickers=["ABC"],
-            required_start="2024-01-01",
-            required_end="2024-12-31",
-            force_refresh=True,
-            cfg=cfg,
-        )
-    except data_cache.DataFetchError:
-        pass
+    data_cache.load_or_fetch(
+        tickers=["ABC"],
+        required_start="2024-01-01",
+        required_end="2024-12-31",
+        force_refresh=True,
+        cfg=cfg,
+    )
 
     assert captured["start"] == "2021-04-06"
     assert captured["end"] == "2025-01-01"
