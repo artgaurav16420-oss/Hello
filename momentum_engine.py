@@ -100,6 +100,19 @@ def to_bare(sym: str) -> str:
 
 
 def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
+    """absent_symbol_effective_price operation.
+    
+    Args:
+        last_known_price (float): Input parameter.
+        absent_periods (int): Input parameter.
+        max_absent_periods (int): Input parameter.
+    
+    Returns:
+        float: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     px = float(last_known_price)
     if not np.isfinite(px) or px <= 0:
         return 0.0
@@ -118,11 +131,24 @@ class OptimizationErrorType(Enum):
 
 
 class OptimizationError(Exception):
+    """OptimizationError type used by the backtesting system."""
     def __init__(
         self,
         message:    str,
         error_type: OptimizationErrorType = OptimizationErrorType.NUMERICAL,
     ):
+        """__init__ operation.
+        
+        Args:
+            message (str): Input parameter.
+            error_type (OptimizationErrorType): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         super().__init__(message)
         self.error_type = error_type
 
@@ -141,6 +167,7 @@ class Trade:
 
 @dataclass
 class SolverDiagnostics:
+    """SolverDiagnostics type used by the backtesting system."""
     status:            str
     gamma_intent:      float
     actual_weight:     float
@@ -162,7 +189,19 @@ class SolverDiagnostics:
 # ─── Matrix Building Helper ───────────────────────────────────────────────────
 
 class _ConstraintBuilder:
+    """_ConstraintBuilder type used by the backtesting system."""
     def __init__(self, n_vars: int):
+        """__init__ operation.
+        
+        Args:
+            n_vars (int): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         self.n_vars = n_vars
         self.A_parts: list = []
         self.l_parts: list = []
@@ -185,6 +224,7 @@ class _ConstraintBuilder:
 @dataclass
 class UltimateConfig:
     # Portfolio construction
+    """UltimateConfig type used by the backtesting system."""
     INITIAL_CAPITAL:          float = 1_000_000.0
     MAX_POSITIONS:            int   = 10
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20
@@ -294,6 +334,7 @@ DEFAULT_MAX_ABSENT_PERIODS = int(UltimateConfig.MAX_ABSENT_PERIODS)
 
 @dataclass
 class PortfolioState:
+    """PortfolioState type used by the backtesting system."""
     RISK_CONTROL_FIELDS: ClassVar[Tuple[str, ...]] = (
         "override_active",
         "override_cooldown",
@@ -334,6 +375,20 @@ class PortfolioState:
         cfg:            UltimateConfig,
         gross_exposure: float = 1.0,
     ) -> None:
+        """update_exposure operation.
+        
+        Args:
+            regime_score (float): Input parameter.
+            realized_cvar (float): Input parameter.
+            cfg (UltimateConfig): Input parameter.
+            gross_exposure (float): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         target   = 1.0 / (1.0 + np.exp(-cfg.REGIME_SIGMOID_STEEPNESS * (regime_score - 0.5)))
         new_mult = self.exposure_multiplier + float(
             np.clip(target - self.exposure_multiplier, -cfg.DELEVERAGING_LIMIT, cfg.DELEVERAGING_LIMIT)
@@ -412,6 +467,17 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
+        """record_eod operation.
+        
+        Args:
+            prices (Dict[str, float]): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         max_absent_periods = (
             self.max_absent_periods
             if self.max_absent_periods is not None
@@ -449,6 +515,14 @@ class PortfolioState:
             hist.append((pd.Timestamp(current_date), vol_value))
 
     def reset(self) -> None:
+        """reset operation.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         initial_cash = float(getattr(self, "_initial_cash", self.cash))
         self.shares = {}
         self.cash = initial_cash
@@ -466,6 +540,14 @@ class PortfolioState:
         self.decay_rounds = 0
 
     def to_dict(self) -> dict:
+        """to_dict operation.
+        
+        Returns:
+            dict: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         def _r(v):
             if isinstance(v, float):
                 return round(v, 10)
@@ -501,11 +583,33 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PortfolioState":
+        """from_dict operation.
+        
+        Args:
+            d (dict): Input parameter.
+        
+        Returns:
+            "PortfolioState": Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         ps     = cls()
         errors: List[str] = []
         risk_control_errors: List[str] = []
 
         def _as_bool(value) -> bool:
+            """_as_bool operation.
+            
+            Args:
+                value (float): Input parameter.
+            
+            Returns:
+                bool: Result of this operation.
+            
+            Raises:
+                Exception: Propagates runtime, validation, I/O, or provider errors.
+            """
             if isinstance(value, bool):
                 return value
             if isinstance(value, str):
@@ -538,6 +642,19 @@ class PortfolioState:
             return _as_nonneg_int(value)
 
         def _get(key, converter, default):
+            """_get operation.
+            
+            Args:
+                key (Any): Input parameter.
+                converter (Any): Input parameter.
+                default (Any): Input parameter.
+            
+            Returns:
+                Any: Result of this operation.
+            
+            Raises:
+                Exception: Propagates runtime, validation, I/O, or provider errors.
+            """
             try:
                 return converter(d[key]) if key in d else default
             except Exception as exc:
@@ -658,6 +775,20 @@ def _compute_one_way_slip_rate_vectorized(
     adv_notional: np.ndarray,
     trade_notional: np.ndarray,
 ) -> np.ndarray:
+    """_compute_one_way_slip_rate_vectorized operation.
+    
+    Args:
+        cfg (UltimateConfig): Input parameter.
+        portfolio_value (float): Input parameter.
+        adv_notional (np.ndarray): Input parameter.
+        trade_notional (np.ndarray): Input parameter.
+    
+    Returns:
+        np.ndarray: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     adv_arr = np.asarray(adv_notional, dtype=float)
     trade_arr = np.asarray(trade_notional, dtype=float)
@@ -678,6 +809,21 @@ def _compute_pv_exec(
     cfg: UltimateConfig,
     symbols_to_force_close: Set[str],
 ) -> Tuple[float, float]:
+    """_compute_pv_exec operation.
+    
+    Args:
+        state (PortfolioState): Input parameter.
+        prices (np.ndarray): Input parameter.
+        active_symbols (List[str]): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+        symbols_to_force_close (Set[str]): Input parameter.
+    
+    Returns:
+        Tuple[float, float]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     absent_snapshot: Dict[str, int] = dict(state.absent_periods)
     t1_price_snapshot: Dict[str, float] = dict(state.last_known_prices)
@@ -716,6 +862,24 @@ def _compute_desired_shares(
     current_shares: Optional[Dict[str, int]] = None,
     conviction_scores: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]:
+    """_compute_desired_shares operation.
+    
+    Args:
+        target_weights (np.ndarray): Input parameter.
+        prices (np.ndarray): Input parameter.
+        pv_exec (float): Input parameter.
+        adv_shares (Optional[np.ndarray]): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+        active_symbols (Optional[List[str]]): Input parameter.
+        current_shares (Optional[Dict[str, int]]): Input parameter.
+        conviction_scores (Optional[np.ndarray]): Input parameter.
+    
+    Returns:
+        Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     desired_shares: Dict[str, int] = {}
     valid_targets: List[Tuple[int, str, float, float]] = []
     symbols = active_symbols if active_symbols is not None else [str(i) for i in range(len(target_weights))]
@@ -760,6 +924,23 @@ def _apply_drift_gate(
     cfg: UltimateConfig,
     active_symbols: List[str],
 ) -> Tuple[Dict[str, int], set[str]]:
+    """_apply_drift_gate operation.
+    
+    Args:
+        desired_shares (Dict[str, int]): Input parameter.
+        current_shares (Dict[str, int]): Input parameter.
+        target_weights (np.ndarray): Input parameter.
+        prices (np.ndarray): Input parameter.
+        pv_exec (float): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+        active_symbols (List[str]): Input parameter.
+    
+    Returns:
+        Tuple[Dict[str, int], set[str]]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     drift_threshold = cfg.DRIFT_TOLERANCE
     drift_gated_syms: set[str] = set()
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
@@ -787,6 +968,21 @@ def _allocate_residual_cash(
     prices: np.ndarray,
     cfg: UltimateConfig,
 ) -> Dict[str, int]:
+    """_allocate_residual_cash operation.
+    
+    Args:
+        residual_budget (float): Input parameter.
+        valid_targets (List[Tuple[int, str, float, float]]): Input parameter.
+        conviction_scores (Optional[np.ndarray]): Input parameter.
+        prices (np.ndarray): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+    
+    Returns:
+        Dict[str, int]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if residual_budget <= 0 or not valid_targets:
         return {}
     allocations: Dict[str, int] = {}
@@ -1170,6 +1366,21 @@ def compute_book_cvar(
     hist_log_rets:  pd.DataFrame,
     cfg:            UltimateConfig,
 ) -> float:
+    """compute_book_cvar operation.
+    
+    Args:
+        state (PortfolioState): Input parameter.
+        prices (np.ndarray): Input parameter.
+        active_symbols (List[str]): Input parameter.
+        hist_log_rets (pd.DataFrame): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+    
+    Returns:
+        float: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     mtm_weights: Dict[str, float] = {}
     pv = state.cash
@@ -1331,6 +1542,17 @@ class InstitutionalRiskEngine:
     """
     # NOT thread-safe across optimize() calls without _solver_lock.
     def __init__(self, cfg: UltimateConfig):
+        """__init__ operation.
+        
+        Args:
+            cfg (UltimateConfig): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         self.cfg:       UltimateConfig              = cfg
         self.last_diag: Optional[SolverDiagnostics] = None
         self._solver:       Optional[Any] = None
@@ -1358,6 +1580,25 @@ class InstitutionalRiskEngine:
         sector_labels:       Optional[np.ndarray] = None,
         execution_date:      Optional[pd.Timestamp] = None,
     ) -> np.ndarray:
+        """optimize operation.
+        
+        Args:
+            expected_returns (np.ndarray): Input parameter.
+            historical_returns (pd.DataFrame): Input parameter.
+            adv_shares (np.ndarray): Input parameter.
+            prices (np.ndarray): Input parameter.
+            portfolio_value (float): Input parameter.
+            prev_w (Optional[np.ndarray]): Input parameter.
+            exposure_multiplier (float): Input parameter.
+            sector_labels (Optional[np.ndarray]): Input parameter.
+            execution_date (Optional[pd.Timestamp]): Input parameter.
+        
+        Returns:
+            np.ndarray: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         original_m = len(expected_returns)
         if original_m == 0:
             return np.array([])

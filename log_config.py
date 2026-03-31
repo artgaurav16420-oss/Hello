@@ -72,6 +72,14 @@ class ScanContext:
         self.start_time: float = 0.0
 
     def __enter__(self) -> "ScanContext":
+        """__enter__ operation.
+        
+        Returns:
+            "ScanContext": Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         if not math.isclose(self.start_time, 0.0, rel_tol=1e-9, abs_tol=1e-12):
             raise RuntimeError("ScanContext is not reentrant; create a new instance for each scan.")
         self._prev_id    = getattr(_local, "correlation_id", None)
@@ -90,6 +98,19 @@ class ScanContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """__exit__ operation.
+        
+        Args:
+            exc_type (Any): Input parameter.
+            exc_val (Any): Input parameter.
+            exc_tb (Any): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         elapsed = time.monotonic() - self.start_time
         status  = "error" if exc_type else "ok"
         logging.getLogger(__name__).info(
@@ -145,6 +166,17 @@ class DeadLetterTracker:
             })
 
     def flush(self, logger_name: str = "dead_letter") -> None:
+        """flush operation.
+        
+        Args:
+            logger_name (str): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         with self._lock:
             entries_snapshot = list(self._entries)
             self._entries.clear()
@@ -240,6 +272,17 @@ class JsonFormatter(logging.Formatter):
         return base.strftime("%Y-%m-%dT%H:%M:%S") + f".{us:06d}Z"
 
     def format(self, record: logging.LogRecord) -> str:
+        """format operation.
+        
+        Args:
+            record (logging.LogRecord): Input parameter.
+        
+        Returns:
+            str: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         try:
             # Base fields — ts is now a genuine UTC ISO-8601 string with μs.
             obj: Dict[str, Any] = {
