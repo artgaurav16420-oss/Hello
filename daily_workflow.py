@@ -1808,7 +1808,7 @@ def main_menu() -> None:
                 custom_cfg.MAX_POSITIONS = 8
 
             preview      = copy.deepcopy(states["custom"])
-            preview, mkt = _run_scan(universe, preview, LABEL_CUSTOM_SCREENER, custom_cfg, name="custom")
+            preview, mkt = _run_scan(universe, preview, f"{LABEL_CUSTOM_SCREENER} SCAN", custom_cfg, name="custom")
             mkt_cache["custom"] = mkt
             _print_status(preview, f"PREVIEW — {LABEL_CUSTOM_SCREENER}", mkt, cfg=custom_cfg)
             if input(f"  {C.YLW}Save these changes? (y/n): {C.RST}").strip().lower() == "y":
