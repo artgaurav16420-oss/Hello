@@ -964,7 +964,7 @@ class SecondaryProvider(DataProvider):
                 "Low":       float(item.get("3. low",              np.nan)),
                 "Close":     float(item.get("4. close",            np.nan)),
                 COLUMN_ADJ_CLOSE: float(item.get("5. adjusted close",   np.nan)),
-                "Volume":    float(item.get("6. volume",           np.nan)),
+                COLUMN_VOLUME:    float(item.get("6. volume",           np.nan)),
             })
 
         if not rows:
