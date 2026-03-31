@@ -875,7 +875,7 @@ def execute_rebalance(
         )
 
     target_weights = np.clip(
-        np.where(np.isfinite(np.array(target_weights, dtype=float, copy=True)), target_weights, 0.0),
+        np.where(np.isfinite(target_weights), target_weights, 0.0),
         0.0,
         cfg.MAX_SINGLE_NAME_WEIGHT,
     )
