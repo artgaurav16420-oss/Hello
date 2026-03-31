@@ -153,7 +153,7 @@ def configure_data_cache(
     global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR, _CACHE_CONFIGURED
     if dotenv_path is None and cache_dir is not None:
         candidate = Path(cache_dir)
-        if candidate.name == ".env" or (candidate.exists() and candidate.is_file()):
+        if candidate.name == ".env" or candidate.suffix == ".env":
             dotenv_path = candidate
             cache_dir = None
     load_dotenv_safe(dotenv_path)
