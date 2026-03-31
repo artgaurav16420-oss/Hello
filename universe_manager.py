@@ -39,7 +39,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-from data_cache import CACHE_DIR
+import data_cache
+data_cache.configure_data_cache()
+CACHE_DIR = data_cache.CACHE_DIR
 
 logger = logging.getLogger(__name__)
 
