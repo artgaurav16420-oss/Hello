@@ -790,7 +790,7 @@ class GrowwProvider(DataProvider):
             raw_df[COLUMN_ADJ_CLOSE] = adj_close
 
             dividends, splits = self._extract_actions_from_batches(raw_df.index, ns_ticker, yf_raw)
-            raw_df["Dividends"] = dividends
+            raw_df[COLUMN_DIVIDENDS] = dividends
             raw_df[COLUMN_STOCK_SPLITS] = splits
 
             frames[ns_ticker] = raw_df
