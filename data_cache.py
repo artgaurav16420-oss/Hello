@@ -1430,7 +1430,10 @@ def load_or_fetch(
             with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
                 live_manifest = _load_manifest()
                 live_entries = live_manifest.setdefault("entries", {})
-                live_entries.update(manifest.get("entries", {}))
+                for ticker in tickers_to_download:
+                    entry = entries.get(ticker)
+                    if entry is not None:
+                        live_entries[ticker] = entry
                 _save_manifest(live_manifest)
     finally:
         for provider in providers:
