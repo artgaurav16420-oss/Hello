@@ -1194,6 +1194,21 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _load_cached_frame(parquet_path: Path, ticker: str, cfg=None) -> pd.DataFrame:
+    """
+    Load and normalize a cached parquet frame so legacy cache files remain usable.
+
+    Older cached/provider frames may miss Adj Close or action columns. We pass all
+    cache reads through _ensure_price_columns before validation to avoid
+    unnecessary re-downloads when Close-only history is otherwise valid.
+    """
+    cached_df = pd.read_parquet(parquet_path)
+    normalized = _ensure_price_columns(_normalize_history_index(cached_df))
+    if not _is_valid_dataframe(normalized, ticker=ticker, cfg=cfg):
+        raise ValueError(f"cached frame failed validation for {ticker}")
+    return normalized
+
+
 def _latest_business_day() -> str:
     """
     Return the most recent Mon–Fri business day before today as 'YYYY-MM-DD'.
@@ -1313,7 +1328,7 @@ def load_or_fetch(
             tickers_to_download.append(ticker)
         else:
             try:
-                df = _normalize_history_index(pd.read_parquet(parquet_path))
+                df = _load_cached_frame(parquet_path, ticker=ticker, cfg=cfg)
                 market_data[ticker] = df
             except Exception as exc:
                 logger.warning("[Cache] Corrupted parquet for %s: %s", ticker, exc)
@@ -1588,13 +1603,8 @@ def _recover_from_stale_cache(
         if not parquet_path.exists():
             continue
         try:
-            fallback_df = _normalize_history_index(pd.read_parquet(parquet_path))
+            fallback_df = _load_cached_frame(parquet_path, ticker=ticker, cfg=cfg)
             if fallback_df is None or fallback_df.empty:
-                continue
-            # Recovery must enforce the same structural/row-count thresholds as
-            # the primary download path; otherwise very short stale frames can
-            # sneak in and poison downstream signals.
-            if not _is_valid_dataframe(fallback_df, ticker=ticker, cfg=cfg):
                 continue
             market_data[ticker] = fallback_df
             recovered += 1
