@@ -229,10 +229,20 @@ class _ManifestProcessFileLock:
         if not self._owner_file.exists():
             # Owner file missing but lock dir exists - might be in-progress acquisition.
             # Wait briefly for owner file to appear to avoid race with a fresh lock.
+            # But first check if lock dir was removed - fast-path out if so.
+            if not self._lock_dir.exists():
+                # Lock dir was already removed by another process - not stale, just gone
+                return False
+
             max_wait = 1.0  # Wait up to 1 second for owner file to appear
             wait_step = 0.05
             elapsed = 0.0
             while elapsed < max_wait:
+                # Check if lock dir was removed during our wait
+                if not self._lock_dir.exists():
+                    # Lock dir removed - not stale, just gone
+                    return False
+
                 time.sleep(wait_step)
                 elapsed += wait_step
                 if self._owner_file.exists():
@@ -240,6 +250,11 @@ class _ManifestProcessFileLock:
                     break
             else:
                 # Owner file still missing after wait - check lock dir age
+                # But first verify lock dir still exists
+                if not self._lock_dir.exists():
+                    # Lock dir removed during wait - not stale, just gone
+                    return False
+
                 try:
                     lock_dir_stat = self._lock_dir.stat()
                     lock_dir_age = time.time() - lock_dir_stat.st_mtime
