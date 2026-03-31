@@ -15,7 +15,7 @@ from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 class _StaticResult:
     def __init__(self):
-        self.metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}
+        self.metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1, "turnover": 0.0, "sortino": 1.0}
         self.rebal_log = None
 
 
