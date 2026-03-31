@@ -41,6 +41,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from abc import ABC, abstractmethod
@@ -64,7 +65,15 @@ _RATE_LIMITED = object()
 
 # Maximum consecutive 429 retries per symbol before aborting
 _MAX_RATE_LIMIT_RETRIES = 5
-_MANIFEST_WRITE_LOCK = threading.Lock()
+_MANIFEST_LOCK_POLL_SEC = 0.1
+_MANIFEST_LOCK_TIMEOUT_SEC = 30.0
+_SUSPENSION_GAP_DAYS = 7
+
+_DEFAULT_CACHE_DIR = Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
+CACHE_DIR: Path | None = _DEFAULT_CACHE_DIR
+MANIFEST_FILE: Path | None = _DEFAULT_CACHE_DIR / "_manifest.json"
+_MANIFEST_LOCK_DIR: Path | None = _DEFAULT_CACHE_DIR / "_manifest.lock"
+_CACHE_CONFIGURED = False
 
 
 def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
@@ -125,10 +134,6 @@ def _safe_yf_download(*args, **kwargs) -> pd.DataFrame:
         )
     return data
 
-
-
-CACHE_DIR     = Path("data/cache")
-MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 # Large multi-ticker yfinance requests are brittle for mixed universes that
 # include newly listed/suspended symbols. Smaller chunks reduce the chance that
 # one malformed ticker poisons the whole batch and improves completion rates on
@@ -136,14 +141,29 @@ MANIFEST_FILE = CACHE_DIR / "_manifest.json"
 _DOWNLOAD_CHUNK_SIZE = 25
 
 
-def configure_data_cache(dotenv_path: Optional[Path] = None) -> None:
+def configure_data_cache(
+    cache_dir: Optional[Path] = None,
+    dotenv_path: Optional[Path] = None,
+) -> None:
     """Initialize data-cache environment and filesystem paths.
 
     Callers must invoke configure_data_cache() once before using module
     functions so cache paths and optional local env vars are initialized.
     """
+    global CACHE_DIR, MANIFEST_FILE, _MANIFEST_LOCK_DIR, _CACHE_CONFIGURED
+    if dotenv_path is None and cache_dir is not None:
+        candidate = Path(cache_dir)
+        if candidate.name == ".env" or candidate.suffix == ".env":
+            dotenv_path = candidate
+            cache_dir = None
     load_dotenv_safe(dotenv_path)
+    # After load_dotenv_safe, honor DATA_CACHE_DIR from .env if set
+    resolved_cache_dir = cache_dir or os.environ.get("DATA_CACHE_DIR") or _DEFAULT_CACHE_DIR
+    CACHE_DIR = Path(resolved_cache_dir)
+    MANIFEST_FILE = CACHE_DIR / "_manifest.json"
+    _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _CACHE_CONFIGURED = True
 
 
 _GROWW_BASE_URL           = "https://api.groww.in/v1"
@@ -153,8 +173,268 @@ _GROWW_CHUNK_DAYS         = 1080
 _GROWW_INDEX_PREFIXES     = ("^",)
 
 
-class DataFetchError(RuntimeError):
-    """Raised when one or more requested ticker chunks cannot be fetched."""
+def _ensure_cache_paths_configured() -> None:
+    global _CACHE_CONFIGURED
+    if not _CACHE_CONFIGURED:
+        configure_data_cache()
+
+
+class _ManifestProcessFileLock:
+    """Cross-process lock implemented using an atomic lock directory with stale-lock cleanup."""
+
+    def __init__(self, lock_dir: Path, timeout_s: float = _MANIFEST_LOCK_TIMEOUT_SEC) -> None:
+        self._lock_dir = lock_dir
+        self._timeout_s = timeout_s
+        self._owner_file = lock_dir / "owner"
+
+    def _is_process_alive(self, pid: int) -> bool:
+        """Check if a process with the given PID is alive."""
+        if pid <= 0:
+            return False
+        try:
+            # os.kill with signal 0 checks process existence without sending a signal
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            # Process doesn't exist
+            return False
+        except PermissionError:
+            # Process exists but we don't have permission to signal it
+            return True
+        except OSError as e:
+            # Distinguish between ESRCH (no such process) and EPERM (permission denied)
+            import errno
+            if e.errno == errno.ESRCH:
+                # Process doesn't exist
+                return False
+            elif e.errno == errno.EPERM:
+                # Process exists but can't be signaled
+                return True
+            else:
+                # Other OS errors - assume process might be alive to be safe
+                return True
+        except Exception:
+            # Fallback: assume process might be alive on unexpected errors
+            return True
+
+    def _is_lock_stale(self) -> bool:
+        """
+        Detect if the current lock is stale by checking:
+        1. Owner file existence and parsability
+        2. Process liveness via os.kill(pid, 0)
+        3. Lock age against a stale threshold (2x timeout)
+
+        Returns True if the lock is stale and can be safely removed.
+        """
+        if not self._owner_file.exists():
+            # Owner file missing but lock dir exists - might be in-progress acquisition.
+            # Wait briefly for owner file to appear to avoid race with a fresh lock.
+            # But first check if lock dir was removed - fast-path out if so.
+            if not self._lock_dir.exists():
+                # Lock dir was already removed by another process - not stale, just gone
+                return False
+
+            max_wait = 1.0  # Wait up to 1 second for owner file to appear
+            wait_step = 0.05
+            elapsed = 0.0
+            while elapsed < max_wait:
+                # Check if lock dir was removed during our wait
+                if not self._lock_dir.exists():
+                    # Lock dir removed - not stale, just gone
+                    return False
+
+                time.sleep(wait_step)
+                elapsed += wait_step
+                if self._owner_file.exists():
+                    # Owner file appeared, proceed with normal staleness check
+                    break
+            else:
+                # Owner file still missing after wait - check lock dir age
+                # But first verify lock dir still exists
+                if not self._lock_dir.exists():
+                    # Lock dir removed during wait - not stale, just gone
+                    return False
+
+                try:
+                    lock_dir_stat = self._lock_dir.stat()
+                    lock_dir_age = time.time() - lock_dir_stat.st_mtime
+                    # Only treat as stale if directory is older than our wait window
+                    if lock_dir_age < max_wait:
+                        # Directory is fresh, likely still being set up
+                        return False
+                    # Directory is old with no owner file - treat as stale
+                    return True
+                except Exception:
+                    # Can't stat lock dir, treat as stale to be safe
+                    return True
+
+        try:
+            # Read and parse owner file
+            content = self._owner_file.read_text(encoding="utf-8").strip()
+            pid = None
+            for part in content.split():
+                if part.startswith("pid="):
+                    try:
+                        pid = int(part.split("=", 1)[1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+
+            # If we can't parse the PID, check file age only
+            if pid is None:
+                logger.debug("[Lock] Could not parse PID from owner file, checking age only")
+                # Fall through to age-based check below
+            else:
+                # Check if the owning process is still alive
+                if self._is_process_alive(pid):
+                    # Process is alive - lock is NOT stale regardless of age
+                    logger.debug("[Lock] Owner PID %d is alive, lock is valid", pid)
+                    return False
+                else:
+                    # Process is dead - lock IS stale regardless of age
+                    logger.debug("[Lock] Owner PID %d is dead, lock is stale", pid)
+                    return True
+
+            # Fallback: if PID couldn't be parsed, use file age as safety net
+            stat_info = self._owner_file.stat()
+            lock_age = time.time() - stat_info.st_mtime
+            stale_threshold = max(60.0, self._timeout_s * 2.0)
+
+            return lock_age >= stale_threshold
+
+        except FileNotFoundError:
+            # Owner file disappeared between exists check and read
+            return True
+        except Exception as exc:
+            # On unexpected errors reading/parsing, check age as fallback
+            logger.debug("[Lock] Error checking lock staleness: %s", exc)
+            try:
+                stat_info = self._owner_file.stat()
+                lock_age = time.time() - stat_info.st_mtime
+                stale_threshold = max(60.0, self._timeout_s * 2.0)
+                return lock_age >= stale_threshold
+            except Exception:
+                # Can't determine staleness reliably, assume not stale to be safe
+                return False
+
+    def _remove_stale_lock(self) -> bool:
+        """
+        Attempt to remove a stale lock directory and owner file.
+        Returns True if removal succeeded, False otherwise.
+        Uses try/except to guard against races with live lockers.
+        """
+        try:
+            # Try to remove owner file first
+            if self._owner_file.exists():
+                self._owner_file.unlink()
+            # Then remove the lock directory
+            if self._lock_dir.exists():
+                self._lock_dir.rmdir()
+            logger.debug("[Lock] Successfully removed stale lock at %s", self._lock_dir)
+            return True
+        except FileNotFoundError:
+            # Lock already removed by another process
+            return True
+        except OSError as exc:
+            # Directory not empty or permission denied - another process may have claimed it
+            logger.debug("[Lock] Could not remove stale lock: %s", exc)
+            return False
+        except Exception as exc:
+            logger.debug("[Lock] Unexpected error removing stale lock: %s", exc)
+            return False
+
+    def __enter__(self) -> "_ManifestProcessFileLock":
+        deadline = time.monotonic() + max(0.0, float(self._timeout_s))
+        stale_check_attempted = False
+
+        while True:
+            try:
+                self._lock_dir.mkdir(parents=False, exist_ok=False)
+                self._owner_file.write_text(
+                    f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
+                    encoding="utf-8",
+                )
+                return self
+            except FileExistsError:
+                # Before waiting, check if the existing lock is stale
+                # Only attempt stale cleanup once to avoid repeated overhead
+                if not stale_check_attempted:
+                    stale_check_attempted = True
+                    if self._is_lock_stale():
+                        logger.info(
+                            "[Lock] Detected stale lock at %s, attempting cleanup",
+                            self._lock_dir
+                        )
+                        if self._remove_stale_lock():
+                            # Successfully removed stale lock, retry acquisition immediately
+                            stale_check_attempted = False  # Allow another check on next collision
+                            continue
+
+                # Check timeout
+                if time.monotonic() >= deadline:
+                    # Perform one final stale check before raising TimeoutError
+                    # to handle case where owner was alive but just exited
+                    if self._is_lock_stale():
+                        logger.info(
+                            "[Lock] Final check found stale lock at %s before timeout",
+                            self._lock_dir
+                        )
+                        if self._remove_stale_lock():
+                            # Reset and allow one more acquisition attempt
+                            stale_check_attempted = False
+                            continue
+                    raise TimeoutError(
+                        f"Timed out waiting for manifest lock {self._lock_dir}"
+                    )
+                time.sleep(_MANIFEST_LOCK_POLL_SEC)
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            # Atomically rename the lock directory to prevent race conditions
+            # where waiters see a missing owner file before the directory is removed
+            # Use unique name to avoid collision with leftover released directories
+            base_name = f"{self._lock_dir.name}_released"
+            released_dir = self._lock_dir.parent / f"{base_name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+            # Ensure uniqueness even if PID+uuid somehow collides
+            attempt = 0
+            while released_dir.exists() and attempt < 100:
+                released_dir = self._lock_dir.parent / f"{base_name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+                attempt += 1
+
+            try:
+                self._lock_dir.rename(released_dir)
+            except FileNotFoundError:
+                # Lock already removed by another process
+                return
+
+            # Now clean up the renamed directory and owner file
+            renamed_owner_file = released_dir / "owner"
+            try:
+                if renamed_owner_file.exists():
+                    renamed_owner_file.unlink()
+            except FileNotFoundError:
+                pass
+
+            try:
+                released_dir.rmdir()
+            except FileNotFoundError:
+                pass
+        except OSError as os_exc:
+            # Tolerate benign OS errors (directory not empty, permission issues)
+            logger.debug(
+                "[Lock] Non-fatal error releasing lock %s: %s",
+                self._lock_dir,
+                os_exc,
+            )
+        except Exception as cleanup_exc:
+            # Log unexpected errors during cleanup to avoid hiding programming errors
+            logger.error(
+                "[Lock] Unexpected error releasing lock %s: %s",
+                self._lock_dir,
+                cleanup_exc,
+                exc_info=True,
+            )
 
 
 class DataProvider(ABC):
@@ -545,7 +825,11 @@ class YFinanceProvider(DataProvider):
         if result.empty:
             return result
         if len(tickers) > 1 and not isinstance(result.columns, pd.MultiIndex):
-            return None
+            logger.warning(
+                "[Cache] Batch yfinance response for %d tickers had flat columns; retrying individually.",
+                len(tickers),
+            )
+            return self._download_individual(tickers, start, end)
         return result
 
     def _download_batch(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
@@ -789,13 +1073,18 @@ def _download_with_timeout(
 
 
 def _load_manifest() -> dict:
+    _ensure_cache_paths_configured()
     default_manifest = {"schema_version": 1, "entries": {}}
+    assert MANIFEST_FILE is not None
     if not MANIFEST_FILE.exists():
         return default_manifest
 
     try:
         with MANIFEST_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
+            if not isinstance(data, dict):
+                logger.warning("[Cache] Manifest root must be a JSON object; starting fresh.")
+                return default_manifest
             if "schema_version" in data:
                 return data
             else:
@@ -806,6 +1095,8 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(manifest_data: dict) -> None:
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None and MANIFEST_FILE is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     temp_file = MANIFEST_FILE.with_name(MANIFEST_FILE.name + ".tmp")
     try:
@@ -823,6 +1114,8 @@ def _save_manifest(manifest_data: dict) -> None:
 
 
 def invalidate_cache() -> None:
+    _ensure_cache_paths_configured()
+    assert MANIFEST_FILE is not None
     if MANIFEST_FILE.exists():
         try:
             MANIFEST_FILE.unlink()
@@ -960,6 +1253,8 @@ def load_or_fetch(
     force_refresh: bool = False,
     cfg=None,
 ) -> Dict[str, pd.DataFrame]:
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest()
     entries  = manifest["entries"]
@@ -1020,7 +1315,7 @@ def load_or_fetch(
                 df = _normalize_history_index(pd.read_parquet(parquet_path))
                 market_data[ticker] = df
             except Exception as exc:
-                logger.debug("[Cache] Corrupted parquet for %s: %s", ticker, exc)
+                logger.warning("[Cache] Corrupted parquet for %s: %s", ticker, exc)
                 tickers_to_download.append(ticker)
 
     if not tickers_to_download:
@@ -1146,10 +1441,14 @@ def load_or_fetch(
             # Note: _save_manifest is intentionally called only on download/recovery
             # paths. Any future code path that mutates `entries` without downloading
             # must explicitly call _save_manifest() to keep manifest state in sync.
-            with _MANIFEST_WRITE_LOCK:
+            assert _MANIFEST_LOCK_DIR is not None
+            with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
                 live_manifest = _load_manifest()
                 live_entries = live_manifest.setdefault("entries", {})
-                live_entries.update(manifest.get("entries", {}))
+                for ticker in tickers_to_download:
+                    entry = entries.get(ticker)
+                    if entry is not None:
+                        live_entries[ticker] = entry
                 _save_manifest(live_manifest)
     finally:
         for provider in providers:
@@ -1192,6 +1491,8 @@ def _process_chunk(
     valid data was actually saved.  Returning the validated set here lets the
     caller use ground-truth instead of inferred membership.
     """
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     manifest_entries = entries
     saved_tickers: set = set()
 
@@ -1229,18 +1530,27 @@ def _process_chunk(
                 continue
 
             parquet_path = CACHE_DIR / f"{ticker}.parquet"
-            df.to_parquet(parquet_path)
+            # Use unique temp file per writer to avoid race conditions
+            tmp_path = CACHE_DIR / f"{ticker}.parquet.tmp.{uuid.uuid4().hex}"
+            try:
+                df.to_parquet(tmp_path)
+                # Atomically replace the final parquet file
+                tmp_path.replace(parquet_path)
+            except Exception:
+                # Clean up temp file on failure
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise
 
             gap_series   = df.index.to_series().diff().dt.days
             max_gap      = gap_series.max()
             max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
-            expected_gap = 7
 
             manifest_entries[ticker] = {
                 "fetched_at":    pd.Timestamp.now(tz=_IST_TZ).isoformat(),
                 "rows":          len(df),
                 "last_date":     df.index[-1].strftime("%Y-%m-%d"),
-                "suspended":     max_gap_days > expected_gap,
+                "suspended":     max_gap_days > _SUSPENSION_GAP_DAYS,
                 "max_gap_days":  max_gap_days,
             }
             market_data[ticker] = df
@@ -1268,6 +1578,8 @@ def _recover_from_stale_cache(
     accurately reflects that the data is stale and will be refreshed when the
     provider recovers.
     """
+    _ensure_cache_paths_configured()
+    assert CACHE_DIR is not None
     recovered = 0
     recovered_symbols: List[str] = []
     for ticker in chunk:

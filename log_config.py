@@ -302,8 +302,6 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
                 close_i = value.find(q, 1)
                 if close_i != -1:
                     value = value[1:close_i]
-                elif value.endswith(q) and len(value) >= 2:
-                    value = value[1:-1]
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
                 # Per dotenv convention, inline comments must be preceded by
@@ -317,7 +315,7 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
 
             os.environ.setdefault(key, value)
     except (OSError, UnicodeDecodeError, ValueError, TypeError, IndexError, AttributeError) as exc:
-        log.debug("[Env] Could not parse .env at %s: %s", env_path, exc)
+        log.warning("[Env] Could not parse .env at %s: %s", env_path, exc)
 
 # ─── One-call setup ───────────────────────────────────────────────────────────
 
@@ -363,6 +361,7 @@ def configure_logging(
         return
 
     for h in list(root.handlers):
+        h.close()
         root.removeHandler(h)
 
     fmt = JsonFormatter() if json_stdout else logging.Formatter(
