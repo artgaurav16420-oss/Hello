@@ -681,12 +681,11 @@ def test_run_optimization_uses_selected_universe(monkeypatch):
     monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
 
     captured = {}
-
-    def _fake_pre_load_data(universe_type):
+    def _capture_preload(universe_type):
         captured["pre_load_universe"] = universe_type
         return {}
 
-    monkeypatch.setattr(optimizer, "pre_load_data", _fake_pre_load_data)
+    monkeypatch.setattr(optimizer, "pre_load_data", _capture_preload)
 
     monkeypatch.setattr(optimizer, "run_backtest", lambda **kwargs: _StaticResult())
     monkeypatch.setattr(
@@ -703,12 +702,11 @@ def test_run_optimization_normalizes_unknown_universe(monkeypatch):
     monkeypatch.setattr(optimizer, "save_optimal_config", lambda best_params: None)
 
     captured = {}
-
-    def _fake_pre_load_data(universe_type):
+    def _capture_preload(universe_type):
         captured["pre_load_universe"] = universe_type
         return {}
 
-    monkeypatch.setattr(optimizer, "pre_load_data", _fake_pre_load_data)
+    monkeypatch.setattr(optimizer, "pre_load_data", _capture_preload)
 
     class _Result:
         metrics = {"final": 1.0, "cagr": 1.0, "max_dd": 1.0, "calmar": 1.1}

@@ -928,18 +928,23 @@ def run_optimization(
     in_memory:     bool      = False,
     study_name:    str | None = None,
 ):
+    def _resolve_execution_mode():
+        if in_memory:
+            logger.info(
+                "In-memory mode: storage=:memory:, n_jobs=%d. "
+                "Trial history will not be persisted.",
+                1,
+            )
+            return ":memory:", 1
+        return OPTUNA_STORAGE, N_JOBS
+
+    def _unpack_preloaded(preloaded_payload):
+        if isinstance(preloaded_payload, dict) and "market_data" in preloaded_payload:
+            return preloaded_payload["market_data"], preloaded_payload.get("precomputed_matrices")
+        return preloaded_payload, None
+
     universe_type = _normalize_universe_type(universe_type)
-    if in_memory:
-        effective_storage = ":memory:"
-        effective_n_jobs  = 1
-        logger.info(
-            "In-memory mode: storage=:memory:, n_jobs=%d. "
-            "Trial history will not be persisted.",
-            effective_n_jobs,
-        )
-    else:
-        effective_storage = OPTUNA_STORAGE
-        effective_n_jobs  = N_JOBS
+    effective_storage, effective_n_jobs = _resolve_execution_mode()
 
     if effective_n_jobs != 1:
         logger.warning(
@@ -956,12 +961,7 @@ def run_optimization(
 
     logger.info("Optimization universe: %s", universe_type)
     preloaded = pre_load_data(universe_type)
-    if isinstance(preloaded, dict) and "market_data" in preloaded:
-        market_data          = preloaded["market_data"]
-        precomputed_matrices = preloaded.get("precomputed_matrices")
-    else:
-        market_data          = preloaded
-        precomputed_matrices = None
+    market_data, precomputed_matrices = _unpack_preloaded(preloaded)
 
     os.makedirs("data", exist_ok=True)
     effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME

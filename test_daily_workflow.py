@@ -350,25 +350,34 @@ def test_detect_and_apply_splits_requires_explicit_stock_splits_signal():
     assert state.shares["ABC"] == 10
 
 
-def test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event():
-    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
-    state = PortfolioState(
+def _split_state() -> PortfolioState:
+    return PortfolioState(
         shares={"ABC": 10},
         entry_prices={"ABC": 1000.0},
         last_known_prices={"ABC": 1000.0},
         cash=0.0,
     )
-    idx = pd.date_range("2024-01-01", periods=2)
-    market_data = {
+
+
+def _split_market_data(split_series, close_series=None):
+    idx = pd.date_range("2024-01-01", periods=len(split_series))
+    closes = close_series or [1000.0, 500.0][: len(split_series)]
+    return {
         "ABC.NS": pd.DataFrame(
             {
-                "Close": [1000.0, 500.0],
-                "Dividends": [0.0, 0.0],
-                "Stock Splits": [0.0, 2.0],
+                "Close": closes,
+                "Dividends": [0.0] * len(split_series),
+                "Stock Splits": split_series,
             },
             index=idx,
         )
     }
+
+
+def test_detect_and_apply_splits_applies_when_stock_splits_column_marks_event():
+    cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
+    state = _split_state()
+    market_data = _split_market_data([0.0, 2.0], close_series=[1000.0, 500.0])
 
     adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
 
@@ -406,23 +415,11 @@ def test_detect_and_apply_splits_first_run_uses_position_marker_not_full_history
 
 def test_detect_and_apply_splits_without_anchor_compounds_visible_split_events():
     cfg = UltimateConfig(AUTO_ADJUST_PRICES=True)
-    state = PortfolioState(
-        shares={"ABC": 10},
-        entry_prices={"ABC": 1000.0},
-        last_known_prices={"ABC": 1000.0},
-        cash=0.0,
+    state = _split_state()
+    market_data = _split_market_data(
+        [0.0, 2.0, 0.0, 2.0, 0.0],
+        close_series=[1000.0, 500.0, 505.0, 252.5, 255.0],
     )
-    idx = pd.date_range("2024-01-01", periods=5)
-    market_data = {
-        "ABC.NS": pd.DataFrame(
-            {
-                "Close": [1000.0, 500.0, 505.0, 252.5, 255.0],
-                "Dividends": [0.0] * 5,
-                "Stock Splits": [0.0, 2.0, 0.0, 2.0, 0.0],
-            },
-            index=idx,
-        )
-    }
 
     adjusted = dw.detect_and_apply_splits(state, market_data, cfg)
 

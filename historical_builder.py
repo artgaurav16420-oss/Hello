@@ -729,9 +729,8 @@ def verify_parquet(parquet_path: str) -> bool:
             print(f"    • {issue}")
         print("\n  STATUS: BIASED / INVALID — rebuild required")
         return False
-    else:
-        print("\n  STATUS: OK — looks like valid PIT data")
-        return True
+    print("\n  STATUS: OK — looks like valid PIT data")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

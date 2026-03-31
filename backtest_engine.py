@@ -464,12 +464,11 @@ class BacktestEngine:
                                 date,
                             )
                             apply_decay = True
+            elif self.state.shares:
+                apply_decay = True
             else:
-                if self.state.shares:
-                    apply_decay = True
-                else:
-                    self.state.decay_rounds         = 0
-                    self.state.consecutive_failures = 0
+                self.state.decay_rounds         = 0
+                self.state.consecutive_failures = 0
 
         _exhaust_decay = False
         if apply_decay and not optimization_succeeded:

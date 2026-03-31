@@ -726,15 +726,9 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         else:
             missing_tickers.append(bare_ticker)
 
-    if missing_tickers and use_cache:
-        with _UNIVERSE_CACHE_FILE_LOCK:
-            cache = _load_universe_cache()
-            sector_map_cache = cache.get("sector_map", {})
-            sector_cache = sector_map_cache.get("sectors", {})
-            sector_cache_fetched_at = sector_map_cache.get("fetched_at")
-
-        still_missing = []
-        for bare_ticker in missing_tickers:
+    def _resolve_missing_from_sector_cache(candidates: list[str], sector_cache: dict, sector_cache_fetched_at) -> list[str]:
+        still_missing: list[str] = []
+        for bare_ticker in candidates:
             if bare_ticker in sector_cache:
                 cached_sector, fetched_at = _normalize_sector_cache_entry(
                     sector_cache[bare_ticker],
@@ -744,7 +738,18 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                     resolved_map[bare_ticker] = cached_sector
                     continue
             still_missing.append(bare_ticker)
-        missing_tickers = still_missing
+        return still_missing
+
+    if missing_tickers and use_cache:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            sector_map_cache = cache.get("sector_map", {})
+            sector_cache = sector_map_cache.get("sectors", {})
+            sector_cache_fetched_at = sector_map_cache.get("fetched_at")
+
+        missing_tickers = _resolve_missing_from_sector_cache(
+            missing_tickers, sector_cache, sector_cache_fetched_at
+        )
 
     if missing_tickers:
         with _SECTOR_FETCH_LOCK:
@@ -757,18 +762,9 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                     sector_cache = sector_map_cache.get("sectors", {})
                     sector_cache_fetched_at = sector_map_cache.get("fetched_at")
 
-                still_missing = []
-                for bare_ticker in missing_tickers:
-                    if bare_ticker in sector_cache:
-                        cached_sector, fetched_at = _normalize_sector_cache_entry(
-                            sector_cache[bare_ticker],
-                            fallback_fetched_at=sector_cache_fetched_at,
-                        )
-                        if cached_sector is not None and _is_cache_entry_fresh(fetched_at):
-                            resolved_map[bare_ticker] = cached_sector
-                            continue
-                    still_missing.append(bare_ticker)
-                missing_tickers = still_missing
+                missing_tickers = _resolve_missing_from_sector_cache(
+                    missing_tickers, sector_cache, sector_cache_fetched_at
+                )
 
             if missing_tickers:
                 logger.info("[Universe] Fetching sector data for %d missing tickers...", len(missing_tickers))

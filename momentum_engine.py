@@ -831,20 +831,24 @@ def execute_rebalance(
               needing to subtract them via actual_notional.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
-    local_prices = np.array(prices, dtype=float, copy=True)
 
-    for sym, i in active_idx.items():
-        px = float(local_prices[i])
-        if np.isfinite(px) and px > 0:
-            state.last_known_prices[sym] = px
-        else:
-            px = float(state.last_known_prices.get(sym, 0.0))
-        local_prices[i] = px
-        state.absent_periods.pop(sym, None)
+    def _refresh_prices_and_absence_marks() -> np.ndarray:
+        local_prices_out = np.array(prices, dtype=float, copy=True)
+        for sym, i in active_idx.items():
+            px = float(local_prices_out[i])
+            if np.isfinite(px) and px > 0:
+                state.last_known_prices[sym] = px
+            else:
+                px = float(state.last_known_prices.get(sym, 0.0))
+            local_prices_out[i] = px
+            state.absent_periods.pop(sym, None)
+        return local_prices_out
 
-    symbols_to_force_close: List[str] = []
-    for sym in list(state.shares.keys()):
-        if sym not in active_idx:
+    def _collect_force_close_symbols() -> List[str]:
+        to_close: List[str] = []
+        for sym in list(state.shares.keys()):
+            if sym in active_idx:
+                continue
             count = state.absent_periods.get(sym, 0) + 1
             state.absent_periods[sym] = count
             if count >= cfg.MAX_ABSENT_PERIODS:
@@ -853,7 +857,11 @@ def execute_rebalance(
                     "(≥ MAX_ABSENT_PERIODS=%d) — treating as delisted; closing position.",
                     sym, count, cfg.MAX_ABSENT_PERIODS,
                 )
-                symbols_to_force_close.append(sym)
+                to_close.append(sym)
+        return to_close
+
+    local_prices = _refresh_prices_and_absence_marks()
+    symbols_to_force_close = _collect_force_close_symbols()
 
     # Phase 1: build pv_exec excluding force-close candidates (see docstring)
     force_close_set = set(symbols_to_force_close)
@@ -866,10 +874,11 @@ def execute_rebalance(
             state.decay_rounds, cfg.MAX_DECAY_ROUNDS,
         )
 
-    capped_targets = np.array(target_weights, dtype=float, copy=True)
-    capped_targets = np.where(np.isfinite(capped_targets), capped_targets, 0.0)
-    capped_targets = np.clip(capped_targets, 0.0, cfg.MAX_SINGLE_NAME_WEIGHT)
-    target_weights = capped_targets
+    target_weights = np.clip(
+        np.where(np.isfinite(target_weights), target_weights, 0.0),
+        0.0,
+        cfg.MAX_SINGLE_NAME_WEIGHT,
+    )
 
     new_weights:      Dict[str, float] = {}
     new_shares:       Dict[str, int]   = {}
