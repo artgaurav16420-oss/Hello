@@ -195,9 +195,24 @@ class _ManifestProcessFileLock:
             # os.kill with signal 0 checks process existence without sending a signal
             os.kill(pid, 0)
             return True
-        except OSError:
-            # Process doesn't exist or we don't have permission to check
+        except ProcessLookupError:
+            # Process doesn't exist
             return False
+        except PermissionError:
+            # Process exists but we don't have permission to signal it
+            return True
+        except OSError as e:
+            # Distinguish between ESRCH (no such process) and EPERM (permission denied)
+            import errno
+            if e.errno == errno.ESRCH:
+                # Process doesn't exist
+                return False
+            elif e.errno == errno.EPERM:
+                # Process exists but can't be signaled
+                return True
+            else:
+                # Other OS errors - assume process might be alive to be safe
+                return True
         except Exception:
             # Fallback: assume process might be alive on unexpected errors
             return True
@@ -212,8 +227,31 @@ class _ManifestProcessFileLock:
         Returns True if the lock is stale and can be safely removed.
         """
         if not self._owner_file.exists():
-            # Owner file missing but lock dir exists - treat as stale
-            return True
+            # Owner file missing but lock dir exists - might be in-progress acquisition.
+            # Wait briefly for owner file to appear to avoid race with a fresh lock.
+            max_wait = 1.0  # Wait up to 1 second for owner file to appear
+            wait_step = 0.05
+            elapsed = 0.0
+            while elapsed < max_wait:
+                time.sleep(wait_step)
+                elapsed += wait_step
+                if self._owner_file.exists():
+                    # Owner file appeared, proceed with normal staleness check
+                    break
+            else:
+                # Owner file still missing after wait - check lock dir age
+                try:
+                    lock_dir_stat = self._lock_dir.stat()
+                    lock_dir_age = time.time() - lock_dir_stat.st_mtime
+                    # Only treat as stale if directory is older than our wait window
+                    if lock_dir_age < max_wait:
+                        # Directory is fresh, likely still being set up
+                        return False
+                    # Directory is old with no owner file - treat as stale
+                    return True
+                except Exception:
+                    # Can't stat lock dir, treat as stale to be safe
+                    return True
 
         try:
             # Read and parse owner file
@@ -319,6 +357,17 @@ class _ManifestProcessFileLock:
 
                 # Check timeout
                 if time.monotonic() >= deadline:
+                    # Perform one final stale check before raising TimeoutError
+                    # to handle case where owner was alive but just exited
+                    if self._is_lock_stale():
+                        logger.info(
+                            "[Lock] Final check found stale lock at %s before timeout",
+                            self._lock_dir
+                        )
+                        if self._remove_stale_lock():
+                            # Reset and allow one more acquisition attempt
+                            stale_check_attempted = False
+                            continue
                     raise TimeoutError(
                         f"Timed out waiting for manifest lock {self._lock_dir}"
                     )
@@ -328,7 +377,16 @@ class _ManifestProcessFileLock:
         try:
             # Atomically rename the lock directory to prevent race conditions
             # where waiters see a missing owner file before the directory is removed
-            released_dir = self._lock_dir.parent / f"{self._lock_dir.name}_released"
+            # Use unique name to avoid collision with leftover released directories
+            base_name = f"{self._lock_dir.name}_released"
+            released_dir = self._lock_dir.parent / f"{base_name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+            # Ensure uniqueness even if PID+uuid somehow collides
+            attempt = 0
+            while released_dir.exists() and attempt < 100:
+                released_dir = self._lock_dir.parent / f"{base_name}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+                attempt += 1
+
             try:
                 self._lock_dir.rename(released_dir)
             except FileNotFoundError:
