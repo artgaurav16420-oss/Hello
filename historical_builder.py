@@ -891,6 +891,18 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
 
 
 def _download_archive(universe_type: str, output_path: Path) -> Path:
+    """_download_archive operation.
+    
+    Args:
+        universe_type (str): Input parameter.
+        output_path (Path): Input parameter.
+    
+    Returns:
+        Path: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     urls = REMOTE_ARCHIVE_URLS.get(universe_type, [])
     if not urls:
         raise FileNotFoundError(f"[HistoricalBuilder] No remote archive URL configured for {universe_type}. Build via build_historical_fallback.py instead.")

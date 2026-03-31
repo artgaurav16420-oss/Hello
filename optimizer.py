@@ -143,6 +143,17 @@ DRAWDOWN_FLOOR                = 1.0  # keep consistent with backtest_engine Calm
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
+    """_stdout_supports_rupee operation.
+    
+    Args:
+        stdout (Any): Input parameter.
+    
+    Returns:
+        bool: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     stream = stdout if stdout is not None else getattr(sys, "stdout", None)
     if stream is None:
         return False
@@ -386,6 +397,7 @@ def _fitness_from_metrics(
 
 
 class MomentumObjective:
+    """MomentumObjective type used by the backtesting system."""
     def __init__(
         self,
         market_data: dict,
@@ -393,12 +405,37 @@ class MomentumObjective:
         search_space: dict | None = None,
         precomputed_matrices: dict | None = None,
     ):
+        """__init__ operation.
+        
+        Args:
+            market_data (dict): Input parameter.
+            universe_type (str): Input parameter.
+            search_space (dict | None): Input parameter.
+            precomputed_matrices (dict | None): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         self.market_data          = market_data
         self.universe_type        = universe_type
         self.search_space         = search_space or SEARCH_SPACE_BOUNDS
         self.precomputed_matrices = precomputed_matrices
 
     def __call__(self, trial: optuna.Trial) -> tuple[float, float]:
+        """__call__ operation.
+        
+        Args:
+            trial (optuna.Trial): Input parameter.
+        
+        Returns:
+            tuple[float, float]: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         cfg = UltimateConfig()
 
         halflife_fast_bounds = self.search_space["HALFLIFE_FAST"]
@@ -696,6 +733,18 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
 
 
 def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
+    """pre_load_data operation.
+    
+    Args:
+        universe_type (str): Input parameter.
+        cfg (UltimateConfig | None): Input parameter.
+    
+    Returns:
+        dict: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     logger.info("Initializing Data Pre-fetch phase...")
     normalized_universe = _normalize_universe_type(universe_type)
 
@@ -824,6 +873,18 @@ def _validate_optimal_config(params: dict) -> list[str]:
 
 
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
+    """save_optimal_config operation.
+    
+    Args:
+        best_params (dict): Input parameter.
+        filepath (str): Input parameter.
+    
+    Returns:
+        Any: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     violations = _validate_optimal_config(best_params)
     if violations:
         msg = "; ".join(violations)
@@ -862,6 +923,17 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
 
 def _oos_journal_path(study_name: str) -> Path:
     # ARCH-FIX-9
+    """_oos_journal_path operation.
+    
+    Args:
+        study_name (str): Input parameter.
+    
+    Returns:
+        Path: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     cleaned = re.sub(r"[\\/]+", "_", (study_name or "").strip())
     cleaned = cleaned.replace("..", "_")
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
@@ -873,6 +945,18 @@ def _oos_journal_path(study_name: str) -> Path:
 
 
 def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
+    """_pareto_sort_key operation.
+    
+    Args:
+        study (optuna.Study): Input parameter.
+        trial (optuna.trial.FrozenTrial): Input parameter.
+    
+    Returns:
+        tuple: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if trial.values is None:
         raise ValueError(f"Trial #{trial.number} has no objective values for Pareto sorting.")
     normalized: list[float] = []
@@ -891,9 +975,29 @@ def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenT
 
 def _error_triage_callback_factory() -> callable:
     # ARCH-FIX-8
+    """_error_triage_callback_factory operation.
+    
+    Returns:
+        callable: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     consecutive_failures = {"count": 0}
 
     def _error_triage_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        """_error_triage_callback operation.
+        
+        Args:
+            study (optuna.Study): Input parameter.
+            trial (optuna.trial.FrozenTrial): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         if trial.state == optuna.trial.TrialState.FAIL:
             consecutive_failures["count"] += 1
             fail_reason = trial.system_attrs.get("fail_reason")
@@ -928,6 +1032,19 @@ def run_optimization(
     in_memory:     bool      = False,
     study_name:    str | None = None,
 ):
+    """run_optimization operation.
+    
+    Args:
+        universe_type (str): Input parameter.
+        in_memory (bool): Input parameter.
+        study_name (str | None): Input parameter.
+    
+    Returns:
+        Any: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     def _resolve_execution_mode():
         if in_memory:
             logger.info(
@@ -997,6 +1114,18 @@ def run_optimization(
     logger.info("Starting %d Bayesian Trials (This may take a while)...", N_TRIALS)
 
     def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        """_best_trial_callback operation.
+        
+        Args:
+            study (optuna.Study): Input parameter.
+            trial (optuna.trial.FrozenTrial): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
         ranked_best = _deterministic_best_trials(study)
@@ -1293,6 +1422,17 @@ def run_optimization(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """_parse_args operation.
+    
+    Args:
+        argv (list[str] | None): Input parameter.
+    
+    Returns:
+        argparse.Namespace: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     parser = argparse.ArgumentParser(
         description="Run Bayesian optimizer for momentum strategy."
     )

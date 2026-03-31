@@ -138,6 +138,18 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 # ─── Historical Universe Logic ────────────────────────────────────────────────
 
 def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
+    """_load_pit_universe_from_csv operation.
+    
+    Args:
+        universe_type (str): Input parameter.
+        date (pd.Timestamp): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     if not csv_path.exists():
         return []
@@ -192,6 +204,17 @@ def _clear_all_caches() -> None:
 
 
 def _clear_historical_universe_caches(hist_file: Path) -> None:
+    """_clear_historical_universe_caches operation.
+    
+    Args:
+        hist_file (Path): Input parameter.
+    
+    Returns:
+        None: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     universe_type = hist_file.stem.removeprefix("historical_")
     # Lock acquisition order must remain stable across this module:
     # 1) _HISTORICAL_UNIVERSE_DF_CACHE_LOCK, 2) _UNIVERSE_LOOKUP_CACHE_LOCK.
@@ -208,6 +231,17 @@ def _clear_historical_universe_caches(hist_file: Path) -> None:
 
 
 def _coerce_historical_members(value) -> List[str]:
+    """_coerce_historical_members operation.
+    
+    Args:
+        value (float): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if isinstance(value, str):
         return [value]
     if hasattr(value, "tolist"):
@@ -219,6 +253,17 @@ def _coerce_historical_members(value) -> List[str]:
 
 
 def _normalize_historical_members(values) -> List[str]:
+    """_normalize_historical_members operation.
+    
+    Args:
+        values (float): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     normalized: set[str] = set()
     for t in values:
         if t is None:
@@ -231,6 +276,18 @@ def _normalize_historical_members(values) -> List[str]:
 
 
 def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
+    """_is_cache_entry_fresh operation.
+    
+    Args:
+        fetched_at (str | None): Input parameter.
+        ttl_hours (int): Input parameter.
+    
+    Returns:
+        bool: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if not fetched_at:
         return False
     try:
@@ -261,6 +318,18 @@ def _normalize_sector_cache_entry(
     *,
     fallback_fetched_at: str | None = None,
 ) -> tuple[str | None, str | None]:
+    """_normalize_sector_cache_entry operation.
+    
+    Args:
+        entry (Any): Input parameter.
+        fallback_fetched_at (str | None): Input parameter.
+    
+    Returns:
+        tuple[str | None, str | None]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if isinstance(entry, dict):
         sector = str(entry.get("sector", "Unknown") or "Unknown")
         fetched_at = entry.get("fetched_at") or fallback_fetched_at
@@ -443,6 +512,14 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 # ─── Cache Management ─────────────────────────────────────────────────────────
 
 def _load_universe_cache() -> dict:
+    """_load_universe_cache operation.
+    
+    Returns:
+        dict: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if not UNIVERSE_CACHE_FILE.exists():
         return {}
     try:
@@ -453,6 +530,17 @@ def _load_universe_cache() -> dict:
         return {}
 
 def _save_universe_cache(data: dict) -> None:
+    """_save_universe_cache operation.
+    
+    Args:
+        data (dict): Input parameter.
+    
+    Returns:
+        None: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     temp_file = UNIVERSE_CACHE_FILE.with_name(UNIVERSE_CACHE_FILE.name + ".tmp")
     try:
@@ -479,6 +567,18 @@ def invalidate_universe_cache() -> None:
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 
 def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
+    """_apply_adv_filter operation.
+    
+    Args:
+        tickers (List[str]): Input parameter.
+        cfg (Any): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
 
@@ -587,6 +687,18 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
 # ─── Network Fetchers ─────────────────────────────────────────────────────────
 
 def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
+    """_fetch_csv_with_headers operation.
+    
+    Args:
+        url (str): Input parameter.
+        timeout (float): Input parameter.
+    
+    Returns:
+        pd.DataFrame: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/csv,application/csv",
@@ -597,6 +709,18 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
+    """fetch_nse_equity_universe operation.
+    
+    Args:
+        cfg (Any): Input parameter.
+        apply_adv_filter (bool): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     with _UNIVERSE_CACHE_FILE_LOCK:
         cache = _load_universe_cache()
         entry = cache.get("total_equity", {})
@@ -644,6 +768,18 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
         raise error from exc
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
+    """get_nifty500 operation.
+    
+    Args:
+        cfg (Any): Input parameter.
+        apply_adv_filter (bool): Input parameter.
+    
+    Returns:
+        List[str]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     with _UNIVERSE_CACHE_FILE_LOCK:
         cache = _load_universe_cache()
         entry = cache.get("nifty500", {})
@@ -818,6 +954,17 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
                     # to prevent indefinite hangs (previously no timeout was set, allowing
                     # up to 30s per symbol × 8 workers = 240s total wall-time hang).
                     def _fetch_single_sector(sym: str) -> Tuple[str, Optional[str]]:
+                        """Fetch one symbol sector in fallback threaded mode.
+
+                        Args:
+                            sym (str): Bare ticker symbol without exchange suffix.
+
+                        Returns:
+                            Tuple[str, Optional[str]]: Symbol and resolved sector value.
+
+                        Raises:
+                            Exception: Propagates yfinance/network errors after logging.
+                        """
                         # BUG-FIX-SIGNAL: The previous implementation used signal.alarm()
                         # (SIGALRM) inside this worker function.  Python's signal module
                         # strictly requires that signals are set and handled only in the

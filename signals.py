@@ -344,6 +344,17 @@ def compute_adv(
         # in notional_cols; pd.NA is not recognised as a float by np.isfinite
         # (raises TypeError on older NumPy).  Cast to float first, treating NA
         # as 0.0 so the ADV gate treats the symbol as illiquid.
+        """_safe_adv operation.
+        
+        Args:
+            sym (str): Input parameter.
+        
+        Returns:
+            float: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         raw = adv_last_row.get(sym, 0.0)
         try:
             x = float(raw)

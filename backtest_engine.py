@@ -99,7 +99,20 @@ class BacktestResults:
 # ─── Engine ───────────────────────────────────────────────────────────────────
 
 class BacktestEngine:
+    """BacktestEngine type used by the backtesting system."""
     def __init__(self, engine: InstitutionalRiskEngine, initial_cash: float = 1_000_000):
+        """__init__ operation.
+        
+        Args:
+            engine (InstitutionalRiskEngine): Input parameter.
+            initial_cash (float): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
         self.state.equity_hist_cap = engine.cfg.EQUITY_HIST_CAP
@@ -138,6 +151,31 @@ class BacktestEngine:
         # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
         # runs; without clearing per-run buffers, equity/trade/rebalance state
         # accumulates and contaminates subsequent outputs.
+        """run operation.
+        
+        Args:
+            close (pd.DataFrame): Input parameter.
+            volume (pd.DataFrame): Input parameter.
+            returns (pd.DataFrame): Input parameter.
+            rebalance_dates (pd.DatetimeIndex): Input parameter.
+            start_date (str): Input parameter.
+            end_date (Optional[str]): Input parameter.
+            idx_df (Optional[pd.DataFrame]): Input parameter.
+            sector_map (Optional[dict]): Input parameter.
+            open_px (Optional[pd.DataFrame]): Input parameter.
+            high_px (Optional[pd.DataFrame]): Input parameter.
+            low_px (Optional[pd.DataFrame]): Input parameter.
+            dividends (Optional[pd.DataFrame]): Input parameter.
+            splits (Optional[pd.DataFrame]): Input parameter.
+            universe_by_rebalance_date (Optional[Dict[pd.Timestamp, set[str]]]): Input parameter.
+            log_rets_arr (Optional[np.ndarray]): Input parameter.
+        
+        Returns:
+            pd.DataFrame: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         self._reset_run_state()
         # Guard against stale values left by a prior state.from_dict()
         # deserialization when reusing the same BacktestEngine instance.
@@ -261,6 +299,30 @@ class BacktestEngine:
         date_pos: Optional[int] = None,
         log_rets_arr: Optional[np.ndarray] = None,
     ) -> None:
+        """_run_rebalance operation.
+        
+        Args:
+            date (pd.Timestamp): Input parameter.
+            close (pd.DataFrame): Input parameter.
+            volume (pd.DataFrame): Input parameter.
+            returns (pd.DataFrame): Input parameter.
+            symbols (List[str]): Input parameter.
+            prices_t (np.ndarray): Input parameter.
+            idx_df (Optional[pd.DataFrame]): Input parameter.
+            sector_map (Optional[dict]): Input parameter.
+            open_px (Optional[pd.DataFrame]): Input parameter.
+            high_px (Optional[pd.DataFrame]): Input parameter.
+            low_px (Optional[pd.DataFrame]): Input parameter.
+            member_universe (Optional[set[str]]): Input parameter.
+            date_pos (Optional[int]): Input parameter.
+            log_rets_arr (Optional[np.ndarray]): Input parameter.
+        
+        Returns:
+            None: Result of this operation.
+        
+        Raises:
+            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
         cfg = self.engine.cfg
 
         sym_to_global_idx = {sym: i for i, sym in enumerate(symbols)}
@@ -555,6 +617,18 @@ class BacktestEngine:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
+    """_compute_warmup_start operation.
+    
+    Args:
+        start_date (str): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+    
+    Returns:
+        str: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
     cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
     history_gate  = int(getattr(cfg, "HISTORY_GATE",  90))
@@ -616,6 +690,22 @@ def _build_adv_vector(
     cfg: Optional[UltimateConfig] = None,
     return_notional: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, pd.DataFrame]:
+    """_build_adv_vector operation.
+    
+    Args:
+        symbols (List[str]): Input parameter.
+        close (pd.DataFrame): Input parameter.
+        volume (pd.DataFrame): Input parameter.
+        date (pd.Timestamp): Input parameter.
+        cfg (Optional[UltimateConfig]): Input parameter.
+        return_notional (bool): Input parameter.
+    
+    Returns:
+        np.ndarray | tuple[np.ndarray, pd.DataFrame]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     adv_zero_reasons: dict[str, list[str]] = {
         "missing_column": [],
         "empty_lookback": [],
@@ -697,6 +787,18 @@ def _build_adv_vector(
 
 
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
+    """_build_sector_labels operation.
+    
+    Args:
+        sel_syms (List[str]): Input parameter.
+        sector_map (Optional[dict]): Input parameter.
+    
+    Returns:
+        Optional[np.ndarray]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if not sector_map:
         return None
     known_sectors = sorted(s for s in set(sector_map.get(sym, "Unknown") for sym in sel_syms)
@@ -725,6 +827,23 @@ def _execution_prices(
     low_px: Optional[pd.DataFrame],
     return_open_fallback_mask: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """_execution_prices operation.
+    
+    Args:
+        symbols (List[str]): Input parameter.
+        date (pd.Timestamp): Input parameter.
+        close_prices (np.ndarray): Input parameter.
+        open_px (Optional[pd.DataFrame]): Input parameter.
+        high_px (Optional[pd.DataFrame]): Input parameter.
+        low_px (Optional[pd.DataFrame]): Input parameter.
+        return_open_fallback_mask (bool): Input parameter.
+    
+    Returns:
+        np.ndarray | tuple[np.ndarray, np.ndarray]: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     exec_px = close_prices.copy()
     open_fallback_mask = np.zeros(len(symbols), dtype=bool)
 
@@ -864,6 +983,19 @@ def build_precomputed_matrices(
     cfg: Optional[UltimateConfig] = None,
     symbols: Optional[set[str]] = None,
 ) -> dict:
+    """build_precomputed_matrices operation.
+    
+    Args:
+        market_data (dict): Input parameter.
+        cfg (Optional[UltimateConfig]): Input parameter.
+        symbols (Optional[set[str]]): Input parameter.
+    
+    Returns:
+        dict: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if cfg is None:
         cfg = UltimateConfig()
 
@@ -962,6 +1094,24 @@ def run_backtest(
     universe:      Optional[List[str]]      = None,
     precomputed_matrices: Optional[dict]    = None,
 ) -> BacktestResults:
+    """run_backtest operation.
+    
+    Args:
+        market_data (dict): Input parameter.
+        universe_type (Optional[str]): Input parameter.
+        start_date (str): Input parameter.
+        end_date (str): Input parameter.
+        cfg (Optional[UltimateConfig]): Input parameter.
+        sector_map (Optional[dict]): Input parameter.
+        universe (Optional[List[str]]): Input parameter.
+        precomputed_matrices (Optional[dict]): Input parameter.
+    
+    Returns:
+        BacktestResults: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if cfg is None:
         cfg = UltimateConfig()
 
@@ -1077,6 +1227,18 @@ def run_backtest(
             return result
 
         def _resolve_column(df: pd.DataFrame, sym: str) -> pd.Series:
+            """Resolve a symbol column allowing bare and .NS label variants.
+
+            Args:
+                df (pd.DataFrame): Matrix containing price-like columns per symbol.
+                sym (str): Requested symbol key.
+
+            Returns:
+                pd.Series: Matched column series for the requested symbol.
+
+            Raises:
+                KeyError: If no matching column can be resolved.
+            """
             if sym in df.columns:
                 return df[sym]
             if isinstance(sym, str) and sym.endswith(".NS"):
@@ -1243,6 +1405,17 @@ def run_backtest(
 
 
 def print_backtest_results(results: BacktestResults) -> None:
+    """print_backtest_results operation.
+    
+    Args:
+        results (BacktestResults): Input parameter.
+    
+    Returns:
+        None: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     m = results.metrics
     if not m:
         print("\n  \033[31m[!] Backtest returned no metrics. Check date range.\033[0m")
@@ -1273,6 +1446,20 @@ def _compute_metrics(
     periods_per_year: int = 252,
     trades: Optional[List[Trade]] = None,
 ) -> Dict:
+    """_compute_metrics operation.
+    
+    Args:
+        eq (pd.Series): Input parameter.
+        initial (float): Input parameter.
+        periods_per_year (int): Input parameter.
+        trades (Optional[List[Trade]]): Input parameter.
+    
+    Returns:
+        Dict: Result of this operation.
+    
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
     if initial <= 0:
         logger.warning(
             "[Backtest] Non-positive initial capital (%.4f) supplied; returning neutral metrics.",
