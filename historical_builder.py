@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 
+# Default historical NIFTY500 parquet filename used by bootstrap_historical_parquet().
 NIFTY500_PARQUET_FILENAME = "historical_nifty500.parquet"
 
 # Remote master archives used by main() bootstrapping flow.

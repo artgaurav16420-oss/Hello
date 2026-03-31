@@ -59,7 +59,6 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
-_IST_TZ = TIMEZONE_IST
 
 # Sentinel returned by _fetch_candles_chunk to signal rate-limit hit
 _RATE_LIMITED = object()
@@ -645,7 +644,7 @@ class GrowwProvider(DataProvider):
             return None
 
         if hasattr(series.index, "tz") and series.index.tz is not None:
-            series.index = series.index.tz_convert(_IST_TZ).tz_localize(None)
+            series.index = series.index.tz_convert(TIMEZONE_IST).tz_localize(None)
         series.index = pd.DatetimeIndex(series.index).normalize()
         return pd.to_numeric(series, errors="coerce")
 
@@ -997,7 +996,7 @@ def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
 
     if isinstance(out.index, pd.DatetimeIndex):
         if out.index.tz is not None:
-            out.index = out.index.tz_convert(_IST_TZ).tz_localize(None)
+            out.index = out.index.tz_convert(TIMEZONE_IST).tz_localize(None)
         out.index = out.index.normalize()
 
         if out.index.duplicated().any():
@@ -1217,7 +1216,7 @@ def _latest_business_day() -> str:
     holidays (not just Mon–Fri weekdays). Falls back to pandas BDay logic on
     any calendar import/runtime failure.
     """
-    today = pd.Timestamp.now(tz=_IST_TZ).normalize()
+    today = pd.Timestamp.now(tz=TIMEZONE_IST).normalize()
     try:
         import pandas_market_calendars as mcal
 
@@ -1229,9 +1228,9 @@ def _latest_business_day() -> str:
         if len(valid_days) > 0:
             last_valid = pd.Timestamp(valid_days[-1])
             if last_valid.tzinfo is None:
-                last_valid = last_valid.tz_localize(_IST_TZ)
+                last_valid = last_valid.tz_localize(TIMEZONE_IST)
             else:
-                last_valid = last_valid.tz_convert(_IST_TZ)
+                last_valid = last_valid.tz_convert(TIMEZONE_IST)
             return last_valid.strftime("%Y-%m-%d")
     except Exception as exc:
         logger.debug("Falling back to BDay due to NSE calendar error: %s", exc, exc_info=True)
@@ -1563,7 +1562,7 @@ def _process_chunk(
             max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
 
             manifest_entries[ticker] = {
-                "fetched_at":    pd.Timestamp.now(tz=_IST_TZ).isoformat(),
+                "fetched_at":    pd.Timestamp.now(tz=TIMEZONE_IST).isoformat(),
                 "rows":          len(df),
                 "last_date":     df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":     max_gap_days > _SUSPENSION_GAP_DAYS,
@@ -1622,9 +1621,9 @@ def _recover_from_stale_cache(
             # retry_after acts as a cooldown: we do not attempt a re-download
             # until at least the next business day.  last_date is preserved
             # accurately so callers know the true data freshness.
-            _tomorrow = (pd.Timestamp.now(tz=_IST_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+            _tomorrow = (pd.Timestamp.now(tz=TIMEZONE_IST) + timedelta(days=1)).strftime("%Y-%m-%d")
             entries[ticker] = {
-                "fetched_at":   existing.get("fetched_at", pd.Timestamp.now(tz=_IST_TZ).isoformat()),
+                "fetched_at":   existing.get("fetched_at", pd.Timestamp.now(tz=TIMEZONE_IST).isoformat()),
                 "rows":         len(fallback_df),
                 "last_date":    fallback_df.index[-1].strftime("%Y-%m-%d"),
                 "suspended":    existing.get("suspended", False),

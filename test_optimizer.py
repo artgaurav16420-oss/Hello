@@ -64,14 +64,15 @@ def _make_study(captured=None, include_trials=False, trial=None):
     best_trial = trial or _make_best_trial()
 
     class _Study:
-        best_params = dict(best_trial.params)
-        best_trials = [best_trial]
-        directions = [
-            optuna.study.StudyDirection.MAXIMIZE,
-            optuna.study.StudyDirection.MAXIMIZE,
-        ]
-        if include_trials:
-            trials = [best_trial]
+        def __init__(self):
+            self.best_params = dict(best_trial.params)
+            self.best_trials = [best_trial]
+            self.directions = [
+                optuna.study.StudyDirection.MAXIMIZE,
+                optuna.study.StudyDirection.MAXIMIZE,
+            ]
+            if include_trials:
+                self.trials = [best_trial]
 
         def optimize(self, objective, **kwargs):
             if captured is not None:
