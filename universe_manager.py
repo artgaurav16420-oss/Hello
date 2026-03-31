@@ -474,7 +474,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
     lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
 
-    now_ist = datetime.now(tz=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     end_date = now_ist.strftime("%Y-%m-%d")
     start_date = (now_ist - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 
