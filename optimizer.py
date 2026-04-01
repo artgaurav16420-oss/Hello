@@ -37,7 +37,6 @@ from pathlib import Path
 # but by the time Python resolves that import numpy is already loaded — too late.
 import osqp  # noqa: F401
 
-import numpy as np
 import pandas as pd
 import optuna
 from typing import Any
@@ -727,7 +726,7 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
 
     raise OptimizationError(
         "Regime benchmark validation failed. Neither ^CRSLDX nor ^NSEI has usable Close data. "
-        "Details: " + "; ".join(benchmark_notes),
+        f"Details: {'; '.join(benchmark_notes)}",
         OptimizationErrorType.DATA,
     )
 
@@ -1046,6 +1045,17 @@ def run_optimization(
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     def _resolve_execution_mode():
+        """Resolve Optuna storage backend and worker count for this run.
+
+        Args:
+            None.
+
+        Returns:
+            tuple[str, int]: Effective storage URI and ``n_jobs`` for optimization.
+
+        Raises:
+            Exception: Propagates unexpected runtime/environment errors.
+        """
         if in_memory:
             logger.info(
                 "In-memory mode: storage=:memory:, n_jobs=%d. "
@@ -1149,12 +1159,15 @@ def run_optimization(
             "  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %-10s  %s",
             "Year","CAGR%","DD%","Turn","AvgPos","AvgExp","ForcedCash","Score","Flags",
         )
-        logger.info("  " + "-"*82)
+        logger.info(f"  {'-' * 82}")
         for d in diags:
             flags = []
-            if d.get("ceiling_hit"): flags.append("CEIL")
-            if d.get("dd_gate_hit"): flags.append("DD-GATE")
-            if d.get("anomaly_hit"): flags.append("ANOM")
+            if d.get("ceiling_hit"):
+                flags.append("CEIL")
+            if d.get("dd_gate_hit"):
+                flags.append("DD-GATE")
+            if d.get("anomaly_hit"):
+                flags.append("ANOM")
             logger.info(
                 "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %9.4f  %s",
                 d["year"],
@@ -1163,7 +1176,7 @@ def run_optimization(
                 d.get("forced_cash_penalty", 0.0),
                 d["score"], " ".join(flags) if flags else "—",
             )
-        logger.info("  " + "-"*82)
+        logger.info(f"  {'-' * 82}")
         if diags:
             avg_cagr = sum(d["cagr"]       for d in diags) / len(diags)
             avg_dd   = sum(abs(d["max_dd"]) for d in diags) / len(diags)
@@ -1363,7 +1376,7 @@ def run_optimization(
                 "status": status_tag,
             }
             with journal_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(oos_result_dict) + "\n")
+                fh.write(f"{json.dumps(oos_result_dict)}\n")
                 fh.flush()
                 os.fsync(fh.fileno())
             if passes:

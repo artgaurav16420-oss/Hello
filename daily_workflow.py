@@ -716,6 +716,18 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
     adjusted: List[str] = []
 
     def _sweep_dividends(sym: str, row: pd.DataFrame) -> None:
+        """Sweep unapplied dividends for a held symbol into portfolio cash.
+
+        Args:
+            sym (str): Bare symbol currently tracked in portfolio state.
+            row (pd.DataFrame): Price/dividend history for the symbol.
+
+        Returns:
+            None: Updates ``state.cash`` and ``state.dividend_ledger`` in-place.
+
+        Raises:
+            Exception: Propagates unexpected runtime or data access failures.
+        """
         if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
             return
         if getattr(cfg, "AUTO_ADJUST_PRICES", True):
@@ -918,7 +930,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             "last_rebalance_date":  state.last_rebalance_date,
         }
         try:
-            tmp = risk_file + ".tmp"
+            tmp = f"{risk_file}.tmp"
             with open(tmp, "w") as f:
                 json.dump(risk_payload, f, indent=2, sort_keys=True)
                 f.flush()
@@ -1204,6 +1216,19 @@ def _run_scan(
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
         def _build_close_series(universe_symbols: list[str], mkt_data: dict, use_adjusted: bool) -> Dict[str, pd.Series]:
+            """Build a map of bare symbols to close-price series.
+
+            Args:
+                universe_symbols (list[str]): Symbols to include in the output map.
+                mkt_data (dict): Downloaded market data keyed by NSE ticker.
+                use_adjusted (bool): Whether to prefer ``Adj Close`` when available.
+
+            Returns:
+                Dict[str, pd.Series]: Per-symbol close series keyed by bare symbol.
+
+            Raises:
+                Exception: Propagates unexpected runtime or data access failures.
+            """
             close_map: Dict[str, pd.Series] = {}
             for sym in universe_symbols:
                 ns = to_ns(sym)
@@ -1960,6 +1985,22 @@ def _preview_scan_and_maybe_save(
     universe: List[str],
     cfg: UltimateConfig,
 ) -> None:
+    """Run a preview scan, render output, and optionally persist changes.
+
+    Args:
+        states (dict): Portfolio state objects keyed by portfolio identifier.
+        mkt_cache (dict): Mutable market-data cache keyed by portfolio identifier.
+        portfolio_key (str): Portfolio key to preview (e.g., ``"nifty"``).
+        label (str): Human-readable label for UI/log output.
+        universe (List[str]): Universe symbols to scan.
+        cfg (UltimateConfig): Strategy configuration for this scan.
+
+    Returns:
+        None: Mutates ``states``/``mkt_cache`` and writes portfolio files.
+
+    Raises:
+        Exception: Propagates scan/runtime failures from downstream helpers.
+    """
     preview = copy.deepcopy(states[portfolio_key])
     preview, mkt = _run_scan(universe, preview, f"{label} SCAN", cfg, name=portfolio_key)
     mkt_cache[portfolio_key] = mkt

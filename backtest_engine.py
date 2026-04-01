@@ -1013,7 +1013,7 @@ def build_precomputed_matrices(
     for sym in target_symbols:
         if not sym:
             continue
-        key = sym if sym.endswith(".NS") else sym + ".NS"
+        key = sym if sym.endswith(".NS") else f"{sym}.NS"
         row = market_data.get(key)
         if row is None or row.empty:
             continue
@@ -1132,7 +1132,7 @@ def run_backtest(
         history_gate = int(getattr(cfg, "HISTORY_GATE", 20))
         vol_dict: Dict[str, pd.Series] = {}
         for sym in list(union_universe):
-            key = sym if sym.endswith(".NS") else sym + ".NS"
+            key = sym if sym.endswith(".NS") else f"{sym}.NS"
             row = market_data.get(key)
             if row is None:
                 row = market_data.get(sym)

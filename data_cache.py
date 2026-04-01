@@ -39,7 +39,6 @@ import json
 import logging
 import os
 import random
-import threading
 import time
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
@@ -61,7 +60,7 @@ from shared_constants import (
 )
 
 import requests
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -466,6 +465,12 @@ class _ManifestProcessFileLock:
 
 
 class DataProvider(ABC):
+    """Abstract interface for market data providers.
+
+    Implementations are responsible for downloading historical OHLCV data
+    for the requested ticker list and date window.
+    """
+
     @abstractmethod
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
         """download operation.
@@ -1330,7 +1335,7 @@ def _save_manifest(manifest_data: dict) -> None:
     _ensure_cache_paths_configured()
     assert CACHE_DIR is not None and MANIFEST_FILE is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = MANIFEST_FILE.with_name(MANIFEST_FILE.name + ".tmp")
+    temp_file = MANIFEST_FILE.with_name(f"{MANIFEST_FILE.name}.tmp")
     try:
         with temp_file.open("w", encoding="utf-8") as file:
             json.dump(manifest_data, file, indent=2)
@@ -1600,7 +1605,7 @@ def load_or_fetch(
             upper_t = upper_t[:-4]
         elif upper_t.endswith(".NS"):
             upper_t = upper_t[:-3]
-        return upper_t + ".NS"
+        return f"{upper_t}.NS"
 
     standardized_tickers = list(dict.fromkeys(_clean_ticker(t) for t in tickers))
 
