@@ -866,7 +866,7 @@ def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict
         Args:
             candidates (list[str]): Bare tickers missing from static sector map.
             sector_cache (dict): Cached sector payload keyed by bare ticker.
-            sector_cache_fetched_at: Fallback cache timestamp for legacy entries.
+            sector_cache_fetched_at (str | None): Fallback cache timestamp for legacy entries.
 
         Returns:
             list[str]: Candidate tickers still unresolved after cache lookup.
