@@ -85,7 +85,18 @@ from shared_constants import (
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
 _SUSPENSION_GAP_DAYS = 30
-_ENABLE_REBAL_PLACEHOLDERS = bool(int(str(os.environ.get("ENABLE_REBAL_PLACEHOLDERS", "0"))))
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, str(default))).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+_ENABLE_REBAL_PLACEHOLDERS = _parse_bool_env("ENABLE_REBAL_PLACEHOLDERS", default=False)
 
 
 # ─── Results container ────────────────────────────────────────────────────────
@@ -1211,14 +1222,18 @@ def _resolve_universe_by_date(
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    union_universe = set(universe or [])
+    def _normalize_symbol(sym: str) -> str:
+        s = str(sym).strip().upper()
+        return s[:-3] if s.endswith(".NS") else s
+
+    union_universe = {_normalize_symbol(sym) for sym in (universe or []) if str(sym).strip()}
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
     selected_universe_type = universe_type or "nse_total"
 
     if union_universe:
         history_gate = int(getattr(cfg, "HISTORY_GATE", 20))
         vol_dict: Dict[str, pd.Series] = {}
-        for sym in list(union_universe):
+        for sym in sorted(union_universe):
             key = sym if sym.endswith(".NS") else f"{sym}.NS"
             row = market_data.get(key)
             if row is None:
@@ -1251,7 +1266,7 @@ def _resolve_universe_by_date(
     else:
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
-            member_set = set(historical_members or [])
+            member_set = {_normalize_symbol(sym) for sym in (historical_members or []) if str(sym).strip()}
             universe_by_rebalance_date[pd.Timestamp(d)] = member_set
             union_universe.update(member_set)
 
@@ -1516,13 +1531,18 @@ def run_backtest(
     precomputed_matrices: Optional[dict] = None,
 ) -> BacktestResults:
     """run_backtest operation."""
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    if start_ts > end_ts:
+        raise ValueError(
+            f"Invalid backtest date range: start_date ({start_ts.date()}) is after end_date ({end_ts.date()})."
+        )
+
     if cfg is None:
         cfg = UltimateConfig()
 
     warmup_start = _compute_warmup_start(start_date, cfg)
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
-    if len(all_target_dates) == 0:
-        all_target_dates = pd.DatetimeIndex([pd.Timestamp(end_date)])
 
     union_universe, universe_by_rebalance_date, _selected_universe_type = _resolve_universe_by_date(
         market_data=market_data,
