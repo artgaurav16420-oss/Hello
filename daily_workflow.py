@@ -970,10 +970,8 @@ def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioSt
     """
     with state_file.open("r", encoding="utf-8") as vf:
         parsed = json.loads(vf.read())
-    if "cash" not in parsed or "shares" not in parsed:
-        return False
     expected = expected_state.to_dict()
-    return parsed.get("cash") == expected.get("cash") and parsed.get("shares") == expected.get("shares")
+    return parsed == expected
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
     """save_portfolio_state operation.
@@ -1041,6 +1039,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 "Do not restart the process until the issue is resolved.",
                 name, jexc,
             )
+            raise
 
         if os.name == "posix":
             dir_fd = os.open("data", getattr(os, "O_DIRECTORY", 0))
@@ -2001,7 +2000,7 @@ def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) ->
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     cvar = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
-    cvar_color = C.RED if cvar > 0.12 else C.GRN
+    cvar_color = C.RED if cvar > cfg.CVAR_DAILY_LIMIT else C.GRN
     return "\n".join([
         f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}",
         f"  {C.YLW}⚡{C.RST} Exposure Multiplier : {C.BLD}{state.exposure_multiplier:.3f}{C.RST}",
@@ -2353,6 +2352,9 @@ def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
         universe_identifier = "nifty500"
 
     end = datetime.today().strftime("%Y-%m-%d")
+    if pd.Timestamp(start) > pd.Timestamp(end):
+        print(f"  {C.RED}Invalid date range: start date {start} is after end date {end}.{C.RST}")
+        return
     bt_cfg = load_optimized_config()
 
     if universe_identifier == "custom":
@@ -2474,10 +2476,15 @@ def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
         try:
             amt_str = input(f"  {C.CYN}Amount (₹): {C.RST}").replace(",", "").strip()
             amt = float(amt_str)
-            state.cash = max(0.0, state.cash + amt)
+            old_cash = state.cash
+            if amt >= 0:
+                actual_change = amt
+            else:
+                actual_change = max(amt, -old_cash)
+            state.cash = old_cash + actual_change
             save_portfolio_state(state, name)
-            action = "Deposited" if amt >= 0 else "Withdrew"
-            print(f"  {C.GRN}[+] {action} ₹{abs(amt):,.2f}. New Cash: ₹{state.cash:,.2f}{C.RST}")
+            action = "Deposited" if actual_change >= 0 else "Withdrew"
+            print(f"  {C.GRN}[+] {action} \u20b9{abs(actual_change):,.2f}. New Cash: \u20b9{state.cash:,.2f}{C.RST}")
         except ValueError:
             print(f"  {C.RED}Invalid amount.{C.RST}")
     else:
@@ -2503,9 +2510,13 @@ def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> 
     confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
     if confirm.upper() == "YES":
         for n in ["nse_total", "nifty", "custom"]:
+            targets: List[str] = []
             p = f"data/portfolio_state_{n}.json"
             for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
-                target = p + suffix
+                targets.append(p + suffix)
+            targets.append(f"data/portfolio_risk_{n}.json")
+            targets.extend(str(path) for path in pathlib.Path("data").glob(f"pending_rebalance_{n}*"))
+            for target in targets:
                 if not os.path.exists(target):
                     continue
                 removed = False
