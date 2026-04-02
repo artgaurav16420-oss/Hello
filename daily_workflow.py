@@ -2512,8 +2512,9 @@ def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> 
         for n in ["nse_total", "nifty", "custom"]:
             targets: List[str] = []
             p = f"data/portfolio_state_{n}.json"
-            for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
-                targets.append(p + suffix)
+            targets.append(p)
+            for i in range(BACKUP_GENERATIONS):
+                targets.append(f"{p}.bak.{i}")
             targets.append(f"data/portfolio_risk_{n}.json")
             targets.extend(str(path) for path in pathlib.Path("data").glob(f"pending_rebalance_{n}*"))
             for target in targets:

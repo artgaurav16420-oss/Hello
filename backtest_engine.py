@@ -1289,6 +1289,15 @@ def _prepare_backtest_matrices(
                 return df[ns_sym]
             raise KeyError(sym)
 
+        unresolved = [sym for sym in selected if sym not in matrices["close"].columns and
+                      (not (isinstance(sym, str) and sym.endswith(".NS") and sym[:-3] in matrices["close"].columns)) and
+                      (f"{sym}.NS" if isinstance(sym, str) and not sym.endswith(".NS") else sym) not in matrices["close"].columns]
+        if unresolved:
+            raise ValueError(
+                "Precomputed matrices missing symbols for requested universe: "
+                + ", ".join(sorted(map(str, unresolved)))
+            )
+
         def _select(df: pd.DataFrame) -> pd.DataFrame:
             return pd.DataFrame({sym: _resolve_column(df, sym) for sym in selected}, index=df.index)
 
