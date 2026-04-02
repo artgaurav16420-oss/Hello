@@ -1108,11 +1108,11 @@ def _error_triage_callback_factory() -> Callable[[optuna.Study, optuna.trial.Fro
 def _resolve_execution_mode(in_memory: bool) -> tuple[str, int]:
     if in_memory:
         logger.info(
-            "In-memory mode: storage=:memory:, n_jobs=%d. "
+            "In-memory mode: storage=sqlite:///:memory:, n_jobs=%d. "
             "Trial history will not be persisted.",
             1,
         )
-        return ":memory:", 1
+        return "sqlite:///:memory:", 1
     return OPTUNA_STORAGE, N_JOBS
 
 

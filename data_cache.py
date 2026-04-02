@@ -229,19 +229,24 @@ class _ManifestProcessFileLock:
             stat_info = path.stat()
             lock_age = time.time() - stat_info.st_mtime
             return lock_age >= stale_threshold
-        except Exception:
+        except Exception as exc:
+            logger.debug("[Lock] Failed to stat %s for stale check: %s", path, exc)
             return False
 
     def _wait_for_owner_file(self, max_wait: float, wait_step: float) -> bool:
-        elapsed = 0.0
-        while elapsed < max_wait:
-            if not self._lock_dir.exists():
-                return False
-            time.sleep(wait_step)
-            elapsed += wait_step
-            if self._owner_file.exists():
-                return True
-        return False
+        try:
+            elapsed = 0.0
+            while elapsed < max_wait:
+                if not self._lock_dir.exists():
+                    return False
+                time.sleep(wait_step)
+                elapsed += wait_step
+                if self._owner_file.exists():
+                    return True
+            return False
+        except Exception as exc:
+            logger.debug("[Lock] Error while waiting for owner file: %s", exc)
+            return False
 
     @staticmethod
     def _parse_owner_pid(content: str) -> Optional[int]:
@@ -324,10 +329,18 @@ class _ManifestProcessFileLock:
 
     def _try_acquire_once(self) -> bool:
         self._lock_dir.mkdir(parents=False, exist_ok=False)
-        self._owner_file.write_text(
-            f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
-            encoding="utf-8",
-        )
+        try:
+            self._owner_file.write_text(
+                f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            try:
+                if self._lock_dir.exists():
+                    self._lock_dir.rmdir()
+            except Exception as cleanup_exc:
+                logger.debug("[Lock] Failed cleanup after owner write failure: %s", cleanup_exc)
+            raise
         return True
 
     def _remove_stale_lock(self) -> bool:
@@ -686,13 +699,17 @@ class GrowwProvider(DataProvider):
                 continue
             try:
                 ts = pd.Timestamp(str(c[0]))
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(TIMEZONE_IST)
+                else:
+                    ts = ts.tz_convert(TIMEZONE_IST)
                 open_ = float(c[1])
                 high = float(c[2])
                 low = float(c[3])
                 close = float(c[4])
                 vol = float(c[5]) if c[5] is not None else 0.0
                 rows.append({
-                    "Date": ts.normalize(),
+                    "Date": ts.tz_localize(None).normalize(),
                     "Open": open_,
                     "High": high,
                     "Low": low,
@@ -1567,7 +1584,7 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
     return chain
 
 
-def _clean_ticker_symbol(ticker: str) -> str:
+def _clean_ticker_symbol(ticker: Optional[str]) -> str:
     if ticker is None:
         raise ValueError("ticker list contains None")
     t_str = str(ticker).strip()
@@ -1576,10 +1593,16 @@ def _clean_ticker_symbol(ticker: str) -> str:
     if t_str.startswith("^"):
         return t_str
     upper_t = t_str.upper()
-    if upper_t.endswith(".NSE"):
+    if upper_t.endswith(".BSE"):
         upper_t = upper_t[:-4]
-    elif upper_t.endswith(".NS"):
+    elif upper_t.endswith(".BO"):
         upper_t = upper_t[:-3]
+    if upper_t.endswith(".NSE"):
+        upper_t = f"{upper_t[:-4]}.NS"
+    elif upper_t.endswith(".NS"):
+        return upper_t
+    if upper_t.endswith(".NS"):
+        return upper_t
     return f"{upper_t}.NS"
 
 
@@ -1603,6 +1626,7 @@ def _retry_unresolved_individually(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
     cfg: Any,
+    updated_tickers: set[str],
 ) -> List[str]:
     still_missing: List[str] = []
     if not unresolved:
@@ -1630,6 +1654,7 @@ def _retry_unresolved_individually(
                 cfg,
                 provider_name=type(provider).__name__,
             )
+            updated_tickers.update(saved)
             if ticker in saved:
                 resolved = True
                 break
@@ -1638,14 +1663,16 @@ def _retry_unresolved_individually(
     return still_missing
 
 
-def _save_manifest_entries_for_downloaded_tickers(tickers_to_download: List[str], entries: dict) -> None:
+def _save_manifest_entries_for_downloaded_tickers(updated_tickers: set[str], entries: dict) -> None:
+    if not updated_tickers:
+        return
     assert _MANIFEST_LOCK_DIR is not None
     with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
         live_manifest = _load_manifest()
         live_entries = live_manifest.setdefault("entries", {})
-        for ticker in tickers_to_download:
+        for ticker in sorted(updated_tickers):
             entry = entries.get(ticker)
-            if entry is not None:
+            if entry is not None and live_entries.get(ticker) != entry:
                 live_entries[ticker] = entry
         _save_manifest(live_manifest)
 
@@ -1690,6 +1717,7 @@ def load_or_fetch(
     latest_bday = _latest_business_day()
 
     tickers_to_download = []
+    updated_tickers: set[str] = set()
     market_data: Dict[str, pd.DataFrame] = {}
 
     for ticker in standardized_tickers:
@@ -1757,9 +1785,11 @@ def load_or_fetch(
                             cfg,
                             provider_name=type(provider).__name__,
                         )
+                        updated_tickers.update(saved)
                         missing_from_provider = [t for t in chunk if t not in saved]
 
                         if not missing_from_provider:
+                            chunk = []
                             break
 
                         chunk = missing_from_provider
@@ -1785,9 +1815,11 @@ def load_or_fetch(
                         entries,
                         market_data,
                         cfg,
+                        updated_tickers,
                     )
                     if unresolved_after_retry:
-                        _recover_from_stale_cache(unresolved_after_retry, entries, market_data, cfg=cfg)
+                        recovered = _recover_from_stale_cache(unresolved_after_retry, entries, market_data, cfg=cfg)
+                        updated_tickers.update(recovered)
 
             # BUG-FIX-MANIFEST-IO: save manifest once after ALL chunks complete,
             # not once per chunk. Previously 300 tickers (4 chunks) triggered 4
@@ -1797,7 +1829,7 @@ def load_or_fetch(
             # Note: _save_manifest is intentionally called only on download/recovery
             # paths. Any future code path that mutates `entries` without downloading
             # must explicitly call _save_manifest() to keep manifest state in sync.
-            _save_manifest_entries_for_downloaded_tickers(tickers_to_download, entries)
+            _save_manifest_entries_for_downloaded_tickers(updated_tickers, entries)
     finally:
         for provider in providers:
             close_fn = getattr(provider, "close", None)
@@ -1890,6 +1922,9 @@ def _save_dataframe_atomic(df: pd.DataFrame, parquet_path: Path) -> None:
     tmp_path = CACHE_DIR / f"{parquet_path.name}.tmp.{uuid.uuid4().hex}"
     try:
         df.to_parquet(tmp_path)
+        # Best-effort durability before atomic replace.
+        with tmp_path.open("rb") as fh:
+            os.fsync(fh.fileno())
         tmp_path.replace(parquet_path)
     except Exception:
         if tmp_path.exists():
@@ -1915,7 +1950,7 @@ def _recover_from_stale_cache(
     entries: dict,
     market_data: Dict[str, pd.DataFrame],
     cfg=None,
-) -> None:
+) -> set[str]:
     """
     Load stale-but-present parquets as a fallback when all providers fail.
 
@@ -1991,6 +2026,7 @@ def _recover_from_stale_cache(
             "[Cache] Skipping %d symbols from chunk starting with %s after all providers failed.",
             missing, chunk[0],
         )
+    return set(recovered_symbols)
 
 
 def get_cache_summary() -> dict:

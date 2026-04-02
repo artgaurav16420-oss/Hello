@@ -353,7 +353,7 @@ class PortfolioState:
     consecutive_failures: int              = 0
     # Presence-aware optional fields: None means "missing from persisted state",
     # allowing callers to apply UltimateConfig defaults only when absent.
-    equity_hist_cap:      int              = field(default_factory=lambda: max(500, int(UltimateConfig().CVAR_LOOKBACK * 2)))
+    equity_hist_cap:      Optional[int]    = None
     max_absent_periods:   Optional[int]    = None
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
@@ -366,7 +366,10 @@ class PortfolioState:
     def __post_init__(self) -> None:
         self._initial_cash = float(self.cash)
         self._initial_exposure_multiplier = float(self.exposure_multiplier)
-        self._equity_hist_cap = int(self.equity_hist_cap)
+        if self.equity_hist_cap is None:
+            self._equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
+        else:
+            self._equity_hist_cap = int(self.equity_hist_cap)
 
     def update_exposure(
         self,
@@ -503,7 +506,10 @@ class PortfolioState:
 
         pv_rounded = round(float(pv), 10)
         self.equity_hist.append(pv_rounded)
-        self._equity_hist_cap = int(self.equity_hist_cap)
+        if self.equity_hist_cap is None:
+            self._equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
+        else:
+            self._equity_hist_cap = int(self.equity_hist_cap)
         if self._equity_hist_cap > 0 and len(self.equity_hist) > self._equity_hist_cap:
             self.equity_hist = self.equity_hist[-self._equity_hist_cap:]
 
@@ -608,7 +614,6 @@ class PortfolioState:
         ps = cls()
         errors: List[str] = []
         risk_control_errors: List[str] = []
-        default_equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
 
         ps.weights = _state_get(
             d, "weights", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
@@ -640,15 +645,7 @@ class PortfolioState:
         ps.consecutive_failures = _state_get(
             d, "consecutive_failures", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
         )
-        ps.equity_hist_cap = _state_get(
-            d,
-            "equity_hist_cap",
-            _as_nonneg_int_or_default,
-            default_equity_hist_cap,
-            cls.RISK_CONTROL_FIELDS,
-            errors,
-            risk_control_errors,
-        )
+        ps.equity_hist_cap = _load_equity_hist_cap(d)
         ps.max_absent_periods = _state_get(
             d, "max_absent_periods", _as_optional_nonneg_int, None, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
         )
@@ -680,7 +677,10 @@ class PortfolioState:
             d, "last_rebalance_date", str, "", cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
         )
         ps._initial_cash = float(ps.cash)
-        ps._equity_hist_cap = int(ps.equity_hist_cap)
+        if ps.equity_hist_cap is None:
+            ps._equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
+        else:
+            ps._equity_hist_cap = int(ps.equity_hist_cap)
 
         if errors:
             logger.error(
@@ -719,16 +719,26 @@ def _as_nonneg_int(value: Any) -> int:
     return parsed
 
 
-def _as_nonneg_int_or_default(value: Any) -> int:
-    if value is None:
-        return max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
-    return _as_nonneg_int(value)
-
-
 def _as_optional_nonneg_int(value: Any) -> Optional[int]:
     if value is None:
         return None
     return _as_nonneg_int(value)
+
+
+def _load_equity_hist_cap(payload: dict) -> Optional[int]:
+    if "equity_hist_cap" not in payload:
+        return None
+    value = payload.get("equity_hist_cap")
+    if value is None:
+        return None
+    try:
+        return _as_optional_nonneg_int(value)
+    except Exception as exc:
+        logger.warning(
+            "PortfolioState.from_dict: invalid non-critical field 'equity_hist_cap' (%s); using None.",
+            exc,
+        )
+        return None
 
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
@@ -754,14 +764,6 @@ def _state_get(
         return converter(payload[key]) if key in payload else default
     except Exception as exc:
         msg = f"{key}: {exc}"
-        if key == "equity_hist_cap":
-            logger.warning(
-                "PortfolioState.from_dict: invalid non-critical field '%s' (%s); using default %r.",
-                key,
-                exc,
-                default,
-            )
-            return default
         if key in risk_control_fields:
             risk_control_errors.append(msg)
         else:
@@ -1591,7 +1593,7 @@ def _apply_ghost_return_synthesis(
     ghost_mask = np.array([(s not in active_idx) or (s in rets.columns and rets[s].isna().all()) for s in held_syms])
     if not ghost_mask.any():
         return
-    ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
+    ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask, strict=True) if is_ghost)
     for sym in ghost_cols:
         daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
         row_seeds = _row_seeds_from_index(rets.index, _ghost_seed_for(sym))
