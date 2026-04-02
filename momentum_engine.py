@@ -1489,7 +1489,7 @@ def compute_book_cvar(
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     mtm_weights, pv = _build_mtm_weights_and_pv(state, prices, active_idx)
 
-    if pv <= 1e-6:
+    if (not np.isfinite(pv)) or pv <= 1e-6:
         return 0.0
 
     held_syms = list(mtm_weights.keys())

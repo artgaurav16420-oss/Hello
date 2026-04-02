@@ -241,8 +241,13 @@ def _extract_rebalance_summary(rebal_log: pd.DataFrame | None) -> tuple[float, f
     if rebal_log is None or rebal_log.empty:
         return avg_cvar, avg_exposure, avg_positions, n_rebalances
     fallback_series = pd.Series([0.0])
+    exposure_fallback_series = pd.Series([1.0])
     avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", fallback_series), errors="coerce").fillna(0.0).mean())
-    avg_exposure = float(pd.to_numeric(rebal_log.get("exposure_multiplier", fallback_series), errors="coerce").fillna(0.0).mean())
+    avg_exposure = float(
+        pd.to_numeric(rebal_log.get("exposure_multiplier", exposure_fallback_series), errors="coerce")
+        .fillna(1.0)
+        .mean()
+    )
     avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0).mean())
     n_rebalances = len(rebal_log)
     return avg_cvar, avg_exposure, avg_positions, n_rebalances
@@ -1174,6 +1179,18 @@ def _load_oos_journal_records(journal_path: Path, current_meta: dict[str, float 
             continue
         try:
             rec = json.loads(line)
+            if not isinstance(rec, dict):
+                logger.warning(
+                    "Skipping journal line %d in %s: JSON row is %s, expected object.",
+                    line_idx, journal_path, type(rec).__name__,
+                )
+                continue
+            if "trial_number" not in rec:
+                logger.warning(
+                    "Skipping journal line %d in %s: missing trial_number key.",
+                    line_idx, journal_path,
+                )
+                continue
             trial_number = rec["trial_number"]
             rec_meta = rec.get("meta")
             if rec_meta != current_meta:
@@ -1198,7 +1215,7 @@ def _load_oos_journal_records(journal_path: Path, current_meta: dict[str, float 
                 )
                 continue
             completed_trial_ids[trial_number] = rec
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
             logger.warning(
                 "Skipping corrupt/truncated journal line %d in %s: %s (line: %r)",
                 line_idx, journal_path, e, line[:100]
