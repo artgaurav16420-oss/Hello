@@ -743,7 +743,7 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
         return None
     try:
         return _as_optional_nonneg_int(value)
-    except Exception as exc:
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
         logger.warning(
             "PortfolioState.from_dict: invalid non-critical field 'equity_hist_cap' (%s); using None.",
             exc,

@@ -1155,8 +1155,9 @@ def _create_optimization_study(study_name: str, storage: str) -> optuna.Study:
     return study
 
 
-def _current_oos_meta() -> dict[str, float | str]:
+def _current_oos_meta(universe_type: str) -> dict[str, float | str]:
     return {
+        "universe_type": universe_type,
         "test_start": TEST_START,
         "test_end": TEST_END,
         "oos_max_dd_cap": float(OOS_MAX_DD_CAP),
@@ -1441,7 +1442,7 @@ def run_optimization(
 
     oos_results_list = []
     journal_path = _oos_journal_path(effective_study_name)  # ARCH-FIX-9
-    current_meta = _current_oos_meta()
+    current_meta = _current_oos_meta(universe_type)
     completed_trial_ids = _load_oos_journal_records(journal_path, current_meta)
 
     for rank, trial_candidate in enumerate(top_k_trials, 1):

@@ -709,7 +709,7 @@ class GrowwProvider(DataProvider):
                 close = float(c[4])
                 vol = float(c[5]) if c[5] is not None else 0.0
                 rows.append({
-                    "Date": ts.tz_localize(None).normalize(),
+                    "Date": ts.normalize().replace(tzinfo=None),
                     "Open": open_,
                     "High": high,
                     "Low": low,
@@ -1627,6 +1627,16 @@ def _retry_unresolved_individually(
     cfg: Any,
     updated_tickers: set[str],
 ) -> List[str]:
+    """
+    Retry unresolved symbols one-by-one through the provider chain.
+
+    Side effect:
+    - ``updated_tickers`` is mutated in-place with symbols successfully saved
+      during this retry pass.
+
+    Returns:
+    - The list of symbols still unresolved after trying all providers.
+    """
     still_missing: List[str] = []
     if not unresolved:
         return still_missing
