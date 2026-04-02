@@ -1340,33 +1340,75 @@ def _snap_rebalance_dates_to_holidays(
         eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
         if len(eligible) > 0:
             snapped_key = eligible[-1]
-            if snapped_key not in snapped_universe:
+            if snapped_key in snapped_universe:
+                logger.warning(
+                    "[Backtest] Holiday snap collision: target %s also maps to %s; merging member sets.",
+                    target_d.date(),
+                    snapped_key.date(),
+                )
+                snapped_universe[snapped_key].update(members)
+            else:
                 snapped_universe[snapped_key] = set(members)
     return rebal_dates, snapped_universe if snapped_universe else universe_by_rebalance_date
 
 
 def _rebal_filter_universe(*args: object, **kwargs: object) -> Dict[str, object]:
-    """_rebal_filter_universe operation."""
+    """_rebal_filter_universe operation.
+
+    TODO: implement steps 1-2 of rebalance flow:
+    - apply date/member universe eligibility
+    - include currently held symbols even if not in fresh universe
+    - return normalized symbol list and index mappings consumed by later phases
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
     return {"args": args, "kwargs": kwargs}
 
 
 def _rebal_build_valuation(*args: object, **kwargs: object) -> Dict[str, object]:
-    """_rebal_build_valuation operation."""
+    """_rebal_build_valuation operation.
+
+    TODO: implement steps 3-6:
+    - build ADV vector and valuation-price series
+    - compute portfolio value and previous weights
+    - return valuation bundle for CVaR/optimizer phases
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
     return {"args": args, "kwargs": kwargs}
 
 
 def _rebal_check_cvar_breach(*args: object, **kwargs: object) -> Dict[str, object]:
-    """_rebal_check_cvar_breach operation."""
+    """_rebal_check_cvar_breach operation.
+
+    TODO: implement steps 8-10:
+    - compute book CVaR on valuation state
+    - set soft/hard breach flags and override/decay triggers
+    - return breach decision state used by target generation phase
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
     return {"args": args, "kwargs": kwargs}
 
 
 def _rebal_generate_targets(*args: object, **kwargs: object) -> Dict[str, object]:
-    """_rebal_generate_targets operation."""
+    """_rebal_generate_targets operation.
+
+    TODO: implement steps 11-13:
+    - generate signals and selection set
+    - call optimizer with failure handling and decay fallback
+    - return target weights plus flags (apply_decay, forced_to_cash)
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
     return {"args": args, "kwargs": kwargs}
 
 
 def _rebal_execute_trades(*args: object, **kwargs: object) -> Dict[str, object]:
-    """_rebal_execute_trades operation."""
+    """_rebal_execute_trades operation.
+
+    TODO: implement step 14:
+    - resolve execution prices (open/close fallback rules)
+    - invoke execute_rebalance and capture trade/slippage effects
+    - return execution summary for rebalance audit row construction
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
     return {"args": args, "kwargs": kwargs}
 
 

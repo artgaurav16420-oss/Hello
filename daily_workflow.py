@@ -249,13 +249,19 @@ def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Pat
     return path
 
 
-def _is_claim_stale(claim_path: pathlib.Path, current_date_str: str, max_age_hours: int) -> bool:
+def _is_claim_stale(
+    claim_path: pathlib.Path,
+    current_date_str: str,
+    max_age_hours: int,
+    stat_result: os.stat_result,
+) -> bool:
     """_is_claim_stale operation.
 
     Args:
         claim_path (pathlib.Path): Input parameter.
         current_date_str (str): Input parameter.
         max_age_hours (int): Input parameter.
+        stat_result (os.stat_result): Input parameter.
 
     Returns:
         bool: Result of this operation.
@@ -263,7 +269,6 @@ def _is_claim_stale(claim_path: pathlib.Path, current_date_str: str, max_age_hou
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    stat_result = claim_path.stat()
     mtime = datetime.fromtimestamp(stat_result.st_mtime)
     claim_date_str = ""
     try:
@@ -322,6 +327,7 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
                 claim_path=claim_path,
                 current_date_str=date_str,
                 max_age_hours=24,
+                stat_result=stat_result,
             )
 
             if is_stale:
@@ -1049,8 +1055,8 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
         if tmp_file.exists():
             try:
                 os.remove(tmp_file)
-            except Exception:
-                pass
+            except OSError as cleanup_exc:
+                logger.debug("Cleanup failed for tmp state file '%s': %s", tmp_file, cleanup_exc)
 def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     """_apply_risk_overlay operation.
 
@@ -1199,6 +1205,8 @@ def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 1 should resolve session date range, assemble symbol universe,
+    # and populate ctx["market_data"] via load_or_fetch.
     return ctx
 
 
@@ -1214,6 +1222,8 @@ def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 2 should detect/apply splits, build close matrix, forward-fill,
+    # and compute regime inputs (idx slice, close_hist, log returns).
     return ctx
 
 
@@ -1229,6 +1239,8 @@ def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 3 should update exposure multiplier and evaluate book CVaR
+    # hard/soft breach flags used by optimization and decay phases.
     return ctx
 
 
@@ -1244,6 +1256,8 @@ def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 4 should generate signals, sector labels, and optimizer
+    # targets; record solver/data failure outcomes in ctx.
     return ctx
 
 
@@ -1259,6 +1273,8 @@ def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 5 should compute decay targets when optimization fails and
+    # enforce full-liquidation behavior when limits are exhausted.
     return ctx
 
 
@@ -1274,6 +1290,8 @@ def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 6 should run trading-calendar stale-bar checks and lock/adjust
+    # weights for stale held symbols before execution.
     return ctx
 
 
@@ -1289,6 +1307,8 @@ def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 7 should perform pending-sentinel claim/write and call
+    # execute_rebalance with finalized targets and scenario losses.
     return ctx
 
 
@@ -1304,6 +1324,8 @@ def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
+    # TODO: Phase 8 should record EOD prices/equity, update absent tracking,
+    # emit summary logs, and render trade action sheets.
     return ctx
 
 def _run_scan(
@@ -2303,7 +2325,7 @@ def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    _ = states
+    # states parameter reserved for future use (e.g., backtest-from-live-state).
     print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
     print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
     bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
