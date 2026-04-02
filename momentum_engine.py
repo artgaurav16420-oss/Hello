@@ -605,114 +605,80 @@ class PortfolioState:
         Raises:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
-        ps     = cls()
+        ps = cls()
         errors: List[str] = []
         risk_control_errors: List[str] = []
+        default_equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
 
-        def _as_bool(value) -> bool:
-            """_as_bool operation.
-            
-            Args:
-                value (float): Input parameter.
-            
-            Returns:
-                bool: Result of this operation.
-            
-            Raises:
-                Exception: Propagates runtime, validation, I/O, or provider errors.
-            """
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, str):
-                v = value.strip().lower()
-                if v in {"true", "1", "yes", "y", "on"}:
-                    return True
-                if v in {"false", "0", "no", "n", "off"}:
-                    return False
-                raise ValueError(f"cannot parse bool from '{value}'")
-            if isinstance(value, int):
-                if value in (0, 1):
-                    return bool(value)
-                raise ValueError(f"integer bool flag must be 0/1, got {value}")
-            raise TypeError(f"unsupported bool type: {type(value).__name__}")
-
-        def _as_nonneg_int(value) -> int:
-            parsed = int(value)
-            if parsed < 0:
-                raise ValueError(f"value must be non-negative, got {parsed}")
-            return parsed
-
-        def _as_nonneg_int_or_default(value) -> int:
-            if value is None:
-                return max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
-            return _as_nonneg_int(value)
-
-        def _as_optional_nonneg_int(value) -> Optional[int]:
-            if value is None:
-                return None
-            return _as_nonneg_int(value)
-
-        def _get(key, converter, default):
-            """_get operation.
-            
-            Args:
-                key (Any): Input parameter.
-                converter (Any): Input parameter.
-                default (Any): Input parameter.
-            
-            Returns:
-                Any: Result of this operation.
-            
-            Raises:
-                Exception: Propagates runtime, validation, I/O, or provider errors.
-            """
-            try:
-                return converter(d[key]) if key in d else default
-            except Exception as exc:
-                msg = f"{key}: {exc}"
-                if key == "equity_hist_cap":
-                    logger.warning(
-                        "PortfolioState.from_dict: invalid non-critical field '%s' (%s); using default %r.",
-                        key,
-                        exc,
-                        default,
-                    )
-                    return default
-                if key in cls.RISK_CONTROL_FIELDS:
-                    risk_control_errors.append(msg)
-                else:
-                    errors.append(msg)
-                return default
-
-        ps.weights              = _get("weights",              lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.shares               = _get("shares",               lambda v: {k: int(x)   for k, x in v.items()}, {})
-        ps.entry_prices         = _get("entry_prices",         lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.equity_hist          = _get("equity_hist",          lambda v: [float(x) for x in v],                [])
-        ps.universe             = _get("universe",             list,                                            [])
-        ps.cash                 = _get("cash",                 float,                                           ps.cash)
-        ps.exposure_multiplier  = _get("exposure_multiplier",  float,                                           1.0)
-        ps.override_active      = _get("override_active",      _as_bool,                                        False)
-        ps.override_cooldown    = _get("override_cooldown",    _as_nonneg_int,                                 0)
-        ps.consecutive_failures = _get("consecutive_failures", _as_nonneg_int,                                 0)
-        ps.equity_hist_cap      = _get("equity_hist_cap",      _as_nonneg_int_or_default,                      max(500, int(UltimateConfig().CVAR_LOOKBACK * 2)))
-        ps.max_absent_periods   = _get("max_absent_periods",   _as_optional_nonneg_int,                        None)
-        ps.absent_periods       = _get("absent_periods",       lambda v: {k: int(x) for k, x in v.items()},   {})
-        ps.last_known_prices    = _get("last_known_prices",    lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.last_known_volatility= _get("last_known_volatility",lambda v: {k: float(x) for k, x in v.items()}, {})
-        ps.vol_hist             = _get(
-            "vol_hist",
-            lambda v: {
-                str(k): deque(
-                    ((pd.Timestamp(d), float(vol)) for d, vol in vals),
-                    maxlen=int(UltimateConfig().CVAR_LOOKBACK),
-                )
-                for k, vals in v.items()
-            },
-            {},
+        ps.weights = _state_get(
+            d, "weights", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
         )
-        ps.decay_rounds         = _get("decay_rounds",         _as_nonneg_int,                                 0)
-        ps.dividend_ledger      = _get("dividend_ledger",      lambda v: {k: str(x) for k, x in v.items()},     {})
-        ps.last_rebalance_date  = _get("last_rebalance_date",  str,                                             "")
+        ps.shares = _state_get(
+            d, "shares", lambda v: {k: int(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.entry_prices = _state_get(
+            d, "entry_prices", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.equity_hist = _state_get(
+            d, "equity_hist", lambda v: [float(x) for x in v], [], cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.universe = _state_get(
+            d, "universe", list, [], cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.cash = _state_get(
+            d, "cash", float, ps.cash, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.exposure_multiplier = _state_get(
+            d, "exposure_multiplier", float, 1.0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.override_active = _state_get(
+            d, "override_active", _as_bool_flag, False, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.override_cooldown = _state_get(
+            d, "override_cooldown", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.consecutive_failures = _state_get(
+            d, "consecutive_failures", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.equity_hist_cap = _state_get(
+            d,
+            "equity_hist_cap",
+            _as_nonneg_int_or_default,
+            default_equity_hist_cap,
+            cls.RISK_CONTROL_FIELDS,
+            errors,
+            risk_control_errors,
+        )
+        ps.max_absent_periods = _state_get(
+            d, "max_absent_periods", _as_optional_nonneg_int, None, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.absent_periods = _state_get(
+            d, "absent_periods", lambda v: {k: int(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.last_known_prices = _state_get(
+            d, "last_known_prices", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.last_known_volatility = _state_get(
+            d, "last_known_volatility", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.vol_hist = _state_get(
+            d,
+            "vol_hist",
+            _deserialize_vol_hist,
+            {},
+            cls.RISK_CONTROL_FIELDS,
+            errors,
+            risk_control_errors,
+        )
+        ps.decay_rounds = _state_get(
+            d, "decay_rounds", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.dividend_ledger = _state_get(
+            d, "dividend_ledger", lambda v: {k: str(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
+        ps.last_rebalance_date = _state_get(
+            d, "last_rebalance_date", str, "", cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
+        )
         ps._initial_cash = float(ps.cash)
         ps._equity_hist_cap = int(ps.equity_hist_cap)
 
@@ -727,6 +693,80 @@ class PortfolioState:
                 risk_control_errors,
             )
         return ps
+
+
+def _as_bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "1", "yes", "y", "on"}:
+            return True
+        if v in {"false", "0", "no", "n", "off"}:
+            return False
+        raise ValueError(f"cannot parse bool from '{value}'")
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"integer bool flag must be 0/1, got {value}")
+    raise TypeError(f"unsupported bool type: {type(value).__name__}")
+
+
+def _as_nonneg_int(value: Any) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"value must be non-negative, got {parsed}")
+    return parsed
+
+
+def _as_nonneg_int_or_default(value: Any) -> int:
+    if value is None:
+        return max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
+    return _as_nonneg_int(value)
+
+
+def _as_optional_nonneg_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    return _as_nonneg_int(value)
+
+
+def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
+    return {
+        str(k): deque(
+            ((pd.Timestamp(d), float(vol)) for d, vol in vals),
+            maxlen=int(UltimateConfig().CVAR_LOOKBACK),
+        )
+        for k, vals in value.items()
+    }
+
+
+def _state_get(
+    payload: dict,
+    key: str,
+    converter: Any,
+    default: Any,
+    risk_control_fields: Tuple[str, ...],
+    errors: List[str],
+    risk_control_errors: List[str],
+) -> Any:
+    try:
+        return converter(payload[key]) if key in payload else default
+    except Exception as exc:
+        msg = f"{key}: {exc}"
+        if key == "equity_hist_cap":
+            logger.warning(
+                "PortfolioState.from_dict: invalid non-critical field '%s' (%s); using default %r.",
+                key,
+                exc,
+                default,
+            )
+            return default
+        if key in risk_control_fields:
+            risk_control_errors.append(msg)
+        else:
+            errors.append(msg)
+        return default
 
 
 def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
@@ -902,28 +942,51 @@ def _compute_desired_shares(
         price = max(float(prices[i]), 1e-6)
         old_s = current_shares.get(sym, 0)
         current_notional = old_s * price
-
-        if w * pv_exec > current_notional:
-            buy_notional = max(0.0, w * pv_exec - current_notional)
-            s = old_s + int(np.floor(buy_notional / max(price, 1e-9)))
-        else:
-            s = int(np.floor(w * pv_exec / price))
-
-        if adv_shares is not None and i < len(adv_shares):
-            adv_notional = float(adv_shares[i])
-            if adv_notional > 0:
-                max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
-                s = min(s, max_adv_shares)
-                current_weight = current_notional / max(pv_exec, 1.0)
-                target_weight = w
-                if s < old_s and target_weight >= current_weight:
-                    s = old_s
+        s = _desired_shares_from_weight(w, pv_exec, current_notional, old_s, price)
+        s = _apply_adv_share_cap(s, old_s, w, current_notional, pv_exec, price, adv_shares, i, cfg)
 
         desired_shares[sym] = s
         if s > 0:
             score = float(conviction_scores[i]) if conviction_scores is not None and i < len(conviction_scores) else w
             valid_targets.append((i, sym, price, score))
     return desired_shares, valid_targets
+
+
+def _desired_shares_from_weight(
+    target_weight: float,
+    pv_exec: float,
+    current_notional: float,
+    old_shares: int,
+    price: float,
+) -> int:
+    if target_weight * pv_exec > current_notional:
+        buy_notional = max(0.0, target_weight * pv_exec - current_notional)
+        return old_shares + int(np.floor(buy_notional / max(price, 1e-9)))
+    return int(np.floor(target_weight * pv_exec / price))
+
+
+def _apply_adv_share_cap(
+    shares: int,
+    old_shares: int,
+    target_weight: float,
+    current_notional: float,
+    pv_exec: float,
+    price: float,
+    adv_shares: Optional[np.ndarray],
+    index: int,
+    cfg: UltimateConfig,
+) -> int:
+    if adv_shares is None or index >= len(adv_shares):
+        return shares
+    adv_notional = float(adv_shares[index])
+    if adv_notional <= 0:
+        return shares
+    max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
+    capped = min(shares, max_adv_shares)
+    current_weight = current_notional / max(pv_exec, 1.0)
+    if capped < old_shares and target_weight >= current_weight:
+        return old_shares
+    return capped
 
 
 def _apply_drift_gate(
@@ -1415,102 +1478,16 @@ def compute_book_cvar(
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
-    mtm_weights: Dict[str, float] = {}
-    pv = state.cash
-
-    for sym, n_shares in state.shares.items():
-        if sym in active_idx:
-            px = float(prices[active_idx[sym]])
-        else:
-            px = state.last_known_prices.get(sym, 0.0)
-        notional = n_shares * px
-        mtm_weights[sym] = notional
-        pv += notional
+    mtm_weights, pv = _build_mtm_weights_and_pv(state, prices, active_idx)
 
     if pv <= 1e-6:
         return 0.0
 
     held_syms = list(mtm_weights.keys())
     T_cvar = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
-
-    # FIX-MB2-GHOSTPV: fill_value=np.nan so absent symbols get ghost synthesis
-    # rather than silent zero-fill which understates CVaR.
-    rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
-    rets = rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-T_cvar:].copy()
-
-    vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
-    if not hist_log_rets.empty:
-        rolling_vol = (
-            hist_log_rets.replace([np.inf, -np.inf], np.nan)
-            .iloc[-vol_window:]
-            .std()
-            .dropna()
-        )
-        # FIX-MB-VOL: write only under the canonical key as it appears in
-        # state.shares; do not write aliased bare/.NS keys to avoid overwriting
-        # frozen vol for absent ghost symbols.
-        state.record_volatility(
-            current_date=pd.Timestamp(hist_log_rets.index[-1]),
-            vol_by_symbol={str(sym_key): float(max(vol, 1e-4)) for sym_key, vol in rolling_vol.items()},
-            cap=cfg.CVAR_LOOKBACK,
-        )
-
-    ghost_mask = np.array([
-        (s not in active_idx) or (s in rets.columns and rets[s].isna().all())
-        for s in held_syms
-    ])
-    if ghost_mask.any():
-        ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
-
-        for sym in ghost_cols:
-            daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
-
-            sym_base_seed = _ghost_seed_for(sym)
-
-            # FIX-NEW-ME-03 / FIX-GHOST-SEED:
-            # 1) Row seeds are derived from absolute calendar day numbers so a
-            #    (symbol,date) pair maps to the same seed regardless of window
-            #    depth.
-            # 2) The original SeedSequence(row_seeds).spawn(...) fan-out was
-            #    also flawed: spawn() deterministically derives child streams
-            #    from a parent entropy tree, not from each row seed as an
-            #    independent RNG seed. That breaks strict per-row replay.
-            #    Correct approach is one Generator per row via default_rng(int(seed)).
-            if hasattr(rets.index, 'asi8'):
-                if rets.index.tz is None:
-                    idx_utc = rets.index.tz_localize("UTC")
-                else:
-                    idx_utc = rets.index.tz_convert("UTC")
-                # Normalize to UTC midnight for cross-environment reproducibility.
-                days_since_epoch = (idx_utc.normalize().asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
-            else:
-                # Fallback for non-datetime index: use positional integers
-                days_since_epoch = np.arange(len(rets), dtype=np.int64)
-
-            # FIX-MB-ME-05: XOR in uint64 space to prevent signed overflow.
-            row_seeds = (
-                np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
-            )
-
-            vol_series = np.full(len(row_seeds), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
-            sym_hist = list(state.vol_hist.get(sym, deque()))
-            if sym_hist:
-                hist_dates = [pd.Timestamp(d) for d, _ in sym_hist]
-                hist_vals = [float(v) for _, v in sym_hist]
-                for idx_row, row_date in enumerate(pd.DatetimeIndex(rets.index)):
-                    nearest = None
-                    for j, d_hist in enumerate(hist_dates):
-                        if d_hist <= row_date:
-                            nearest = j
-                        else:
-                            break
-                    if nearest is not None:
-                        vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
-
-            # AFTER — one Generator per ghost symbol; draws all rows in a single vectorized call
-            raw = np.array([np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds], dtype=float)
-            synth_rets = daily_drift + vol_series * raw
-            rets.loc[:, sym] = synth_rets
+    rets = _prepare_cvar_returns(hist_log_rets, held_syms, T_cvar)
+    _record_current_volatility(state, hist_log_rets, cfg)
+    _apply_ghost_return_synthesis(state, rets, held_syms, active_idx, cfg)
 
     rets = rets.fillna(0.0)
 
@@ -1525,6 +1502,102 @@ def compute_book_cvar(
     tail_mean     = float(np.mean(sorted_losses[-tail_n:]))
 
     return tail_mean
+
+
+def _build_mtm_weights_and_pv(
+    state: PortfolioState,
+    prices: np.ndarray,
+    active_idx: Dict[str, int],
+) -> Tuple[Dict[str, float], float]:
+    mtm_weights: Dict[str, float] = {}
+    pv = state.cash
+    for sym, n_shares in state.shares.items():
+        if sym in active_idx:
+            px = float(prices[active_idx[sym]])
+        else:
+            px = state.last_known_prices.get(sym, 0.0)
+        notional = n_shares * px
+        mtm_weights[sym] = notional
+        pv += notional
+    return mtm_weights, pv
+
+
+def _prepare_cvar_returns(hist_log_rets: pd.DataFrame, held_syms: List[str], t_cvar: int) -> pd.DataFrame:
+    rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
+    return rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-t_cvar:].copy()
+
+
+def _record_current_volatility(state: PortfolioState, hist_log_rets: pd.DataFrame, cfg: UltimateConfig) -> None:
+    vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
+    if hist_log_rets.empty:
+        return
+    rolling_vol = (
+        hist_log_rets.replace([np.inf, -np.inf], np.nan)
+        .iloc[-vol_window:]
+        .std()
+        .dropna()
+    )
+    state.record_volatility(
+        current_date=pd.Timestamp(hist_log_rets.index[-1]),
+        vol_by_symbol={str(sym_key): float(max(vol, 1e-4)) for sym_key, vol in rolling_vol.items()},
+        cap=cfg.CVAR_LOOKBACK,
+    )
+
+
+def _row_seeds_from_index(index: pd.Index, sym_base_seed: int) -> np.ndarray:
+    if hasattr(index, "asi8"):
+        idx = pd.DatetimeIndex(index)
+        if idx.tz is None:
+            idx_utc = idx.tz_localize("UTC")
+        else:
+            idx_utc = idx.tz_convert("UTC")
+        days_since_epoch = (idx_utc.normalize().asi8 // np.int64(86_400 * 10 ** 9)).astype(np.int64)
+    else:
+        days_since_epoch = np.arange(len(index), dtype=np.int64)
+    return np.uint64(sym_base_seed) ^ days_since_epoch.astype(np.uint64)
+
+
+def _ghost_vol_series_for_symbol(
+    state: PortfolioState,
+    sym: str,
+    index: pd.Index,
+    cfg: UltimateConfig,
+) -> np.ndarray:
+    vol_series = np.full(len(index), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
+    sym_hist = list(state.vol_hist.get(sym, deque()))
+    if not sym_hist:
+        return vol_series
+    hist_dates = [pd.Timestamp(d) for d, _ in sym_hist]
+    hist_vals = [float(v) for _, v in sym_hist]
+    for idx_row, row_date in enumerate(pd.DatetimeIndex(index)):
+        nearest = None
+        for j, d_hist in enumerate(hist_dates):
+            if d_hist <= row_date:
+                nearest = j
+            else:
+                break
+        if nearest is not None:
+            vol_series[idx_row] = max(hist_vals[nearest], cfg.GHOST_VOL_FALLBACK)
+    return vol_series
+
+
+def _apply_ghost_return_synthesis(
+    state: PortfolioState,
+    rets: pd.DataFrame,
+    held_syms: List[str],
+    active_idx: Dict[str, int],
+    cfg: UltimateConfig,
+) -> None:
+    ghost_mask = np.array([(s not in active_idx) or (s in rets.columns and rets[s].isna().all()) for s in held_syms])
+    if not ghost_mask.any():
+        return
+    ghost_cols = sorted(s for s, is_ghost in zip(held_syms, ghost_mask) if is_ghost)
+    for sym in ghost_cols:
+        daily_drift = float(cfg.GHOST_RET_DRIFT) / 252.0
+        row_seeds = _row_seeds_from_index(rets.index, _ghost_seed_for(sym))
+        vol_series = _ghost_vol_series_for_symbol(state, sym, rets.index, cfg)
+        raw = np.array([np.random.default_rng(int(seed)).standard_normal() for seed in row_seeds], dtype=float)
+        rets.loc[:, sym] = daily_drift + vol_series * raw
 
 
 def compute_decay_targets(
@@ -1566,6 +1639,119 @@ def compute_decay_targets(
 
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
+
+def raw_rets_empty_after_sanitization(historical_returns: pd.DataFrame) -> bool:
+    return historical_returns.replace([np.inf, -np.inf], np.nan).empty
+
+
+def _validate_optimizer_input_shapes(
+    expected_returns: np.ndarray,
+    historical_returns: pd.DataFrame,
+    adv_shares: np.ndarray,
+    prices: np.ndarray,
+    prev_w: Optional[np.ndarray],
+    sector_labels: Optional[np.ndarray],
+    portfolio_value: float,
+) -> None:
+    original_m = len(expected_returns)
+    if len(prices) != original_m or len(adv_shares) != original_m:
+        raise OptimizationError(
+            "Input length mismatch across expected_returns/prices/adv_shares.",
+            OptimizationErrorType.DATA,
+        )
+    if prev_w is not None and len(prev_w) != original_m:
+        raise OptimizationError(
+            "prev_w length must match expected_returns length.",
+            OptimizationErrorType.DATA,
+        )
+    if sector_labels is not None and len(sector_labels) != original_m:
+        raise OptimizationError(
+            "Sector mapping array length does not match expected_returns length.",
+            OptimizationErrorType.DATA,
+        )
+    if not np.all(np.isfinite(expected_returns)):
+        raise OptimizationError("expected_returns contains non-finite values.", OptimizationErrorType.DATA)
+    if not np.all(np.isfinite(prices)) or np.any(prices <= 0):
+        raise OptimizationError("prices must be finite and strictly positive.", OptimizationErrorType.DATA)
+    if not np.all(np.isfinite(adv_shares)) or np.any(adv_shares < 0):
+        raise OptimizationError("adv_shares must be finite and non-negative.", OptimizationErrorType.DATA)
+    if not np.isfinite(portfolio_value) or portfolio_value <= 0:
+        raise OptimizationError(
+            "portfolio_value must be finite and strictly positive.",
+            OptimizationErrorType.DATA,
+        )
+    if raw_rets_empty_after_sanitization(historical_returns):
+        raise OptimizationError("historical_returns is empty after sanitisation.", OptimizationErrorType.DATA)
+    if historical_returns.shape[1] != original_m:
+        raise OptimizationError(
+            "historical_returns columns must align with expected_returns length.",
+            OptimizationErrorType.DATA,
+        )
+
+
+def _apply_history_gate(
+    raw_rets: pd.DataFrame,
+    cfg: UltimateConfig,
+) -> Tuple[pd.DataFrame, np.ndarray, List[str], int, int]:
+    lookback = min(max(int(cfg.HISTORY_GATE), 1), len(raw_rets))
+    min_valid_ratio = 0.70
+    required_count = max(1, int(np.ceil(lookback * min_valid_ratio)))
+    valid_counts = raw_rets.tail(lookback).notna().sum()
+    keep_mask = valid_counts >= required_count
+    kept_indices = np.flatnonzero(keep_mask.to_numpy())
+    excluded_symbols = valid_counts.index[~keep_mask].tolist()
+    clean_rets = raw_rets.iloc[:, kept_indices].ffill()
+    return clean_rets, kept_indices, excluded_symbols, lookback, required_count
+
+
+def _fill_missing_returns(clean_rets: pd.DataFrame) -> pd.DataFrame:
+    row_means = clean_rets.mean(axis=1)
+    return clean_rets.apply(lambda col: col.fillna(row_means)).fillna(0.0)
+
+
+def _drop_zero_volatility_columns(
+    clean_rets: pd.DataFrame,
+    kept_indices: np.ndarray,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    col_stds = clean_rets.std()
+    valid_vol_mask = col_stds >= 1e-10
+    if not valid_vol_mask.all() and valid_vol_mask.any():
+        clean_rets = clean_rets.loc[:, valid_vol_mask]
+        kept_indices = kept_indices[valid_vol_mask.to_numpy()]
+    return clean_rets, kept_indices
+
+
+def _compute_exposure_bounds(
+    cfg: UltimateConfig,
+    exposure_multiplier: float,
+    adv_limit: np.ndarray,
+    sector_labels: Optional[np.ndarray],
+) -> Tuple[float, float, float]:
+    gamma = float(np.clip(exposure_multiplier, cfg.MIN_EXPOSURE_FLOOR, 1.0))
+    l_gamma = max(cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - cfg.CAPITAL_ELASTICITY))
+    u_gamma = min(1.0, gamma)
+
+    max_possible_weight = 0.0
+    if sector_labels is not None:
+        labels = np.asarray(sector_labels, dtype=int)
+        for sec_id in np.unique(labels):
+            mask = labels == sec_id
+            sec_adv_sum = float(np.sum(adv_limit[mask]))
+            if sec_id == -1:
+                max_possible_weight += sec_adv_sum
+            else:
+                max_possible_weight += min(sec_adv_sum, cfg.MAX_SECTOR_WEIGHT)
+    else:
+        max_possible_weight = float(np.sum(adv_limit))
+
+    u_gamma = min(u_gamma, max_possible_weight)
+    if max_possible_weight < l_gamma:
+        l_gamma = max_possible_weight * 0.99
+    if np.sum(adv_limit) < l_gamma:
+        l_gamma = np.sum(adv_limit) * 0.99
+    u_gamma = max(u_gamma, l_gamma)
+    return gamma, l_gamma, u_gamma
+
 
 class InstitutionalRiskEngine:
     """Risk optimizer wrapper with reusable solver cache.
@@ -1649,55 +1835,18 @@ class InstitutionalRiskEngine:
                     OptimizationErrorType.DATA,
                 )
 
-        if len(prices) != original_m or len(adv_shares) != original_m:
-            raise OptimizationError(
-                "Input length mismatch across expected_returns/prices/adv_shares.",
-                OptimizationErrorType.DATA,
-            )
-        if prev_w is not None and len(prev_w) != original_m:
-            raise OptimizationError(
-                "prev_w length must match expected_returns length.",
-                OptimizationErrorType.DATA,
-            )
-        if sector_labels is not None and len(sector_labels) != original_m:
-            raise OptimizationError(
-                "Sector mapping array length does not match expected_returns length.",
-                OptimizationErrorType.DATA,
-            )
-        if not np.all(np.isfinite(expected_returns)):
-            raise OptimizationError(
-                "expected_returns contains non-finite values.", OptimizationErrorType.DATA
-            )
-        if not np.all(np.isfinite(prices)) or np.any(prices <= 0):
-            raise OptimizationError(
-                "prices must be finite and strictly positive.", OptimizationErrorType.DATA
-            )
-        if not np.all(np.isfinite(adv_shares)) or np.any(adv_shares < 0):
-            raise OptimizationError(
-                "adv_shares must be finite and non-negative.", OptimizationErrorType.DATA
-            )
-        if not np.isfinite(portfolio_value) or portfolio_value <= 0:
-            raise OptimizationError(
-                "portfolio_value must be finite and strictly positive.", OptimizationErrorType.DATA
-            )
+        _validate_optimizer_input_shapes(
+            expected_returns=expected_returns,
+            historical_returns=historical_returns,
+            adv_shares=adv_shares,
+            prices=prices,
+            prev_w=prev_w,
+            sector_labels=sector_labels,
+            portfolio_value=portfolio_value,
+        )
 
         raw_rets = historical_returns.replace([np.inf, -np.inf], np.nan)
-        if raw_rets.empty:
-            raise OptimizationError("historical_returns is empty after sanitisation.", OptimizationErrorType.DATA)
-
-        if raw_rets.shape[1] != original_m:
-            raise OptimizationError(
-                "historical_returns columns must align with expected_returns length.",
-                OptimizationErrorType.DATA,
-            )
-
-        lookback = min(max(int(self.cfg.HISTORY_GATE), 1), len(raw_rets))
-        min_valid_ratio = 0.70
-        required_count = max(1, int(np.ceil(lookback * min_valid_ratio)))
-        valid_counts = raw_rets.tail(lookback).notna().sum()
-        keep_mask = valid_counts >= required_count
-        kept_indices = np.flatnonzero(keep_mask.to_numpy())
-        excluded_symbols = valid_counts.index[~keep_mask].tolist()
+        clean_rets, kept_indices, excluded_symbols, lookback, required_count = _apply_history_gate(raw_rets, self.cfg)
 
         if excluded_symbols:
             logger.info(
@@ -1715,7 +1864,6 @@ class InstitutionalRiskEngine:
                 OptimizationErrorType.DATA,
             )
 
-        clean_rets = raw_rets.iloc[:, kept_indices].ffill()
         # FIX-ZERO-FILL: replace zeros with the cross-sectional row mean so that
         # pre-IPO NaN cells (after ffill exhausts real data) are treated as
         # 'market-average return that day' rather than 'risk-free zero return'.
@@ -1728,7 +1876,6 @@ class InstitutionalRiskEngine:
         # producing a more conservative (realistic) covariance estimate.
         # The history gate already ensures at most ~30% of any column is NaN,
         # so row means are anchored by the majority of real observations.
-        _row_means = clean_rets.mean(axis=1)
         # FIX-SYSTEMIC-NAN: chain a final .fillna(0.0) to handle systemic
         # market-closure days where every stock has NaN (e.g. a total provider
         # gap or unexpected exchange suspension).  On such days _row_means is
@@ -1736,20 +1883,17 @@ class InstitutionalRiskEngine:
         # crash LedoitWolf with 'Input contains NaN'.  Filling with 0.0 treats
         # a total market closure as a flat day — the most conservative
         # assumption and consistent with the price ffill applied upstream.
-        clean_rets = clean_rets.apply(lambda col: col.fillna(_row_means)).fillna(0.0)
+        clean_rets = _fill_missing_returns(clean_rets)
 
         col_stds = clean_rets.std()
         valid_vol_mask = col_stds >= 1e-10
-
         if not valid_vol_mask.all():
             zero_cols = valid_vol_mask[~valid_vol_mask].index.tolist()
             logger.warning(
                 "[Optimizer] Detected %d zero-volatility asset(s): %s",
                 len(zero_cols), zero_cols,
             )
-            if valid_vol_mask.any():
-                clean_rets = clean_rets.loc[:, valid_vol_mask]
-                kept_indices = kept_indices[valid_vol_mask.to_numpy()]
+        clean_rets, kept_indices = _drop_zero_volatility_columns(clean_rets, kept_indices)
 
         expected_returns = expected_returns[kept_indices]
         prices = prices[kept_indices]
@@ -1773,7 +1917,7 @@ class InstitutionalRiskEngine:
         Sigma_reg = lw.covariance_
         ridge     = 0.0
 
-        gamma    = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
+        gamma = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
 
         adv_w           = adv_shares / np.maximum(adv_shares.sum(), 1e-9)
         adv_w_series    = pd.Series(adv_w, index=clean_rets.columns)
@@ -1801,43 +1945,12 @@ class InstitutionalRiskEngine:
         adv_limit = np.clip((adv_shares * self.cfg.MAX_ADV_PCT) / portfolio_value, 1e-9, 0.40)
         adv_limit = np.minimum(adv_limit, self.cfg.MAX_SINGLE_NAME_WEIGHT)
 
-        l_gamma = max(self.cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - self.cfg.CAPITAL_ELASTICITY))
-        u_gamma = min(1.0, gamma)
-
-        # FIX-MB-SECTOR: known-sector groups capped at MAX_SECTOR_WEIGHT;
-        # unknown-sector (sentinel -1) stocks governed only by ADV limits.
-        max_possible_weight = 0.0
-        if sector_labels is not None:
-            labels = np.asarray(sector_labels, dtype=int)
-            for sec_id in np.unique(labels):
-                mask    = labels == sec_id
-                sec_adv_sum = float(np.sum(adv_limit[mask]))
-                if sec_id == -1:
-                    max_possible_weight += sec_adv_sum
-                else:
-                    # FIX-BUDGET-MISMATCH: always apply MAX_SECTOR_WEIGHT cap here,
-                    # matching the constraint builder which now adds a sector
-                    # constraint for ALL sector sizes including single-stock sectors
-                    # (FIX-SECTOR-SINGLE).  The previous 'mask.sum() >= 2' guard
-                    # left single-stock sectors uncapped in the budget, inflating
-                    # max_possible_weight and therefore l_gamma above the actual
-                    # feasible maximum enforced by the OSQP constraint matrix —
-                    # causing guaranteed primal infeasibility when
-                    # MAX_SECTOR_WEIGHT < MAX_SINGLE_NAME_WEIGHT.
-                    max_possible_weight += min(sec_adv_sum, self.cfg.MAX_SECTOR_WEIGHT)
-        else:
-            max_possible_weight = float(np.sum(adv_limit))
-
-        u_gamma = min(u_gamma, max_possible_weight)
-        if max_possible_weight < l_gamma:
-            l_gamma = max_possible_weight * 0.99
-        if np.sum(adv_limit) < l_gamma:
-            l_gamma = np.sum(adv_limit) * 0.99
-
-        # BUG-ME-06: monotonicity is guaranteed by the preceding
-        # `u_gamma = max(u_gamma, l_gamma)` statement, so the
-        # `if l_gamma > u_gamma` block is unreachable dead code and has been removed.
-        u_gamma = max(u_gamma, l_gamma)
+        gamma, l_gamma, u_gamma = _compute_exposure_bounds(
+            self.cfg,
+            gamma,
+            adv_limit,
+            sector_labels,
+        )
 
         impact     = np.clip(
             self.cfg.IMPACT_COEFF * portfolio_value

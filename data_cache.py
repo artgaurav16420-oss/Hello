@@ -61,7 +61,7 @@ from shared_constants import (
 
 import requests
 from datetime import timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -224,6 +224,35 @@ class _ManifestProcessFileLock:
             # Fallback: assume process might be alive on unexpected errors
             return True
 
+    def _lock_age_is_stale(self, path: Path, stale_threshold: float) -> bool:
+        try:
+            stat_info = path.stat()
+            lock_age = time.time() - stat_info.st_mtime
+            return lock_age >= stale_threshold
+        except Exception:
+            return False
+
+    def _wait_for_owner_file(self, max_wait: float, wait_step: float) -> bool:
+        elapsed = 0.0
+        while elapsed < max_wait:
+            if not self._lock_dir.exists():
+                return False
+            time.sleep(wait_step)
+            elapsed += wait_step
+            if self._owner_file.exists():
+                return True
+        return False
+
+    @staticmethod
+    def _parse_owner_pid(content: str) -> Optional[int]:
+        for part in content.split():
+            if part.startswith("pid="):
+                try:
+                    return int(part.split("=", 1)[1])
+                except (ValueError, IndexError):
+                    return None
+        return None
+
     def _is_lock_stale(self) -> bool:
         """
         Detect if the current lock is stale by checking:
@@ -243,19 +272,8 @@ class _ManifestProcessFileLock:
 
             max_wait = 1.0  # Wait up to 1 second for owner file to appear
             wait_step = 0.05
-            elapsed = 0.0
-            while elapsed < max_wait:
-                # Check if lock dir was removed during our wait
-                if not self._lock_dir.exists():
-                    # Lock dir removed - not stale, just gone
-                    return False
-
-                time.sleep(wait_step)
-                elapsed += wait_step
-                if self._owner_file.exists():
-                    # Owner file appeared, proceed with normal staleness check
-                    break
-            else:
+            owner_exists = self._wait_for_owner_file(max_wait=max_wait, wait_step=wait_step)
+            if not owner_exists:
                 # Owner file still missing after wait - check lock dir age
                 # But first verify lock dir still exists
                 if not self._lock_dir.exists():
@@ -265,11 +283,8 @@ class _ManifestProcessFileLock:
                 try:
                     lock_dir_stat = self._lock_dir.stat()
                     lock_dir_age = time.time() - lock_dir_stat.st_mtime
-                    # Only treat as stale if directory is older than our wait window
                     if lock_dir_age < max_wait:
-                        # Directory is fresh, likely still being set up
                         return False
-                    # Directory is old with no owner file - treat as stale
                     return True
                 except Exception:
                     # Can't stat lock dir, treat as stale to be safe
@@ -278,14 +293,7 @@ class _ManifestProcessFileLock:
         try:
             # Read and parse owner file
             content = self._owner_file.read_text(encoding="utf-8").strip()
-            pid = None
-            for part in content.split():
-                if part.startswith("pid="):
-                    try:
-                        pid = int(part.split("=", 1)[1])
-                        break
-                    except (ValueError, IndexError):
-                        pass
+            pid = self._parse_owner_pid(content)
 
             # If we can't parse the PID, check file age only
             if pid is None:
@@ -302,11 +310,8 @@ class _ManifestProcessFileLock:
                 return True
 
             # Fallback: if PID couldn't be parsed, use file age as safety net
-            stat_info = self._owner_file.stat()
-            lock_age = time.time() - stat_info.st_mtime
             stale_threshold = max(60.0, self._timeout_s * 2.0)
-
-            return lock_age >= stale_threshold
+            return self._lock_age_is_stale(self._owner_file, stale_threshold)
 
         except FileNotFoundError:
             # Owner file disappeared between exists check and read
@@ -314,14 +319,16 @@ class _ManifestProcessFileLock:
         except Exception as exc:
             # On unexpected errors reading/parsing, check age as fallback
             logger.debug("[Lock] Error checking lock staleness: %s", exc)
-            try:
-                stat_info = self._owner_file.stat()
-                lock_age = time.time() - stat_info.st_mtime
-                stale_threshold = max(60.0, self._timeout_s * 2.0)
-                return lock_age >= stale_threshold
-            except Exception:
-                # Can't determine staleness reliably, assume not stale to be safe
-                return False
+            stale_threshold = max(60.0, self._timeout_s * 2.0)
+            return self._lock_age_is_stale(self._owner_file, stale_threshold)
+
+    def _try_acquire_once(self) -> bool:
+        self._lock_dir.mkdir(parents=False, exist_ok=False)
+        self._owner_file.write_text(
+            f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
+            encoding="utf-8",
+        )
+        return True
 
     def _remove_stale_lock(self) -> bool:
         """
@@ -363,11 +370,7 @@ class _ManifestProcessFileLock:
 
         while True:
             try:
-                self._lock_dir.mkdir(parents=False, exist_ok=False)
-                self._owner_file.write_text(
-                    f"pid={os.getpid()} token={uuid.uuid4().hex}\n",
-                    encoding="utf-8",
-                )
+                self._try_acquire_once()
                 return self
             except FileExistsError:
                 # Before waiting, check if the existing lock is stale
@@ -625,7 +628,7 @@ class GrowwProvider(DataProvider):
         rather than blocking indefinitely (e.g. when a token is revoked).
         """
         start_ts = pd.Timestamp(start)
-        end_ts   = pd.Timestamp(end)
+        end_ts = pd.Timestamp(end)
 
         all_candles: List[list] = []
         cursor = start_ts
@@ -641,9 +644,6 @@ class GrowwProvider(DataProvider):
 
             if result is _RATE_LIMITED:
                 consecutive_rate_limits += 1
-
-                # FIX-MB-DC-02: abort after too many consecutive 429s to prevent
-                # infinite blocking (e.g. revoked token, suspended account).
                 if consecutive_rate_limits >= _MAX_RATE_LIMIT_RETRIES:
                     logger.warning(
                         "[Groww] %s: hit rate-limit %d times consecutively "
@@ -652,7 +652,6 @@ class GrowwProvider(DataProvider):
                         groww_symbol, consecutive_rate_limits, _MAX_RATE_LIMIT_RETRIES,
                     )
                     return None
-
                 backoff = min(5.0 * (2 ** (consecutive_rate_limits - 1)), 60.0)
                 backoff += random.uniform(0, backoff * 0.2)
                 logger.warning(
@@ -670,27 +669,7 @@ class GrowwProvider(DataProvider):
         if not all_candles:
             return None
 
-        rows = []
-        for c in all_candles:
-            if not isinstance(c, list) or len(c) < 6:
-                continue
-            try:
-                ts    = pd.Timestamp(str(c[0]))
-                open_ = float(c[1])
-                high  = float(c[2])
-                low   = float(c[3])
-                close = float(c[4])
-                vol   = float(c[5]) if c[5] is not None else 0.0
-                rows.append({
-                    "Date":   ts.normalize(),
-                    "Open":   open_,
-                    "High":   high,
-                    "Low":    low,
-                    "Close":  close,
-                    "Volume": vol,
-                })
-            except Exception:
-                continue
+        rows = self._candles_to_rows(all_candles)
 
         if not rows:
             return None
@@ -698,6 +677,31 @@ class GrowwProvider(DataProvider):
         df = pd.DataFrame(rows).set_index("Date").sort_index()
         df = df[~df.index.duplicated(keep="last")]
         return df
+
+    @staticmethod
+    def _candles_to_rows(all_candles: List[list]) -> List[Dict[str, float | pd.Timestamp]]:
+        rows: List[Dict[str, float | pd.Timestamp]] = []
+        for c in all_candles:
+            if not isinstance(c, list) or len(c) < 6:
+                continue
+            try:
+                ts = pd.Timestamp(str(c[0]))
+                open_ = float(c[1])
+                high = float(c[2])
+                low = float(c[3])
+                close = float(c[4])
+                vol = float(c[5]) if c[5] is not None else 0.0
+                rows.append({
+                    "Date": ts.normalize(),
+                    "Open": open_,
+                    "High": high,
+                    "Low": low,
+                    "Close": close,
+                    "Volume": vol,
+                })
+            except Exception:
+                continue
+        return rows
 
     @staticmethod
     def _extract_batch_series(
@@ -1369,6 +1373,34 @@ def invalidate_cache() -> None:
             logger.error("[Cache] Failed to invalidate cache: %s", e, exc_info=True)
 
 
+def _minimum_history_rows(cfg: Any) -> int:
+    if cfg is None:
+        return 5
+    history_gate_raw = getattr(cfg, "HISTORY_GATE", None)
+    return int(history_gate_raw) if history_gate_raw is not None else 5
+
+
+def _has_required_index_shape(df: pd.DataFrame) -> bool:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return False
+    if not df.index.is_unique:
+        return False
+    if not df.index.is_monotonic_increasing:
+        return False
+    return True
+
+
+def _has_required_ohlcv_columns(df: pd.DataFrame, ticker: Optional[str]) -> bool:
+    if "Close" not in df.columns or df["Close"].isnull().all():
+        return False
+    if COLUMN_ADJ_CLOSE not in df.columns or df[COLUMN_ADJ_CLOSE].isnull().all():
+        return False
+    is_index_ticker = bool(ticker) and str(ticker).startswith("^")
+    if (not is_index_ticker) and ("Volume" not in df.columns or df["Volume"].isnull().all()):
+        return False
+    return True
+
+
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
     """_is_valid_dataframe operation.
     
@@ -1383,28 +1415,12 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    if cfg is not None:
-        history_gate_raw = getattr(cfg, "HISTORY_GATE", None)
-        min_rows = int(history_gate_raw) if history_gate_raw is not None else 5
-    else:
-        min_rows = 5
+    min_rows = _minimum_history_rows(cfg)
     if df is None or df.empty or len(df) < min_rows:
         return False
-    if not isinstance(df.index, pd.DatetimeIndex):
+    if not _has_required_index_shape(df):
         return False
-    if not df.index.is_unique:
-        return False
-    if not df.index.is_monotonic_increasing:
-        return False
-
-    if "Close" not in df.columns or df["Close"].isnull().all():
-        return False
-
-    if COLUMN_ADJ_CLOSE not in df.columns or df[COLUMN_ADJ_CLOSE].isnull().all():
-        return False
-
-    is_index_ticker = bool(ticker) and str(ticker).startswith("^")
-    if (not is_index_ticker) and ("Volume" not in df.columns or df["Volume"].isnull().all()):
+    if not _has_required_ohlcv_columns(df, ticker):
         return False
 
     return True
@@ -1551,6 +1567,89 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
     return chain
 
 
+def _clean_ticker_symbol(ticker: str) -> str:
+    if ticker is None:
+        raise ValueError("ticker list contains None")
+    t_str = str(ticker).strip()
+    if not t_str:
+        raise ValueError("ticker list contains empty string")
+    if t_str.startswith("^"):
+        return t_str
+    upper_t = t_str.upper()
+    if upper_t.endswith(".NSE"):
+        upper_t = upper_t[:-4]
+    elif upper_t.endswith(".NS"):
+        upper_t = upper_t[:-3]
+    return f"{upper_t}.NS"
+
+
+def _normalize_tickers(tickers: List[str]) -> List[str]:
+    return list(dict.fromkeys(_clean_ticker_symbol(t) for t in tickers))
+
+
+def _resolve_fetch_window(required_start: str, required_end: str, cfg: Any) -> tuple[str, str]:
+    cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
+    dynamic_padding_days = max(400, cfg_lookback * 2)
+    padded_start = (pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)).strftime("%Y-%m-%d")
+    yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
+    return padded_start, yf_end
+
+
+def _retry_unresolved_individually(
+    unresolved: List[str],
+    providers: List[DataProvider],
+    padded_start: str,
+    yf_end: str,
+    entries: dict,
+    market_data: Dict[str, pd.DataFrame],
+    cfg: Any,
+) -> List[str]:
+    still_missing: List[str] = []
+    if not unresolved:
+        return still_missing
+    for ticker in unresolved:
+        resolved = False
+        for provider in providers:
+            try:
+                raw_single = _download_with_timeout([ticker], padded_start, yf_end, provider=provider)
+            except Exception as exc:
+                logger.warning(
+                    "[Cache] Provider %s failed on individual retry for %s: %s",
+                    type(provider).__name__,
+                    ticker,
+                    exc,
+                )
+                raw_single = None
+            if raw_single is None or raw_single.empty:
+                continue
+            saved = _process_chunk(
+                [ticker],
+                raw_single,
+                entries,
+                market_data,
+                cfg,
+                provider_name=type(provider).__name__,
+            )
+            if ticker in saved:
+                resolved = True
+                break
+        if not resolved:
+            still_missing.append(ticker)
+    return still_missing
+
+
+def _save_manifest_entries_for_downloaded_tickers(tickers_to_download: List[str], entries: dict) -> None:
+    assert _MANIFEST_LOCK_DIR is not None
+    with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
+        live_manifest = _load_manifest()
+        live_entries = live_manifest.setdefault("entries", {})
+        for ticker in tickers_to_download:
+            entry = entries.get(ticker)
+            if entry is not None:
+                live_entries[ticker] = entry
+        _save_manifest(live_manifest)
+
+
 def load_or_fetch(
     tickers: List[str],
     required_start: str,
@@ -1579,47 +1678,14 @@ def load_or_fetch(
     manifest = _load_manifest()
     entries  = manifest["entries"]
 
-    def _clean_ticker(t: str) -> str:
-        """_clean_ticker operation.
-        
-        Args:
-            t (str): Input parameter.
-        
-        Returns:
-            str: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
-        if t is None:
-            raise ValueError("ticker list contains None")
-        t_str = str(t).strip()
-        if not t_str:
-            raise ValueError("ticker list contains empty string")
-        if t_str.startswith("^"):
-            return t_str
-        upper_t = t_str.upper()
-        # Strip only terminal exchange suffixes. Order matters: .NSE must be
-        # checked before .NS so ".NSE" is removed as one suffix (not partial).
-        if upper_t.endswith(".NSE"):
-            upper_t = upper_t[:-4]
-        elif upper_t.endswith(".NS"):
-            upper_t = upper_t[:-3]
-        return f"{upper_t}.NS"
-
-    standardized_tickers = list(dict.fromkeys(_clean_ticker(t) for t in tickers))
+    standardized_tickers = _normalize_tickers(tickers)
 
     if not required_start:
         raise ValueError("required_start must be provided")
     if not required_end:
         raise ValueError("required_end must be provided")
 
-    cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
-    dynamic_padding_days = max(400, cfg_lookback * 2)
-    padded_start = (
-        pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)
-    ).strftime("%Y-%m-%d")
-    yf_end = (pd.Timestamp(required_end) + timedelta(days=1)).strftime("%Y-%m-%d")
+    padded_start, yf_end = _resolve_fetch_window(required_start, required_end, cfg)
 
     latest_bday = _latest_business_day()
 
@@ -1657,55 +1723,6 @@ def load_or_fetch(
 
     providers = _build_provider_chain(cfg)
     try:
-        def _retry_unresolved_individually(unresolved: List[str]) -> List[str]:
-            """
-            Retry unresolved symbols one-by-one through the full provider chain.
-
-            A chunk-level provider failure can drop many otherwise valid symbols
-            at once (for example when one problematic symbol poisons a batched
-            response). This best-effort pass limits blast radius by retrying
-            each unresolved symbol in isolation before stale-cache recovery.
-            Returns the still-missing tickers after individual retries.
-            """
-            still_missing: List[str] = []
-            if not unresolved:
-                return still_missing
-
-            for ticker in unresolved:
-                resolved = False
-                for provider in providers:
-                    try:
-                        raw_single = _download_with_timeout(
-                            [ticker], padded_start, yf_end, provider=provider
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[Cache] Provider %s failed on individual retry for %s: %s",
-                            type(provider).__name__,
-                            ticker,
-                            exc,
-                        )
-                        raw_single = None
-
-                    if raw_single is None or raw_single.empty:
-                        continue
-
-                    saved = _process_chunk(
-                        [ticker],
-                        raw_single,
-                        entries,
-                        market_data,
-                        cfg,
-                        provider_name=type(provider).__name__,
-                    )
-                    if ticker in saved:
-                        resolved = True
-                        break
-
-                if not resolved:
-                    still_missing.append(ticker)
-            return still_missing
-
         if tickers_to_download:
             logger.info("[Cache] Initiating download for %d missing/stale symbols.", len(tickers_to_download))
             chunks = [
@@ -1760,7 +1777,15 @@ def load_or_fetch(
                 # unresolved tickers (reassigned to missing_from_provider each pass),
                 # so a non-empty chunk is the correct and complete recovery signal.
                 if chunk:
-                    unresolved_after_retry = _retry_unresolved_individually(chunk)
+                    unresolved_after_retry = _retry_unresolved_individually(
+                        chunk,
+                        providers,
+                        padded_start,
+                        yf_end,
+                        entries,
+                        market_data,
+                        cfg,
+                    )
                     if unresolved_after_retry:
                         _recover_from_stale_cache(unresolved_after_retry, entries, market_data, cfg=cfg)
 
@@ -1772,15 +1797,7 @@ def load_or_fetch(
             # Note: _save_manifest is intentionally called only on download/recovery
             # paths. Any future code path that mutates `entries` without downloading
             # must explicitly call _save_manifest() to keep manifest state in sync.
-            assert _MANIFEST_LOCK_DIR is not None
-            with _ManifestProcessFileLock(_MANIFEST_LOCK_DIR):
-                live_manifest = _load_manifest()
-                live_entries = live_manifest.setdefault("entries", {})
-                for ticker in tickers_to_download:
-                    entry = entries.get(ticker)
-                    if entry is not None:
-                        live_entries[ticker] = entry
-                _save_manifest(live_manifest)
+            _save_manifest_entries_for_downloaded_tickers(tickers_to_download, entries)
     finally:
         for provider in providers:
             close_fn = getattr(provider, "close", None)
@@ -1829,11 +1846,7 @@ def _process_chunk(
 
     for ticker in chunk:
         try:
-            df = _extract_ticker_frame(
-                raw_data,
-                ticker,
-                is_single_request=(len(chunk) == 1),
-            )
+            df = _extract_ticker_frame(raw_data, ticker, is_single_request=(len(chunk) == 1))
             if df is None or df.empty:
                 # FIX-NEW-DC-02: log at WARNING rather than silently skipping so
                 # callers can distinguish a provider returning no data for a ticker
@@ -1861,29 +1874,8 @@ def _process_chunk(
                 continue
 
             parquet_path = CACHE_DIR / f"{ticker}.parquet"
-            # Use unique temp file per writer to avoid race conditions
-            tmp_path = CACHE_DIR / f"{ticker}.parquet.tmp.{uuid.uuid4().hex}"
-            try:
-                df.to_parquet(tmp_path)
-                # Atomically replace the final parquet file
-                tmp_path.replace(parquet_path)
-            except Exception:
-                # Clean up temp file on failure
-                if tmp_path.exists():
-                    tmp_path.unlink()
-                raise
-
-            gap_series   = df.index.to_series().diff().dt.days
-            max_gap      = gap_series.max()
-            max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
-
-            manifest_entries[ticker] = {
-                "fetched_at":    pd.Timestamp.now(tz=TIMEZONE_IST).isoformat(),
-                "rows":          len(df),
-                "last_date":     df.index[-1].strftime("%Y-%m-%d"),
-                "suspended":     max_gap_days > _SUSPENSION_GAP_DAYS,
-                "max_gap_days":  max_gap_days,
-            }
+            _save_dataframe_atomic(df, parquet_path)
+            manifest_entries[ticker] = _build_manifest_entry(df)
             market_data[ticker] = df
             saved_tickers.add(ticker)
 
@@ -1891,6 +1883,31 @@ def _process_chunk(
             logger.error("[Cache] Failed processing downloaded dataframe for %s: %s", ticker, exc, exc_info=True)
 
     return saved_tickers
+
+
+def _save_dataframe_atomic(df: pd.DataFrame, parquet_path: Path) -> None:
+    assert CACHE_DIR is not None
+    tmp_path = CACHE_DIR / f"{parquet_path.name}.tmp.{uuid.uuid4().hex}"
+    try:
+        df.to_parquet(tmp_path)
+        tmp_path.replace(parquet_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def _build_manifest_entry(df: pd.DataFrame) -> dict:
+    gap_series = df.index.to_series().diff().dt.days
+    max_gap = gap_series.max()
+    max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
+    return {
+        "fetched_at": pd.Timestamp.now(tz=TIMEZONE_IST).isoformat(),
+        "rows": len(df),
+        "last_date": df.index[-1].strftime("%Y-%m-%d"),
+        "suspended": max_gap_days > _SUSPENSION_GAP_DAYS,
+        "max_gap_days": max_gap_days,
+    }
 
 
 def _recover_from_stale_cache(
