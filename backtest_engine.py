@@ -45,8 +45,9 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -84,6 +85,18 @@ from shared_constants import (
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
 _SUSPENSION_GAP_DAYS = 30
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, str(default))).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
+_ENABLE_REBAL_PLACEHOLDERS = _parse_bool_env("ENABLE_REBAL_PLACEHOLDERS", default=False)
 
 
 # ─── Results container ────────────────────────────────────────────────────────
@@ -324,6 +337,15 @@ class BacktestEngine:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
         cfg = self.engine.cfg
+        # TODO(refactor follow-up): structural placeholder hooks.
+        # These _rebal_* helpers are no-op scaffolding while logic remains inline below;
+        # return values are intentionally discarded until phased extraction is completed.
+        if _ENABLE_REBAL_PLACEHOLDERS:
+            _rebal_filter_universe(
+                state=self.state,
+                symbols=symbols,
+                member_universe=member_universe,
+            )
 
         sym_to_global_idx = {sym: i for i, sym in enumerate(symbols)}
 
@@ -349,6 +371,14 @@ class BacktestEngine:
             log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
 
         col_to_idx = {sym: i for i, sym in enumerate(close.columns)}
+        if _ENABLE_REBAL_PLACEHOLDERS:
+            _rebal_build_valuation(
+                state=self.state,
+                close=close,
+                volume=volume,
+                date=date,
+                active_symbols=active_symbols,
+            )
         prev_idx = date_pos - 1
         if prev_idx < 0:
             return
@@ -441,6 +471,14 @@ class BacktestEngine:
         soft_cvar_breach       = False
 
         if self.state.shares:
+            if _ENABLE_REBAL_PLACEHOLDERS:
+                _rebal_check_cvar_breach(
+                    state=self.state,
+                    valuation_prices=valuation_prices,
+                    active_symbols=active_symbols,
+                    hist_log_rets=hist_log_rets,
+                    cfg=cfg,
+                )
             book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
@@ -465,6 +503,13 @@ class BacktestEngine:
                 )
 
         if not _force_full_cash:
+            if _ENABLE_REBAL_PLACEHOLDERS:
+                _rebal_generate_targets(
+                    state=self.state,
+                    hist_log_rets=hist_log_rets,
+                    adv_vector=adv_vector,
+                    cfg=cfg,
+                )
             try:
                 raw_daily, adj_scores, sel_idx, _gate_counts = generate_signals(
                     hist_log_rets,
@@ -560,6 +605,13 @@ class BacktestEngine:
                 )
 
         if optimization_succeeded or apply_decay:
+            if _ENABLE_REBAL_PLACEHOLDERS:
+                _rebal_execute_trades(
+                    state=self.state,
+                    target_weights=target_weights,
+                    active_symbols=active_symbols,
+                    date=date,
+                )
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
 
@@ -864,6 +916,90 @@ def _execution_prices(
     return exec_px
 
 
+def _detect_suspension_gaps(df: pd.DataFrame, threshold_days: int) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """_detect_suspension_gaps operation.
+
+    Args:
+        df (pd.DataFrame): Input parameter.
+        threshold_days (int): Input parameter.
+
+    Returns:
+        List[Tuple[pd.Timestamp, pd.Timestamp]]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if len(df) < 2:
+        return []
+    gap_days = df.index.to_series().diff().dt.days
+    gap_end_dates = list(gap_days[gap_days > threshold_days].index)
+    gaps: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for gap_end in gap_end_dates:
+        end_loc = df.index.get_loc(gap_end)
+        if isinstance(end_loc, slice):
+            end_loc = end_loc.start
+        if isinstance(end_loc, np.ndarray):
+            end_loc = int(np.flatnonzero(end_loc)[0]) if end_loc.any() else 0
+        if int(end_loc) <= 0:
+            continue
+        gap_start = df.index[int(end_loc) - 1]
+        gaps.append((pd.Timestamp(gap_start), pd.Timestamp(gap_end)))
+    return gaps
+
+
+def _generate_synthetic_fill(
+    ticker: str,
+    gap_start: pd.Timestamp,
+    gap_end: pd.Timestamp,
+    pre_gap_df: pd.DataFrame,
+    has_adj_close: bool,
+) -> pd.DataFrame:
+    """_generate_synthetic_fill operation.
+
+    Args:
+        ticker (str): Input parameter.
+        gap_start (pd.Timestamp): Input parameter.
+        gap_end (pd.Timestamp): Input parameter.
+        pre_gap_df (pd.DataFrame): Input parameter.
+        has_adj_close (bool): Input parameter.
+
+    Returns:
+        pd.DataFrame: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    gap_idx = pd.bdate_range(gap_start, gap_end)
+    synth_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)].difference(pre_gap_df.index)
+    if len(synth_idx) == 0:
+        return pd.DataFrame()
+
+    pre_gap_close = pre_gap_df["Close"].loc[:gap_start]
+    pre_gap_rets = pre_gap_close.pct_change(fill_method=None).dropna()
+    hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
+
+    seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
+    seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**32 - 1)
+    rng = np.random.RandomState(seed)
+    noise_rets = rng.normal(0, hist_vol, len(synth_idx))
+    walk_returns = np.cumprod(1.0 + noise_rets)
+
+    synth = pd.DataFrame(index=synth_idx)
+    close_anchor = float(pre_gap_df.loc[gap_start, COLUMN_CLOSE])
+    synth[COLUMN_CLOSE] = close_anchor * walk_returns
+
+    if has_adj_close:
+        adj_anchor = pre_gap_df.loc[gap_start, COLUMN_ADJ_CLOSE]
+        if pd.isna(adj_anchor):
+            adj_anchor = close_anchor
+        adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
+        synth[COLUMN_ADJ_CLOSE] = synth[COLUMN_CLOSE] * adj_close_ratio
+
+    if COLUMN_VOLUME in pre_gap_df.columns:
+        synth[COLUMN_VOLUME] = 0.0
+    return synth
+
+
 def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """In-memory suspension simulation used only during backtest runtime.
 
@@ -880,11 +1016,8 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     the full business-day range (gap_start, gap_end), making the price path
     deterministic and length-consistent with the seed.
     """
-    if len(df) < 2:
-        return df.copy()
-
-    gap_days = df.index.to_series().diff().dt.days
-    max_gap  = int(gap_days.max()) if not gap_days.empty else 0
+    gaps = _detect_suspension_gaps(df=df, threshold_days=_SUSPENSION_GAP_DAYS)
+    max_gap = int(df.index.to_series().diff().dt.days.max()) if len(df) > 1 else 0
     if max_gap <= _SUSPENSION_GAP_DAYS:
         return df.copy()
 
@@ -894,69 +1027,20 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         ticker, max_gap,
     )
 
-    gap_end_dates = list(gap_days[gap_days > _SUSPENSION_GAP_DAYS].index)
-    if not gap_end_dates:
+    if not gaps:
         return df.copy()
 
     synth_frames = []
-
-    for gap_end in gap_end_dates:
-        # Locate gap boundaries in the ORIGINAL df (not a growing frame).
-        end_loc = df.index.get_loc(gap_end)
-        if isinstance(end_loc, slice):
-            end_loc = end_loc.start
-        if isinstance(end_loc, np.ndarray):
-            end_loc = int(np.flatnonzero(end_loc)[0]) if end_loc.any() else 0
-        if end_loc <= 0:
-            continue
-
-        gap_start = df.index[int(end_loc) - 1]
-        gap_idx   = pd.bdate_range(gap_start, gap_end)
-        gap_idx   = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
-        if len(gap_idx) == 0:
-            continue
-
-        # Exclude dates already in the ORIGINAL df (not the growing frame).
-        synth_idx = gap_idx.difference(df.index)
-        if len(synth_idx) == 0:
-            continue
-
-        pre_gap_close = df["Close"].loc[:gap_start]
-        # FIX-BUG-5: pass fill_method=None to match all other pct_change call sites
-        # in the codebase and suppress the pandas 3.x DeprecationWarning for the
-        # default fill_method='pad'. For gap-filled synthetic series, ffill before
-        # computing returns could mask zero-return days near the gap boundary.
-        pre_gap_rets  = pre_gap_close.pct_change(fill_method=None).dropna()
-        hist_vol      = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
-
-        seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
-        # FIX-BE-SEED-WIDTH: RandomState accepts only [0, 2**32-1] seeds.
-        # Keep deterministic hashing, but bound to uint32 to avoid ValueError.
-        seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:16], 16) % (2**32 - 1)
-        rng  = np.random.RandomState(seed)
-        noise_rets   = rng.normal(0, hist_vol, len(synth_idx))
-        walk_returns = np.cumprod(1.0 + noise_rets)
-
-        synth = pd.DataFrame(index=synth_idx)
-        close_anchor = float(df.loc[gap_start, COLUMN_CLOSE])
-        synth[COLUMN_CLOSE] = close_anchor * walk_returns
-
-        if COLUMN_ADJ_CLOSE in df.columns:
-            adj_anchor = df.loc[gap_start, COLUMN_ADJ_CLOSE]
-            if pd.isna(adj_anchor):
-                adj_anchor = close_anchor
-            # FIX-NEW-BE-03: preserve the pre-gap Adj Close / Close ratio.
-            # Assumption: no split/dividend corporate action occurs during the
-            # suspension gap. That is usually true for short halt windows; if it
-            # is violated, this synthetic fill is still acceptable because such
-            # in-gap events are rare and the simulation is a robustness fallback.
-            adj_close_ratio = float(adj_anchor) / max(float(close_anchor), 1e-12)
-            synth[COLUMN_ADJ_CLOSE] = synth["Close"] * adj_close_ratio
-
-        if COLUMN_VOLUME in df.columns:
-            synth[COLUMN_VOLUME] = 0.0
-
-        synth_frames.append(synth)
+    for gap_start, gap_end in gaps:
+        synth = _generate_synthetic_fill(
+            ticker=ticker,
+            gap_start=gap_start,
+            gap_end=gap_end,
+            pre_gap_df=df,
+            has_adj_close=(COLUMN_ADJ_CLOSE in df.columns),
+        )
+        if not synth.empty:
+            synth_frames.append(synth)
 
     if not synth_frames:
         return df.copy()
@@ -976,6 +1060,49 @@ def _deduplicate_index(df: pd.DataFrame) -> pd.DataFrame:
     if not df.index.is_unique:
         return df[~df.index.duplicated(keep="last")]
     return df
+
+
+def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: UltimateConfig) -> pd.Series:
+    """_extract_series_for_symbol operation.
+
+    Args:
+        market_data (dict): Input parameter.
+        sym (str): Input parameter.
+        column (str): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+
+    Returns:
+        pd.Series: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    key = sym if sym.endswith(".NS") else f"{sym}.NS"
+    row = market_data.get(key)
+    if row is None:
+        row = market_data.get(sym)
+    if row is None or row.empty:
+        return pd.Series(dtype=float)
+
+    max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
+    if column == "close":
+        valuation_series = row.get(COLUMN_ADJ_CLOSE, row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        return valuation_series.ffill(limit=max_absent_periods)
+    if column == "close_adj":
+        return row.get(COLUMN_ADJ_CLOSE, row["Close"]).ffill(limit=max_absent_periods)
+    if column == "open":
+        return row.get("Open", row["Close"]).ffill(limit=max_absent_periods)
+    if column == "high":
+        return row.get("High", row["Close"]).ffill(limit=max_absent_periods)
+    if column == "low":
+        return row.get("Low", row["Close"]).ffill(limit=max_absent_periods)
+    if column == "dividends":
+        return row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
+    if column == "splits":
+        return row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
+    if column == "volume":
+        return row["Volume"]
+    raise ValueError(f"Unsupported column kind: {column}")
 
 
 def build_precomputed_matrices(
@@ -1006,32 +1133,22 @@ def build_precomputed_matrices(
         for key in market_data.keys():
             if isinstance(key, str) and key.endswith(".NS"):
                 target_symbols.add(key[:-3])
-
     close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
-    max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
 
     for sym in target_symbols:
         if not sym:
             continue
-        key = sym if sym.endswith(".NS") else f"{sym}.NS"
-        row = market_data.get(key)
-        if row is None or row.empty:
+        close_s = _extract_series_for_symbol(market_data, sym, "close", cfg)
+        if close_s.empty:
             continue
-
-        # FIX-MB-BE-02: valuation_series is used for BOTH close and returns so
-        # that signals and execution prices are derived from the same series.
-        # When AUTO_ADJUST_PRICES=True this is Adj Close (same as before).
-        # When AUTO_ADJUST_PRICES=False this is raw Close — previously returns
-        # was always computed from Adj Close regardless, creating a mismatch.
-        valuation_series = row.get(COLUMN_ADJ_CLOSE, row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
-        close_d[sym] = valuation_series.ffill(limit=max_absent_periods)
-        close_adj_d[sym] = row.get(COLUMN_ADJ_CLOSE, row["Close"]).ffill(limit=max_absent_periods)
-        open_d[sym] = row.get("Open", row["Close"]).ffill(limit=max_absent_periods)
-        high_d[sym] = row.get("High", row["Close"]).ffill(limit=max_absent_periods)
-        low_d[sym] = row.get("Low", row["Close"]).ffill(limit=max_absent_periods)
-        div_d[sym] = row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
-        split_d[sym] = row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
-        volume_d[sym] = row["Volume"]
+        close_d[sym] = close_s
+        close_adj_d[sym] = _extract_series_for_symbol(market_data, sym, "close_adj", cfg)
+        open_d[sym] = _extract_series_for_symbol(market_data, sym, "open", cfg)
+        high_d[sym] = _extract_series_for_symbol(market_data, sym, "high", cfg)
+        low_d[sym] = _extract_series_for_symbol(market_data, sym, "low", cfg)
+        div_d[sym] = _extract_series_for_symbol(market_data, sym, "dividends", cfg)
+        split_d[sym] = _extract_series_for_symbol(market_data, sym, "splits", cfg)
+        volume_d[sym] = _extract_series_for_symbol(market_data, sym, "volume", cfg)
 
     if not close_d:
         return {}
@@ -1083,68 +1200,47 @@ def build_precomputed_matrices(
         "returns": returns,
     }
 
+def _resolve_universe_by_date(
+    market_data: dict,
+    universe_type: Optional[str],
+    universe: Optional[List[str]],
+    all_target_dates: pd.DatetimeIndex,
+    cfg: UltimateConfig,
+) -> Tuple[set[str], Dict[pd.Timestamp, set[str]], str]:
+    """_resolve_universe_by_date operation.
 
-def run_backtest(
-    market_data:   dict,
-    universe_type: Optional[str] = None,
-    start_date:    str = "2020-01-01",
-    end_date:      str = "2020-12-31",
-    cfg:           Optional[UltimateConfig] = None,
-    sector_map:    Optional[dict]           = None,
-    universe:      Optional[List[str]]      = None,
-    precomputed_matrices: Optional[dict]    = None,
-) -> BacktestResults:
-    """run_backtest operation.
-    
     Args:
         market_data (dict): Input parameter.
         universe_type (Optional[str]): Input parameter.
-        start_date (str): Input parameter.
-        end_date (str): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-        sector_map (Optional[dict]): Input parameter.
         universe (Optional[List[str]]): Input parameter.
-        precomputed_matrices (Optional[dict]): Input parameter.
-    
+        all_target_dates (pd.DatetimeIndex): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+
     Returns:
-        BacktestResults: Result of this operation.
-    
+        Tuple[set[str], Dict[pd.Timestamp, set[str]], str]: Result of this operation.
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    if cfg is None:
-        cfg = UltimateConfig()
+    def _normalize_symbol(sym: str) -> str:
+        s = str(sym).strip().upper()
+        return s[:-3] if s.endswith(".NS") else s
 
-    # FIX-MB-BE-01: capture the warmup start date and use it when we need to
-    # build matrices from scratch. Previously the return value was discarded,
-    # so standalone backtest calls got no warm-up guarantee.
-    warmup_start = _compute_warmup_start(start_date, cfg)
-
-    all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
-    if len(all_target_dates) == 0:
-        all_target_dates = pd.DatetimeIndex([pd.Timestamp(end_date)])
-
-    union_universe = set(universe or [])
+    union_universe = {_normalize_symbol(sym) for sym in (universe or []) if str(sym).strip()}
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
     selected_universe_type = universe_type or "nse_total"
 
     if union_universe:
         history_gate = int(getattr(cfg, "HISTORY_GATE", 20))
         vol_dict: Dict[str, pd.Series] = {}
-        for sym in list(union_universe):
+        for sym in sorted(union_universe):
             key = sym if sym.endswith(".NS") else f"{sym}.NS"
             row = market_data.get(key)
             if row is None:
                 row = market_data.get(sym)
             if row is not None and not row.empty and "Volume" in row.columns:
-                # FIX-BUG-3: use module-level np instead of importing inside the loop.
-                # `import numpy as _np` inside a 500+ iteration loop triggers a
-                # sys.modules dict lookup on every iteration; np is already available.
                 valid_volume = row["Volume"].replace(0, np.nan).notna().astype(float)
-                vol_dict[sym] = valid_volume.rolling(
-                    history_gate,
-                    min_periods=history_gate,
-                ).sum()
+                vol_dict[sym] = valid_volume.rolling(history_gate, min_periods=history_gate).sum()
 
         if vol_dict:
             cum_vol_df = pd.DataFrame(vol_dict).sort_index()
@@ -1164,116 +1260,73 @@ def run_backtest(
                 eligible_row = pit_eligible_map.loc[ts]
                 pit_syms = set(eligible_row[eligible_row].index.tolist())
                 universe_by_rebalance_date[ts] = pit_syms & union_universe
-                logger.debug(
-                    "[Backtest][MB-04] %s: %d/%d custom universe symbols pass PIT volume gate.",
-                    ts.date(), len(universe_by_rebalance_date[ts]), len(union_universe),
-                )
         else:
-            logger.warning(
-                "[Backtest][MB-04] No volume data found for custom universe; "
-                "survivorship bias is NOT corrected for this backtest."
-            )
             for d in all_target_dates:
                 universe_by_rebalance_date[pd.Timestamp(d)] = set(union_universe)
     else:
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
-            member_set = set(historical_members or [])
+            member_set = {_normalize_symbol(sym) for sym in (historical_members or []) if str(sym).strip()}
             universe_by_rebalance_date[pd.Timestamp(d)] = member_set
             union_universe.update(member_set)
 
-        if not union_universe:
-            raise RuntimeError(
-                "No historical constituents resolved across requested backtest dates; "
-                "verify universe snapshots or date range."
-            )
+    return union_universe, universe_by_rebalance_date, selected_universe_type
 
+
+def _prepare_backtest_matrices(
+    market_data: dict,
+    union_universe: set[str],
+    warmup_start: str,
+    end_date: str,
+    cfg: UltimateConfig,
+    precomputed_matrices: Optional[dict],
+) -> Dict[str, pd.DataFrame]:
+    """_prepare_backtest_matrices operation."""
     matrices = precomputed_matrices
     if matrices:
-        close_cols = list(matrices["close"].columns)
-        close_col_set = set(close_cols)
-        close_col_bare = {
-            col[:-3] if isinstance(col, str) and col.endswith(".NS") else col
-            for col in close_cols
-        }
-
-        # FIX-MB-BE-06: normalize universe symbols when selecting precomputed
-        # columns. `build_precomputed_matrices` stores bare symbols (e.g. "TCS")
-        # while historical universes are .NS-suffixed (e.g. "TCS.NS"). The
-        # previous exact-match check could drop every symbol and hard-fail.
-        selected = sorted(
-            sym
-            for sym in union_universe
-            if sym in close_col_set
-            or (sym[:-3] if isinstance(sym, str) and sym.endswith(".NS") else sym) in close_col_bare
-        )
-        if not selected:
-            raise ValueError("No valid symbols found in precomputed matrices for the dynamic historical universe.")
-
-        # FIX-MB-C-02: restrict the time axis of passed-in matrices to
-        # [warmup_start, end_date].  Without this, callers that build a full
-        # TRAIN_START→TEST_END matrix and pass it here give every backtest
-        # (and every WFO fold called via run_backtest) visibility of data
-        # beyond end_date in signal generation, constituting look-ahead bias.
+        selected = sorted(union_universe)
         _warmup_ts = pd.Timestamp(warmup_start)
-        _end_ts    = pd.Timestamp(end_date) if end_date else None
+        _end_ts = pd.Timestamp(end_date) if end_date else None
 
-        def _clip(df):
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                return df
-            result = df.loc[_warmup_ts:] if _warmup_ts is not None else df
+        def _clip(df: pd.DataFrame) -> pd.DataFrame:
+            out = df.loc[_warmup_ts:] if _warmup_ts is not None else df
             if _end_ts is not None:
-                result = result.loc[:_end_ts]
-            return result
+                out = out.loc[:_end_ts]
+            return out
 
         def _resolve_column(df: pd.DataFrame, sym: str) -> pd.Series:
-            """Resolve a symbol column allowing bare and .NS label variants.
-
-            Args:
-                df (pd.DataFrame): Matrix containing price-like columns per symbol.
-                sym (str): Requested symbol key.
-
-            Returns:
-                pd.Series: Matched column series for the requested symbol.
-
-            Raises:
-                KeyError: If no matching column can be resolved.
-            """
             if sym in df.columns:
                 return df[sym]
-            if isinstance(sym, str) and sym.endswith(".NS"):
-                bare = sym[:-3]
-                if bare in df.columns:
-                    return df[bare]
+            if isinstance(sym, str) and sym.endswith(".NS") and sym[:-3] in df.columns:
+                return df[sym[:-3]]
             ns_sym = f"{sym}.NS" if isinstance(sym, str) and not sym.endswith(".NS") else sym
             if ns_sym in df.columns:
                 return df[ns_sym]
             raise KeyError(sym)
 
-        def _select_with_universe_labels(df: pd.DataFrame) -> pd.DataFrame:
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                return df
+        unresolved = [sym for sym in selected if sym not in matrices["close"].columns and
+                      (not (isinstance(sym, str) and sym.endswith(".NS") and sym[:-3] in matrices["close"].columns)) and
+                      (f"{sym}.NS" if isinstance(sym, str) and not sym.endswith(".NS") else sym) not in matrices["close"].columns]
+        if unresolved:
+            raise ValueError(
+                "Precomputed matrices missing symbols for requested universe: "
+                + ", ".join(sorted(map(str, unresolved)))
+            )
+
+        def _select(df: pd.DataFrame) -> pd.DataFrame:
             return pd.DataFrame({sym: _resolve_column(df, sym) for sym in selected}, index=df.index)
 
-        close     = _select_with_universe_labels(_clip(matrices["close"]))
-        open_px   = _select_with_universe_labels(_clip(matrices["open"]))
-        high_px   = _select_with_universe_labels(_clip(matrices["high"]))
-        low_px    = _select_with_universe_labels(_clip(matrices["low"]))
-        dividends = _select_with_universe_labels(_clip(matrices["dividends"]))
-        splits    = _select_with_universe_labels(_clip(matrices["splits"]))
-        volume    = _select_with_universe_labels(_clip(matrices["volume"]))
-        returns   = _select_with_universe_labels(_clip(matrices["returns"]))
+        close = _select(_clip(matrices["close"]))
+        open_px = _select(_clip(matrices["open"]))
+        high_px = _select(_clip(matrices["high"]))
+        low_px = _select(_clip(matrices["low"]))
+        dividends = _select(_clip(matrices["dividends"]))
+        splits = _select(_clip(matrices["splits"]))
+        volume = _select(_clip(matrices["volume"]))
+        returns = _select(_clip(matrices["returns"]))
     else:
-        # FIX-NEW-BE-02: the original filter tested v.index[0] <= warmup_start+30,
-        # which kept almost every DataFrame (any series starting before warmup_start
-        # trivially passes) and silently dropped symbols whose data starts between
-        # warmup_start+30 days and start_date — exactly the IPO-era symbols that do
-        # have valid warm-up history.  The correct guard is: keep any DataFrame whose
-        # LAST row is at or after warmup_start, meaning the data overlaps the window.
         matrices = build_precomputed_matrices(
-            {k: v for k, v in market_data.items()
-             if not isinstance(v, pd.DataFrame) or v.empty
-                or v.index[-1] >= pd.Timestamp(warmup_start)},
+            {k: v for k, v in market_data.items() if not isinstance(v, pd.DataFrame) or v.empty or v.index[-1] >= pd.Timestamp(warmup_start)},
             cfg=cfg,
             symbols=union_universe,
         )
@@ -1289,14 +1342,237 @@ def run_backtest(
         returns = matrices["returns"]
 
     common_idx = close.index.intersection(returns.index)
-    close = close.reindex(common_idx)
-    open_px = open_px.reindex(common_idx)
-    high_px = high_px.reindex(common_idx)
-    low_px = low_px.reindex(common_idx)
-    dividends = dividends.reindex(common_idx).fillna(0.0)
-    splits = splits.reindex(common_idx).fillna(0.0)
-    volume = volume.reindex(common_idx)
-    returns = returns.reindex(common_idx)
+    return {
+        "close": close.reindex(common_idx),
+        "open": open_px.reindex(common_idx),
+        "high": high_px.reindex(common_idx),
+        "low": low_px.reindex(common_idx),
+        "dividends": dividends.reindex(common_idx).fillna(0.0),
+        "splits": splits.reindex(common_idx).fillna(0.0),
+        "volume": volume.reindex(common_idx),
+        "returns": returns.reindex(common_idx),
+    }
+
+
+def _snap_rebalance_dates_to_holidays(
+    close_index: pd.DatetimeIndex,
+    all_target_dates: pd.DatetimeIndex,
+    universe_by_rebalance_date: Dict[pd.Timestamp, set[str]],
+) -> Tuple[pd.DatetimeIndex, Dict[pd.Timestamp, set[str]]]:
+    """_snap_rebalance_dates_to_holidays operation."""
+    trading_index = pd.to_datetime(close_index)
+    valid = []
+    for target in all_target_dates:
+        lower_bound = target - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
+        eligible = trading_index[(trading_index <= target) & (trading_index >= lower_bound)]
+        if len(eligible) == 0:
+            continue
+        valid.append(eligible[-1])
+    rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
+
+    snapped_universe: Dict[pd.Timestamp, set[str]] = {}
+    for target_d, members in sorted(universe_by_rebalance_date.items()):
+        lower = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
+        eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
+        if len(eligible) > 0:
+            snapped_key = eligible[-1]
+            if snapped_key in snapped_universe:
+                logger.warning(
+                    "[Backtest] Holiday snap collision: target %s also maps to %s; merging member sets.",
+                    target_d.date(),
+                    snapped_key.date(),
+                )
+                snapped_universe[snapped_key].update(members)
+            else:
+                snapped_universe[snapped_key] = set(members)
+    return rebal_dates, snapped_universe if snapped_universe else universe_by_rebalance_date
+
+
+class _RebalFilterHookPayload(TypedDict):
+    state_cash: float
+    n_symbols: int
+    has_member_universe: bool
+
+
+class _RebalValuationHookPayload(TypedDict):
+    date: str
+    n_active_symbols: int
+
+
+class _RebalCvarHookPayload(TypedDict):
+    n_active_symbols: int
+    has_positions: bool
+
+
+class _RebalTargetsHookPayload(TypedDict):
+    n_rows: int
+    n_assets: int
+
+
+class _RebalExecutionHookPayload(TypedDict):
+    date: str
+    n_targets: int
+
+
+def _rebal_filter_universe(
+    state: PortfolioState,
+    symbols: List[str],
+    member_universe: Optional[set[str]],
+) -> _RebalFilterHookPayload:
+    """_rebal_filter_universe operation.
+
+    TODO: implement steps 1-2 of rebalance flow:
+    - apply date/member universe eligibility
+    - include currently held symbols even if not in fresh universe
+    - return normalized symbol list and index mappings consumed by later phases
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
+    return {
+        "state_cash": float(state.cash),
+        "n_symbols": int(len(symbols)),
+        "has_member_universe": member_universe is not None,
+    }
+
+
+def _rebal_build_valuation(
+    state: PortfolioState,
+    close: pd.DataFrame,
+    volume: pd.DataFrame,
+    date: pd.Timestamp,
+    active_symbols: List[str],
+) -> _RebalValuationHookPayload:
+    """_rebal_build_valuation operation.
+
+    TODO: implement steps 3-6:
+    - build ADV vector and valuation-price series
+    - compute portfolio value and previous weights
+    - return valuation bundle for CVaR/optimizer phases
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
+    _ = (state, close, volume)
+    return {
+        "date": str(pd.Timestamp(date).date()),
+        "n_active_symbols": int(len(active_symbols)),
+    }
+
+
+def _rebal_check_cvar_breach(
+    state: PortfolioState,
+    valuation_prices: np.ndarray,
+    active_symbols: List[str],
+    hist_log_rets: pd.DataFrame,
+    cfg: UltimateConfig,
+) -> _RebalCvarHookPayload:
+    """_rebal_check_cvar_breach operation.
+
+    TODO: implement steps 8-10:
+    - compute book CVaR on valuation state
+    - set soft/hard breach flags and override/decay triggers
+    - return breach decision state used by target generation phase
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
+    _ = (valuation_prices, hist_log_rets, cfg)
+    return {
+        "n_active_symbols": int(len(active_symbols)),
+        "has_positions": bool(state.shares),
+    }
+
+
+def _rebal_generate_targets(
+    state: PortfolioState,
+    hist_log_rets: pd.DataFrame,
+    adv_vector: np.ndarray,
+    cfg: UltimateConfig,
+) -> _RebalTargetsHookPayload:
+    """_rebal_generate_targets operation.
+
+    TODO: implement steps 11-13:
+    - generate signals and selection set
+    - call optimizer with failure handling and decay fallback
+    - return target weights plus flags (apply_decay, forced_to_cash)
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
+    _ = (state, adv_vector, cfg)
+    return {
+        "n_rows": int(hist_log_rets.shape[0]),
+        "n_assets": int(hist_log_rets.shape[1]),
+    }
+
+
+def _rebal_execute_trades(
+    state: PortfolioState,
+    target_weights: np.ndarray,
+    active_symbols: List[str],
+    date: pd.Timestamp,
+) -> _RebalExecutionHookPayload:
+    """_rebal_execute_trades operation.
+
+    TODO: implement step 14:
+    - resolve execution prices (open/close fallback rules)
+    - invoke execute_rebalance and capture trade/slippage effects
+    - return execution summary for rebalance audit row construction
+    Current behavior: returns opaque payload and caller ignores return value.
+    """
+    _ = (state, active_symbols)
+    return {
+        "date": str(pd.Timestamp(date).date()),
+        "n_targets": int(len(target_weights)),
+    }
+
+
+def run_backtest(
+    market_data: dict,
+    universe_type: Optional[str] = None,
+    start_date: str = "2020-01-01",
+    end_date: str = "2020-12-31",
+    cfg: Optional[UltimateConfig] = None,
+    sector_map: Optional[dict] = None,
+    universe: Optional[List[str]] = None,
+    precomputed_matrices: Optional[dict] = None,
+) -> BacktestResults:
+    """run_backtest operation."""
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    if start_ts > end_ts:
+        raise ValueError(
+            f"Invalid backtest date range: start_date ({start_ts.date()}) is after end_date ({end_ts.date()})."
+        )
+
+    if cfg is None:
+        cfg = UltimateConfig()
+
+    warmup_start = _compute_warmup_start(start_date, cfg)
+    all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
+
+    union_universe, universe_by_rebalance_date, _selected_universe_type = _resolve_universe_by_date(
+        market_data=market_data,
+        universe_type=universe_type,
+        universe=universe,
+        all_target_dates=all_target_dates,
+        cfg=cfg,
+    )
+    if not union_universe:
+        raise RuntimeError(
+            "No historical constituents resolved across requested backtest dates; "
+            "verify universe snapshots or date range."
+        )
+
+    prepared = _prepare_backtest_matrices(
+        market_data=market_data,
+        union_universe=union_universe,
+        warmup_start=warmup_start,
+        end_date=end_date,
+        cfg=cfg,
+        precomputed_matrices=precomputed_matrices,
+    )
+    close = prepared["close"]
+    open_px = prepared["open"]
+    high_px = prepared["high"]
+    low_px = prepared["low"]
+    dividends = prepared["dividends"]
+    splits = prepared["splits"]
+    volume = prepared["volume"]
+    returns = prepared["returns"]
 
     if returns.empty:
         raise RuntimeError("Backtest aborted: returns matrix is empty after clipping.")
@@ -1316,59 +1592,23 @@ def run_backtest(
             "data for the requested universe/date range."
         )
 
-    trading_index = pd.to_datetime(close.index)
-    valid = []
-    for target in all_target_dates:
-        lower_bound = target - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
-        eligible = trading_index[(trading_index <= target) & (trading_index >= lower_bound)]
-        if len(eligible) == 0:
-            logger.debug(
-                "Calendar guard: no prior trading day within %d days of %s; deferring rebalance.",
-                _REBALANCE_SNAP_WINDOW_DAYS, target.date(),
-            )
-            continue
-        valid.append(eligible[-1])
-
-    rebal_dates = pd.DatetimeIndex(pd.DatetimeIndex(valid).unique())
+    rebal_dates, universe_by_rebalance_date = _snap_rebalance_dates_to_holidays(
+        close_index=close.index,
+        all_target_dates=all_target_dates,
+        universe_by_rebalance_date=universe_by_rebalance_date,
+    )
     if rebal_dates.empty:
         raise RuntimeError(
             "Backtest aborted: no valid rebalance dates intersect available "
             "trading history in the requested window."
         )
 
-    # FIX-MB-SNAP: Apply the holiday-snap re-keying unconditionally.
-    if universe_by_rebalance_date:
-        snapped_universe: Dict[pd.Timestamp, set] = {}
-        snapped_universe_target_date: Dict[pd.Timestamp, pd.Timestamp] = {}
-
-        for target_d, members in sorted(universe_by_rebalance_date.items()):
-            lower    = target_d - pd.Timedelta(days=_REBALANCE_SNAP_WINDOW_DAYS)
-            eligible = trading_index[(trading_index <= target_d) & (trading_index >= lower)]
-            if len(eligible) > 0:
-                snapped_key = eligible[-1]
-                if snapped_key in snapped_universe:
-                    existing_target = snapped_universe_target_date[snapped_key]
-                    # FIX-MB-M-04: log at WARNING so operators can audit
-                    # holiday-snap collisions in production and detect
-                    # off-by-one membership window shifts.
-                    logger.warning(
-                        "[Backtest] Holiday snap collision: targets %s and %s both snap to %s. "
-                        "Keeping earliest target's member set (%s) to avoid using a later "
-                        "membership snapshot earlier than it was known.",
-                        existing_target.date(), target_d.date(), snapped_key.date(),
-                        existing_target.date(),
-                    )
-                else:
-                    snapped_universe[snapped_key] = set(members)
-                    snapped_universe_target_date[snapped_key] = target_d
-        universe_by_rebalance_date = snapped_universe
-
     idx_df = market_data.get("^CRSLDX")
     if idx_df is None or idx_df.empty:
         idx_df = market_data.get("^NSEI")
 
     engine = InstitutionalRiskEngine(cfg)
-    bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+    bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
 
     bt.run(
         close, volume, returns, rebal_dates,
@@ -1380,7 +1620,7 @@ def run_backtest(
         log_rets_arr=log_rets_arr,
     )
 
-    eq_daily  = pd.Series(bt._eq_vals, index=bt._eq_dates)
+    eq_daily = pd.Series(bt._eq_vals, index=bt._eq_dates)
     eq_weekly = eq_daily[eq_daily.index.isin(rebal_dates)]
 
     if eq_weekly.empty and not eq_daily.empty:
@@ -1390,20 +1630,14 @@ def run_backtest(
         )
         eq_weekly = eq_daily
 
-    rebal_log = (
-        pd.DataFrame(bt._rebal_rows).set_index("date")
-        if bt._rebal_rows
-        else pd.DataFrame()
-    )
+    rebal_log = pd.DataFrame(bt._rebal_rows).set_index("date") if bt._rebal_rows else pd.DataFrame()
 
     return BacktestResults(
-        equity_curve = eq_weekly,
-        trades       = bt.trades,
-        metrics      = _compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
-        rebal_log    = rebal_log,
+        equity_curve=eq_weekly,
+        trades=bt.trades,
+        metrics=_compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
+        rebal_log=rebal_log,
     )
-
-
 def print_backtest_results(results: BacktestResults) -> None:
     """print_backtest_results operation.
     
@@ -1440,6 +1674,161 @@ def print_backtest_results(results: BacktestResults) -> None:
     print(f"  \033[90m{chr(9472)*65}\033[0m\n")
 
 
+def _calc_cagr(eq: pd.Series, initial: float) -> float:
+    """_calc_cagr operation.
+
+    Args:
+        eq (pd.Series): Input parameter.
+        initial (float): Input parameter.
+
+    Returns:
+        float: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if eq.empty or initial <= 0 or len(eq) < 2:
+        return 0.0
+    first_date = pd.Timestamp(eq.index[0])
+    last_date = pd.Timestamp(eq.index[-1])
+    days_elapsed = (last_date - first_date).days
+    years_elapsed = max(days_elapsed / 365.25, 0.001)
+    if years_elapsed <= 0.001:
+        return 0.0
+    final = float(eq.iloc[-1])
+    return ((final / initial) ** (1.0 / years_elapsed) - 1.0) * 100.0
+
+
+def _calc_drawdown(eq: pd.Series) -> Tuple[pd.Series, float]:
+    """_calc_drawdown operation.
+
+    Args:
+        eq (pd.Series): Input parameter.
+
+    Returns:
+        Tuple[pd.Series, float]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if eq.empty:
+        return pd.Series(dtype=float), 0.0
+    dd = (eq / eq.cummax() - 1.0) * 100.0
+    return dd, float(dd.min())
+
+
+def _calc_sharpe_sortino(daily_returns: pd.Series, periods_per_year: int) -> Tuple[float, float]:
+    """_calc_sharpe_sortino operation.
+
+    Args:
+        daily_returns (pd.Series): Input parameter.
+        periods_per_year (int): Input parameter.
+
+    Returns:
+        Tuple[float, float]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if len(daily_returns) <= 1 or daily_returns.std() <= 0:
+        return 0.0, 0.0
+    ppy = float(periods_per_year)
+    sharpe = (daily_returns.mean() * ppy) / (daily_returns.std() * np.sqrt(ppy))
+    downside = daily_returns[daily_returns < 0]
+    if len(downside) > 1 and downside.std() > 0:
+        sortino = (daily_returns.mean() * ppy) / (downside.std() * np.sqrt(ppy))
+    else:
+        sortino = np.nan
+    return float(sharpe), float(sortino)
+
+
+def _calc_calmar(cagr: float, max_dd: float) -> float:
+    """_calc_calmar operation.
+
+    Args:
+        cagr (float): Input parameter.
+        max_dd (float): Input parameter.
+
+    Returns:
+        float: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if max_dd >= 0.0:
+        return cagr
+    return cagr / max(abs(max_dd), 1.0)
+
+
+def _calc_hit_rate(trades: List[Trade]) -> float:
+    """_calc_hit_rate operation.
+
+    Args:
+        trades (List[Trade]): Input parameter.
+
+    Returns:
+        float: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    round_trip_pnls: List[float] = []
+    buy_queue: Dict[str, List[tuple[int, float]]] = {}
+
+    for trade in trades:
+        if trade.delta_shares == 0:
+            continue
+        qty = abs(int(trade.delta_shares))
+        price = float(trade.exec_price)
+        if trade.direction == "BUY" and trade.delta_shares > 0:
+            buy_queue.setdefault(trade.symbol, []).append((qty, price))
+        elif trade.direction == "SELL" and trade.delta_shares < 0:
+            lots = buy_queue.setdefault(trade.symbol, [])
+            remaining = qty
+            while remaining > 0 and lots:
+                lot_qty, lot_px = lots[0]
+                matched = min(remaining, lot_qty)
+                round_trip_pnls.append((price - lot_px) * matched)
+                remaining -= matched
+                lot_qty -= matched
+                if lot_qty == 0:
+                    lots.pop(0)
+                else:
+                    lots[0] = (lot_qty, lot_px)
+
+    if not round_trip_pnls:
+        return 0.0
+    return (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0
+
+
+def _calc_turnover(trades: List[Trade], eq: pd.Series, years: float) -> float:
+    """_calc_turnover operation.
+
+    Args:
+        trades (List[Trade]): Input parameter.
+        eq (pd.Series): Input parameter.
+        years (float): Input parameter.
+
+    Returns:
+        float: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if not trades or eq.empty:
+        return 0.0
+    buy_trades = [t for t in trades if t.direction == "BUY" and t.delta_shares > 0]
+    sell_trades = [t for t in trades if t.direction == "SELL" and t.delta_shares < 0]
+    total_buy_notional = sum(t.delta_shares * t.exec_price for t in buy_trades)
+    total_sell_notional = sum(abs(t.delta_shares) * t.exec_price for t in sell_trades)
+    avg_equity = float(eq.mean()) if len(eq) > 0 else 0.0
+    if avg_equity <= 0:
+        return 0.0
+    turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
+    clamped_years = max(years, 1.0 / 252)
+    return turnover / clamped_years if clamped_years > 0 else 0.0
+
+
 def _compute_metrics(
     eq: pd.Series,
     initial: float,
@@ -1447,16 +1836,16 @@ def _compute_metrics(
     trades: Optional[List[Trade]] = None,
 ) -> Dict:
     """_compute_metrics operation.
-    
+
     Args:
         eq (pd.Series): Input parameter.
         initial (float): Input parameter.
         periods_per_year (int): Input parameter.
         trades (Optional[List[Trade]]): Input parameter.
-    
+
     Returns:
         Dict: Result of this operation.
-    
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
@@ -1479,118 +1868,31 @@ def _compute_metrics(
             "hit_rate": 0.0, "turnover": 0.0,
         }
 
-    final     = float(eq.iloc[-1])
-    # FIX-MB-BE-03: use len(eq) for n_periods to avoid systematic off-by-one
-    # overstatement of CAGR. With N data points there are N-1 intervals, but
-    # annualisation uses periods_per_year/n_periods as the exponent where
-    # n_periods is the number of return observations (= len(eq) - 1 for daily
-    # returns). However, using len(eq) is more consistent with how most
-    # performance libraries define the period count for a series of equity values
-    # (treating each row as one period).  The original code used len(eq)-1 which
-    # would overstate CAGR by roughly 1/N.  We switch to len(eq) for consistency.
-    # FIX-MB-BE-04: Use calendar days not trading days for annualization
-    # FIX-MB-BE-03 / FIX-MB-BE-04: CAGR uses elapsed calendar days
-    # (days_elapsed / 365.25) to correctly annualise performance across weekends,
-    # holidays, and irregular trading calendars, avoiding systematic over/under-
-    # statement caused by assuming exactly 252 trading bars per year.
-    if not eq.empty and len(eq) >= 2:
-        first_date = pd.Timestamp(eq.index[0])
-        last_date = pd.Timestamp(eq.index[-1])
-        days_elapsed = (last_date - first_date).days
-        years_elapsed = max(days_elapsed / 365.25, 0.001)
-    else:
-        years_elapsed = 1.0
-    if years_elapsed > 0.001:
-        cagr = ((final / initial) ** (1.0 / years_elapsed) - 1.0) * 100.0
-    else:
-        cagr = 0.0
-    dd        = (eq / eq.cummax() - 1.0) * 100.0
-    max_dd    = float(dd.min())
-
+    final = float(eq.iloc[-1])
+    cagr = _calc_cagr(eq, initial)
+    _, max_dd = _calc_drawdown(eq)
     dr = eq.pct_change(fill_method=None).dropna()
-    if len(dr) > 1 and dr.std() > 0:
-        ppy    = float(periods_per_year)
-        sharpe = (dr.mean() * ppy) / (dr.std() * np.sqrt(ppy))
-        downside = dr[dr < 0]
-        if len(downside) > 1 and downside.std() > 0:
-            sortino = (dr.mean() * ppy) / (downside.std() * np.sqrt(ppy))
-        else:
-            sortino = np.nan
-    else:
-        sharpe  = 0.0
-        sortino = 0.0
-
-    if max_dd >= 0.0:
-        calmar = cagr
-    else:
-        calmar = cagr / max(abs(max_dd), 1.0)
+    sharpe, sortino = _calc_sharpe_sortino(dr, periods_per_year)
+    calmar = _calc_calmar(cagr, max_dd)
 
     hit_rate = 0.0
     turnover = 0.0
     if trades:
-        buy_trades  = [t for t in trades if t.direction == "BUY"  and t.delta_shares > 0]
-        sell_trades = [t for t in trades if t.direction == "SELL" and t.delta_shares < 0]
-
-        round_trip_pnls: List[float] = []
-        buy_queue: Dict[str, List[tuple[int, float]]] = {}
-
-        for trade in trades:
-            if trade.delta_shares == 0:
-                continue
-            qty   = abs(int(trade.delta_shares))
-            price = float(trade.exec_price)
-
-            if trade.direction == "BUY" and trade.delta_shares > 0:
-                buy_queue.setdefault(trade.symbol, []).append((qty, price))
-            elif trade.direction == "SELL" and trade.delta_shares < 0:
-                lots = buy_queue.setdefault(trade.symbol, [])
-                remaining = qty
-                while remaining > 0 and lots:
-                    lot_qty, lot_px = lots[0]
-                    matched = min(remaining, lot_qty)
-                    round_trip_pnls.append((price - lot_px) * matched)
-                    remaining -= matched
-                    lot_qty   -= matched
-                    if lot_qty == 0:
-                        lots.pop(0)
-                    else:
-                        lots[0] = (lot_qty, lot_px)
-                # Unmatched remaining sells are excluded from both numerator
-                # and denominator (no buy basis available), keeping ratio accurate.
-
-        if round_trip_pnls:
-            hit_rate = (sum(1 for pnl in round_trip_pnls if pnl > 0) / len(round_trip_pnls)) * 100.0
-
-        total_buy_notional  = sum(t.delta_shares * t.exec_price for t in buy_trades)
-        total_sell_notional = sum(abs(t.delta_shares) * t.exec_price for t in sell_trades)
-        avg_equity = float(eq.mean()) if len(eq) > 0 else float(initial)
-        if avg_equity > 0:
-            # Divide by 2.0 so 1.0 turnover means one full portfolio round-trip:
-            # e.g. buy Rs.100 and sell Rs.100 against Rs.100 average equity -> 1.0.
-            turnover = ((total_buy_notional + total_sell_notional) / 2.0) / avg_equity
-            if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
-                # FIX-MB-M-01 (datetime branch): clamp to at least 1/252 to prevent
-                # near-zero years from inflating annualised turnover in short backtests.
-                years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1.0 / 252)
-            else:
-                # FIX-NEW-BE-01: n_periods was removed in FIX-MB-BE-03; use
-                # len(eq)-1 (number of return intervals) as the fallback for
-                # non-datetime equity index series.
-                # FIX-MB-M-01: clamp to at least 1/252 to prevent near-zero
-                # years from inflating annualised turnover by orders of
-                # magnitude in short test series (e.g. len(eq)=5, ppy=252
-                # would give years≈0.016 and 28× overstated turnover).
-                years = max((len(eq) - 1) / float(periods_per_year), 1.0 / 252)
-            if years > 0:
-                turnover = turnover / years
+        hit_rate = _calc_hit_rate(trades)
+        if hasattr(eq.index, 'dtype') and np.issubdtype(eq.index.dtype, np.datetime64) and len(eq) >= 2:
+            years = (eq.index[-1] - eq.index[0]).days / 365.25
+        else:
+            years = (len(eq) - 1) / float(periods_per_year)
+        turnover = _calc_turnover(trades, eq, years)
 
     return {
-        "cagr":     round(cagr,    2),
-        "max_dd":   round(max_dd,  2),
-        "final":    round(final,   2),
-        "sharpe":   round(sharpe,  2),
-        "sortino":  round(sortino, 2) if np.isfinite(sortino) else sortino,
-        "calmar":   round(calmar,  2),
+        "cagr": round(cagr, 2),
+        "max_dd": round(max_dd, 2),
+        "final": round(final, 2),
+        "sharpe": round(sharpe, 2),
+        "sortino": round(sortino, 2) if np.isfinite(sortino) else sortino,
+        "calmar": round(calmar, 2),
         "hit_rate": round(hit_rate, 2),
         "turnover": round(turnover, 4),
     }
+
