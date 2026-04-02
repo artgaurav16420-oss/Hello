@@ -514,10 +514,17 @@ class PortfolioState:
             self.equity_hist = self.equity_hist[-self._equity_hist_cap:]
 
     def record_volatility(self, current_date: pd.Timestamp, vol_by_symbol: Dict[str, float], cap: int) -> None:
+        effective_cap = int(cap)
         for sym, vol in vol_by_symbol.items():
             vol_value = float(vol)
             self.last_known_volatility[sym] = vol_value
-            hist = self.vol_hist.setdefault(sym, deque(maxlen=int(cap)))
+            hist = self.vol_hist.get(sym)
+            if hist is None:
+                hist = deque(maxlen=effective_cap)
+                self.vol_hist[sym] = hist
+            elif hist.maxlen != effective_cap:
+                hist = deque(hist, maxlen=effective_cap)
+                self.vol_hist[sym] = hist
             hist.append((pd.Timestamp(current_date), vol_value))
 
     def reset(self) -> None:
@@ -682,6 +689,8 @@ class PortfolioState:
             ps._equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
         else:
             ps._equity_hist_cap = int(ps.equity_hist_cap)
+        if ps._equity_hist_cap > 0 and len(ps.equity_hist) > ps._equity_hist_cap:
+            ps.equity_hist = ps.equity_hist[-ps._equity_hist_cap:]
 
         if errors:
             logger.error(
@@ -744,10 +753,7 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
     return {
-        str(k): deque(
-            ((pd.Timestamp(d), float(vol)) for d, vol in vals),
-            maxlen=int(UltimateConfig().CVAR_LOOKBACK),
-        )
+        str(k): deque(((pd.Timestamp(d), float(vol)) for d, vol in vals))
         for k, vals in value.items()
     }
 
@@ -1718,6 +1724,8 @@ def _drop_zero_volatility_columns(
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     col_stds = clean_rets.std()
     valid_vol_mask = col_stds >= 1e-10
+    if not valid_vol_mask.any():
+        return clean_rets.loc[:, valid_vol_mask], kept_indices[valid_vol_mask.to_numpy()]
     if not valid_vol_mask.all() and valid_vol_mask.any():
         clean_rets = clean_rets.loc[:, valid_vol_mask]
         kept_indices = kept_indices[valid_vol_mask.to_numpy()]

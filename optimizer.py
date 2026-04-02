@@ -460,6 +460,14 @@ def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateCo
     cfg.RISK_AVERSION = trial.suggest_float("RISK_AVERSION", risk_min, risk_max, step=risk_step)
     cfg.CVAR_DAILY_LIMIT = trial.suggest_float("CVAR_DAILY_LIMIT", cvar_min, cvar_max, step=cvar_step)
 
+    defaults = UltimateConfig()
+    cfg.MAX_POSITIONS = _suggest_optional_int_param(
+        trial,
+        "MAX_POSITIONS",
+        search_space.get("MAX_POSITIONS"),
+        defaults.MAX_POSITIONS,
+    )
+
     cvar_lb_min, cvar_lb_max, cvar_lb_step = search_space.get("CVAR_LOOKBACK", (60, 150, 10))
     min_required_lookback = cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS
     effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
@@ -475,13 +483,6 @@ def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateCo
             step=int(cvar_lb_step),
         )
 
-    defaults = UltimateConfig()
-    cfg.MAX_POSITIONS = _suggest_optional_int_param(
-        trial,
-        "MAX_POSITIONS",
-        search_space.get("MAX_POSITIONS"),
-        defaults.MAX_POSITIONS,
-    )
     cfg.SIGNAL_LAG_DAYS = _suggest_optional_int_param(
         trial,
         "SIGNAL_LAG_DAYS",
@@ -1154,7 +1155,16 @@ def _create_optimization_study(study_name: str, storage: str) -> optuna.Study:
     return study
 
 
-def _load_oos_journal_records(journal_path: Path) -> dict[int, dict]:
+def _current_oos_meta() -> dict[str, float | str]:
+    return {
+        "test_start": TEST_START,
+        "test_end": TEST_END,
+        "oos_max_dd_cap": float(OOS_MAX_DD_CAP),
+        "oos_soft_max_dd_cap": float(OOS_SOFT_MAX_DD_CAP),
+    }
+
+
+def _load_oos_journal_records(journal_path: Path, current_meta: dict[str, float | str]) -> dict[int, dict]:
     completed_trial_ids: dict[int, dict] = {}
     if not journal_path.exists():
         return completed_trial_ids
@@ -1164,6 +1174,13 @@ def _load_oos_journal_records(journal_path: Path) -> dict[int, dict]:
         try:
             rec = json.loads(line)
             trial_number = rec["trial_number"]
+            rec_meta = rec.get("meta")
+            if rec_meta != current_meta:
+                logger.warning(
+                    "Skipping journal line %d for trial %s due to OOS meta mismatch.",
+                    line_idx, trial_number,
+                )
+                continue
             if rec.get("status") != "PASS":
                 completed_trial_ids[trial_number] = rec
                 continue
@@ -1424,7 +1441,8 @@ def run_optimization(
 
     oos_results_list = []
     journal_path = _oos_journal_path(effective_study_name)  # ARCH-FIX-9
-    completed_trial_ids = _load_oos_journal_records(journal_path)
+    current_meta = _current_oos_meta()
+    completed_trial_ids = _load_oos_journal_records(journal_path, current_meta)
 
     for rank, trial_candidate in enumerate(top_k_trials, 1):
         if trial_candidate.number in completed_trial_ids:
@@ -1477,6 +1495,7 @@ def run_optimization(
                 "oos_calmar": oos_calmar,
                 "metrics": m,
                 "status": status_tag,
+                "meta": current_meta,
             }
             with journal_path.open("a", encoding="utf-8") as fh:
                 fh.write(f"{json.dumps(oos_result_dict)}\n")

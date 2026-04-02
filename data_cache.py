@@ -716,7 +716,8 @@ class GrowwProvider(DataProvider):
                     "Close": close,
                     "Volume": vol,
                 })
-            except Exception:
+            except Exception as exc:
+                logger.debug("[Groww] Malformed candle skipped: %r (%s)", c, exc, exc_info=True)
                 continue
         return rows
 
@@ -1598,9 +1599,7 @@ def _clean_ticker_symbol(ticker: Optional[str]) -> str:
     if upper_t.endswith(".BO"):
         return upper_t
     if upper_t.endswith(".NSE"):
-        upper_t = f"{upper_t[:-4]}.NS"
-    elif upper_t.endswith(".NS"):
-        return upper_t
+        return f"{upper_t[:-4]}.NS"
     if upper_t.endswith(".NS"):
         return upper_t
     return f"{upper_t}.NS"
