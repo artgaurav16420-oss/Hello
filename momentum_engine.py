@@ -677,6 +677,7 @@ class PortfolioState:
             d, "last_rebalance_date", str, "", cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
         )
         ps._initial_cash = float(ps.cash)
+        ps._initial_exposure_multiplier = float(ps.exposure_multiplier)
         if ps.equity_hist_cap is None:
             ps._equity_hist_cap = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
         else:
@@ -981,7 +982,7 @@ def _apply_adv_share_cap(
     if adv_shares is None or index >= len(adv_shares):
         return shares
     adv_notional = float(adv_shares[index])
-    if adv_notional <= 0:
+    if not np.isfinite(adv_notional) or adv_notional <= 0:
         return shares
     max_adv_shares = int(np.floor((adv_notional * cfg.MAX_ADV_PCT) / price))
     capped = min(shares, max_adv_shares)

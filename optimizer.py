@@ -894,8 +894,8 @@ def _validate_cvar_limit(params: dict, violations: list[str]) -> None:
 
 def _validate_position_limits(params: dict, violations: list[str]) -> None:
     max_pos = params.get("MAX_POSITIONS")
-    if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 2):
-        violations.append(f"MAX_POSITIONS must be int >= 2; got {max_pos!r}")
+    if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 0):
+        violations.append(f"MAX_POSITIONS must be int >= 0; got {max_pos!r}")
 
     max_w = params.get("MAX_SINGLE_NAME_WEIGHT")
     if max_w is not None and (
@@ -1207,9 +1207,11 @@ def _build_oos_cfg_from_trial(
 def _clip_oos_matrices(
     precomputed_matrices: dict | None,
     warmup_start: str,
-) -> dict:
+) -> dict | None:
+    if precomputed_matrices is None:
+        return None
     clipped_matrices: dict = {}
-    for k, v in (precomputed_matrices or {}).items():
+    for k, v in precomputed_matrices.items():
         if hasattr(v, "loc"):
             clipped_matrices[k] = v.loc[warmup_start:TEST_END]
         else:

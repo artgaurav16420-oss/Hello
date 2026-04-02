@@ -1594,9 +1594,9 @@ def _clean_ticker_symbol(ticker: Optional[str]) -> str:
         return t_str
     upper_t = t_str.upper()
     if upper_t.endswith(".BSE"):
-        upper_t = upper_t[:-4]
-    elif upper_t.endswith(".BO"):
-        upper_t = upper_t[:-3]
+        return upper_t
+    if upper_t.endswith(".BO"):
+        return upper_t
     if upper_t.endswith(".NSE"):
         upper_t = f"{upper_t[:-4]}.NS"
     elif upper_t.endswith(".NS"):
