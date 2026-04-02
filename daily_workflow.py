@@ -79,7 +79,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 # OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
@@ -249,6 +249,36 @@ def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Pat
     return path
 
 
+def _is_claim_stale(claim_path: pathlib.Path, current_date_str: str, max_age_hours: int) -> bool:
+    """_is_claim_stale operation.
+
+    Args:
+        claim_path (pathlib.Path): Input parameter.
+        current_date_str (str): Input parameter.
+        max_age_hours (int): Input parameter.
+
+    Returns:
+        bool: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    stat_result = claim_path.stat()
+    mtime = datetime.fromtimestamp(stat_result.st_mtime)
+    claim_date_str = ""
+    try:
+        existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+        if isinstance(existing_claim, dict):
+            claim_date_str = str(existing_claim.get("date", ""))
+    except (json.JSONDecodeError, OSError):
+        claim_date_str = ""
+
+    return (
+        claim_date_str != current_date_str
+        or (datetime.now() - mtime).total_seconds() > (max_age_hours * 3600)
+    )
+
+
 def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
     """_try_claim_pending_sentinel operation.
     
@@ -288,12 +318,10 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
                 # Corrupted or unreadable claim — treat as stale
                 claim_date_str = ""
 
-            # Consider the claim stale if:
-            # 1. The stored date differs from the requested date_str, OR
-            # 2. The file modification time is more than 24 hours old
-            is_stale = (
-                claim_date_str != date_str or
-                (datetime.now() - mtime).total_seconds() > 86400
+            is_stale = _is_claim_stale(
+                claim_path=claim_path,
+                current_date_str=date_str,
+                max_age_hours=24,
             )
 
             if is_stale:
@@ -420,12 +448,59 @@ _DEFAULT_SCREENER_URL = os.environ.get(
     "https://www.screener.in/screens/3506127/hello/",
 )
 
-def load_optimized_config() -> UltimateConfig:
-    """load_optimized_config operation.
-    
+def _validate_config_cross_fields(cfg: UltimateConfig) -> UltimateConfig:
+    """_validate_config_cross_fields operation.
+
+    Args:
+        cfg (UltimateConfig): Input parameter.
+
     Returns:
         UltimateConfig: Result of this operation.
-    
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    defaults = UltimateConfig()
+    if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
+        logger.error(
+            "[Config] optimal_cfg.json has HALFLIFE_FAST (%d) > HALFLIFE_SLOW (%d) - invalid. Resetting both.",
+            cfg.HALFLIFE_FAST, cfg.HALFLIFE_SLOW,
+        )
+        cfg.HALFLIFE_FAST = defaults.HALFLIFE_FAST
+        cfg.HALFLIFE_SLOW = defaults.HALFLIFE_SLOW
+    if cfg.MIN_EXPOSURE_FLOOR > 1.0 or cfg.MIN_EXPOSURE_FLOOR < 0.0:
+        logger.error(
+            "[Config] optimal_cfg.json has MIN_EXPOSURE_FLOOR=%.4f outside [0,1]. Resetting.",
+            cfg.MIN_EXPOSURE_FLOOR,
+        )
+        cfg.MIN_EXPOSURE_FLOOR = defaults.MIN_EXPOSURE_FLOOR
+    if cfg.CVAR_DAILY_LIMIT <= 0.0 or cfg.CVAR_DAILY_LIMIT > 0.5:
+        logger.error(
+            "[Config] optimal_cfg.json has CVAR_DAILY_LIMIT=%.4f outside (0, 0.5]. Resetting.",
+            cfg.CVAR_DAILY_LIMIT,
+        )
+        cfg.CVAR_DAILY_LIMIT = defaults.CVAR_DAILY_LIMIT
+    if not isinstance(cfg.MAX_POSITIONS, int) or cfg.MAX_POSITIONS < 2:
+        logger.error(
+            "[Config] optimal_cfg.json has MAX_POSITIONS=%r outside [2, infinity). Resetting.",
+            cfg.MAX_POSITIONS,
+        )
+        cfg.MAX_POSITIONS = defaults.MAX_POSITIONS
+    if not isinstance(cfg.SIGNAL_LAG_DAYS, int) or cfg.SIGNAL_LAG_DAYS < 0:
+        logger.error(
+            "[Config] optimal_cfg.json has SIGNAL_LAG_DAYS=%r < 0. Resetting.",
+            cfg.SIGNAL_LAG_DAYS,
+        )
+        cfg.SIGNAL_LAG_DAYS = defaults.SIGNAL_LAG_DAYS
+    return cfg
+
+
+def load_optimized_config() -> UltimateConfig:
+    """load_optimized_config operation.
+
+    Returns:
+        UltimateConfig: Result of this operation.
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
@@ -443,59 +518,7 @@ def load_optimized_config() -> UltimateConfig:
                     logger.warning("[Config] Ignoring unknown/stale optimized parameter: %s", k)
                     continue
                 setattr(cfg, k, v)
-        # FIX-MB2-CFGVALIDATION: Validate cross-field constraints after applying
-        # all JSON values. A hand-edited or crash-corrupted JSON could produce an
-        # invalid combination (e.g. HALFLIFE_FAST > HALFLIFE_SLOW), which would
-        # silently invert the momentum signal direction. Reset to defaults when
-        # cross-field invariants are violated.
-        # NOTE: HALFLIFE_FAST == HALFLIFE_SLOW is permitted (degenerates to a
-        # single EMA signal) — only strictly FAST > SLOW inverts the signal.
-        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
-            logger.error(
-                "[Config] optimal_cfg.json has HALFLIFE_FAST (%d) > HALFLIFE_SLOW (%d) — "
-                "invalid: would invert momentum signal. Resetting both to defaults.",
-                cfg.HALFLIFE_FAST, cfg.HALFLIFE_SLOW,
-            )
-            defaults = UltimateConfig()
-            cfg.HALFLIFE_FAST = defaults.HALFLIFE_FAST
-            cfg.HALFLIFE_SLOW = defaults.HALFLIFE_SLOW
-        if cfg.MIN_EXPOSURE_FLOOR > 1.0 or cfg.MIN_EXPOSURE_FLOOR < 0.0:
-            logger.error(
-                "[Config] optimal_cfg.json has MIN_EXPOSURE_FLOOR=%.4f outside [0,1]. Resetting.",
-                cfg.MIN_EXPOSURE_FLOOR,
-            )
-            cfg.MIN_EXPOSURE_FLOOR = UltimateConfig().MIN_EXPOSURE_FLOOR
-        if cfg.CVAR_DAILY_LIMIT <= 0.0 or cfg.CVAR_DAILY_LIMIT > 0.5:
-            logger.error(
-                "[Config] optimal_cfg.json has CVAR_DAILY_LIMIT=%.4f outside (0, 0.5]. Resetting.",
-                cfg.CVAR_DAILY_LIMIT,
-            )
-            cfg.CVAR_DAILY_LIMIT = UltimateConfig().CVAR_DAILY_LIMIT
-        if (
-            "MAX_POSITIONS" in best_params
-            and (not isinstance(best_params["MAX_POSITIONS"], int)
-                 or best_params["MAX_POSITIONS"] < 2)
-        ):
-            logger.error(
-                "[Config] optimal_cfg.json has MAX_POSITIONS=%r outside [2, ∞). "
-                "Resetting to default.",
-                best_params.get("MAX_POSITIONS"),
-            )
-            cfg.MAX_POSITIONS = UltimateConfig().MAX_POSITIONS
-
-        if (
-            "SIGNAL_LAG_DAYS" in best_params
-            and (not isinstance(best_params["SIGNAL_LAG_DAYS"], int)
-                 or best_params["SIGNAL_LAG_DAYS"] < 0)
-        ):
-            logger.error(
-                "[Config] optimal_cfg.json has SIGNAL_LAG_DAYS=%r < 0. "
-                "Resetting to default.",
-                best_params.get("SIGNAL_LAG_DAYS"),
-            )
-            cfg.SIGNAL_LAG_DAYS = UltimateConfig().SIGNAL_LAG_DAYS
-    return cfg
-
+    return _validate_config_cross_fields(cfg)
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
     clipped = max(0.0, min(1.0, progress))
     filled = int(round(width * clipped))
@@ -706,51 +729,52 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
         except ValueError:
             print(f"  {C.RED}Invalid input. Using default ₹10,00,000.{C.RST}\n")
 
-# ─── Corporate action / split detection ──────────────────────────────────────
 
+
+def _sweep_dividends(state: PortfolioState, sym: str, row: pd.DataFrame, cfg: UltimateConfig) -> None:
+    """_sweep_dividends operation.
+
+    Args:
+        state (PortfolioState): Input parameter.
+        sym (str): Input parameter.
+        row (pd.DataFrame): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
+        return
+    if getattr(cfg, "AUTO_ADJUST_PRICES", True):
+        return
+    dividends = row["Dividends"][row["Dividends"] > 0]
+    if dividends.empty:
+        return
+    shares_held = state.shares.get(sym, 0)
+    if shares_held <= 0:
+        return
+    last_event_id = state.dividend_ledger.get(sym, "")
+    last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
+    for div_date, div_val in dividends.items():
+        div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
+        if div_date_str <= last_event_date:
+            continue
+        div_val_float = float(div_val)
+        state.cash = round(state.cash + (div_val_float * shares_held), 10)
+        state.dividend_ledger[sym] = f"{div_date_str}:{div_val_float:.8f}"
+        logger.info(
+            "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares) on %s. Added to cash.",
+            sym, div_val_float, shares_held, div_date_str
+        )
 def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: UltimateConfig) -> List[str]:
     """
     Detects splits and sweeps dividends to ensure cash ledger accuracy.
     PHASE 9 FIX: Strictly prevents double-counting splits when AUTO_ADJUST_PRICES=True.
     """
     adjusted: List[str] = []
-
-    def _sweep_dividends(sym: str, row: pd.DataFrame) -> None:
-        """Sweep unapplied dividends for a held symbol into portfolio cash.
-
-        Args:
-            sym (str): Bare symbol currently tracked in portfolio state.
-            row (pd.DataFrame): Price/dividend history for the symbol.
-
-        Returns:
-            None: Updates ``state.cash`` and ``state.dividend_ledger`` in-place.
-
-        Raises:
-            Exception: Propagates unexpected runtime or data access failures.
-        """
-        if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
-            return
-        if getattr(cfg, "AUTO_ADJUST_PRICES", True):
-            return
-        dividends = row["Dividends"][row["Dividends"] > 0]
-        if dividends.empty:
-            return
-        shares_held = state.shares.get(sym, 0)
-        if shares_held <= 0:
-            return
-        last_event_id = state.dividend_ledger.get(sym, "")
-        last_event_date = last_event_id.split(':')[0] if last_event_id else "1900-01-01"
-        for div_date, div_val in dividends.items():
-            div_date_str = pd.Timestamp(div_date).strftime("%Y-%m-%d")
-            if div_date_str <= last_event_date:
-                continue
-            div_val_float = float(div_val)
-            state.cash = round(state.cash + (div_val_float * shares_held), 10)
-            state.dividend_ledger[sym] = f"{div_date_str}:{div_val_float:.8f}"
-            logger.info(
-                "DIVIDEND SWEEP: %s distributed ₹%.2f per share (x %d shares) on %s. Added to cash.",
-                sym, div_val_float, shares_held, div_date_str
-            )
 
     for sym in list(state.shares.keys()):
         ns = to_ns(sym)
@@ -760,7 +784,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
         if row is None or row.empty:
             continue
 
-        _sweep_dividends(sym, row)
+        _sweep_dividends(state, sym, row, cfg)
 
         current_price = float(row["Close"].iloc[-1])
         if not np.isfinite(current_price) or current_price <= 0:
@@ -897,115 +921,115 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
     return list(dict.fromkeys(adjusted))
 
 # ─── State persistence ────────────────────────────────────────────────────────
+def _rotate_backup_chain(state_file: pathlib.Path, generations: int) -> None:
+    """_rotate_backup_chain operation.
+
+    Args:
+        state_file (pathlib.Path): Input parameter.
+        generations (int): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    for i in range(generations - 1, -1, -1):
+        src = state_file.with_suffix(f"{state_file.suffix}.bak.{i}")
+        dst = state_file.with_suffix(f"{state_file.suffix}.bak.{i + 1}")
+        if src.exists():
+            shutil.copy2(src, dst)
+    if state_file.exists():
+        shutil.copy2(state_file, state_file.with_suffix(f"{state_file.suffix}.bak.0"))
+
+
+def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioState) -> bool:
+    """_verify_state_readback operation.
+
+    Args:
+        state_file (pathlib.Path): Input parameter.
+        expected_state (PortfolioState): Input parameter.
+
+    Returns:
+        bool: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    with state_file.open("r", encoding="utf-8") as vf:
+        parsed = json.loads(vf.read())
+    if "cash" not in parsed or "shares" not in parsed:
+        return False
+    expected = expected_state.to_dict()
+    return parsed.get("cash") == expected.get("cash") and parsed.get("shares") == expected.get("shares")
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
     """save_portfolio_state operation.
-    
+
     Args:
         state (PortfolioState): Input parameter.
         name (str): Input parameter.
-    
+
     Returns:
         None: Result of this operation.
-    
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     if PAPER_MODE:
-        # FIX-MB2-PAPERRISK: In paper mode we must NOT write trade/share changes,
-        # but we DO need to persist risk-tracking metadata so that a process restart
-        # mid-stress-event (CVaR breach, decay cycle) does not reset consecutive_failures
-        # and override_cooldown to 0, causing an immediate unrestricted rebalance.
-        # Solution: write a thin "risk-only" overlay file that is read back by
-        # load_portfolio_state and merged onto the in-memory state before returning.
         print(f"  {C.YLW}[!] Paper mode active. Trades not saved; risk metadata persisted.{C.RST}")
         os.makedirs("data", exist_ok=True)
         risk_file = f"data/portfolio_risk_{name}.json"
         risk_payload = {
             "consecutive_failures": state.consecutive_failures,
-            "override_active":      state.override_active,
-            "override_cooldown":    state.override_cooldown,
-            "decay_rounds":         state.decay_rounds,
-            "absent_periods":       dict(sorted(state.absent_periods.items())),
-            "last_rebalance_date":  state.last_rebalance_date,
+            "override_active": state.override_active,
+            "override_cooldown": state.override_cooldown,
+            "decay_rounds": state.decay_rounds,
+            "absent_periods": dict(sorted(state.absent_periods.items())),
+            "last_rebalance_date": state.last_rebalance_date,
         }
         try:
             tmp = f"{risk_file}.tmp"
             with open(tmp, "w") as f:
                 json.dump(risk_payload, f, indent=2, sort_keys=True)
                 f.flush()
-                # [PHASE 2 FIX] Windows fsync safely skips dir flushing, but
-                # file-level fsync remains strictly POSIX-compliant locally via fd.
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
         except Exception as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
-            # [PHASE 2 FIX] Patch Paper Mode Persistence Race Condition:
-            # Guarantee orphaned .tmp files are reliably cleaned on os.replace failures.
             if os.path.exists(tmp):
                 try:
                     os.remove(tmp)
                 except OSError:
                     pass
-        _clear_pending_sentinel(name)  # ARCH-FIX-3
+        _clear_pending_sentinel(name)
         return
 
     os.makedirs("data", exist_ok=True)
-    state_file = f"data/portfolio_state_{name}.json"
-    risk_file  = f"data/portfolio_risk_{name}.json"
-    tmp_file   = f"{state_file}.tmp"
+    state_file = pathlib.Path(f"data/portfolio_state_{name}.json")
+    risk_file = pathlib.Path(f"data/portfolio_risk_{name}.json")
+    tmp_file = pathlib.Path(f"{state_file}.tmp")
     try:
-        for i in range(BACKUP_GENERATIONS - 1, -1, -1):
-            src, dst = f"{state_file}.bak.{i}", f"{state_file}.bak.{i+1}"
-            if os.path.exists(src):
-                shutil.copy2(src, dst)
-        if os.path.exists(state_file):
-            shutil.copy2(state_file, f"{state_file}.bak.0")
+        _rotate_backup_chain(state_file=state_file, generations=BACKUP_GENERATIONS)
 
-        with open(tmp_file, "w") as f:
+        with tmp_file.open("w") as f:
             json.dump(state.to_dict(), f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
 
         os.replace(tmp_file, state_file)
 
-        # Read-back verification: confirm the file we just wrote contains valid
-        # JSON before releasing control. Filesystem-level corruption (rare on
-        # NFS / cloud storage) can produce a silently corrupted file that only
-        # fails on the next startup — at which point the backup chain is the
-        # only recovery path. Catching it here while the previous state is still
-        # in memory allows us to log a clear error and leave the backups intact.
-        with open(state_file, "r", encoding="utf-8") as _vf:
-            _raw = _vf.read()
         try:
-            _parsed = json.loads(_raw)
-            # FIX-MB-DW-03: semantic round-trip — verify critical fields match
-            # the in-memory state so truncated or partial writes are caught now.
-            _state_dict = state.to_dict()
-            if "cash" not in _parsed or "shares" not in _parsed:
-                raise RuntimeError(
-                    "State file semantic corruption: missing 'cash' or 'shares'."
-                )
-            if (_parsed.get("cash") != _state_dict.get("cash")
-                    or _parsed.get("shares") != _state_dict.get("shares")):
-                raise RuntimeError(
-                    "State file semantic corruption: read-back values do not match in-memory state."
-                )
-        except (json.JSONDecodeError, RuntimeError) as _jexc:
+            if not _verify_state_readback(state_file=state_file, expected_state=state):
+                raise RuntimeError("State file semantic corruption: read-back values do not match in-memory state.")
+        except (json.JSONDecodeError, RuntimeError) as jexc:
             logger.critical(
                 "State file write-back verification FAILED for '%s': %s. "
                 "The file on disk may be corrupted. Backups are intact. "
                 "Do not restart the process until the issue is resolved.",
-                name, _jexc,
+                name, jexc,
             )
-            # Do not raise — the in-memory state is still correct and the next
-            # scan will attempt another save. Raising here would crash the
-            # process and leave an operator with no running system.
 
-        # FIX-MB-FDLEAK: Wrap the directory fsync in try/finally to guarantee
-        # the file descriptor is closed even when os.fsync() raises (e.g. on
-        # a remounted read-only filesystem). Without finally, a raised exception
-        # would leave the fd open indefinitely, exhausting the process fd table.
         if os.name == "posix":
             dir_fd = os.open("data", getattr(os, "O_DIRECTORY", 0))
             try:
@@ -1013,22 +1037,85 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             finally:
                 os.close(dir_fd)
 
-        # If a durable full state save succeeded, a paper-mode risk overlay is
-        # stale by definition and must not leak into future normal-mode loads.
-        if os.path.exists(risk_file):
+        if risk_file.exists():
             try:
                 os.remove(risk_file)
             except OSError as exc:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
-        _clear_pending_sentinel(name)  # ARCH-FIX-3
+        _clear_pending_sentinel(name)
 
     except Exception as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
-        if os.path.exists(tmp_file):
+        if tmp_file.exists():
             try:
                 os.remove(tmp_file)
             except Exception:
                 pass
+def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
+    """_apply_risk_overlay operation.
+
+    Args:
+        ps (PortfolioState): Input parameter.
+        name (str): Input parameter.
+
+    Returns:
+        PortfolioState: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    risk_file = f"data/portfolio_risk_{name}.json"
+    if not os.path.exists(risk_file):
+        return ps
+    try:
+        with open(risk_file) as rf:
+            risk = json.load(rf)
+
+        def _ri(key, fallback):
+            v = risk.get(key)
+            return int(v) if v is not None else fallback
+
+        def _rb(key, fallback):
+            v = risk.get(key)
+            if v is None:
+                return fallback
+            if isinstance(v, bool):
+                return v
+            return bool(int(v))
+
+        try:
+            ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
+        except (TypeError, ValueError) as _e:
+            logger.warning("Risk overlay: could not merge consecutive_failures: %s", _e)
+        try:
+            ps.override_active = _rb("override_active", ps.override_active)
+        except (TypeError, ValueError) as _e:
+            logger.warning("Risk overlay: could not merge override_active: %s", _e)
+        try:
+            ps.override_cooldown = _ri("override_cooldown", ps.override_cooldown)
+        except (TypeError, ValueError) as _e:
+            logger.warning("Risk overlay: could not merge override_cooldown: %s", _e)
+        try:
+            ps.decay_rounds = _ri("decay_rounds", ps.decay_rounds)
+        except (TypeError, ValueError) as _e:
+            logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
+        absent_raw = risk.get("absent_periods")
+        if isinstance(absent_raw, dict):
+            ps.absent_periods.clear()
+            for k, v in absent_raw.items():
+                try:
+                    ps.absent_periods[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    pass
+        try:
+            lrd = risk.get("last_rebalance_date")
+            if lrd and isinstance(lrd, str):
+                ps.last_rebalance_date = lrd
+        except (TypeError, ValueError) as _e:
+            logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError, FileNotFoundError) as exc:
+        logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
+    return ps
 
 def load_portfolio_state(name: str) -> PortfolioState:
     """load_portfolio_state operation.
@@ -1055,70 +1142,6 @@ def load_portfolio_state(name: str) -> PortfolioState:
     found_any_state_file = False
     found_risk_overlay = os.path.exists(risk_file)
 
-    def _apply_risk_overlay(ps: PortfolioState) -> PortfolioState:
-        """_apply_risk_overlay operation.
-        
-        Args:
-            ps (PortfolioState): Input parameter.
-        
-        Returns:
-            PortfolioState: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
-        if not os.path.exists(risk_file):
-            return ps
-        try:
-            with open(risk_file) as rf:
-                risk = json.load(rf)
-
-            def _ri(key, fallback):
-                v = risk.get(key)
-                return int(v) if v is not None else fallback
-
-            def _rb(key, fallback):
-                v = risk.get(key)
-                if v is None:
-                    return fallback
-                if isinstance(v, bool):
-                    return v
-                return bool(int(v))
-
-            try:
-                ps.consecutive_failures = _ri("consecutive_failures", ps.consecutive_failures)
-            except (TypeError, ValueError) as _e:
-                logger.warning("Risk overlay: could not merge consecutive_failures: %s", _e)
-            try:
-                ps.override_active = _rb("override_active", ps.override_active)
-            except (TypeError, ValueError) as _e:
-                logger.warning("Risk overlay: could not merge override_active: %s", _e)
-            try:
-                ps.override_cooldown = _ri("override_cooldown", ps.override_cooldown)
-            except (TypeError, ValueError) as _e:
-                logger.warning("Risk overlay: could not merge override_cooldown: %s", _e)
-            try:
-                ps.decay_rounds = _ri("decay_rounds", ps.decay_rounds)
-            except (TypeError, ValueError) as _e:
-                logger.warning("Risk overlay: could not merge decay_rounds: %s", _e)
-            absent_raw = risk.get("absent_periods")
-            if isinstance(absent_raw, dict):
-                ps.absent_periods.clear()
-                for k, v in absent_raw.items():
-                    try:
-                        ps.absent_periods[str(k)] = int(v)
-                    except (TypeError, ValueError):
-                        pass
-            try:
-                lrd = risk.get("last_rebalance_date")
-                if lrd and isinstance(lrd, str):
-                    ps.last_rebalance_date = lrd
-            except (TypeError, ValueError) as _e:
-                logger.warning("Risk overlay: could not merge last_rebalance_date: %s", _e)
-        except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError, FileNotFoundError) as exc:
-            logger.warning("Could not read paper-mode risk overlay for '%s': %s", name, exc)
-        return ps
-
     for path in backups:
         if os.path.exists(path):
             found_any_state_file = True
@@ -1126,7 +1149,7 @@ def load_portfolio_state(name: str) -> PortfolioState:
                 with open(path) as f:
                     ps = PortfolioState.from_dict(json.load(f))
                 if PAPER_MODE:
-                    return _apply_risk_overlay(ps)
+                    return _apply_risk_overlay(ps, name)
                 return ps
             except Exception as exc:
                 logger.warning("Corrupted state at %s: %s", path, exc)
@@ -1155,7 +1178,7 @@ def load_portfolio_state(name: str) -> PortfolioState:
                 "Recovering risk metadata into default PortfolioState().",
                 name,
             )
-            return _apply_risk_overlay(PortfolioState())
+            return _apply_risk_overlay(PortfolioState(), name)
         logger.info(
             "No portfolio state files found for '%s'. Starting clean first-run state.",
             name,
@@ -1164,6 +1187,124 @@ def load_portfolio_state(name: str) -> PortfolioState:
     return PortfolioState()
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
+def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_download_data operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_regime_prep operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_exposure_cvar operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_optimization operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_decay_targeting operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_stale_price_gate operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_execution operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
+
+
+def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """_scan_phase_eod_accounting operation.
+
+    Args:
+        ctx (Dict[str, Any]): Input parameter.
+
+    Returns:
+        Dict[str, Any]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    return ctx
 
 def _run_scan(
     universe: List[str],
@@ -1215,6 +1356,16 @@ def _run_scan(
         Raises:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
+        phase_ctx: Dict[str, Any] = {}
+        _scan_phase_download_data(phase_ctx)
+        _scan_phase_regime_prep(phase_ctx)
+        _scan_phase_exposure_cvar(phase_ctx)
+        _scan_phase_optimization(phase_ctx)
+        _scan_phase_decay_targeting(phase_ctx)
+        _scan_phase_stale_price_gate(phase_ctx)
+        _scan_phase_execution(phase_ctx)
+        _scan_phase_eod_accounting(phase_ctx)
+
         def _build_close_series(universe_symbols: list[str], mkt_data: dict, use_adjusted: bool) -> Dict[str, pd.Series]:
             """Build a map of bare symbols to close-price series.
 
@@ -1752,18 +1903,99 @@ def _run_scan(
 
 # ─── Status display ───────────────────────────────────────────────────────────
 
+def _render_holdings_table(rows: List[dict], cash: float, pv: float) -> str:
+    """_render_holdings_table operation.
+
+    Args:
+        rows (List[dict]): Input parameter.
+        cash (float): Input parameter.
+        pv (float): Input parameter.
+
+    Returns:
+        str: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    c_pipe = f"{C.GRY}│{C.RST}"
+    lines: List[str] = []
+    lines.append(f"  {C.GRY}┌──────────────┬─────────┬───────────┬───────────┬────────┬─────────────┬─────────────┐{C.RST}")
+    lines.append(
+        f"  {c_pipe} {C.B_CYN}{'Symbol':<12}{C.RST} {c_pipe} {C.B_CYN}{'Shares':>7}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Price':>9}{C.RST} {c_pipe} {C.B_CYN}{'Entry':>9}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Weight':>6}{C.RST} {c_pipe} {C.B_CYN}{'Notional':>11}{C.RST} "
+        f"{c_pipe} {C.B_CYN}{'Unreal P&L':>11}{C.RST} {c_pipe}"
+    )
+    lines.append(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+
+    total_pnl = 0.0
+    for r in rows:
+        pnl_val = float(r.get('pnl', float('nan')))
+        pnl_raw = f"₹{pnl_val:+,.0f}" if np.isfinite(pnl_val) else "n/a"
+        pnl_color = C.B_GRN if pnl_val > 0 else (C.B_RED if pnl_val < 0 else C.RST)
+        if np.isfinite(pnl_val):
+            total_pnl += pnl_val
+        lines.append(
+            f"  {c_pipe} {C.BLD}{r['sym']:<12}{C.RST} {c_pipe} {int(r['shares']):>7,d} "
+            f"{c_pipe} {float(r['price']):>9,.2f} {c_pipe} {float(r['entry']):>9,.2f} "
+            f"{c_pipe} {C.CYN}{float(r['weight']):>6.1%}{C.RST} {c_pipe} {float(r['notional']):>11,.0f} "
+            f"{c_pipe} {pnl_color}{pnl_raw:>11}{C.RST} {c_pipe}"
+        )
+
+    lines.append(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+    cash_weight = (cash / pv) if pv > 0 else 0.0
+    lines.append(
+        f"  {c_pipe} {C.BLD}{'Cash':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
+        f"{c_pipe} {C.CYN}{cash_weight:>6.1%}{C.RST} {c_pipe} {cash:>11,.0f} {c_pipe} {'':>11} {c_pipe}"
+    )
+    lines.append(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
+    tot_color = C.B_GRN if total_pnl > 0 else (C.B_RED if total_pnl < 0 else C.RST)
+    lines.append(
+        f"  {c_pipe} {C.BLD}{'TOTAL':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
+        f"{c_pipe} {C.BLD}{1.0:>6.1%}{C.RST} {c_pipe} {C.BLD}{pv:>11,.0f}{C.RST} "
+        f"{c_pipe} {tot_color}{'₹'+f'{total_pnl:+,.0f}':>11}{C.RST} {c_pipe}"
+    )
+    lines.append(f"  {C.GRY}└──────────────┴─────────┴───────────┴───────────┴────────┴─────────────┴─────────────┘{C.RST}")
+    return "\n".join(lines)
+
+
+def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) -> str:
+    """_render_portfolio_diagnostics operation.
+
+    Args:
+        state (PortfolioState): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+
+    Returns:
+        str: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    cvar = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
+    cvar_color = C.RED if cvar > 0.12 else C.GRN
+    return "\n".join([
+        f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}",
+        f"  {C.YLW}⚡{C.RST} Exposure Multiplier : {C.BLD}{state.exposure_multiplier:.3f}{C.RST}",
+        f"  {C.RED}🛡️ {C.RST} Override Active     : {C.BLD}{state.override_active}{C.RST}  {C.GRY}(Cooldown: {state.override_cooldown}){C.RST}",
+        f"  {C.CYN}📉{C.RST} CVaR (realised)     : {cvar_color}{cvar:.2%}{C.RST}",
+        f"  {C.RED}⚠️ {C.RST} Consec. Failures    : {C.BLD}{state.consecutive_failures}{C.RST}",
+        f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n",
+    ])
+
+
 def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Optional[UltimateConfig] = None) -> None:
     """_print_status operation.
-    
+
     Args:
         state (PortfolioState): Input parameter.
         label (str): Input parameter.
         market_data (dict): Input parameter.
         cfg (Optional[UltimateConfig]): Input parameter.
-    
+
     Returns:
         None: Result of this operation.
-    
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
@@ -1778,8 +2010,8 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
         print(f"  {C.GRY}No open positions.{C.RST}\n")
         return
 
-    active     = list(state.shares.keys())
-    prices_now = {}
+    active = list(state.shares.keys())
+    prices_now: Dict[str, float] = {}
     for sym in active:
         ns = to_ns(sym)
         if ns in market_data and not market_data[ns].empty:
@@ -1791,70 +2023,29 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
         state.shares[s] * (prices_now.get(s) or state.last_known_prices.get(s, 0.0))
         for s in active
     )
-    pv  = mtm + state.cash
+    pv = mtm + state.cash
 
-    rows      = []
-    total_pnl = 0.0
+    rows: List[dict] = []
     for sym in active:
-        shares   = state.shares[sym]
-        price    = prices_now.get(sym) or state.last_known_prices.get(sym, float("nan"))
-        entry    = state.entry_prices.get(sym, float("nan"))
+        shares = state.shares[sym]
+        price = prices_now.get(sym) or state.last_known_prices.get(sym, float("nan"))
+        entry = state.entry_prices.get(sym, float("nan"))
         notional = shares * price if np.isfinite(price) else 0.0
-        weight   = notional / pv if pv > 0 else 0.0
-        pnl      = (price - entry) * shares if (np.isfinite(price) and np.isfinite(entry)) else float("nan")
-        if np.isfinite(pnl):
-            total_pnl += pnl
+        weight = notional / pv if pv > 0 else 0.0
+        pnl = (price - entry) * shares if (np.isfinite(price) and np.isfinite(entry)) else float("nan")
         rows.append({
-            "sym": sym, "shares": shares, "price": price,
-            "entry": entry, "weight": weight, "notional": notional, "pnl": pnl,
+            "sym": sym,
+            "shares": shares,
+            "price": price,
+            "entry": entry,
+            "weight": weight,
+            "notional": notional,
+            "pnl": pnl,
         })
 
-    rows.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)  # type: ignore[arg-type]
-    c_pipe = f"{C.GRY}│{C.RST}"
-
-    print(f"  {C.GRY}┌──────────────┬─────────┬───────────┬───────────┬────────┬─────────────┬─────────────┐{C.RST}")
-    print(
-        f"  {c_pipe} {C.B_CYN}{'Symbol':<12}{C.RST} {c_pipe} {C.B_CYN}{'Shares':>7}{C.RST} "
-        f"{c_pipe} {C.B_CYN}{'Price':>9}{C.RST} {c_pipe} {C.B_CYN}{'Entry':>9}{C.RST} "
-        f"{c_pipe} {C.B_CYN}{'Weight':>6}{C.RST} {c_pipe} {C.B_CYN}{'Notional':>11}{C.RST} "
-        f"{c_pipe} {C.B_CYN}{'Unreal P&L':>11}{C.RST} {c_pipe}"
-    )
-    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
-
-    for r in rows:
-        _pnl_val = float(r['pnl'])  # type: ignore[arg-type]
-        pnl_raw   = f"₹{_pnl_val:+,.0f}" if np.isfinite(_pnl_val) else "n/a"
-        pnl_color = C.B_GRN if _pnl_val > 0 else (C.B_RED if _pnl_val < 0 else C.RST)
-        print(
-            f"  {c_pipe} {C.BLD}{r['sym']:<12}{C.RST} {c_pipe} {r['shares']:>7,d} "
-            f"{c_pipe} {r['price']:>9,.2f} {c_pipe} {r['entry']:>9,.2f} "
-            f"{c_pipe} {C.CYN}{r['weight']:>6.1%}{C.RST} {c_pipe} {r['notional']:>11,.0f} "
-            f"{c_pipe} {pnl_color}{pnl_raw:>11}{C.RST} {c_pipe}"
-        )
-
-    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
-    print(
-        f"  {c_pipe} {C.BLD}{'Cash':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
-        f"{c_pipe} {C.CYN}{state.cash/pv:>6.1%}{C.RST} {c_pipe} {state.cash:>11,.0f} {c_pipe} {'':>11} {c_pipe}"
-    )
-    print(f"  {C.GRY}├──────────────┼─────────┼───────────┼───────────┼────────┼─────────────┼─────────────┤{C.RST}")
-    tot_color = C.B_GRN if total_pnl > 0 else (C.B_RED if total_pnl < 0 else C.RST)
-    print(
-        f"  {c_pipe} {C.BLD}{'TOTAL':<12}{C.RST} {c_pipe} {'':>7} {c_pipe} {'':>9} {c_pipe} {'':>9} "
-        f"{c_pipe} {C.BLD}{1.0:>6.1%}{C.RST} {c_pipe} {C.BLD}{pv:>11,.0f}{C.RST} "
-        f"{c_pipe} {tot_color}{'₹'+f'{total_pnl:+,.0f}':>11}{C.RST} {c_pipe}"
-    )
-    print(f"  {C.GRY}└──────────────┴─────────┴───────────┴───────────┴────────┴─────────────┴─────────────┘{C.RST}")
-
-    cvar        = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
-    cvar_color  = C.RED if cvar > 0.12 else C.GRN
-    print(f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}")
-    print(f"  {C.YLW}⚡{C.RST} Exposure Multiplier : {C.BLD}{state.exposure_multiplier:.3f}{C.RST}")
-    print(f"  {C.RED}🛡️ {C.RST} Override Active     : {C.BLD}{state.override_active}{C.RST}  {C.GRY}(Cooldown: {state.override_cooldown}){C.RST}")
-    print(f"  {C.CYN}📉{C.RST} CVaR (realised)     : {cvar_color}{cvar:.2%}{C.RST}")
-    print(f"  {C.RED}⚠️ {C.RST} Consec. Failures    : {C.BLD}{state.consecutive_failures}{C.RST}")
-    print(f"  {C.BLU}📊{C.RST} Equity History Pts  : {C.BLD}{len(state.equity_hist)}{C.RST}\n")
-
+    rows.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)
+    print(_render_holdings_table(rows=rows, cash=state.cash, pv=pv))
+    print(_render_portfolio_diagnostics(state=state, cfg=cfg))
 def _portfolio_activity_badge(state: PortfolioState) -> str:
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
     if not has_activity:
@@ -2020,238 +2211,337 @@ def _preview_scan_and_maybe_save(
 
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
-def main_menu() -> None:
-    """main_menu operation.
-    
+def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
+    """_handle_nse_total_scan operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+        mkt_cache (dict): Input parameter.
+
     Returns:
         None: Result of this operation.
-    
+
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    states    = {
+    _check_and_prompt_initial_capital(states["nse_total"], LABEL_NSE_TOTAL, "nse_total")
+    cfg = load_optimized_config()
+    universe: Optional[List[str]]
+    try:
+        universe = fetch_nse_equity_universe()
+    except UniverseFetchError as e:
+        universe = _prompt_survival_mode(e, "NSE Total")
+        if universe is None:
+            return
+    _preview_scan_and_maybe_save(states, mkt_cache, "nse_total", LABEL_NSE_TOTAL, universe, cfg)
+
+
+def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
+    """_handle_nifty500_scan operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+        mkt_cache (dict): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
+    cfg = load_optimized_config()
+    try:
+        universe = get_nifty500()
+    except UniverseFetchError as e:
+        universe = _prompt_survival_mode(e, "Nifty 500")
+        if universe is None:
+            return
+    _preview_scan_and_maybe_save(states, mkt_cache, "nifty", LABEL_NIFTY_500, universe, cfg)
+
+
+def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
+    """_handle_custom_scan operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+        mkt_cache (dict): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    universe = _get_custom_universe()
+    if not universe:
+        print(f"  {C.RED}[!] No custom universe found.{C.RST}")
+        print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
+        return
+
+    logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
+    _check_and_prompt_initial_capital(states["custom"], LABEL_CUSTOM_SCREENER, "custom")
+
+    custom_cfg = load_optimized_config()
+    if len(universe) < 100:
+        custom_cfg.MAX_POSITIONS = 8
+
+    _preview_scan_and_maybe_save(
+        states, mkt_cache, "custom", LABEL_CUSTOM_SCREENER, universe, custom_cfg
+    )
+
+
+def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
+    """_handle_backtest operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    _ = states
+    print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
+    print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+    bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
+    if not bt_c:
+        return
+
+    raw_start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}")
+    try:
+        start = _normalise_start_date(raw_start)
+    except ValueError as exc:
+        print(f"  {C.RED}{exc}{C.RST}")
+        return
+
+    if bt_c == "1":
+        universe_identifier = "nse_total"
+    elif bt_c == "3":
+        universe_identifier = "custom"
+    else:
+        universe_identifier = "nifty500"
+
+    end = datetime.today().strftime("%Y-%m-%d")
+    bt_cfg = load_optimized_config()
+
+    if universe_identifier == "custom":
+        custom_syms = _get_custom_universe()
+        if not custom_syms:
+            print(f"  {C.RED}[!] No custom universe found. Cannot run backtest.{C.RST}")
+            print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
+            return
+
+        print(f"\n  {C.B_RED}⚠  SURVIVORSHIP BIAS WARNING{C.RST}")
+        print(f"  {C.YLW}Custom screener backtests use today's live stock list for ALL historical{C.RST}")
+        print(f"  {C.YLW}rebalance dates. Stocks that were delisted, merged, or removed from your{C.RST}")
+        print(f"  {C.YLW}screener between {start} and {end} are silently excluded.{C.RST}")
+        print(f"  {C.YLW}This will inflate historical returns. Use Nifty 500 or NSE Total for{C.RST}")
+        print(f"  {C.YLW}unbiased backtesting.{C.RST}")
+        confirm = input(f"\n  {C.CYN}Proceed anyway? (y/n): {C.RST}").strip().lower()
+        if confirm != "y":
+            print(f"  {C.GRY}Cancelled. Returning to main menu.{C.RST}")
+            return
+
+        historical_union = set(custom_syms)
+        data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
+
+        try:
+            print_backtest_results(
+                run_backtest(data, universe_identifier, start, end, cfg=bt_cfg, universe=custom_syms)
+            )
+        except RuntimeError as exc:
+            print(f"\n  {C.B_RED}[!] BACKTEST FAILED{C.RST}")
+            print(f"  {C.RED}{exc}{C.RST}\n")
+    else:
+        all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
+        historical_union = set()
+        for target_date in all_target_dates:
+            members = get_historical_universe(universe_identifier, target_date)
+            historical_union.update(members)
+
+        if not historical_union:
+            print(f"\n  {C.B_RED}[!] BACKTEST BLOCKED — No historical universe data found{C.RST}")
+            print(f"  {C.YLW}Run the following command to generate required snapshots:{C.RST}")
+            print(f"  {C.BLD}    python historical_builder.py{C.RST}")
+            print(f"  {C.GRY}Required files:{C.RST}")
+            print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
+            return
+
+        data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
+
+        try:
+            print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
+        except RuntimeError as exc:
+            print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
+            print(f"  {C.RED}{exc}{C.RST}")
+            print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
+            print(f"  {C.BLD}    python historical_builder.py{C.RST}")
+            print(f"  {C.GRY}Required files:{C.RST}")
+            print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
+
+
+def _handle_status(states: Dict[str, PortfolioState], mkt_cache: dict, cfg: UltimateConfig) -> None:
+    """_handle_status operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+        mkt_cache (dict): Input parameter.
+        cfg (UltimateConfig): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    for name, label in [
+        ("nse_total", LABEL_NSE_TOTAL),
+        ("nifty", LABEL_NIFTY_500),
+        ("custom", LABEL_CUSTOM_SCREENER),
+    ]:
+        has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
+        if has_activity:
+            mkt = mkt_cache.get(name) or {}
+            if not mkt and states[name].shares:
+                syms = list({to_ns(s) for s in states[name].shares})
+                end = datetime.today().strftime("%Y-%m-%d")
+                mkt = load_or_fetch(
+                    syms,
+                    (datetime.today() - timedelta(days=22)).strftime("%Y-%m-%d"),
+                    end,
+                    cfg=cfg,
+                )
+                mkt_cache[name] = mkt
+            _print_status(states[name], label, mkt, cfg=cfg)
+    if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0) for n in states):
+        print(f"  {C.GRY}All portfolios are empty.{C.RST}")
+
+
+def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
+    """_handle_manage_cash operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
+    print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
+    p_c = _prompt_menu_choice(f"  {C.CYN}Choice: {C.RST}", ["1", "2", "3"])
+    if not p_c:
+        return
+    p_map = {"1": "nse_total", "2": "nifty", "3": "custom"}
+    if p_c in p_map:
+        name = p_map[p_c]
+        state = states[name]
+        print(f"\n  {C.BLD}Current Cash: {C.GRN}₹{state.cash:,.2f}{C.RST}")
+        print(f"  {C.GRY}Use positive number to deposit, negative to withdraw.{C.RST}")
+        try:
+            amt_str = input(f"  {C.CYN}Amount (₹): {C.RST}").replace(",", "").strip()
+            amt = float(amt_str)
+            state.cash = max(0.0, state.cash + amt)
+            save_portfolio_state(state, name)
+            action = "Deposited" if amt >= 0 else "Withdrew"
+            print(f"  {C.GRN}[+] {action} ₹{abs(amt):,.2f}. New Cash: ₹{state.cash:,.2f}{C.RST}")
+        except ValueError:
+            print(f"  {C.RED}Invalid amount.{C.RST}")
+    else:
+        print(f"  {C.RED}Invalid choice.{C.RST}")
+
+
+def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> Tuple[Dict[str, PortfolioState], dict]:
+    """_handle_clear_states operation.
+
+    Args:
+        states (Dict[str, PortfolioState]): Input parameter.
+        mkt_cache (dict): Input parameter.
+
+    Returns:
+        Tuple[Dict[str, PortfolioState], dict]: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    print(f"\n  {C.B_RED}WARNING: This will reset your holdings to zero (cash only).{C.RST}")
+    print(f"  {C.GRY}Market data cache and optimal_cfg.json are NOT affected.{C.RST}")
+    print(f"  {C.GRY}Use this when you want to start a fresh portfolio with new capital.{C.RST}")
+    confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
+    if confirm.upper() == "YES":
+        for n in ["nse_total", "nifty", "custom"]:
+            p = f"data/portfolio_state_{n}.json"
+            for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
+                target = p + suffix
+                if not os.path.exists(target):
+                    continue
+                removed = False
+                for attempt in range(3):
+                    try:
+                        os.remove(target)
+                        removed = True
+                        break
+                    except OSError:
+                        if attempt < 2:
+                            time.sleep(0.1)
+                if not removed:
+                    logger.warning(
+                        "[Clear] Could not delete '%s' after 3 attempts (file may be locked). Skipping.",
+                        target,
+                    )
+        states = {"nse_total": PortfolioState(), "nifty": PortfolioState(), "custom": PortfolioState()}
+        mkt_cache = {"nse_total": {}, "nifty": {}, "custom": {}}
+        print(f"  {C.GRN}[+] Portfolio holdings cleared. Cache and config untouched.{C.RST}")
+    else:
+        print(f"  {C.GRY}Cancelled.{C.RST}")
+    return states, mkt_cache
+
+
+def main_menu() -> None:
+    """main_menu operation.
+
+    Returns:
+        None: Result of this operation.
+
+    Raises:
+        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    states = {
         "nse_total": load_portfolio_state("nse_total"),
-        "nifty":     load_portfolio_state("nifty"),
-        "custom":    load_portfolio_state("custom"),
+        "nifty": load_portfolio_state("nifty"),
+        "custom": load_portfolio_state("custom"),
     }
     mkt_cache: dict = {"nse_total": {}, "nifty": {}, "custom": {}}
 
     while True:
         _render_main_menu(states)
-
-        c = _prompt_menu_choice(f"\n  {C.CYN}Choice: {C.RST}", ["1", "2", "3", "4", "5", "6", "7", "q"])
-        if not c:
+        choice = _prompt_menu_choice(f"\n  {C.CYN}Choice: {C.RST}", ["1", "2", "3", "4", "5", "6", "7", "q"])
+        if not choice:
             continue
 
-        if c == "1":
-            _check_and_prompt_initial_capital(states["nse_total"], LABEL_NSE_TOTAL, "nse_total")
-            cfg = load_optimized_config()
-            _universe: list[str] | None
-            try:
-                _universe = fetch_nse_equity_universe()
-            except UniverseFetchError as e:
-                _universe = _prompt_survival_mode(e, "NSE Total")
-                if _universe is None:
-                    continue
-            _preview_scan_and_maybe_save(
-                states, mkt_cache, "nse_total", LABEL_NSE_TOTAL, _universe, cfg
-            )
-
-        elif c == "2":
-            _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
-            cfg = load_optimized_config()
-            try:
-                _universe = get_nifty500()
-            except UniverseFetchError as e:
-                _universe = _prompt_survival_mode(e, "Nifty 500")
-                if _universe is None:
-                    continue
-            _preview_scan_and_maybe_save(states, mkt_cache, "nifty", LABEL_NIFTY_500, _universe, cfg)
-
-        elif c == "3":
-            universe = _get_custom_universe()
-            if not universe:
-                print(f"  {C.RED}[!] No custom universe found.{C.RST}")
-                print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
-                continue
-
-            logger.info("[Universe] Loaded %d symbols from custom screener.", len(universe))
-            _check_and_prompt_initial_capital(states["custom"], LABEL_CUSTOM_SCREENER, "custom")
-
-            custom_cfg = load_optimized_config()
-            if len(universe) < 100:
-                custom_cfg.MAX_POSITIONS = 8
-
-            _preview_scan_and_maybe_save(
-                states, mkt_cache, "custom", LABEL_CUSTOM_SCREENER, universe, custom_cfg
-            )
-
-        elif c == "4":
-            print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
-            print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
-            bt_c = _prompt_menu_choice(f"  {C.CYN}Choice [Default 2]: {C.RST}", ["1", "2", "3"], default="2")
-            if not bt_c:
-                continue
-
-            raw_start = input(f"  {C.CYN}Start (YYYY-MM-DD) [Default 2020-01-01]: {C.RST}")
-            try:
-                start = _normalise_start_date(raw_start)
-            except ValueError as exc:
-                print(f"  {C.RED}{exc}{C.RST}")
-                continue
-
-            if bt_c == "1":
-                universe_identifier = "nse_total"
-            elif bt_c == "3":
-                universe_identifier = "custom"
-            else:
-                universe_identifier = "nifty500"
-
-            end    = datetime.today().strftime("%Y-%m-%d")
-            bt_cfg = load_optimized_config()
-
-            if universe_identifier == "custom":
-                custom_syms = _get_custom_universe()
-                if not custom_syms:
-                    print(f"  {C.RED}[!] No custom universe found. Cannot run backtest.{C.RST}")
-                    print(f"  {C.GRY}Please verify the Screener.in URL or provide a local file and try again.{C.RST}")
-                    continue
-
-                print(f"\n  {C.B_RED}⚠  SURVIVORSHIP BIAS WARNING{C.RST}")
-                print(f"  {C.YLW}Custom screener backtests use today's live stock list for ALL historical{C.RST}")
-                print(f"  {C.YLW}rebalance dates. Stocks that were delisted, merged, or removed from your{C.RST}")
-                print(f"  {C.YLW}screener between {start} and {end} are silently excluded.{C.RST}")
-                print(f"  {C.YLW}This will inflate historical returns. Use Nifty 500 or NSE Total for{C.RST}")
-                print(f"  {C.YLW}unbiased backtesting.{C.RST}")
-                confirm = input(f"\n  {C.CYN}Proceed anyway? (y/n): {C.RST}").strip().lower()
-                if confirm != "y":
-                    print(f"  {C.GRY}Cancelled. Returning to main menu.{C.RST}")
-                    continue
-
-                historical_union = set(custom_syms)
-                data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
-
-                try:
-                    print_backtest_results(
-                        run_backtest(data, universe_identifier, start, end, cfg=bt_cfg, universe=custom_syms)
-                    )
-                except RuntimeError as exc:
-                    print(f"\n  {C.B_RED}[!] BACKTEST FAILED{C.RST}")
-                    print(f"  {C.RED}{exc}{C.RST}\n")
-
-            else:
-                all_target_dates = pd.date_range(start, end, freq=bt_cfg.REBALANCE_FREQ)
-                historical_union = set()
-                for target_date in all_target_dates:
-                    members = get_historical_universe(universe_identifier, target_date)
-                    historical_union.update(members)
-
-                if not historical_union:
-                    print(f"\n  {C.B_RED}[!] BACKTEST BLOCKED — No historical universe data found{C.RST}")
-                    print(f"  {C.YLW}Run the following command to generate required snapshots:{C.RST}")
-                    print(f"  {C.BLD}    python historical_builder.py{C.RST}")
-                    print(f"  {C.GRY}Required files:{C.RST}")
-                    print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
-                    continue
-
-                data = load_or_fetch([*historical_union, MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX], start, end, cfg=bt_cfg)
-
-                try:
-                    print_backtest_results(run_backtest(data, universe_identifier, start, end, cfg=bt_cfg))
-                except RuntimeError as exc:
-                    print(f"\n  {C.B_RED}[!] BACKTEST FAILED — Historical Universe Data Missing{C.RST}")
-                    print(f"  {C.RED}{exc}{C.RST}")
-                    print(f"\n  {C.CYN}Fix: run the following command to generate required snapshots:{C.RST}")
-                    print(f"  {C.BLD}    python historical_builder.py{C.RST}")
-                    print(f"  {C.GRY}Required files:{C.RST}")
-                    print(f"  {C.GRY}    data/historical_nifty500.parquet  (or data/historical_nse_total.parquet){C.RST}\n")
-
-        elif c == "5":
-            status_cfg = load_optimized_config()
-            for name, label in [
-                ("nse_total", LABEL_NSE_TOTAL),
-                ("nifty", LABEL_NIFTY_500),
-                ("custom", LABEL_CUSTOM_SCREENER),
-            ]:
-                has_activity = states[name].shares or states[name].equity_hist or abs(states[name].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0
-                if has_activity:
-                    mkt = mkt_cache.get(name) or {}
-                    if not mkt and states[name].shares:
-                        syms = list({to_ns(s) for s in states[name].shares})
-                        end  = datetime.today().strftime("%Y-%m-%d")
-                        mkt  = load_or_fetch(
-                            syms,
-                            (datetime.today() - timedelta(days=22)).strftime("%Y-%m-%d"),
-                            end,
-                            cfg=status_cfg,
-                        )
-                        mkt_cache[name] = mkt
-                    _print_status(states[name], label, mkt, cfg=status_cfg)
-            if not any((states[n].shares or states[n].equity_hist or abs(states[n].cash - DEFAULT_INITIAL_CAPITAL) >= 1.0) for n in states):
-                print(f"  {C.GRY}All portfolios are empty.{C.RST}")
-
-        elif c == "6":
-            print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
-            print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
-            p_c = _prompt_menu_choice(f"  {C.CYN}Choice: {C.RST}", ["1", "2", "3"])
-            if not p_c:
-                continue
-            p_map = {"1": "nse_total", "2": "nifty", "3": "custom"}
-            if p_c in p_map:
-                name = p_map[p_c]
-                state = states[name]
-                print(f"\n  {C.BLD}Current Cash: {C.GRN}₹{state.cash:,.2f}{C.RST}")
-                print(f"  {C.GRY}Use positive number to deposit, negative to withdraw.{C.RST}")
-                try:
-                    amt_str = input(f"  {C.CYN}Amount (₹): {C.RST}").replace(",", "").strip()
-                    amt = float(amt_str)
-                    state.cash = max(0.0, state.cash + amt)
-                    save_portfolio_state(state, name)
-                    action = "Deposited" if amt >= 0 else "Withdrew"
-                    print(f"  {C.GRN}[+] {action} ₹{abs(amt):,.2f}. New Cash: ₹{state.cash:,.2f}{C.RST}")
-                except ValueError:
-                    print(f"  {C.RED}Invalid amount.{C.RST}")
-            else:
-                print(f"  {C.RED}Invalid choice.{C.RST}")
-
-        elif c == "7":
-            print(f"\n  {C.B_RED}WARNING: This will reset your holdings to zero (cash only).{C.RST}")
-            print(f"  {C.GRY}Market data cache and optimal_cfg.json are NOT affected.{C.RST}")
-            print(f"  {C.GRY}Use this when you want to start a fresh portfolio with new capital.{C.RST}")
-            confirm = input(f"  {C.CYN}Type 'YES' to confirm: {C.RST}").strip()
-            if confirm.upper() == "YES":
-                for n in ["nse_total", "nifty", "custom"]:
-                    p = f"data/portfolio_state_{n}.json"
-                    for suffix in ["", ".bak.0", ".bak.1", ".bak.2"]:
-                        target = p + suffix
-                        if not os.path.exists(target):
-                            continue
-                        _removed = False
-                        for _attempt in range(3):
-                            try:
-                                os.remove(target)
-                                _removed = True
-                                break
-                            except OSError:
-                                if _attempt < 2:
-                                    time.sleep(0.1)
-                        if not _removed:
-                            logger.warning(
-                                "[Clear] Could not delete '%s' after 3 attempts "
-                                "(file may be locked). Skipping.",
-                                target,
-                            )
-                states    = {"nse_total": PortfolioState(), "nifty": PortfolioState(), "custom": PortfolioState()}
-                mkt_cache = {"nse_total": {}, "nifty": {}, "custom": {}}
-                print(f"  {C.GRN}[+] Portfolio holdings cleared. Cache and config untouched.{C.RST}")
-            else:
-                print(f"  {C.GRY}Cancelled.{C.RST}")
-
-        elif c == "q":
+        if choice == "q":
             print(f"  {C.GRY}Goodbye!{C.RST}\n")
             break
 
-
+        if choice == "1":
+            _handle_nse_total_scan(states, mkt_cache)
+        elif choice == "2":
+            _handle_nifty500_scan(states, mkt_cache)
+        elif choice == "3":
+            _handle_custom_scan(states, mkt_cache)
+        elif choice == "4":
+            _handle_backtest(states)
+        elif choice == "5":
+            _handle_status(states, mkt_cache, load_optimized_config())
+        elif choice == "6":
+            _handle_manage_cash(states)
+        elif choice == "7":
+            states, mkt_cache = _handle_clear_states(states, mkt_cache)
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """_parse_args operation.
     
@@ -2306,3 +2596,11 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
+
+
+
+
+
+
+
+
