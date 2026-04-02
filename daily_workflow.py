@@ -254,6 +254,7 @@ def _is_claim_stale(
     current_date_str: str,
     max_age_hours: int,
     stat_result: os.stat_result,
+    pre_read_claim_date_str: Optional[str] = None,
 ) -> bool:
     """_is_claim_stale operation.
 
@@ -262,6 +263,7 @@ def _is_claim_stale(
         current_date_str (str): Input parameter.
         max_age_hours (int): Input parameter.
         stat_result (os.stat_result): Input parameter.
+        pre_read_claim_date_str (Optional[str]): Input parameter.
 
     Returns:
         bool: Result of this operation.
@@ -270,13 +272,16 @@ def _is_claim_stale(
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     mtime = datetime.fromtimestamp(stat_result.st_mtime)
-    claim_date_str = ""
-    try:
-        existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
-        if isinstance(existing_claim, dict):
-            claim_date_str = str(existing_claim.get("date", ""))
-    except (json.JSONDecodeError, OSError):
+    if pre_read_claim_date_str is not None:
+        claim_date_str = pre_read_claim_date_str
+    else:
         claim_date_str = ""
+        try:
+            existing_claim = json.loads(claim_path.read_text(encoding="utf-8"))
+            if isinstance(existing_claim, dict):
+                claim_date_str = str(existing_claim.get("date", ""))
+        except (json.JSONDecodeError, OSError):
+            claim_date_str = ""
 
     return (
         claim_date_str != current_date_str
@@ -328,6 +333,7 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
                 current_date_str=date_str,
                 max_age_hours=24,
                 stat_result=stat_result,
+                pre_read_claim_date_str=str(claim_date_str),
             )
 
             if is_stale:
@@ -1001,7 +1007,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
-        except Exception as exc:
+        except (OSError, IOError, TypeError, ValueError) as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
             if os.path.exists(tmp):
                 try:
@@ -1050,7 +1056,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
         _clear_pending_sentinel(name)
 
-    except Exception as exc:
+    except (OSError, IOError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
         if tmp_file.exists():
             try:

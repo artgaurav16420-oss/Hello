@@ -324,6 +324,9 @@ class BacktestEngine:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
         cfg = self.engine.cfg
+        # TODO(refactor follow-up): structural placeholder hooks.
+        # These _rebal_* helpers are no-op scaffolding while logic remains inline below;
+        # return values are intentionally discarded until phased extraction is completed.
         _rebal_filter_universe(
             state=self.state,
             symbols=symbols,
