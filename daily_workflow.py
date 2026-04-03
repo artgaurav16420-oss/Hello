@@ -68,6 +68,7 @@ if importlib.util.find_spec("dotenv") is not None:
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -234,9 +235,13 @@ def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Pat
     """
     os.makedirs("data", exist_ok=True)
     path = _pending_sentinel_path(name)
-    tmp_path = path.with_suffix(f"{path.suffix}.{token}.tmp")
+    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
+    payload = {
+        "date": date_str,
+        "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+    }
     with tmp_path.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"token": token, "date": date_str}))
+        fh.write(json.dumps(payload))
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp_path, path)
@@ -363,7 +368,11 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
     # Successfully created the claim file (either first try or after removing stale)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"token": token, "date": date_str}))
+            payload = {
+                "date": date_str,
+                "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            }
+            fh.write(json.dumps(payload))
             fh.flush()
             os.fsync(fh.fileno())
     except Exception:
