@@ -344,7 +344,12 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
                 if close_i != -1:
                     value = value[1:close_i]
                 else:
-                    value = value[1:]
+                    log.warning(
+                        "[Env] Ignoring malformed quoted value for key %s in %s",
+                        key,
+                        env_path,
+                    )
+                    continue
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
                 # Per dotenv convention, inline comments must be preceded by

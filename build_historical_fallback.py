@@ -381,7 +381,7 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
         import pyarrow  # noqa: F401
         df.to_parquet(tmp, engine="pyarrow")
         os.replace(tmp, path)
-    except ImportError:
+    except Exception:
         tmp.unlink(missing_ok=True)
         fd2 = None
         tmp2 = None
@@ -760,10 +760,9 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     for d, tickers in snapshot_df["tickers"].items():
         ticker_list = tickers if isinstance(tickers, list) else list(tickers)
         if not ticker_list:
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
-        else:
-            for tkr in ticker_list:
-                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
+            continue
+        for tkr in ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))

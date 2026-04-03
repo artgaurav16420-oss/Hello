@@ -830,13 +830,12 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 positive_splits = split_series[split_series > 0].sort_index()
                 if not positive_splits.empty and sym in state.shares:
                     marker_key = f"split:{sym}"
-                    raw_markers = state.dividend_ledger.get(marker_key, [])
-                    if isinstance(raw_markers, str):
-                        applied_event_ids = {raw_markers} if raw_markers else set()
-                    elif isinstance(raw_markers, (list, tuple, set)):
+                    raw_markers = state.dividend_ledger.get(marker_key, "")
+                    if isinstance(raw_markers, list):  # legacy bad serialization
                         applied_event_ids = {str(v) for v in raw_markers if str(v)}
                     else:
-                        applied_event_ids = set()
+                        raw = str(raw_markers or "")
+                        applied_event_ids = {m for m in raw.split("|") if m}
                     for split_date, split_val in positive_splits.items():
                         split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
                         event_id = f"{split_date_str}:{split_val:.8f}"
@@ -862,7 +861,7 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                         state.shares[sym] = new_shares
                         state.entry_prices[sym] = round(new_entry, 4)
                         applied_event_ids.add(event_id)
-                        state.dividend_ledger[marker_key] = sorted(applied_event_ids)
+                        state.dividend_ledger[marker_key] = "|".join(sorted(applied_event_ids))
                         adjusted.append(sym)
 
             state.last_known_prices[sym] = current_price
@@ -1071,7 +1070,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
         _clear_pending_sentinel(name)
 
-    except (OSError, IOError, TypeError, ValueError) as exc:
+    except (OSError, IOError, TypeError, ValueError, RuntimeError) as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
         if tmp_file.exists():
             try:
@@ -1768,9 +1767,7 @@ def _run_scan(
             if valid_days is not None and len(valid_days) > 0:
                 trusted_close_index = pd.DatetimeIndex(valid_days)
                 if trusted_close_index.tz is not None:
-                    trusted_close_index = pd.DatetimeIndex(
-                        trusted_close_index.tz_convert(TIMEZONE_IST).to_pydatetime()
-                    )
+                    trusted_close_index = trusted_close_index.tz_localize(None)
                 trusted_close_index = trusted_close_index.normalize()
                 trusted_close_index = trusted_close_index[trusted_close_index <= expected_session_date]
 
@@ -2628,7 +2625,6 @@ if __name__ == "__main__":
 
     # Load .env first so startup-time environment-derived settings resolve from
     # the same source as other entry points.
-    global _EMPTY_UNIVERSE_HALT_AFTER, _DEFAULT_SCREENER_URL
     load_dotenv_safe()
     _EMPTY_UNIVERSE_HALT_AFTER = int(os.environ.get("EMPTY_UNIVERSE_HALT_AFTER", "3"))
     _DEFAULT_SCREENER_URL = os.environ.get(
