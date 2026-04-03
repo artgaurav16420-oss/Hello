@@ -30,6 +30,7 @@ import sqlite3
 import sys
 import tempfile
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 # OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
@@ -232,6 +233,32 @@ def _iter_wfo_slices(train_start: str, train_end: str):
         )
 
 
+def _extract_rebalance_summary(rebal_log: pd.DataFrame | None) -> tuple[float, float, float, int]:
+    avg_cvar = 0.0
+    avg_exposure = 1.0
+    avg_positions = 0.0
+    n_rebalances = 0
+    if rebal_log is None or rebal_log.empty:
+        return avg_cvar, avg_exposure, avg_positions, n_rebalances
+    fallback_series = pd.Series([0.0])
+    exposure_fallback_series = pd.Series([1.0])
+    avg_cvar = float(pd.to_numeric(rebal_log.get("realised_cvar", fallback_series), errors="coerce").fillna(0.0).mean())
+    avg_exposure = float(
+        pd.to_numeric(rebal_log.get("exposure_multiplier", exposure_fallback_series), errors="coerce")
+        .fillna(1.0)
+        .mean()
+    )
+    avg_positions = float(pd.to_numeric(rebal_log.get("n_positions", fallback_series), errors="coerce").fillna(0.0).mean())
+    n_rebalances = len(rebal_log)
+    return avg_cvar, avg_exposure, avg_positions, n_rebalances
+
+
+def _compute_turnover_drag(turnover: float) -> tuple[float, float, float]:
+    base_friction_drag = turnover * 0.30
+    churn_penalty = (max(0.0, turnover - 18.0) ** 2) / 10.0
+    return base_friction_drag, churn_penalty, base_friction_drag + churn_penalty
+
+
 def _fitness_from_metrics(
     metrics: dict,
     rebal_log: pd.DataFrame,
@@ -266,26 +293,13 @@ def _fitness_from_metrics(
     final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
 
     # Base friction: 30 bps round-trip cost (15 bps per side for slippage/STT/fees).
-    base_friction_drag = turnover * 0.30
     # Nonlinear churn penalty: heavily penalizes turnover beyond ~18 round-trips/year.
-    churn_penalty = (max(0.0, turnover - 18.0) ** 2) / 10.0
-
-    turnover_drag = base_friction_drag + churn_penalty
+    _, _, turnover_drag = _compute_turnover_drag(turnover)
     cagr_net = cagr - turnover_drag
 
-    avg_cvar            = 0.0
-    avg_exposure        = 1.0
-    avg_positions       = 0.0
-    n_rebalances        = 0
+    avg_cvar, avg_exposure, avg_positions, n_rebalances = _extract_rebalance_summary(rebal_log)
     # forced_cash_penalty is dead code (always 0.0) per BUG-OPT-05; preserved for log-parser and test compatibility
     forced_cash_penalty = 0.0
-
-    if rebal_log is not None and not rebal_log.empty:
-        fallback_series = pd.Series([0.0])
-        avg_cvar      = float(pd.to_numeric(rebal_log.get("realised_cvar",      fallback_series), errors="coerce").fillna(0.0).mean())
-        avg_exposure  = float(pd.to_numeric(rebal_log.get("exposure_multiplier", fallback_series), errors="coerce").fillna(0.0).mean())
-        avg_positions = float(pd.to_numeric(rebal_log.get("n_positions",         fallback_series), errors="coerce").fillna(0.0).mean())
-        n_rebalances  = len(rebal_log)
 
     _pos_deficit       = max(0.0, 6.0 - avg_positions)
     concentration_mult = 1.0 + _pos_deficit * 0.30
@@ -395,6 +409,172 @@ def _fitness_from_metrics(
     return score, calmar_score, diag
 
 
+def _int_bounds_with_step(bounds: tuple | list) -> tuple[int, int, int]:
+    if len(bounds) == 3:
+        low, high, step = bounds
+        return int(low), int(high), int(step)
+    low, high = bounds[:2]
+    return int(low), int(high), 1
+
+
+def _float_bounds_with_step(bounds: tuple | list) -> tuple[float, float, float]:
+    if len(bounds) == 3:
+        low, high, step = bounds
+        return float(low), float(high), float(step)
+    low, high = bounds[:2]
+    return float(low), float(high), 0.01
+
+
+def _suggest_optional_int_param(
+    trial: optuna.Trial,
+    name: str,
+    bounds: tuple | list | None,
+    default_value: int,
+) -> int:
+    if bounds is None:
+        return default_value
+    low, high, step = _int_bounds_with_step(bounds)
+    if isinstance(trial, optuna.trial.FixedTrial) and name not in trial.params:
+        return default_value
+    return trial.suggest_int(name, low, high, step=step)
+
+
+def _suggest_optional_float_param(
+    trial: optuna.Trial,
+    name: str,
+    bounds: tuple | list | None,
+    default_value: float,
+) -> float:
+    if bounds is None:
+        return default_value
+    low, high, step = _float_bounds_with_step(bounds)
+    if isinstance(trial, optuna.trial.FixedTrial) and name not in trial.params:
+        return default_value
+    return trial.suggest_float(name, low, high, step=step)
+
+
+def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateConfig:
+    cfg = UltimateConfig()
+
+    hf_min, hf_max, hf_step = _int_bounds_with_step(search_space["HALFLIFE_FAST"])
+    hs_min, hs_max, hs_step = _int_bounds_with_step(search_space["HALFLIFE_SLOW"])
+    cfg.HALFLIFE_FAST = trial.suggest_int("HALFLIFE_FAST", hf_min, hf_max, step=hf_step)
+    cfg.HALFLIFE_SLOW = trial.suggest_int("HALFLIFE_SLOW", hs_min, hs_max, step=hs_step)
+    if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
+        raise optuna.TrialPruned()
+
+    continuity_min, continuity_max, continuity_step = search_space["CONTINUITY_BONUS"]
+    cfg.CONTINUITY_BONUS = trial.suggest_float(
+        "CONTINUITY_BONUS", continuity_min, continuity_max, step=continuity_step
+    )
+
+    risk_min, risk_max, risk_step = search_space["RISK_AVERSION"]
+    cvar_min, cvar_max, cvar_step = search_space["CVAR_DAILY_LIMIT"]
+    cfg.RISK_AVERSION = trial.suggest_float("RISK_AVERSION", risk_min, risk_max, step=risk_step)
+    cfg.CVAR_DAILY_LIMIT = trial.suggest_float("CVAR_DAILY_LIMIT", cvar_min, cvar_max, step=cvar_step)
+
+    defaults = UltimateConfig()
+    cfg.MAX_POSITIONS = _suggest_optional_int_param(
+        trial,
+        "MAX_POSITIONS",
+        search_space.get("MAX_POSITIONS"),
+        defaults.MAX_POSITIONS,
+    )
+
+    cvar_lb_min, cvar_lb_max, cvar_lb_step = search_space.get("CVAR_LOOKBACK", (60, 150, 10))
+    min_required_lookback = cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS
+    effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
+    if effective_cvar_lb_min > int(cvar_lb_max):
+        raise optuna.TrialPruned()
+    if isinstance(trial, optuna.trial.FixedTrial) and "CVAR_LOOKBACK" not in trial.params:
+        cfg.CVAR_LOOKBACK = max(UltimateConfig().CVAR_LOOKBACK, effective_cvar_lb_min)
+    else:
+        cfg.CVAR_LOOKBACK = trial.suggest_int(
+            "CVAR_LOOKBACK",
+            int(effective_cvar_lb_min),
+            int(cvar_lb_max),
+            step=int(cvar_lb_step),
+        )
+
+    cfg.SIGNAL_LAG_DAYS = _suggest_optional_int_param(
+        trial,
+        "SIGNAL_LAG_DAYS",
+        search_space.get("SIGNAL_LAG_DAYS"),
+        defaults.SIGNAL_LAG_DAYS,
+    )
+    cfg.MIN_EXPOSURE_FLOOR = _suggest_optional_float_param(
+        trial,
+        "MIN_EXPOSURE_FLOOR",
+        search_space.get("MIN_EXPOSURE_FLOOR"),
+        float(defaults.MIN_EXPOSURE_FLOOR),
+    )
+    return cfg
+
+
+def _slice_precomputed_matrices_for_fold(
+    precomputed_matrices: dict | None,
+    wf_is_start: str,
+    wf_oos_start: str,
+    wf_oos_end: str,
+    cfg: UltimateConfig,
+) -> dict | None:
+    if precomputed_matrices is None:
+        return None
+    warmup_oos_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
+    warmup_is_ts = pd.Timestamp(_compute_warmup_start(wf_is_start, cfg))
+    fold_start_ts = min(warmup_is_ts, warmup_oos_ts)
+    oos_end_ts = pd.Timestamp(wf_oos_end)
+    fold_matrices: dict = {}
+    for key, df in precomputed_matrices.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            fold_matrices[key] = df.loc[fold_start_ts:oos_end_ts]
+        else:
+            fold_matrices[key] = df
+    return fold_matrices
+
+
+def _execute_objective_fold(
+    market_data: dict,
+    universe_type: str,
+    fold_matrices: dict | None,
+    wf_oos_start: str,
+    wf_oos_end: str,
+    cfg: UltimateConfig,
+) -> tuple[float, float, dict]:
+    oos = run_backtest(
+        market_data=market_data,
+        precomputed_matrices=fold_matrices,
+        universe_type=universe_type,
+        start_date=wf_oos_start,
+        end_date=wf_oos_end,
+        cfg=cfg,
+    )
+    return _fitness_from_metrics(oos.metrics, getattr(oos, "rebal_log", pd.DataFrame()))
+
+
+def _log_objective_fold_diag(trial_id: int, oos_year: int, diag: dict) -> None:
+    ceiling_tag = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
+    ddgate_tag = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
+    anomaly_tag = " ⚠ ANOMALOUS-RETURNS" if diag.get("anomaly_hit") else ""
+    cashpen_tag = (
+        f" ⚠ FORCED-CASH={diag.get('forced_cash_penalty', 0.0):.2f}"
+        if diag.get("forced_cash_penalty", 0.0) > 0.1 else ""
+    )
+    logger.info(
+        "[Trial %s | %d] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
+        "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
+        "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  ForcedCashPen=%.4f  "
+        "RawScore=%.4f  Score=%.4f%s%s%s%s",
+        trial_id, oos_year,
+        diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
+        diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
+        diag["risk_penalty"], diag["exposure_penalty"], diag.get("dd_penalty", 0.0),
+        diag.get("forced_cash_penalty", 0.0),
+        diag["raw_score"], diag["score"],
+        ceiling_tag, ddgate_tag, anomaly_tag, cashpen_tag,
+    )
+
+
 class MomentumObjective:
     """MomentumObjective type used by the backtesting system."""
     def __init__(
@@ -435,100 +615,7 @@ class MomentumObjective:
         Raises:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
-        cfg = UltimateConfig()
-
-        halflife_fast_bounds = self.search_space["HALFLIFE_FAST"]
-        halflife_slow_bounds = self.search_space["HALFLIFE_SLOW"]
-
-        if len(halflife_fast_bounds) == 3:
-            halflife_fast_min, halflife_fast_max, halflife_fast_step = halflife_fast_bounds
-        else:
-            halflife_fast_min, halflife_fast_max = halflife_fast_bounds[:2]
-            halflife_fast_step = 1
-
-        if len(halflife_slow_bounds) == 3:
-            halflife_slow_min, halflife_slow_max, halflife_slow_step = halflife_slow_bounds
-        else:
-            halflife_slow_min, halflife_slow_max = halflife_slow_bounds[:2]
-            halflife_slow_step = 1
-
-        cfg.HALFLIFE_FAST = trial.suggest_int(
-            "HALFLIFE_FAST", int(halflife_fast_min), int(halflife_fast_max), step=int(halflife_fast_step)
-        )
-        cfg.HALFLIFE_SLOW = trial.suggest_int(
-            "HALFLIFE_SLOW", int(halflife_slow_min), int(halflife_slow_max), step=int(halflife_slow_step)
-        )
-
-        if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
-            raise optuna.TrialPruned()
-
-        continuity_min, continuity_max, continuity_step = self.search_space["CONTINUITY_BONUS"]
-        cfg.CONTINUITY_BONUS = trial.suggest_float(
-            "CONTINUITY_BONUS", continuity_min, continuity_max, step=continuity_step
-        )
-
-        risk_aversion_min, risk_aversion_max, risk_aversion_step = self.search_space["RISK_AVERSION"]
-        cvar_min, cvar_max, cvar_step = self.search_space["CVAR_DAILY_LIMIT"]
-        cfg.RISK_AVERSION    = trial.suggest_float(
-            "RISK_AVERSION", risk_aversion_min, risk_aversion_max, step=risk_aversion_step
-        )
-        cfg.CVAR_DAILY_LIMIT = trial.suggest_float(
-            "CVAR_DAILY_LIMIT", cvar_min, cvar_max, step=cvar_step
-        )
-
-        cvar_lb_bounds = self.search_space.get("CVAR_LOOKBACK", (60, 150, 10))
-        cvar_lb_min, cvar_lb_max, cvar_lb_step = cvar_lb_bounds
-        min_required_lookback = cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS
-        effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
-
-        if effective_cvar_lb_min > int(cvar_lb_max):
-            raise optuna.TrialPruned()
-
-        if isinstance(trial, optuna.trial.FixedTrial) and "CVAR_LOOKBACK" not in trial.params:
-            cfg.CVAR_LOOKBACK = max(UltimateConfig().CVAR_LOOKBACK, effective_cvar_lb_min)
-        else:
-            cfg.CVAR_LOOKBACK = trial.suggest_int(
-                "CVAR_LOOKBACK", int(effective_cvar_lb_min), int(cvar_lb_max), step=int(cvar_lb_step)
-            )
-
-        _mp_bounds = self.search_space.get("MAX_POSITIONS")
-        if _mp_bounds is not None:
-            _mp_min, _mp_max, _mp_step = _mp_bounds
-            if isinstance(trial, optuna.trial.FixedTrial) and "MAX_POSITIONS" not in trial.params:
-                cfg.MAX_POSITIONS = UltimateConfig().MAX_POSITIONS
-            else:
-                cfg.MAX_POSITIONS = trial.suggest_int(
-                    "MAX_POSITIONS",
-                    int(_mp_min),
-                    int(_mp_max),
-                    step=int(_mp_step),
-                )
-
-        _lag_bounds = self.search_space.get("SIGNAL_LAG_DAYS")
-        if _lag_bounds is not None:
-            _lag_min, _lag_max, _lag_step = _lag_bounds
-            if isinstance(trial, optuna.trial.FixedTrial) and "SIGNAL_LAG_DAYS" not in trial.params:
-                cfg.SIGNAL_LAG_DAYS = UltimateConfig().SIGNAL_LAG_DAYS
-            else:
-                cfg.SIGNAL_LAG_DAYS = trial.suggest_int(
-                    "SIGNAL_LAG_DAYS",
-                    int(_lag_min),
-                    int(_lag_max),
-                    step=int(_lag_step),
-                )
-
-        _floor_bounds = self.search_space.get("MIN_EXPOSURE_FLOOR")
-        if _floor_bounds is not None:
-            _floor_min, _floor_max, _floor_step = _floor_bounds
-            if isinstance(trial, optuna.trial.FixedTrial) and "MIN_EXPOSURE_FLOOR" not in trial.params:
-                cfg.MIN_EXPOSURE_FLOOR = UltimateConfig().MIN_EXPOSURE_FLOOR
-            else:
-                cfg.MIN_EXPOSURE_FLOOR = trial.suggest_float(
-                    "MIN_EXPOSURE_FLOOR",
-                    float(_floor_min),
-                    float(_floor_max),
-                    step=float(_floor_step),
-                )
+        cfg = _suggest_trial_config(trial, self.search_space)
 
         if hasattr(trial, "set_user_attr"):
             trial.set_user_attr("resolved_cfg", dict(vars(cfg)))
@@ -541,65 +628,27 @@ class MomentumObjective:
 
         for wf_is_start, _, wf_oos_start, wf_oos_end in _iter_wfo_slices(TRAIN_START, TRAIN_END):
             oos_year = pd.Timestamp(wf_oos_start).year
-
-            fold_matrices = None
-            if self.precomputed_matrices is not None:
-                # FIX-BUG-14: clip fold matrices from the warmup of wf_is_start,
-                # not the warmup of wf_oos_start.  The OOS backtest (start_date=
-                # wf_oos_start) uses precomputed_matrices for signal warmup; those
-                # signals are computed over the IS window starting at wf_is_start.
-                # Using _compute_warmup_start(wf_oos_start) could truncate the IS
-                # data for short signal lookbacks, leaving run_backtest without the
-                # full 2-year in-sample history needed for warm signal computation.
-                # Taking min() of both warmup starts is safe because the full
-                # precomputed_matrices span the entire training+test range.
-                warmup_oos_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
-                warmup_is_ts  = pd.Timestamp(_compute_warmup_start(wf_is_start,  cfg))
-                fold_start_ts = min(warmup_is_ts, warmup_oos_ts)
-                oos_end_ts    = pd.Timestamp(wf_oos_end)
-                fold_matrices = {}
-                for key, df in self.precomputed_matrices.items():
-                    if isinstance(df, pd.DataFrame) and not df.empty:
-                        fold_matrices[key] = df.loc[fold_start_ts:oos_end_ts]
-                    else:
-                        fold_matrices[key] = df
-
-            oos = run_backtest(
-                market_data          = self.market_data,
-                precomputed_matrices = fold_matrices,
-                universe_type        = self.universe_type,
-                start_date           = wf_oos_start,
-                end_date             = wf_oos_end,
-                cfg                  = cfg,
+            fold_matrices = _slice_precomputed_matrices_for_fold(
+                self.precomputed_matrices,
+                wf_is_start,
+                wf_oos_start,
+                wf_oos_end,
+                cfg,
             )
-            m = oos.metrics
-            score, calmar_score, diag = _fitness_from_metrics(m, getattr(oos, "rebal_log", pd.DataFrame()))
+            score, calmar_score, diag = _execute_objective_fold(
+                self.market_data,
+                self.universe_type,
+                fold_matrices,
+                wf_oos_start,
+                wf_oos_end,
+                cfg,
+            )
 
             diag["year"]     = oos_year
             diag["eq_start"] = wf_oos_start
             diag["eq_end"]   = wf_oos_end
             slice_diags.append(diag)
-
-            _ceiling_tag = " ⚠ CEILING HIT"       if diag["ceiling_hit"]                    else ""
-            _ddgate_tag  = " ⚠ DD-GATE (>40%)"     if diag["dd_gate_hit"]                    else ""
-            _anomaly_tag = " ⚠ ANOMALOUS-RETURNS"  if diag.get("anomaly_hit")                else ""
-            _cashpen_tag = (
-                f" ⚠ FORCED-CASH={diag.get('forced_cash_penalty', 0.0):.2f}"
-                if diag.get("forced_cash_penalty", 0.0) > 0.1 else ""
-            )
-            logger.info(
-                "[Trial %s | %d] CAGR=%+.1f%%  DD=%.1f%%  Turn=%.2fx  "
-                "AvgExp=%.2f  AvgPos=%.1f  AvgCVaR=%.3f%%  "
-                "RiskPenalty=%.2f  ExpPenalty=%.2f  DDPenalty=%.4f  ForcedCashPen=%.4f  "
-                "RawScore=%.4f  Score=%.4f%s%s%s%s",
-                trial_id, oos_year,
-                diag["cagr"], abs(diag["max_dd"]), diag["turnover"],
-                diag["avg_exposure"], diag["avg_positions"], diag["avg_cvar_pct"],
-                diag["risk_penalty"], diag["exposure_penalty"], diag.get("dd_penalty", 0.0),
-                diag.get("forced_cash_penalty", 0.0),
-                diag["raw_score"], diag["score"],
-                _ceiling_tag, _ddgate_tag, _anomaly_tag, _cashpen_tag,
-            )
+            _log_objective_fold_diag(trial_id, oos_year, diag)
 
             if not pd.notna(score):
                 raise optuna.TrialPruned()
@@ -659,6 +708,26 @@ class MomentumObjective:
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
+def _benchmark_close_series(df: pd.DataFrame | None) -> pd.Series | None:
+    if not isinstance(df, pd.DataFrame) or df.empty or "Close" not in df.columns:
+        return None
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    return close if not close.empty else None
+
+
+def _benchmark_coverage_note(
+    ticker: str,
+    coverage_start: pd.Timestamp,
+    coverage_end: pd.Timestamp,
+    required_start: pd.Timestamp,
+    required_end: pd.Timestamp,
+) -> str:
+    return (
+        f"{ticker}: coverage {coverage_start.date()} -> {coverage_end.date()} does not span "
+        f"{required_start.date()} -> {required_end.date()}"
+    )
+
+
 def _validate_regime_benchmark_data(market_data: dict, required_start: str, required_end: str) -> None:
     """
     Validate regime benchmark inputs.
@@ -682,9 +751,8 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
         if "Close" not in df.columns:
             benchmark_notes.append(f"{ticker}: missing Close column")
             continue
-
-        close = pd.to_numeric(df["Close"], errors="coerce").dropna()
-        if close.empty:
+        close = _benchmark_close_series(df)
+        if close is None:
             benchmark_notes.append(f"{ticker}: Close column has no finite values")
             continue
 
@@ -693,14 +761,20 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
         coverage_end = pd.Timestamp(close.index.max())
         if coverage_start > required_start_ts or coverage_end < required_end_ts:
             partial_coverage_notes.append(
-                f"{ticker}: coverage {coverage_start.date()} -> {coverage_end.date()} does not span "
-                f"{required_start_ts.date()} -> {required_end_ts.date()}"
+                _benchmark_coverage_note(
+                    ticker,
+                    coverage_start,
+                    coverage_end,
+                    required_start_ts,
+                    required_end_ts,
+                )
             )
             continue
 
-        if len(close.loc[required_start_ts:required_end_ts]) < 200:
+        required_window_rows = len(close.loc[required_start_ts:required_end_ts])
+        if required_window_rows < 200:
             benchmark_notes.append(
-                f"{ticker}: only {len(close.loc[required_start_ts:required_end_ts])} rows within required window"
+                f"{ticker}: only {required_window_rows} rows within required window"
             )
             continue
 
@@ -709,7 +783,7 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
             ticker,
             coverage_start.date(),
             coverage_end.date(),
-            len(close.loc[required_start_ts:required_end_ts]),
+            required_window_rows,
         )
         return
 
@@ -822,33 +896,20 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     }
 
 
-def _validate_optimal_config(params: dict) -> list[str]:
-    """Validate cross-field constraints before persisting optimal config."""
-    violations: list[str] = []
-
+def _validate_cvar_limit(params: dict, violations: list[str]) -> None:
     cvar = params.get("CVAR_DAILY_LIMIT")
-    if cvar is not None:
-        if not isinstance(cvar, (int, float)) or cvar <= 0.0:
-            violations.append(f"CVAR_DAILY_LIMIT must be > 0; got {cvar!r}")
-        elif cvar > 0.50:
-            violations.append(f"CVAR_DAILY_LIMIT={cvar:.3f} exceeds 50% — implausibly loose")
+    if cvar is None:
+        return
+    if not isinstance(cvar, (int, float)) or cvar <= 0.0:
+        violations.append(f"CVAR_DAILY_LIMIT must be > 0; got {cvar!r}")
+    elif cvar > 0.50:
+        violations.append(f"CVAR_DAILY_LIMIT={cvar:.3f} exceeds 50% — implausibly loose")
 
+
+def _validate_position_limits(params: dict, violations: list[str]) -> None:
     max_pos = params.get("MAX_POSITIONS")
-    if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 2):
-        violations.append(f"MAX_POSITIONS must be int >= 2; got {max_pos!r}")
-
-    hf = params.get("HALFLIFE_FAST")
-    hs = params.get("HALFLIFE_SLOW")
-    if hf is not None and hs is not None and hf > hs:
-        violations.append(
-            f"HALFLIFE_FAST ({hf}) > HALFLIFE_SLOW ({hs}) — would invert momentum signal"
-        )
-
-    exp_floor = params.get("MIN_EXPOSURE_FLOOR")
-    if exp_floor is not None and (
-        not isinstance(exp_floor, (int, float)) or not (0.0 <= exp_floor <= 1.0)
-    ):
-        violations.append(f"MIN_EXPOSURE_FLOOR={exp_floor!r} must be in [0, 1]")
+    if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 0):
+        violations.append(f"MAX_POSITIONS must be int >= 0; got {max_pos!r}")
 
     max_w = params.get("MAX_SINGLE_NAME_WEIGHT")
     if max_w is not None and (
@@ -856,18 +917,39 @@ def _validate_optimal_config(params: dict) -> list[str]:
     ):
         violations.append(f"MAX_SINGLE_NAME_WEIGHT={max_w!r} must be in [0.01, 1.0]")
 
-    risk_av = params.get("RISK_AVERSION")
-    if risk_av is not None and (
-        not isinstance(risk_av, (int, float)) or risk_av <= 0
-    ):
-        violations.append(f"RISK_AVERSION must be > 0; got {risk_av!r}")
+
+def _validate_signal_params(params: dict, violations: list[str]) -> None:
+    hf = params.get("HALFLIFE_FAST")
+    hs = params.get("HALFLIFE_SLOW")
+    if hf is not None and hs is not None and hf > hs:
+        violations.append(
+            f"HALFLIFE_FAST ({hf}) > HALFLIFE_SLOW ({hs}) — would invert momentum signal"
+        )
 
     lag = params.get("SIGNAL_LAG_DAYS")
     if lag is not None and (not isinstance(lag, int) or lag < 0):
-        violations.append(
-            f"SIGNAL_LAG_DAYS must be int >= 0; got {lag!r}"
-        )
+        violations.append(f"SIGNAL_LAG_DAYS must be int >= 0; got {lag!r}")
 
+
+def _validate_risk_params(params: dict, violations: list[str]) -> None:
+    exp_floor = params.get("MIN_EXPOSURE_FLOOR")
+    if exp_floor is not None and (
+        not isinstance(exp_floor, (int, float)) or not (0.0 <= exp_floor <= 1.0)
+    ):
+        violations.append(f"MIN_EXPOSURE_FLOOR={exp_floor!r} must be in [0, 1]")
+
+    risk_av = params.get("RISK_AVERSION")
+    if risk_av is not None and (not isinstance(risk_av, (int, float)) or risk_av <= 0):
+        violations.append(f"RISK_AVERSION must be > 0; got {risk_av!r}")
+
+
+def _validate_optimal_config(params: dict) -> list[str]:
+    """Validate cross-field constraints before persisting optimal config."""
+    violations: list[str] = []
+    _validate_cvar_limit(params, violations)
+    _validate_position_limits(params, violations)
+    _validate_signal_params(params, violations)
+    _validate_risk_params(params, violations)
     return violations
 
 
@@ -972,7 +1054,32 @@ def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenT
     return sorted(study.best_trials, key=lambda t: _pareto_sort_key(study, t), reverse=True)
 
 
-def _error_triage_callback_factory() -> callable:
+def _error_class_from_trial(trial: optuna.trial.FrozenTrial) -> str:
+    fail_reason = trial.system_attrs.get("fail_reason")
+    if fail_reason:
+        return fail_reason.split(":", 1)[0]
+    return "Unknown"
+
+
+def _set_trial_error_class_user_attr(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+    error_class: str,
+) -> None:
+    try:
+        if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
+            study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
+    except Exception as e:
+        logger.error(
+            "Failed to set trial user attribute 'error_class'=%r for trial %s: %s (storage=%s)",
+            error_class,
+            getattr(trial, "_trial_id", "unknown"),
+            e,
+            getattr(study, "_storage", "unknown"),
+        )
+
+
+def _error_triage_callback_factory() -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
     # ARCH-FIX-8
     """_error_triage_callback_factory operation.
     
@@ -999,22 +1106,8 @@ def _error_triage_callback_factory() -> callable:
         """
         if trial.state == optuna.trial.TrialState.FAIL:
             consecutive_failures["count"] += 1
-            fail_reason = trial.system_attrs.get("fail_reason")
-            if fail_reason:
-                error_class = fail_reason.split(":", 1)[0]
-            else:
-                error_class = "Unknown"
-            try:
-                if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
-                    study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
-            except Exception as e:
-                logger.error(
-                    "Failed to set trial user attribute 'error_class'=%r for trial %s: %s (storage=%s)",
-                    error_class,
-                    getattr(trial, "_trial_id", "unknown"),
-                    e,
-                    getattr(study, "_storage", "unknown"),
-                )
+            error_class = _error_class_from_trial(trial)
+            _set_trial_error_class_user_attr(study, trial, error_class)
             if consecutive_failures["count"] > int(N_TRIALS * 0.30):
                 study.stop()
                 raise RuntimeError(
@@ -1024,6 +1117,151 @@ def _error_triage_callback_factory() -> callable:
             consecutive_failures["count"] = 0
 
     return _error_triage_callback
+
+
+def _resolve_execution_mode(in_memory: bool) -> tuple[str, int]:
+    if in_memory:
+        logger.info(
+            "In-memory mode: storage=sqlite:///:memory:, n_jobs=%d. "
+            "Trial history will not be persisted.",
+            1,
+        )
+        return "sqlite:///:memory:", 1
+    return OPTUNA_STORAGE, N_JOBS
+
+
+def _unpack_preloaded_payload(preloaded_payload: Any) -> tuple[dict, dict | None]:
+    if isinstance(preloaded_payload, dict) and "market_data" in preloaded_payload:
+        return preloaded_payload["market_data"], preloaded_payload.get("precomputed_matrices")
+    return preloaded_payload, None
+
+
+def _force_single_worker_if_needed(n_jobs: int) -> int:
+    if n_jobs != 1:
+        logger.warning(
+            "OPTUNA_N_JOBS=%d: forced to 1. For parallelism run multiple "
+            "processes against the same storage.",
+            n_jobs,
+        )
+        return 1
+    return n_jobs
+
+
+def _enable_sqlite_wal(storage: str) -> None:
+    if not storage.startswith("sqlite:///"):
+        return
+    db_path = re.sub(r"^sqlite:///", "", storage.split("?")[0])
+    if db_path == ":memory:":
+        return
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+
+
+def _create_optimization_study(study_name: str, storage: str) -> optuna.Study:
+    study = optuna.create_study(
+        study_name=study_name,
+        directions=["maximize", "maximize"],
+        sampler=_build_sampler(),
+        storage=storage,
+        load_if_exists=True,
+    )
+    if isinstance(storage, str):
+        _enable_sqlite_wal(storage)
+    return study
+
+
+def _current_oos_meta(universe_type: str) -> dict[str, float | str]:
+    return {
+        "universe_type": universe_type,
+        "test_start": TEST_START,
+        "test_end": TEST_END,
+        "oos_max_dd_cap": float(OOS_MAX_DD_CAP),
+        "oos_soft_max_dd_cap": float(OOS_SOFT_MAX_DD_CAP),
+    }
+
+
+def _load_oos_journal_records(journal_path: Path, current_meta: dict[str, float | str]) -> dict[int, dict]:
+    completed_trial_ids: dict[int, dict] = {}
+    if not journal_path.exists():
+        return completed_trial_ids
+    for line_idx, line in enumerate(journal_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+            if not isinstance(rec, dict):
+                logger.warning(
+                    "Skipping journal line %d in %s: JSON row is %s, expected object.",
+                    line_idx, journal_path, type(rec).__name__,
+                )
+                continue
+            if "trial_number" not in rec:
+                logger.warning(
+                    "Skipping journal line %d in %s: missing trial_number key.",
+                    line_idx, journal_path,
+                )
+                continue
+            trial_number = rec["trial_number"]
+            rec_meta = rec.get("meta")
+            if rec_meta != current_meta:
+                logger.warning(
+                    "Skipping journal line %d for trial %s due to OOS meta mismatch.",
+                    line_idx, trial_number,
+                )
+                continue
+            if rec.get("status") != "PASS":
+                completed_trial_ids[trial_number] = rec
+                continue
+            if not isinstance(rec.get("oos_calmar"), (int, float)):
+                logger.warning(
+                    "Skipping journal line %d: PASS record missing valid oos_calmar (got %r)",
+                    line_idx, rec.get("oos_calmar")
+                )
+                continue
+            if not isinstance(rec.get("metrics"), dict):
+                logger.warning(
+                    "Skipping journal line %d: PASS record missing valid metrics dict (got %r)",
+                    line_idx, type(rec.get("metrics")).__name__
+                )
+                continue
+            completed_trial_ids[trial_number] = rec
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            logger.warning(
+                "Skipping corrupt/truncated journal line %d in %s: %s (line: %r)",
+                line_idx, journal_path, e, line[:100]
+            )
+            continue
+    return completed_trial_ids
+
+
+def _build_oos_cfg_from_trial(
+    trial_candidate: optuna.trial.FrozenTrial,
+    valid_fields: dict,
+) -> UltimateConfig:
+    oos_cfg = UltimateConfig()
+    resolved_cfg = trial_candidate.user_attrs.get("resolved_cfg", {})
+    for k, v in resolved_cfg.items():
+        if k in valid_fields:
+            setattr(oos_cfg, k, v)
+    for k, v in trial_candidate.params.items():
+        if k in valid_fields:
+            setattr(oos_cfg, k, v)
+    return oos_cfg
+
+
+def _clip_oos_matrices(
+    precomputed_matrices: dict | None,
+    warmup_start: str,
+) -> dict:
+    if precomputed_matrices is None:
+        return {}
+    clipped_matrices: dict = {}
+    for k, v in precomputed_matrices.items():
+        if hasattr(v, "loc"):
+            clipped_matrices[k] = v.loc[warmup_start:TEST_END]
+        else:
+            clipped_matrices[k] = v
+    return clipped_matrices
 
 
 def run_optimization(
@@ -1044,42 +1282,9 @@ def run_optimization(
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    def _resolve_execution_mode():
-        """Resolve Optuna storage backend and worker count for this run.
-
-        Args:
-            None.
-
-        Returns:
-            tuple[str, int]: Effective storage URI and ``n_jobs`` for optimization.
-
-        Raises:
-            Exception: Propagates unexpected runtime/environment errors.
-        """
-        if in_memory:
-            logger.info(
-                "In-memory mode: storage=:memory:, n_jobs=%d. "
-                "Trial history will not be persisted.",
-                1,
-            )
-            return ":memory:", 1
-        return OPTUNA_STORAGE, N_JOBS
-
-    def _unpack_preloaded(preloaded_payload):
-        if isinstance(preloaded_payload, dict) and "market_data" in preloaded_payload:
-            return preloaded_payload["market_data"], preloaded_payload.get("precomputed_matrices")
-        return preloaded_payload, None
-
     universe_type = _normalize_universe_type(universe_type)
-    effective_storage, effective_n_jobs = _resolve_execution_mode()
-
-    if effective_n_jobs != 1:
-        logger.warning(
-            "OPTUNA_N_JOBS=%d: forced to 1. For parallelism run multiple "
-            "processes against the same storage.",
-            effective_n_jobs,
-        )
-        effective_n_jobs = 1
+    effective_storage, effective_n_jobs = _resolve_execution_mode(in_memory)
+    effective_n_jobs = _force_single_worker_if_needed(effective_n_jobs)
 
     print("\n\033[1;36m=== INSTITUTIONAL TIME-SERIES CV OPTIMIZER ===\033[0m")
     print(f"\033[90mIn-Sample (Train) : {TRAIN_START} to {TRAIN_END}\033[0m")
@@ -1088,7 +1293,7 @@ def run_optimization(
 
     logger.info("Optimization universe: %s", universe_type)
     preloaded = pre_load_data(universe_type)
-    market_data, precomputed_matrices = _unpack_preloaded(preloaded)
+    market_data, precomputed_matrices = _unpack_preloaded_payload(preloaded)
 
     os.makedirs("data", exist_ok=True)
     effective_study_name = (study_name or DEFAULT_STUDY_NAME).strip() or DEFAULT_STUDY_NAME
@@ -1101,18 +1306,7 @@ def run_optimization(
             effective_study_name, OBJECTIVE_VERSION,
         )
 
-    study = optuna.create_study(
-        study_name     = effective_study_name,
-        directions     = ["maximize", "maximize"],  # ARCH-FIX-2 [composite, calmar]
-        sampler        = _build_sampler(),
-        storage        = effective_storage,
-        load_if_exists = True,
-    )
-    if isinstance(effective_storage, str) and effective_storage.startswith("sqlite:///"):
-        # ARCH-FIX-4: enable WAL mode for better multi-process write concurrency.
-        db_path = re.sub(r"^sqlite:///", "", effective_storage.split("?")[0])
-        with sqlite3.connect(db_path, timeout=30) as _conn:
-            _conn.execute("PRAGMA journal_mode=WAL")
+    study = _create_optimization_study(effective_study_name, effective_storage)
 
 
     objective = MomentumObjective(
@@ -1275,39 +1469,8 @@ def run_optimization(
 
     oos_results_list = []
     journal_path = _oos_journal_path(effective_study_name)  # ARCH-FIX-9
-    completed_trial_ids: dict[int, dict] = {}
-    if journal_path.exists():
-        for line_idx, line in enumerate(journal_path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            try:
-                rec = json.loads(line)
-                trial_number = rec["trial_number"]
-                # Validate the record has required fields and correct status
-                if rec.get("status") != "PASS":
-                    # Skip non-PASS records or store them without validation
-                    completed_trial_ids[trial_number] = rec
-                    continue
-                # For PASS records, validate required keys exist and have expected types
-                if not isinstance(rec.get("oos_calmar"), (int, float)):
-                    logger.warning(
-                        "Skipping journal line %d: PASS record missing valid oos_calmar (got %r)",
-                        line_idx, rec.get("oos_calmar")
-                    )
-                    continue
-                if not isinstance(rec.get("metrics"), dict):
-                    logger.warning(
-                        "Skipping journal line %d: PASS record missing valid metrics dict (got %r)",
-                        line_idx, type(rec.get("metrics")).__name__
-                    )
-                    continue
-                completed_trial_ids[trial_number] = rec
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                logger.warning(
-                    "Skipping corrupt/truncated journal line %d in %s: %s (line: %r)",
-                    line_idx, journal_path, e, line[:100]
-                )
-                continue
+    current_meta = _current_oos_meta(universe_type)
+    completed_trial_ids = _load_oos_journal_records(journal_path, current_meta)
 
     for rank, trial_candidate in enumerate(top_k_trials, 1):
         if trial_candidate.number in completed_trial_ids:
@@ -1315,25 +1478,11 @@ def run_optimization(
             if rec.get("status") == "PASS":
                 oos_results_list.append((rec["oos_calmar"], trial_candidate, trial_candidate.params, rec["metrics"]))
             continue
-        oos_cfg      = UltimateConfig()
-        resolved_cfg = trial_candidate.user_attrs.get("resolved_cfg", {})
-        for k, v in resolved_cfg.items():
-            if k in valid_fields:
-                setattr(oos_cfg, k, v)
-        for k, v in trial_candidate.params.items():
-            if k in valid_fields:
-                setattr(oos_cfg, k, v)
+        oos_cfg = _build_oos_cfg_from_trial(trial_candidate, valid_fields)
 
         try:
             warmup_start = _compute_warmup_start(TEST_START, oos_cfg)  # ARCH-FIX-5
-            clipped_matrices = {}
-            for k, v in (precomputed_matrices or {}).items():
-                if hasattr(v, "loc"):
-                    # DataFrame: clip to warmup_start:TEST_END
-                    clipped_matrices[k] = v.loc[warmup_start:TEST_END]
-                else:
-                    # Non-DataFrame artifact: keep original value unchanged
-                    clipped_matrices[k] = v
+            clipped_matrices = _clip_oos_matrices(precomputed_matrices, warmup_start)
             oos_result = run_backtest(
                 market_data          = market_data,
                 precomputed_matrices = clipped_matrices,
@@ -1374,6 +1523,7 @@ def run_optimization(
                 "oos_calmar": oos_calmar,
                 "metrics": m,
                 "status": status_tag,
+                "meta": current_meta,
             }
             with journal_path.open("a", encoding="utf-8") as fh:
                 fh.write(f"{json.dumps(oos_result_dict)}\n")
