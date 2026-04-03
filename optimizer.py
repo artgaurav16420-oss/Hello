@@ -417,6 +417,14 @@ def _int_bounds_with_step(bounds: tuple | list) -> tuple[int, int, int]:
     return int(low), int(high), 1
 
 
+def _float_bounds_with_step(bounds: tuple | list) -> tuple[float, float, float]:
+    if len(bounds) == 3:
+        low, high, step = bounds
+        return float(low), float(high), float(step)
+    low, high = bounds[:2]
+    return float(low), float(high), 0.01
+
+
 def _suggest_optional_int_param(
     trial: optuna.Trial,
     name: str,
@@ -439,10 +447,10 @@ def _suggest_optional_float_param(
 ) -> float:
     if bounds is None:
         return default_value
-    low, high, step = bounds
+    low, high, step = _float_bounds_with_step(bounds)
     if isinstance(trial, optuna.trial.FixedTrial) and name not in trial.params:
         return default_value
-    return trial.suggest_float(name, float(low), float(high), step=float(step))
+    return trial.suggest_float(name, low, high, step=step)
 
 
 def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateConfig:
@@ -1143,6 +1151,8 @@ def _enable_sqlite_wal(storage: str) -> None:
     if not storage.startswith("sqlite:///"):
         return
     db_path = re.sub(r"^sqlite:///", "", storage.split("?")[0])
+    if db_path == ":memory:":
+        return
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
 
@@ -1242,9 +1252,9 @@ def _build_oos_cfg_from_trial(
 def _clip_oos_matrices(
     precomputed_matrices: dict | None,
     warmup_start: str,
-) -> dict | None:
+) -> dict:
     if precomputed_matrices is None:
-        return None
+        return {}
     clipped_matrices: dict = {}
     for k, v in precomputed_matrices.items():
         if hasattr(v, "loc"):
