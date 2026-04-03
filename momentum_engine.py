@@ -752,7 +752,6 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
 
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
-    _maxlen = int(UltimateConfig().CVAR_LOOKBACK)
     return {
         str(k): deque(
             ((pd.Timestamp(d), float(vol)) for d, vol in vals),
