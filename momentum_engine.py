@@ -752,8 +752,12 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
 
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
+    _maxlen = int(UltimateConfig().CVAR_LOOKBACK)
     return {
-        str(k): deque(((pd.Timestamp(d), float(vol)) for d, vol in vals))
+        str(k): deque(
+            ((pd.Timestamp(d), float(vol)) for d, vol in vals),
+            maxlen=_maxlen,
+        )
         for k, vals in value.items()
     }
 
@@ -1725,8 +1729,8 @@ def _drop_zero_volatility_columns(
     col_stds = clean_rets.std()
     valid_vol_mask = col_stds >= 1e-10
     if not valid_vol_mask.any():
-        return clean_rets.loc[:, valid_vol_mask], kept_indices[valid_vol_mask.to_numpy()]
-    if not valid_vol_mask.all() and valid_vol_mask.any():
+        return clean_rets, kept_indices
+    if not valid_vol_mask.all():
         clean_rets = clean_rets.loc[:, valid_vol_mask]
         kept_indices = kept_indices[valid_vol_mask.to_numpy()]
     return clean_rets, kept_indices
