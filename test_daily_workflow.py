@@ -715,13 +715,16 @@ def test_detect_and_apply_splits_fractional_cash_applies_one_way_slippage():
 
 
 def test_pending_sentinel_helpers_roundtrip(tmp_path: Path, monkeypatch):
+    import hashlib
+
     monkeypatch.chdir(tmp_path)
     token = "tok-1"
     date_str = "2026-03-30"
     path = dw._write_pending_sentinel("nifty", token, date_str)
     assert path.exists()
     payload = dw._load_pending_sentinel("nifty")
-    assert payload == {"token": token, "date": date_str}
+    assert payload["date"] == date_str
+    assert payload["token_hash"] == hashlib.sha256(token.encode("utf-8")).hexdigest()
     dw._clear_pending_sentinel("nifty")
     assert dw._load_pending_sentinel("nifty") is None
 
@@ -746,7 +749,7 @@ def test_circuit_breaker_concurrent_increment_and_reset():
 def test_circuit_breaker_save_logs_error_and_load_lock_fallback(tmp_path: Path, monkeypatch, caplog):
     monkeypatch.chdir(tmp_path)
     breaker = dw.CircuitBreaker(count=3)
-    monkeypatch.setattr(pathlib.Path, "write_text", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk fail")))
+    monkeypatch.setattr(dw.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk fail")))
     with caplog.at_level(logging.ERROR):
         breaker.save("data/circuit_breaker.json")
     assert "Failed to persist circuit breaker count" in caplog.text

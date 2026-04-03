@@ -118,7 +118,6 @@ def test_run_optimization_raises_when_no_completed_trials(monkeypatch):
 
 def test_optimizer_logger_does_not_duplicate_handlers_on_reload():
     before = len(optimizer.logger.handlers)
-    optimizer._get_test_end_2_cached.cache_clear()
     importlib.reload(optimizer)
     after = len(optimizer.logger.handlers)
 
@@ -322,20 +321,6 @@ def test_optimizer_defaults_reflect_v11_58_search_space():
     assert optimizer.SEARCH_SPACE_BOUNDS["MIN_EXPOSURE_FLOOR"] == (0.0, 0.20, 0.05)
 
 
-def test_resolve_period_2_end_defaults_to_today_when_no_env_override():
-    resolved = optimizer._resolve_period_2_end(today=pd.Timestamp("2026-03-23"))
-
-    assert resolved == "2026-03-23"
-
-
-def test_resolve_period_2_end_clamps_env_cutoff_before_period_start(caplog):
-    with caplog.at_level("WARNING"):
-        resolved = optimizer._resolve_period_2_end("2024-12-31")
-
-    assert resolved == optimizer.TEST_START_2
-    assert "clamping" in caplog.text
-
-
 def test_save_optimal_config_replaces_existing_file_atomically(tmp_path: Path):
     output_path = tmp_path / "optimal_cfg.json"
     output_path.write_text('{"old": 1}', encoding="utf-8")
@@ -385,9 +370,7 @@ def test_pre_load_data_deduplicates_inputs_and_appends_crsldx_index(monkeypatch)
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    # Period-2 end is dynamic (today/env override), so tests must resolve it via
-    # _get_test_end_2() rather than a static module constant.
-    assert captured["required_end"] == max(optimizer.TEST_END, optimizer._get_test_end_2())
+    assert captured["required_end"] == optimizer.TEST_END
     assert captured["tickers"].count("ABC") == 1
     assert "^NSEI" in captured["tickers"]
     assert "^CRSLDX" in captured["tickers"]
@@ -424,9 +407,7 @@ def test_pre_load_data_includes_historical_union_for_nifty500(monkeypatch):
     assert "^NSEI" in result["market_data"]
     assert result["precomputed_matrices"] is None
     assert captured["required_start"] == optimizer._compute_warmup_start("2020-01-01", optimizer.UltimateConfig())
-    # Period-2 end is dynamic (today/env override), so tests must resolve it via
-    # _get_test_end_2() rather than a static module constant.
-    assert captured["required_end"] == max(optimizer.TEST_END, optimizer._get_test_end_2())
+    assert captured["required_end"] == optimizer.TEST_END
     assert "LIVEONLY" in captured["tickers"]
     assert "OLD1" in captured["tickers"]
     assert "OLD2" in captured["tickers"]
@@ -766,8 +747,8 @@ def test_run_optimization_in_memory_uses_memory_storage_and_uncapped_n_jobs(monk
 
     optimizer.run_optimization(in_memory=True)
 
-    assert captured["storage"] == ":memory:", (
-        f"in_memory=True must use ':memory:' storage, got: {captured['storage']!r}"
+    assert captured["storage"] == "sqlite:///:memory:", (
+        f"in_memory=True must use 'sqlite:///:memory:' storage, got: {captured['storage']!r}"
     )
 
 

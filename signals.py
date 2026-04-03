@@ -65,6 +65,7 @@ def compute_regime_score(
     idx_hist: Optional[pd.DataFrame],
     cfg: Optional['UltimateConfig'] = None,
     universe_close_hist: Optional[pd.DataFrame] = None,
+    as_of_date: Optional[pd.Timestamp] = None,
 ) -> float:
     """
     Computes a macroeconomic regime score bounded [0, 1].
@@ -86,11 +87,13 @@ def compute_regime_score(
         logger.debug("[Signals] Missing index history for regime. Defaulting to 0.5")
         return 0.5
 
-    close_series = (
-        idx_hist["Close"].iloc[:-1]
-        if idx_hist.index[-1].date() == pd.Timestamp.today().date()
-        else idx_hist["Close"]
+    reference_date = (
+        pd.Timestamp(as_of_date).date() if as_of_date is not None else pd.Timestamp.today().date()
     )
+    last_is_today = False
+    if isinstance(idx_hist.index, pd.DatetimeIndex) and len(idx_hist.index) > 0:
+        last_is_today = idx_hist.index[-1].date() == reference_date
+    close_series = idx_hist["Close"].iloc[:-1] if last_is_today else idx_hist["Close"]
 
     sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50
@@ -121,7 +124,7 @@ def compute_regime_score(
     base_score = 1.0 / (1.0 + np.exp(-trend_steepness * trend_deviation))
 
     ewma_span = int(cfg.REGIME_VOL_EWMA_SPAN) if cfg else 20
-    all_returns = close_series.pct_change(fill_method=None).dropna()
+    all_returns = close_series.pct_change().dropna()
 
     vol_component = 0.5
     if len(all_returns) >= 5:
@@ -205,8 +208,8 @@ def compute_regime_score(
                 valid = (obs_count >= min_obs) & (sma_vals > 0) & sma_vals.notna() & last.notna()
                 if valid.any():
                     breadth_component = float(
-    (last[valid] > sma_vals.reindex(last[valid].index, fill_value=np.nan)).mean()  # defensive reindex for column-alignment safety
-)
+                        (last[valid] > sma_vals.reindex(last[valid].index, fill_value=np.nan)).mean()
+                    )  # defensive reindex for column-alignment safety
 
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     regime_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
@@ -344,17 +347,7 @@ def compute_adv(
         # in notional_cols; pd.NA is not recognised as a float by np.isfinite
         # (raises TypeError on older NumPy).  Cast to float first, treating NA
         # as 0.0 so the ADV gate treats the symbol as illiquid.
-        """_safe_adv operation.
-        
-        Args:
-            sym (str): Input parameter.
-        
-        Returns:
-            float: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Return ADV for symbol, defaulting to 0.0 if missing or invalid."""
         raw = adv_last_row.get(sym, 0.0)
         try:
             x = float(raw)

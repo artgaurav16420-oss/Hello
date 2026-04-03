@@ -554,12 +554,12 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
         )
 
     df = pd.read_csv(csv)
-    # BUG-HB-02: parse_dates is deprecated in pandas 2.x; use explicit pd.to_datetime instead.
-    df["date"] = pd.to_datetime(df["date"])
     if df.empty or "date" not in df.columns or "ticker" not in df.columns:
         raise ValueError(
             f"[HistoricalBuilder] CSV at {csv_path} is empty or missing required columns."
         )
+    # BUG-HB-02: parse_dates is deprecated in pandas 2.x; use explicit pd.to_datetime instead.
+    df["date"] = pd.to_datetime(df["date"])
 
     # Normalise tickers
     df["ticker"] = df["ticker"].astype(str).str.strip().apply(_ns_ticker)
@@ -950,6 +950,9 @@ def main() -> None:
     print("=" * 60)
 
     for universe in ("nifty500", "nse_total"):
+        if universe == "nse_total":
+            logger.info("[HistoricalBuilder] Skipping nse_total — no public historical archive exists.")
+            continue
         normalized_csv = DATA_DIR / f"historical_{universe}.csv"
         parquet_out = DATA_DIR / f"historical_{universe}.parquet"
 
@@ -998,7 +1001,7 @@ if __name__ == "__main__":
     if "--verify" in sys.argv:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         parquet_path = DATA_DIR / NIFTY500_PARQUET_FILENAME
-        verify_parquet(str(parquet_path))
-        sys.exit(0)
+        is_valid = verify_parquet(str(parquet_path))
+        sys.exit(0 if is_valid else 1)
 
     main()

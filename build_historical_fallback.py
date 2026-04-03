@@ -378,9 +378,10 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     tmp = Path(tmp_path)
     try:
         os.close(fd)
+        import pyarrow  # noqa: F401
         df.to_parquet(tmp, engine="pyarrow")
         os.replace(tmp, path)
-    except Exception:
+    except ImportError:
         tmp.unlink(missing_ok=True)
         fd2 = None
         tmp2 = None
@@ -757,8 +758,12 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
-        for tkr in (tickers if isinstance(tickers, list) else list(tickers)):
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
+        ticker_list = tickers if isinstance(tickers, list) else list(tickers)
+        if not ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
+        else:
+            for tkr in ticker_list:
+                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))
@@ -860,7 +865,10 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             df_existing = pd.read_parquet(parquet_path)
             wbm_rows: dict[pd.Timestamp, list] = {}
             for date_str, tickers in snapshots:
-                ts = pd.Timestamp(date_str)
+                try:
+                    ts = pd.Timestamp(date_str)
+                except Exception:
+                    continue
                 wbm_rows[ts] = sorted(set(tickers))
 
             wbm_dates_sorted = sorted(wbm_rows.keys())
@@ -1047,8 +1055,11 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         )
 
         df_check = pd.read_parquet(parquet_path)
-        first_row = df_check.iloc[0]["tickers"]
-        n_syms = len(first_row) if isinstance(first_row, list) else len(list(first_row))
+        if df_check.empty:
+            n_syms = 0
+        else:
+            first_row = df_check.iloc[0]["tickers"]
+            n_syms = len(first_row) if isinstance(first_row, list) else len(list(first_row))
         print(f"  ✓ {parquet_path}  |  {len(df_check)} snapshots  |  ~{n_syms} symbols/snapshot")
 
     print()

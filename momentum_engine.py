@@ -597,7 +597,10 @@ class PortfolioState:
             "last_known_prices":    _r(self.last_known_prices),
             "last_known_volatility":_r(self.last_known_volatility),
             "vol_hist":             {
-                k: [(pd.Timestamp(d).strftime("%Y-%m-%d"), float(v)) for d, v in vals]
+                k: {
+                    "maxlen": vals.maxlen,
+                    "data": [(pd.Timestamp(d).strftime("%Y-%m-%d"), float(v)) for d, v in vals],
+                }
                 for k, vals in sorted(self.vol_hist.items())
             },
             "decay_rounds":         self.decay_rounds,
@@ -752,10 +755,14 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
 
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
+    default_maxlen = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
     return {
         str(k): deque(
-            ((pd.Timestamp(d), float(vol)) for d, vol in vals),
-            maxlen=_maxlen,
+            (
+                (pd.Timestamp(d), float(vol))
+                for d, vol in (vals.get("data", []) if isinstance(vals, dict) else vals)
+            ),
+            maxlen=int(vals.get("maxlen", default_maxlen)) if isinstance(vals, dict) else default_maxlen,
         )
         for k, vals in value.items()
     }

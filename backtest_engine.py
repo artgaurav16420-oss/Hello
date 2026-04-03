@@ -255,8 +255,16 @@ class BacktestEngine:
                         self.state.cash = round(self.state.cash + _frac_proceeds, 10)
 
                     self.state.shares[sym] = new_shares
-                    old_entry = float(self.state.entry_prices.get(sym, price_now * max(split_ratio, 1e-12)))
-                    self.state.entry_prices[sym] = round(old_entry / max(split_ratio, 1e-12), 4)
+                    split_denom = max(split_ratio, 1e-12)
+                    if sym not in self.state.entry_prices:
+                        logger.warning(
+                            "[Backtest] Missing entry price for %s during split adjustment on %s; "
+                            "using current price as fallback instead of inferring a pre-split entry.",
+                            sym,
+                            date,
+                        )
+                    old_entry = float(self.state.entry_prices.get(sym, price_now))
+                    self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
                     pending_splits.pop(sym, None)
 
             # BUG-BE-06: Rebalance runs before dividend sweep so T+0 reinvestment
@@ -362,10 +370,11 @@ class BacktestEngine:
 
         if date_pos is None:
             _loc = close.index.get_loc(date)
-            assert isinstance(_loc, (int, np.integer)), (
-                f"Duplicate timestamp {date} detected in close index. "
-                "Deduplicate the index in build_precomputed_matrices before running backtest."
-            )
+            if not isinstance(_loc, (int, np.integer)):
+                raise ValueError(
+                    f"Duplicate timestamp {date} detected in close index. "
+                    "Deduplicate the index in build_precomputed_matrices before running backtest."
+                )
             date_pos = int(_loc)
         if log_rets_arr is None:
             log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
@@ -975,7 +984,7 @@ def _generate_synthetic_fill(
         return pd.DataFrame()
 
     pre_gap_close = pre_gap_df["Close"].loc[:gap_start]
-    pre_gap_rets = pre_gap_close.pct_change(fill_method=None).dropna()
+    pre_gap_rets = pre_gap_close.pct_change().dropna()
     hist_vol = float(pre_gap_rets.std()) if len(pre_gap_rets) > 10 else 0.02
 
     seed_material = f"{ticker}_{pd.Timestamp(gap_start).strftime('%Y%m%d')}"
@@ -1174,7 +1183,7 @@ def build_precomputed_matrices(
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
-    returns = returns_base.pct_change(fill_method=None).clip(lower=-0.99)
+    returns = returns_base.pct_change().clip(lower=-0.99)
     common_idx = returns.index.intersection(close.index)
     close = close.reindex(common_idx)
     close_adj = close_adj.reindex(common_idx)
@@ -1185,8 +1194,10 @@ def build_precomputed_matrices(
     splits_df = splits_df.reindex(common_idx).fillna(0.0)
     volume_df = volume_df.reindex(common_idx)
     returns = returns.reindex(common_idx)
-    assert (close.index == volume_df.index).all(), "close and volume index mismatch"
-    assert (close.index == returns.index).all(), "close and returns index mismatch after alignment"
+    if not close.index.equals(volume_df.index):
+        raise ValueError("close and volume index mismatch")
+    if not close.index.equals(returns.index):
+        raise ValueError("close and returns index mismatch after alignment")
 
     return {
         "close": close,
@@ -1871,7 +1882,7 @@ def _compute_metrics(
     final = float(eq.iloc[-1])
     cagr = _calc_cagr(eq, initial)
     _, max_dd = _calc_drawdown(eq)
-    dr = eq.pct_change(fill_method=None).dropna()
+    dr = eq.pct_change().dropna()
     sharpe, sortino = _calc_sharpe_sortino(dr, periods_per_year)
     calmar = _calc_calmar(cagr, max_dd)
 
