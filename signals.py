@@ -93,7 +93,12 @@ def compute_regime_score(
     last_is_today = False
     if isinstance(idx_hist.index, pd.DatetimeIndex) and len(idx_hist.index) > 0:
         last_is_today = idx_hist.index[-1].date() == reference_date
-    close_series = idx_hist["Close"].iloc[:-1] if last_is_today else idx_hist["Close"]
+    if last_is_today and len(idx_hist.index) > 1:
+        close_series = idx_hist["Close"].iloc[:-1]
+    else:
+        close_series = idx_hist["Close"]
+    if close_series.empty:
+        return 0.5
 
     sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50

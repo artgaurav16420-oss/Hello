@@ -21,6 +21,7 @@ CHANGES:
   and SIGNAL_LAG_DAYS as optional optimization dimensions.
 """
 import argparse
+import inspect
 import json
 import logging
 import math
@@ -863,22 +864,10 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         required_start = _actual_warmup_start,
         required_end   = _fetch_end,
     )
-    if cfg is not None:
+    load_or_fetch_params = inspect.signature(load_or_fetch).parameters
+    if cfg is not None and "cfg" in load_or_fetch_params:
         kwargs["cfg"] = cfg
-    try:
-        market_data = load_or_fetch(**kwargs)
-    except TypeError as _te:
-        if "unexpected keyword argument 'cfg'" not in str(_te):
-            raise
-        # FIX-MB-OPT-02: log the dropped parameter so forward-compatibility
-        # shims are visible during debugging rather than failing silently.
-        logger.warning(
-            "pre_load_data: dropped 'cfg' kwarg due to TypeError (%s). "
-            "load_or_fetch does not accept cfg; retrying without it.",
-            _te,
-        )
-        kwargs.pop("cfg", None)
-        market_data = load_or_fetch(**kwargs)
+    market_data = load_or_fetch(**kwargs)
 
     if getattr(cfg, "SIMULATE_HALTS", False):
         market_data = apply_halt_simulation(market_data)

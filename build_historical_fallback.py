@@ -47,10 +47,11 @@ def _bootstrap_env() -> None:
     """Load env vars from `.env` with optional python-dotenv dependency."""
     try:
         from dotenv import load_dotenv  # type: ignore
-        load_dotenv()
-    except Exception:
+    except ImportError:
         from log_config import load_dotenv_safe
         load_dotenv_safe()
+        return
+    load_dotenv()
 
 
 _bootstrap_env()
@@ -381,7 +382,7 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
         import pyarrow  # noqa: F401
         df.to_parquet(tmp, engine="pyarrow")
         os.replace(tmp, path)
-    except ImportError:
+    except Exception:
         tmp.unlink(missing_ok=True)
         fd2 = None
         tmp2 = None
@@ -759,9 +760,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
         ticker_list = tickers if isinstance(tickers, list) else list(tickers)
-        if not ticker_list:
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
-        else:
+        if ticker_list:
             for tkr in ticker_list:
                 csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
@@ -867,7 +866,8 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             for date_str, tickers in snapshots:
                 try:
                     ts = pd.Timestamp(date_str)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("[Hybrid] Skipping malformed snapshot date %r: %s", date_str, exc)
                     continue
                 wbm_rows[ts] = sorted(set(tickers))
 

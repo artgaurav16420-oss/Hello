@@ -263,7 +263,9 @@ class BacktestEngine:
                             sym,
                             date,
                         )
-                    old_entry = float(self.state.entry_prices.get(sym, price_now))
+                        old_entry = float(price_now * split_denom)
+                    else:
+                        old_entry = float(self.state.entry_prices[sym])
                     self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
                     pending_splits.pop(sym, None)
 
@@ -1183,7 +1185,7 @@ def build_precomputed_matrices(
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
-    returns = returns_base.pct_change().clip(lower=-0.99)
+    returns = (returns_base / returns_base.shift(1) - 1).clip(lower=-0.99)
     common_idx = returns.index.intersection(close.index)
     close = close.reindex(common_idx)
     close_adj = close_adj.reindex(common_idx)
