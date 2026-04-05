@@ -47,7 +47,6 @@ DATA_DIR             = Path("data")
 UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
-_ADV_MAX_WORKERS     = 1  # Reserved for future parallel ADV fetching. Currently unused; single-threaded fetch avoids data-provider rate-limit issues.
 
 # Default timeout for individual yfinance sector info calls (seconds).
 # Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.

@@ -20,6 +20,7 @@ BUG FIXES (murder board):
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import logging
 import os
@@ -375,13 +376,11 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     collisions across concurrent writers.
     """
     path = Path(path)
-    try:
-        import pyarrow  # noqa: F401
-    except ImportError as e:
+    if importlib.util.find_spec("pyarrow") is None:
         raise ImportError(
             f"pyarrow is required to write {path}. "
             "Install it with: pip install pyarrow"
-        ) from e
+        )
 
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
     tmp = Path(tmp_path)
