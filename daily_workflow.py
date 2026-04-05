@@ -111,6 +111,7 @@ from data_cache import load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
 from signals import generate_signals, compute_adv, compute_regime_score
 from log_config import ScanContext, DeadLetterTracker
+from shared_utils import atomic_write_file
 from shared_constants import (
     COLUMN_STOCK_SPLITS,
     TIMEZONE_IST,
@@ -181,20 +182,16 @@ class CircuitBreaker:
             try:
                 os.makedirs("data", exist_ok=True)
                 snapshot = int(self.count)
-                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"consecutive_empty": snapshot}))
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp, path)
-                # Fsync parent directory to ensure rename is durable
-                parent_dir = pathlib.Path(path).parent
-                if os.name == "posix":
-                    dir_fd = os.open(str(parent_dir), getattr(os, "O_DIRECTORY", 0))
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
+                atomic_write_file(
+                    pathlib.Path(path),
+                    lambda tmp: tmp.write_text(
+                        json.dumps({"consecutive_empty": snapshot}),
+                        encoding="utf-8",
+                    ),
+                    suffix=".tmp",
+                    fsync_file=True,
+                    fsync_dir=True,
+                )
                 if pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).exists():
                     pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE).unlink()
             except Exception as exc:
@@ -230,22 +227,17 @@ def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Pat
     """
     os.makedirs("data", exist_ok=True)
     path = _pending_sentinel_path(name)
-    tmp_path = path.with_suffix(f"{path.suffix}.{uuid.uuid4().hex}.tmp")
     payload = {
         "date": date_str,
         "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
     }
-    with tmp_path.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload))
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_path, path)
-    if os.name == "posix":
-        dir_fd = os.open(str(path.parent), getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+    atomic_write_file(
+        path,
+        lambda tmp: tmp.write_text(json.dumps(payload), encoding="utf-8"),
+        suffix=".tmp",
+        fsync_file=True,
+        fsync_dir=True,
+    )
     return path
 
 
@@ -2658,8 +2650,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
-
 
 
 

@@ -4,7 +4,7 @@ build_historical_fallback.py
 Generate point-in-time (PIT) universe parquets for survivorship-safe backtests.
 
 BUG FIXES (murder board):
-- FIX-MB-DUPNS: The module previously defined _ns() twice at module level. The
+- FIX-MB-DUPNS: The module previously defined normalize_ns_ticker() twice at module level. The
   second definition (line ~130) silently shadowed the first. Both were identical
   in the original code, but any future edit to one would not affect the other.
   Fixed by removing the duplicate; a single definition is kept at the top of
@@ -24,7 +24,6 @@ import importlib.util
 import io
 import logging
 import os
-import tempfile
 import threading
 import time
 import random
@@ -42,6 +41,16 @@ import osqp  # noqa: F401
 import numpy as np
 import pandas as pd
 import requests
+
+from shared_utils import (
+    NSE_DEFAULT_HEADERS,
+    NSE_URL_EQUITY_MASTER_CSV,
+    NSE_URL_NIFTY500_CSV,
+    NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
+    atomic_write_file,
+    fetch_nse_csv,
+    normalize_ns_ticker,
+)
 
 
 def _bootstrap_env() -> None:
@@ -67,8 +76,8 @@ _WBM_MIN_SNAPSHOTS    = 2
 _WBM_SLEEP_SECS       = 0.3
 
 _NSE_N500_CSV_URLS = [
-    "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
-    "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+    NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
+    NSE_URL_NIFTY500_CSV,
     "https://www1.nseindia.com/content/indices/ind_nifty500list.csv",
 ]
 _NSE_N500_CSV_URL = _NSE_N500_CSV_URLS[0]
@@ -82,21 +91,15 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 
-NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-}
+NSE_HEADERS = NSE_DEFAULT_HEADERS
 
 NSE_SOURCES = {
     "nifty500": [
-        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
-        "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
+        NSE_URL_NIFTY500_CSV,
+        NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
     ],
     "nse_total": [
-        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+        NSE_URL_EQUITY_MASTER_CSV,
     ],
     "nifty500_changes": [
         "https://archives.nseindia.com/content/indices/ind_nifty500_change_notice.csv",
@@ -119,14 +122,8 @@ _NSE_SESSION: "requests.Session | None" = None  # FIX-10
 _NSE_SESSION_LOCK = threading.Lock()
 
 
-# FIX-MB-DUPNS: Single canonical definition of _ns(). The original module had
+# FIX-MB-DUPNS: Single canonical definition of normalize_ns_ticker(). The original module had
 # two definitions; the second shadowed the first. Removed the duplicate.
-def _ns(sym: str) -> str:
-    """Return sym with exactly one '.NS' suffix, upper-cased."""
-    s = str(sym).strip().upper()
-    return s if s.endswith(".NS") or s.startswith("^") else f"{s}.NS"
-
-
 def _get_nse_session() -> requests.Session:
     """Create and warm a singleton session for NSE requests."""
     global _NSE_SESSION
@@ -281,7 +278,7 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
     for col in ("symbol", "symbols", "ticker", "nse symbol", "nse_symbol"):
         if col in df.columns:
             raw = df[col].dropna().astype(str).str.strip()
-            tickers = [_ns(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")]
+            tickers = [t for t in (normalize_ns_ticker(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")) if t]
             if tickers:
                 return sorted(set(tickers))
     logger.warning("[Wayback] Fallback regex parsing path entered; CSV columns: %s", list(df.columns))  # FIX-12
@@ -294,7 +291,7 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
             v = val.strip().upper()
             if pattern.match(v) and v not in skip:
                 counts[v] = counts.get(v, 0) + 1  # FIX-12
-    found = sorted(_ns(sym) for sym, cnt in counts.items() if cnt >= MIN_TICKER_OCCURRENCES)  # FIX-12
+    found = sorted(t for t in (normalize_ns_ticker(sym) for sym, cnt in counts.items() if cnt >= MIN_TICKER_OCCURRENCES) if t)  # FIX-12
     if len(found) < 10:
         logger.warning("[Wayback] Fallback regex parser yielded fewer than 10 tickers (%d).", len(found))  # FIX-12
     return found
@@ -357,24 +354,7 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
 
 
 def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
-    """
-    Write *df* to *path* as a Parquet file using atomic write with unique temp file.
-
-    FIX-BUG-16: all four ``to_parquet`` calls in this module previously used
-    the default engine.  ``universe_manager._load_historical_universe_df``
-    reads with ``engine='pyarrow'`` (pinned in FIX-NEW-UM-02), and
-    ``historical_builder.build_parquet_from_csv`` also pins pyarrow on write
-    (FIX-NEW-HB-01).  If the system default engine is ``fastparquet``, Python
-    ``list`` values in the ``tickers`` column do not round-trip through a
-    pyarrow read, producing either a read error or stringified lists instead
-    of real Python lists, breaking ``_coerce_historical_members`` in
-    ``universe_manager``.  Pinning the same engine on both sides of the
-    parquet channel ensures deterministic list round-trips regardless of
-    which engines are installed.
-
-    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
-    collisions across concurrent writers.
-    """
+    """Write parquet via shared atomic writer."""
     path = Path(path)
     if importlib.util.find_spec("pyarrow") is None:
         raise ImportError(
@@ -382,34 +362,24 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
             "Install it with: pip install pyarrow"
         )
 
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
-    tmp = Path(tmp_path)
-    try:
-        os.close(fd)
-        df.to_parquet(tmp, engine="pyarrow")
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write_file(
+        path,
+        lambda tmp: df.to_parquet(tmp, engine="pyarrow"),
+        suffix=".tmp.parquet",
+        fsync_file=True,
+        fsync_dir=True,
+    )
 
 
 def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
-    """
-    Write *df* to *path* as a CSV file using atomic write with unique temp file.
-
-    FIX-ATOMIC-WRITE: Uses unique temp file via tempfile.mkstemp to avoid
-    collisions across concurrent writers.
-    """
-    path = Path(path)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.csv", prefix=".tmp_")
-    tmp = Path(tmp_path)
-    try:
-        os.close(fd)
-        df.to_csv(tmp, **kwargs)
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    """Write CSV via shared atomic writer."""
+    atomic_write_file(
+        Path(path),
+        lambda tmp: df.to_csv(tmp, **kwargs),
+        suffix=".tmp.csv",
+        fsync_file=True,
+        fsync_dir=True,
+    )
 
 
 # Backward compatibility alias
@@ -512,20 +482,21 @@ def fetch_nifty500_current() -> List[str]:
     """Download current Nifty 500 constituent list from NSE India."""
     for url in NSE_SOURCES["nifty500"]:
         logger.info("  Trying: %s", url)
-        resp = _fetch_with_retry(url)
-        if resp is None:
-            continue
         try:
-            df = pd.read_csv(io.StringIO(resp.text))
+            session = _get_nse_session()
+            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS, session=session)
             df.columns = [c.strip().upper() for c in df.columns]
             sym_col = next((c for c in ["SYMBOL", "TICKER", "COMPANY SYMBOL"] if c in df.columns), None)
             if sym_col is None:
                 logger.warning("  Could not find SYMBOL column in CSV. Columns: %s", list(df.columns))
                 continue
-            syms = [_ns(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s]
+            syms = [t for t in (normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s) if t]
             if len(syms) >= 100:
                 logger.info("  ✓ Fetched %d Nifty 500 symbols.", len(syms))
                 return sorted(syms)
+        except requests.ConnectionError as exc:
+            logger.warning("  Connection error for %s, invalidating session: %s", url, exc)
+            _invalidate_nse_session()
         except Exception as exc:
             logger.warning("  Parse error: %s", exc, exc_info=True)
 
@@ -537,21 +508,22 @@ def fetch_nse_total_current() -> List[str]:
     """Download current NSE Total equity list from NSE India."""
     for url in NSE_SOURCES["nse_total"]:
         logger.info("  Trying: %s", url)
-        resp = _fetch_with_retry(url)
-        if resp is None:
-            continue
         try:
-            df = pd.read_csv(io.StringIO(resp.text))
+            session = _get_nse_session()
+            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS, session=session)
             df.columns = [c.strip().upper() for c in df.columns]
             if "SERIES" in df.columns:
                 df = df[df["SERIES"].str.strip() == "EQ"]
             sym_col = next((c for c in ["SYMBOL", "TICKER"] if c in df.columns), None)
             if sym_col is None:
                 continue
-            syms = [_ns(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s]
+            syms = [t for t in (normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s) if t]
             if len(syms) >= 500:
                 logger.info("  ✓ Fetched %d NSE Total equity symbols.", len(syms))
                 return sorted(syms)
+        except requests.ConnectionError as exc:
+            logger.warning("  Connection error for %s, invalidating session: %s", url, exc)
+            _invalidate_nse_session()
         except Exception as exc:
             logger.warning("  Parse error: %s", exc, exc_info=True)
 
@@ -569,7 +541,7 @@ def fetch_via_nsepy(universe_type: str) -> List[str]:
                 if universe_type == "nifty500":
                     stocks = nse.get_index_quote("cnx nifty 500")
                     if stocks:
-                        return sorted([_ns(s) for s in stocks.keys()])
+                        return sorted([t for t in (normalize_ns_ticker(s) for s in stocks.keys()) if t])
             except Exception:
                 pass
     except Exception:
@@ -795,7 +767,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             symbols = fetch_via_nsepy("nifty500")
         if not symbols:
             logger.warning("All network sources failed — using Nifty 50 hard-floor.")
-            symbols = [_ns(s) for s in NIFTY50_CORE]
+            symbols = [normalize_ns_ticker(s) for s in NIFTY50_CORE]
 
         market_data = load_or_fetch(
             symbols, start_date, TODAY_UTC.strftime("%Y-%m-%d"), cfg=cfg
@@ -996,7 +968,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         symbols = fetch_nse_total_current()
 
         if not symbols:
-            symbols = [_ns(s) for s in NIFTY50_CORE]
+            symbols = [normalize_ns_ticker(s) for s in NIFTY50_CORE]
             logger.warning("NSE Total fetch failed — using Nifty 50 hard-floor.")
 
         logger.info("Fetching market data for volume-gate PIT construction...")

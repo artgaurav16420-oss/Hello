@@ -35,6 +35,12 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from shared_utils import (
+    NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
+    fetch_nse_csv,
+    normalize_ns_ticker,
+)
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
@@ -51,7 +57,7 @@ REMOTE_ARCHIVE_URLS: dict[str, list[str]] = {
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Official NSE constituent CSV URLs (current)
-_NSE_NIFTY500_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
+_NSE_NIFTY500_CSV_URL = NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV
 
 # Wayback Machine endpoints
 _WBM_CDX_URL   = "https://web.archive.org/cdx/search/cdx"
@@ -76,17 +82,6 @@ _HEADERS = {
 }
 
 # ── Ticker normalisation ───────────────────────────────────────────────────────
-
-def _ns_ticker(sym: str) -> str:
-    """Return sym with exactly one '.NS' suffix, upper-cased."""
-    sym = sym.strip().upper()
-    if sym.startswith("^"):
-        return sym
-    # Remove any existing .NS / .BO / .BSE suffix
-    for sfx in (".NS", ".BO", ".BSE"):
-        if sym.endswith(sfx):
-            sym = sym[: -len(sfx)]
-    return sym + ".NS"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,7 +168,7 @@ def _extract_symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
     for col in ("symbol", "symbols", "ticker", "nse symbol", "nse_symbol"):
         if col in df.columns:
             raw = df[col].dropna().astype(str).str.strip()
-            tickers = [_ns_ticker(s) for s in raw if s and s.upper() != "SYMBOL"]
+            tickers = [t for t in (normalize_ns_ticker(s) for s in raw if s and s.upper() != "SYMBOL") if t]
             if tickers:
                 return sorted(set(tickers))
 
@@ -185,7 +180,7 @@ def _extract_symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
         for val in df[col].dropna().astype(str):
             v = val.strip().upper()
             if pattern.match(v) and v not in {"SERIES", "ISIN", "INDUSTRY", "NAME"}:
-                candidates.add(_ns_ticker(v))
+                candidates.add(normalize_ns_ticker(v))
 
     return sorted(candidates)
 
@@ -389,13 +384,7 @@ def _build_pit_csv_from_yfinance_approx(
     # that way stocks that fell out of Nifty 500 are still represented.
     print("[HistoricalBuilder] Fetching current Nifty 500 list from NSE...")
     try:
-        resp = requests.get(
-            _NSE_NIFTY500_CSV_URL,
-            headers=_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        nse_df = pd.read_csv(io.BytesIO(resp.content), encoding="latin-1")
+        nse_df = fetch_nse_csv(_NSE_NIFTY500_CSV_URL, timeout=30, headers=_HEADERS)
         current_n500 = _extract_symbols_from_nse_csv(nse_df)
         print(f"  Got {len(current_n500)} current Nifty 500 members.")
     except Exception as exc:
@@ -563,7 +552,7 @@ def build_parquet_from_csv(csv_path: str, output_path: str) -> Path:
     df = df[df["date"].notna()].copy()
 
     # Normalise tickers
-    df["ticker"] = df["ticker"].astype(str).str.strip().apply(_ns_ticker)
+    df["ticker"] = df["ticker"].astype(str).str.strip().apply(normalize_ns_ticker)
     df = df[df["ticker"].str.endswith(".NS")]
 
     # Group by snapshot date → sorted unique ticker list
@@ -886,7 +875,8 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     out = out[out["date"].notna()].copy()
-    out["ticker"] = out["ticker"].astype(str).str.strip().map(_ns_ticker)
+    out["ticker"] = out["ticker"].astype(str).str.strip().map(normalize_ns_ticker)
+    out = out[out["ticker"] != ""]
     out = out[["date", "ticker"]].drop_duplicates().sort_values(["date", "ticker"]).reset_index(drop=True)
     return out
 
@@ -994,7 +984,8 @@ def main() -> None:
             raise ValueError(f"[HistoricalBuilder] Unsupported archive schema for {raw_path}.")
 
         tmp.columns = [c.lower() for c in tmp.columns]
-        tmp["ticker"] = tmp["ticker"].astype(str).map(_ns_ticker)
+        tmp["ticker"] = tmp["ticker"].astype(str).map(normalize_ns_ticker)
+        tmp = tmp[tmp["ticker"] != ""]
         tmp[["date", "ticker"]].to_csv(normalized_csv, index=False)
         build_parquet_from_csv(str(normalized_csv), str(parquet_out))
 
