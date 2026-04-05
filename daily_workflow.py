@@ -61,11 +61,6 @@ BUG FIXES (murder board):
 from __future__ import annotations
 import importlib.util
 
-if importlib.util.find_spec("dotenv") is not None:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
 import argparse
 import copy
 import hashlib
@@ -831,7 +826,9 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 if not positive_splits.empty and sym in state.shares:
                     marker_key = f"split:{sym}"
                     raw_markers = state.dividend_ledger.get(marker_key, "")
-                    if isinstance(raw_markers, list):  # legacy bad serialization
+                    if isinstance(raw_markers, str):
+                        applied_event_ids = {m for m in raw_markers.split("|") if m}
+                    elif isinstance(raw_markers, (list, tuple, set)):
                         applied_event_ids = {str(v) for v in raw_markers if str(v)}
                     else:
                         raw = str(raw_markers or "")
@@ -1831,11 +1828,11 @@ def _run_scan(
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             pending = _load_pending_sentinel(name=name)  # ARCH-FIX-3
-            if pending and pending.get("date") == today.strftime("%Y-%m-%d"):
+            if pending and pending.get("date") == session_date.strftime("%Y-%m-%d"):
                 logger.warning("Rebalance already committed for today, skipping")
                 return state, market_data
             token = str(uuid.uuid4())
-            if not _try_claim_pending_sentinel(name=name, token=token, date_str=today.strftime("%Y-%m-%d")):
+            if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
                 logger.warning("Rebalance claim already exists for today, skipping")
                 return state, market_data
             _write_pending_sentinel(
@@ -2651,7 +2648,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

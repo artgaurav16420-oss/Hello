@@ -1909,4 +1909,3 @@ def _compute_metrics(
         "hit_rate": round(hit_rate, 2),
         "turnover": round(turnover, 4),
     }
-

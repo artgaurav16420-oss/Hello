@@ -47,10 +47,11 @@ def _bootstrap_env() -> None:
     """Load env vars from `.env` with optional python-dotenv dependency."""
     try:
         from dotenv import load_dotenv  # type: ignore
-        load_dotenv()
-    except Exception:
+    except ImportError:
         from log_config import load_dotenv_safe
         load_dotenv_safe()
+        return
+    load_dotenv()
 
 
 _bootstrap_env()
@@ -863,7 +864,8 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             for date_str, tickers in snapshots:
                 try:
                     ts = pd.Timestamp(date_str)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("[Hybrid] Skipping malformed snapshot date %r: %s", date_str, exc)
                     continue
                 wbm_rows[ts] = sorted(set(tickers))
 
