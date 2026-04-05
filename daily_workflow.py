@@ -1019,7 +1019,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             os.replace(tmp, risk_file)
             if os.name == "posix":
                 dir_path = os.path.dirname(risk_file) or "."
-                dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY)
+                dir_fd = os.open(dir_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                 try:
                     os.fsync(dir_fd)
                 finally:
