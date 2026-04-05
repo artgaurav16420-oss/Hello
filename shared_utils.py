@@ -25,21 +25,33 @@ NSE_DEFAULT_HEADERS: dict[str, str] = {
 }
 
 
+_NULL_LIKE_SYMBOLS: frozenset[str] = frozenset({
+    "NAN", "NONE", "NULL", "NA", "N/A", "NAT", "<NA>", "NIL",
+})
+
+
 def normalize_ns_ticker(sym: str) -> str:
     """Return symbol normalized to uppercase NSE format with a `.NS` suffix.
+
+    Returns an empty string for None, NaN-like, or suffix-only inputs so
+    callers can filter invalid results with a simple truthiness check.
 
     - Preserves index symbols beginning with `^`.
     - Removes trailing `.NS`, `.BO`, `.BSE` first, then appends `.NS`.
     """
+    if sym is None:
+        return ""
     symbol = str(sym).strip().upper()
-    if not symbol:
-        return symbol
+    if not symbol or symbol in _NULL_LIKE_SYMBOLS:
+        return ""
     if symbol.startswith("^"):
         return symbol
     for sfx in (".NS", ".BO", ".BSE"):
         if symbol.endswith(sfx):
             symbol = symbol[: -len(sfx)]
             break
+    if not symbol:
+        return ""
     return f"{symbol}.NS"
 
 
@@ -133,14 +145,17 @@ def atomic_write_file(
                 os.fsync(fh.fileno())
 
         os.replace(tmp_path, dst)
-
-        if fsync_dir and os.name == "posix":
-            dir_fd = os.open(str(dst.parent), getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        return dst
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
+
+    # fsync the directory after a successful rename so the new name is durable.
+    # This runs outside the cleanup try/except: tmp_path no longer exists at
+    # this point and there is nothing to unlink even if fsync_dir fails.
+    if fsync_dir and os.name == "posix":
+        dir_fd = os.open(str(dst.parent), getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    return dst
