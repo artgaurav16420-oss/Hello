@@ -19,7 +19,7 @@ NSE_DEFAULT_HEADERS: dict[str, str] = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/csv,application/csv,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/csv,application/csv,text/html;q=0.1,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/",
 }
@@ -75,26 +75,37 @@ def fetch_nse_csv(
         merged_headers.update(headers)
 
     last_error: Exception | None = None
-    for attempt in range(retries):
+    response_content: bytes | None = None
+
+    # Retry loop - execute at least once even when retries=0
+    for attempt in range(max(1, retries)):
         try:
             client = session or requests
             response = client.get(url, headers=merged_headers, timeout=timeout)
             response.raise_for_status()
-            if encoding is not None:
-                return pd.read_csv(io.BytesIO(response.content), encoding=encoding)
-            for enc in ("utf-8", "latin-1", "cp1252"):
-                try:
-                    return pd.read_csv(io.BytesIO(response.content), encoding=enc)
-                except Exception:
-                    continue
-            return pd.read_csv(io.StringIO(response.text))
-        except Exception as exc:
+            response_content = response.content
+            break
+        except requests.RequestException as exc:
             last_error = exc
-            if attempt < retries - 1:
+            if attempt < max(1, retries) - 1:
                 time.sleep(backoff_seconds * (2 ** attempt))
 
-    assert last_error is not None
-    raise last_error
+    # If all retry attempts failed, re-raise the transport exception
+    if response_content is None:
+        if last_error is not None:
+            raise last_error
+        raise requests.RequestException("Failed to fetch CSV: no content retrieved")
+
+    # Parse CSV outside retry loop to avoid retrying parse errors
+    if encoding is not None:
+        return pd.read_csv(io.BytesIO(response_content), encoding=encoding)
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return pd.read_csv(io.BytesIO(response_content), encoding=enc)
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    # Final fallback: decode as text and let pandas handle it
+    return pd.read_csv(io.StringIO(response_content.decode("utf-8", errors="replace")))
 
 
 def atomic_write_file(

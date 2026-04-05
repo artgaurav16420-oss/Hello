@@ -168,7 +168,7 @@ def _extract_symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
     for col in ("symbol", "symbols", "ticker", "nse symbol", "nse_symbol"):
         if col in df.columns:
             raw = df[col].dropna().astype(str).str.strip()
-            tickers = [normalize_ns_ticker(s) for s in raw if s and s.upper() != "SYMBOL"]
+            tickers = [t for t in (normalize_ns_ticker(s) for s in raw if s and s.upper() != "SYMBOL") if t]
             if tickers:
                 return sorted(set(tickers))
 

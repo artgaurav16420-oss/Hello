@@ -31,7 +31,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -609,7 +609,12 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
     lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
 
-    now_ist = datetime.now(ZoneInfo(TIMEZONE_IST))
+    try:
+        tz_ist = ZoneInfo(TIMEZONE_IST)
+    except ZoneInfoNotFoundError:
+        # Fallback to fixed offset UTC+05:30 when IANA database is unavailable
+        tz_ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz_ist)
     end_date = now_ist.strftime("%Y-%m-%d")
     start_date = (now_ist - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 

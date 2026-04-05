@@ -278,7 +278,7 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
     for col in ("symbol", "symbols", "ticker", "nse symbol", "nse_symbol"):
         if col in df.columns:
             raw = df[col].dropna().astype(str).str.strip()
-            tickers = [normalize_ns_ticker(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")]
+            tickers = [t for t in (normalize_ns_ticker(s) for s in raw if s and s.upper() not in ("SYMBOL", "TICKER", "")) if t]
             if tickers:
                 return sorted(set(tickers))
     logger.warning("[Wayback] Fallback regex parsing path entered; CSV columns: %s", list(df.columns))  # FIX-12
@@ -291,7 +291,7 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
             v = val.strip().upper()
             if pattern.match(v) and v not in skip:
                 counts[v] = counts.get(v, 0) + 1  # FIX-12
-    found = sorted(normalize_ns_ticker(sym) for sym, cnt in counts.items() if cnt >= MIN_TICKER_OCCURRENCES)  # FIX-12
+    found = sorted(t for t in (normalize_ns_ticker(sym) for sym, cnt in counts.items() if cnt >= MIN_TICKER_OCCURRENCES) if t)  # FIX-12
     if len(found) < 10:
         logger.warning("[Wayback] Fallback regex parser yielded fewer than 10 tickers (%d).", len(found))  # FIX-12
     return found
@@ -366,6 +366,8 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
         path,
         lambda tmp: df.to_parquet(tmp, engine="pyarrow"),
         suffix=".tmp.parquet",
+        fsync_file=True,
+        fsync_dir=True,
     )
 
 
@@ -375,6 +377,8 @@ def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
         Path(path),
         lambda tmp: df.to_csv(tmp, **kwargs),
         suffix=".tmp.csv",
+        fsync_file=True,
+        fsync_dir=True,
     )
 
 
@@ -485,7 +489,7 @@ def fetch_nifty500_current() -> List[str]:
             if sym_col is None:
                 logger.warning("  Could not find SYMBOL column in CSV. Columns: %s", list(df.columns))
                 continue
-            syms = [normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s]
+            syms = [t for t in (normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s) if t]
             if len(syms) >= 100:
                 logger.info("  ✓ Fetched %d Nifty 500 symbols.", len(syms))
                 return sorted(syms)
@@ -508,7 +512,7 @@ def fetch_nse_total_current() -> List[str]:
             sym_col = next((c for c in ["SYMBOL", "TICKER"] if c in df.columns), None)
             if sym_col is None:
                 continue
-            syms = [normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s]
+            syms = [t for t in (normalize_ns_ticker(s) for s in df[sym_col].dropna().astype(str).str.strip().unique() if s) if t]
             if len(syms) >= 500:
                 logger.info("  ✓ Fetched %d NSE Total equity symbols.", len(syms))
                 return sorted(syms)
@@ -529,7 +533,7 @@ def fetch_via_nsepy(universe_type: str) -> List[str]:
                 if universe_type == "nifty500":
                     stocks = nse.get_index_quote("cnx nifty 500")
                     if stocks:
-                        return sorted([normalize_ns_ticker(s) for s in stocks.keys()])
+                        return sorted([t for t in (normalize_ns_ticker(s) for s in stocks.keys()) if t])
             except Exception:
                 pass
     except Exception:
