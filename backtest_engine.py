@@ -47,7 +47,7 @@ import logging
 import hashlib
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -85,18 +85,6 @@ from shared_constants import (
 logger = logging.getLogger(__name__)
 _REBALANCE_SNAP_WINDOW_DAYS = 5
 _SUSPENSION_GAP_DAYS = 30
-
-
-def _parse_bool_env(name: str, default: bool = False) -> bool:
-    raw = str(os.environ.get(name, str(default))).strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off", ""}:
-        return False
-    return default
-
-
-_ENABLE_REBAL_PLACEHOLDERS = _parse_bool_env("ENABLE_REBAL_PLACEHOLDERS", default=False)
 
 
 # ─── Results container ────────────────────────────────────────────────────────
@@ -347,15 +335,6 @@ class BacktestEngine:
             Exception: Propagates runtime, validation, I/O, or provider errors.
         """
         cfg = self.engine.cfg
-        # TODO(refactor follow-up): structural placeholder hooks.
-        # These _rebal_* helpers are no-op scaffolding while logic remains inline below;
-        # return values are intentionally discarded until phased extraction is completed.
-        if _ENABLE_REBAL_PLACEHOLDERS:
-            _rebal_filter_universe(
-                state=self.state,
-                symbols=symbols,
-                member_universe=member_universe,
-            )
 
         sym_to_global_idx = {sym: i for i, sym in enumerate(symbols)}
 
@@ -382,14 +361,6 @@ class BacktestEngine:
             log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
 
         col_to_idx = {sym: i for i, sym in enumerate(close.columns)}
-        if _ENABLE_REBAL_PLACEHOLDERS:
-            _rebal_build_valuation(
-                state=self.state,
-                close=close,
-                volume=volume,
-                date=date,
-                active_symbols=active_symbols,
-            )
         prev_idx = date_pos - 1
         if prev_idx < 0:
             return
@@ -482,14 +453,6 @@ class BacktestEngine:
         soft_cvar_breach       = False
 
         if self.state.shares:
-            if _ENABLE_REBAL_PLACEHOLDERS:
-                _rebal_check_cvar_breach(
-                    state=self.state,
-                    valuation_prices=valuation_prices,
-                    active_symbols=active_symbols,
-                    hist_log_rets=hist_log_rets,
-                    cfg=cfg,
-                )
             book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
@@ -514,13 +477,6 @@ class BacktestEngine:
                 )
 
         if not _force_full_cash:
-            if _ENABLE_REBAL_PLACEHOLDERS:
-                _rebal_generate_targets(
-                    state=self.state,
-                    hist_log_rets=hist_log_rets,
-                    adv_vector=adv_vector,
-                    cfg=cfg,
-                )
             try:
                 raw_daily, adj_scores, sel_idx, _gate_counts = generate_signals(
                     hist_log_rets,
@@ -616,13 +572,6 @@ class BacktestEngine:
                 )
 
         if optimization_succeeded or apply_decay:
-            if _ENABLE_REBAL_PLACEHOLDERS:
-                _rebal_execute_trades(
-                    state=self.state,
-                    target_weights=target_weights,
-                    active_symbols=active_symbols,
-                    date=date,
-                )
             _T = min(len(hist_log_rets), self.engine.cfg.CVAR_LOOKBACK)
             _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
 
@@ -1399,138 +1348,6 @@ def _snap_rebalance_dates_to_holidays(
             else:
                 snapped_universe[snapped_key] = set(members)
     return rebal_dates, snapped_universe if snapped_universe else universe_by_rebalance_date
-
-
-class _RebalFilterHookPayload(TypedDict):
-    state_cash: float
-    n_symbols: int
-    has_member_universe: bool
-
-
-class _RebalValuationHookPayload(TypedDict):
-    date: str
-    n_active_symbols: int
-
-
-class _RebalCvarHookPayload(TypedDict):
-    n_active_symbols: int
-    has_positions: bool
-
-
-class _RebalTargetsHookPayload(TypedDict):
-    n_rows: int
-    n_assets: int
-
-
-class _RebalExecutionHookPayload(TypedDict):
-    date: str
-    n_targets: int
-
-
-def _rebal_filter_universe(
-    state: PortfolioState,
-    symbols: List[str],
-    member_universe: Optional[set[str]],
-) -> _RebalFilterHookPayload:
-    """_rebal_filter_universe operation.
-
-    TODO: implement steps 1-2 of rebalance flow:
-    - apply date/member universe eligibility
-    - include currently held symbols even if not in fresh universe
-    - return normalized symbol list and index mappings consumed by later phases
-    Current behavior: returns opaque payload and caller ignores return value.
-    """
-    return {
-        "state_cash": float(state.cash),
-        "n_symbols": int(len(symbols)),
-        "has_member_universe": member_universe is not None,
-    }
-
-
-def _rebal_build_valuation(
-    state: PortfolioState,
-    close: pd.DataFrame,
-    volume: pd.DataFrame,
-    date: pd.Timestamp,
-    active_symbols: List[str],
-) -> _RebalValuationHookPayload:
-    """_rebal_build_valuation operation.
-
-    TODO: implement steps 3-6:
-    - build ADV vector and valuation-price series
-    - compute portfolio value and previous weights
-    - return valuation bundle for CVaR/optimizer phases
-    Current behavior: returns opaque payload and caller ignores return value.
-    """
-    _ = (state, close, volume)
-    return {
-        "date": str(pd.Timestamp(date).date()),
-        "n_active_symbols": int(len(active_symbols)),
-    }
-
-
-def _rebal_check_cvar_breach(
-    state: PortfolioState,
-    valuation_prices: np.ndarray,
-    active_symbols: List[str],
-    hist_log_rets: pd.DataFrame,
-    cfg: UltimateConfig,
-) -> _RebalCvarHookPayload:
-    """_rebal_check_cvar_breach operation.
-
-    TODO: implement steps 8-10:
-    - compute book CVaR on valuation state
-    - set soft/hard breach flags and override/decay triggers
-    - return breach decision state used by target generation phase
-    Current behavior: returns opaque payload and caller ignores return value.
-    """
-    _ = (valuation_prices, hist_log_rets, cfg)
-    return {
-        "n_active_symbols": int(len(active_symbols)),
-        "has_positions": bool(state.shares),
-    }
-
-
-def _rebal_generate_targets(
-    state: PortfolioState,
-    hist_log_rets: pd.DataFrame,
-    adv_vector: np.ndarray,
-    cfg: UltimateConfig,
-) -> _RebalTargetsHookPayload:
-    """_rebal_generate_targets operation.
-
-    TODO: implement steps 11-13:
-    - generate signals and selection set
-    - call optimizer with failure handling and decay fallback
-    - return target weights plus flags (apply_decay, forced_to_cash)
-    Current behavior: returns opaque payload and caller ignores return value.
-    """
-    _ = (state, adv_vector, cfg)
-    return {
-        "n_rows": int(hist_log_rets.shape[0]),
-        "n_assets": int(hist_log_rets.shape[1]),
-    }
-
-
-def _rebal_execute_trades(
-    state: PortfolioState,
-    target_weights: np.ndarray,
-    active_symbols: List[str],
-    date: pd.Timestamp,
-) -> _RebalExecutionHookPayload:
-    """_rebal_execute_trades operation.
-
-    TODO: implement step 14:
-    - resolve execution prices (open/close fallback rules)
-    - invoke execute_rebalance and capture trade/slippage effects
-    - return execution summary for rebalance audit row construction
-    Current behavior: returns opaque payload and caller ignores return value.
-    """
-    _ = (state, active_symbols)
-    return {
-        "date": str(pd.Timestamp(date).date()),
-        "n_targets": int(len(target_weights)),
-    }
 
 
 def run_backtest(

@@ -20,6 +20,7 @@ BUG FIXES (murder board):
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import io
 import logging
 import os
@@ -355,13 +356,11 @@ def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list
 def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     """Write parquet via shared atomic writer."""
     path = Path(path)
-    try:
-        import pyarrow  # noqa: F401
-    except ImportError as e:
+    if importlib.util.find_spec("pyarrow") is None:
         raise ImportError(
             f"pyarrow is required to write {path}. "
             "Install it with: pip install pyarrow"
-        ) from e
+        )
 
     atomic_write_file(
         path,
