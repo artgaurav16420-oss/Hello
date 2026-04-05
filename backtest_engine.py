@@ -266,8 +266,7 @@ class BacktestEngine:
                             sym,
                             date,
                         )
-                        old_entry = float(price_now * split_denom)
-                        self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
+                        self.state.entry_prices[sym] = round(float(price_now), 4)
                     pending_splits.pop(sym, None)
 
             # BUG-BE-06: Rebalance runs before dividend sweep so T+0 reinvestment

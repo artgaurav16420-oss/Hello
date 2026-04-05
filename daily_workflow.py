@@ -1744,7 +1744,7 @@ def _run_scan(
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             valid_days = None
             expected_session_date = pd.Timestamp.now(tz=TIMEZONE_IST).normalize()
-            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).tz_localize(None)
+            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).replace(tzinfo=None)
             try:
                 import pandas_market_calendars as mcal
 
@@ -1756,7 +1756,7 @@ def _run_scan(
                 if len(valid_days) > 0:
                     expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert(TIMEZONE_IST).normalize().replace(tzinfo=None)
                 else:
-                    expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
+                    expected_session_date = (expected_session_date - pd.offsets.BDay(1)).replace(tzinfo=None)
             except Exception:
                 expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
 
@@ -1784,7 +1784,7 @@ def _run_scan(
                     _last_ts = _chk_df.index[-1]
                     # Normalise timezone before comparison
                     if hasattr(_last_ts, "tzinfo") and _last_ts.tzinfo is not None:
-                        _last_ts = _last_ts.tz_convert(TIMEZONE_IST).tz_localize(None)
+                        _last_ts = _last_ts.tz_convert(TIMEZONE_IST).replace(tzinfo=None)
                     _last_ts = pd.Timestamp(_last_ts)
                     # BUG-FIX-MONDAY: use the close index (actual NSE trading
                     # calendar) as the business-day ruler rather than raw calendar
@@ -2648,7 +2648,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

@@ -599,7 +599,7 @@ class PortfolioState:
             "vol_hist":             {
                 k: {
                     "maxlen": vals.maxlen,
-                    "data": [(pd.Timestamp(d).isoformat(), float(v)) for d, v in vals],
+                    "data": [(pd.Timestamp(d).replace(tzinfo=None).isoformat(), float(v)) for d, v in vals],
                 }
                 for k, vals in sorted(self.vol_hist.items())
             },

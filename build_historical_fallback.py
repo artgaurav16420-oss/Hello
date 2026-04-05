@@ -686,13 +686,11 @@ def build_csv_from_symbols(
 
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
-        if not tickers:
-            # Empty ticker list: emit one row with date and empty ticker field
-            # to indicate the snapshot date exists but has no members
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
-        else:
-            for sym in tickers:
-                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
+        ticker_list = tickers if isinstance(tickers, list) else list(tickers)
+        if not ticker_list:
+            continue
+        for sym in ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
 
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
