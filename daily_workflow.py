@@ -1017,6 +1017,13 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
+            if os.name == "posix":
+                dir_path = os.path.dirname(risk_file) or "."
+                dir_fd = os.open(dir_path, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except (OSError, IOError, TypeError, ValueError) as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
             if os.path.exists(tmp):
@@ -1074,6 +1081,10 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 os.remove(tmp_file)
             except OSError as cleanup_exc:
                 logger.debug("Cleanup failed for tmp state file '%s': %s", tmp_file, cleanup_exc)
+        try:
+            _clear_pending_sentinel(name)
+        except Exception as sentinel_exc:
+            logger.debug("Cleanup failed for pending sentinel '%s': %s", name, sentinel_exc)
         raise
 def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     """_apply_risk_overlay operation.
@@ -2648,7 +2659,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

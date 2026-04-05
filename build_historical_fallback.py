@@ -688,6 +688,7 @@ def build_csv_from_symbols(
     for d, tickers in snapshot_df["tickers"].items():
         ticker_list = tickers if isinstance(tickers, list) else list(tickers)
         if not ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": None})
             continue
         for sym in ticker_list:
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
@@ -756,6 +757,7 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     for d, tickers in snapshot_df["tickers"].items():
         ticker_list = tickers if isinstance(tickers, list) else list(tickers)
         if not ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": None})
             continue
         for tkr in ticker_list:
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
