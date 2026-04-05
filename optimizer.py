@@ -21,6 +21,7 @@ CHANGES:
   and SIGNAL_LAG_DAYS as optional optimization dimensions.
 """
 import argparse
+import inspect
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ from optuna.samplers import TPESampler
 
 
 from log_config import load_dotenv_safe
+load_dotenv_safe()
 from momentum_engine import UltimateConfig, OptimizationError, OptimizationErrorType
 from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
@@ -69,7 +71,6 @@ def _utc_today() -> pd.Timestamp:
 
 def configure_optimizer_logging(color: bool = True) -> None:
     """Call once from __main__ before any optimizer work begins."""
-    load_dotenv_safe()
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
@@ -863,20 +864,10 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         required_start = _actual_warmup_start,
         required_end   = _fetch_end,
     )
-    if cfg is not None:
+    sig = inspect.signature(load_or_fetch)
+    if cfg is not None and "cfg" in sig.parameters:
         kwargs["cfg"] = cfg
-    try:
-        market_data = load_or_fetch(**kwargs)
-    except TypeError as _te:
-        # FIX-MB-OPT-02: log the dropped parameter so forward-compatibility
-        # shims are visible during debugging rather than failing silently.
-        logger.warning(
-            "pre_load_data: dropped 'cfg' kwarg due to TypeError (%s). "
-            "load_or_fetch does not accept cfg; retrying without it.",
-            _te,
-        )
-        kwargs.pop("cfg", None)
-        market_data = load_or_fetch(**kwargs)
+    market_data = load_or_fetch(**kwargs)
 
     if getattr(cfg, "SIMULATE_HALTS", False):
         market_data = apply_halt_simulation(market_data)
@@ -1456,7 +1447,9 @@ def run_optimization(
 
     if not top_k_trials:
         logger.warning("No completed trials for OOS validation; skipping tournament.")
-        save_optimal_config(best_params)
+        fallback_params = best_trial.user_attrs.get("resolved_cfg", {}).copy()
+        fallback_params.update(best_params)
+        save_optimal_config(fallback_params)
         return
 
     valid_fields = UltimateConfig.__dataclass_fields__

@@ -28,6 +28,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 import uuid
@@ -264,12 +265,8 @@ class JsonFormatter(logging.Formatter):
         The result is always UTC and always carries sub-millisecond precision.
         """
         import datetime as _dt
-        epoch_s  = record.created
-        # microseconds: msecs is the fractional-second portion in milliseconds;
-        # multiply by 1000 to get microseconds, then modulo to stay in [0, 999999].
-        us       = int(record.msecs * 1000) % 1_000_000
-        base     = _dt.datetime.fromtimestamp(epoch_s, tz=_dt.timezone.utc)
-        return base.strftime("%Y-%m-%dT%H:%M:%S") + f".{us:06d}Z"
+        base = _dt.datetime.fromtimestamp(record.created, tz=_dt.timezone.utc)
+        return base.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     def format(self, record: logging.LogRecord) -> str:
         """format operation.
@@ -346,6 +343,13 @@ def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
                 close_i = value.find(q, 1)
                 if close_i != -1:
                     value = value[1:close_i]
+                else:
+                    log.warning(
+                        "[Env] Ignoring malformed quoted value for key %s in %s",
+                        key,
+                        env_path,
+                    )
+                    continue
             else:
                 # BUG-FIX-DOTENV-DC: strip inline comments for unquoted values.
                 # Per dotenv convention, inline comments must be preceded by
@@ -395,7 +399,6 @@ def configure_logging(
         configure_logging(log_file="logs/momentum.log")
     """
     root = logging.getLogger()
-    root.setLevel(level)
 
     # LC-01: honour the force flag so test environments can retain their own
     # capture handlers.  In production (force=True, the default) we unconditionally
@@ -403,6 +406,8 @@ def configure_logging(
     # or pytest.  When force=False, skip setup entirely if handlers already exist.
     if not force and root.handlers:
         return
+
+    root.setLevel(level)
 
     for h in list(root.handlers):
         h.close()
@@ -414,7 +419,7 @@ def configure_logging(
     )
 
     # stdout handler
-    sh = logging.StreamHandler()
+    sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     root.addHandler(sh)
 

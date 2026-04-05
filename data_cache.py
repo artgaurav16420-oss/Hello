@@ -336,6 +336,8 @@ class _ManifestProcessFileLock:
             )
         except Exception:
             try:
+                if self._owner_file.exists():
+                    self._owner_file.unlink()
                 if self._lock_dir.exists():
                     self._lock_dir.rmdir()
             except Exception as cleanup_exc:
@@ -783,7 +785,8 @@ class GrowwProvider(DataProvider):
             if common.empty:
                 return raw_close
 
-            ratio = (adj_yf.loc[common] / raw_yf_cls.loc[common]).dropna()
+            raw_prices = raw_yf_cls.loc[common].replace(0, np.nan)
+            ratio = (adj_yf.loc[common] / raw_prices).dropna()
             if ratio.empty:
                 return raw_close
 

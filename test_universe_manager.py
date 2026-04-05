@@ -95,37 +95,18 @@ def test_apply_adv_filter_returns_ns_suffixed_from_bare_input(monkeypatch):
     even when the input list contains bare symbols (e.g. "RELIANCE" not
     "RELIANCE.NS").
 
-    Previously the function appended `symbol` (the bare input) to
-    filtered_tickers instead of `ns_sym` (the normalised key), silently
-    returning bare names that caused downstream cache-key mismatches.
     """
+    import data_cache
+    from momentum_engine import UltimateConfig
+
     bare_inputs = ["RELIANCE", "TCS", "INFY"]
 
-    monkeypatch.setattr(
-        um, "_apply_adv_filter",
-        lambda tickers, cfg=None: _apply_adv_filter_via_fake_data(tickers, cfg),
-    )
+    def _fake_load_or_fetch(tickers, start, end, cfg=None):
+        return _make_adv_market_data(tickers)
 
-    def _apply_adv_filter_via_fake_data(tickers, cfg=None):
-        from momentum_engine import UltimateConfig, to_ns
-        from signals import compute_single_adv
+    monkeypatch.setattr(data_cache, "load_or_fetch", _fake_load_or_fetch)
 
-        if cfg is None:
-            cfg = UltimateConfig()
-
-        market_data = _make_adv_market_data(tickers)
-        min_adv = cfg.MIN_ADV_CRORES * 1e7
-        result = []
-        for sym in tickers:
-            ns = to_ns(sym)
-            if ns in market_data:
-                adv = compute_single_adv(market_data[ns])
-                if adv >= min_adv:
-                    result.append(ns)  # must be ns, not sym
-        return result
-
-    result = um._apply_adv_filter.__wrapped__(bare_inputs) if hasattr(um._apply_adv_filter, "__wrapped__") \
-        else _apply_adv_filter_via_fake_data(bare_inputs)
+    result = _apply_adv_filter(bare_inputs, UltimateConfig(MIN_ADV_CRORES=1))
 
     assert all(t.endswith(".NS") for t in result), (
         f"_apply_adv_filter returned bare symbols: "
@@ -248,6 +229,7 @@ def test_get_sector_map_prefers_batched_yfinance_tickers(monkeypatch):
 
     assert out == {"FOO.NS": "Energy", "BAR.NS": "IT"}
     assert calls["tickers"] == 1
+    assert calls["ticker"] == 0, "Fallback per-ticker path should not be called when batch succeeds"
 
 
 def test_get_sector_map_falls_back_when_batch_tickers_raises_runtime_error(monkeypatch):

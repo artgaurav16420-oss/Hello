@@ -163,7 +163,7 @@ def test_run_backtest_uses_adjusted_close_for_valuation_when_auto_adjust_enabled
     assert list(captured["close"]["AAA"]) == [100.0, 100.0]
 
 
-def test_execution_prices_prefers_vwap_when_intraday_range_available():
+def test_execution_prices_prefers_open_when_intraday_range_available():
     date = pd.Timestamp("2020-01-02")
     symbols = ["AAA"]
     close_prices = np.array([12.0])
@@ -173,7 +173,7 @@ def test_execution_prices_prefers_vwap_when_intraday_range_available():
 
     exec_px = be._execution_prices(symbols, date, close_prices, open_px, high_px, low_px)
 
-    assert exec_px[0] == 12.0
+    assert exec_px[0] == 10.0
 
 
 def test_run_backtest_custom_universe_requires_recent_contiguous_volume():

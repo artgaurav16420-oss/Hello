@@ -376,14 +376,31 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
             exc,
         )
         df = pd.read_parquet(hist_file)
+    try:
+        mtime_after = hist_file.stat().st_mtime
+    except OSError:
+        return df
     # FIX-MB-UM-03: FIFO eviction — mirror the pattern used for
     # _UNIVERSE_LOOKUP_CACHE to bound memory in long-running processes.
     with _HISTORICAL_UNIVERSE_DF_CACHE_LOCK:
+        if mtime_after != mtime:
+            _HISTORICAL_UNIVERSE_DF_CACHE.pop(hist_file, None)
+            _HISTORICAL_UNIVERSE_DATES_CACHE.pop(hist_file, None)
+            stale_universe_type = hist_file.stem.removeprefix("historical_")
+            if stale_universe_type:
+                with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                    stale_keys = [
+                        key for key in _UNIVERSE_LOOKUP_CACHE
+                        if key[0] == stale_universe_type
+                    ]
+                    for key in stale_keys:
+                        _UNIVERSE_LOOKUP_CACHE.pop(key, None)
+            return df
         if len(_HISTORICAL_UNIVERSE_DF_CACHE) >= _HISTORICAL_CACHE_MAXSIZE:
             oldest_key = next(iter(_HISTORICAL_UNIVERSE_DF_CACHE))
             del _HISTORICAL_UNIVERSE_DF_CACHE[oldest_key]
             _HISTORICAL_UNIVERSE_DATES_CACHE.pop(oldest_key, None)
-        _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime, df)
+        _HISTORICAL_UNIVERSE_DF_CACHE[hist_file] = (mtime_after, df)
         _HISTORICAL_UNIVERSE_DATES_CACHE[hist_file] = pd.DatetimeIndex(df.index.unique()).sort_values()
     return df
 
@@ -742,7 +759,8 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
         if apply_adv_filter:
             tickers = _apply_adv_filter(tickers, cfg=cfg)
 
-        logger.info("[Universe] Cached %d raw EQ constituents (unfiltered).", len(tickers))
+        filter_status = "post-ADV-filter" if apply_adv_filter else "unfiltered"
+        logger.info("[Universe] Cached %d raw EQ constituents (%s).", len(tickers), filter_status)
         with _UNIVERSE_CACHE_FILE_LOCK:
             cache = _load_universe_cache()
             cache["total_equity"] = {

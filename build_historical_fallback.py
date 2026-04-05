@@ -47,10 +47,11 @@ def _bootstrap_env() -> None:
     """Load env vars from `.env` with optional python-dotenv dependency."""
     try:
         from dotenv import load_dotenv  # type: ignore
-        load_dotenv()
-    except Exception:
+    except ImportError:
         from log_config import load_dotenv_safe
         load_dotenv_safe()
+        return
+    load_dotenv()
 
 
 _bootstrap_env()
@@ -374,6 +375,14 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     collisions across concurrent writers.
     """
     path = Path(path)
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            f"pyarrow is required to write {path}. "
+            "Install it with: pip install pyarrow"
+        ) from e
+
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
     tmp = Path(tmp_path)
     try:
@@ -382,23 +391,7 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
-        fd2 = None
-        tmp2 = None
-        try:
-            fd2, tmp_path2 = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
-            tmp2 = Path(tmp_path2)
-            os.close(fd2)
-            df.to_parquet(tmp2)
-            os.replace(tmp2, path)
-            logger.warning(
-                "[BHF] pyarrow not available; writing %s with default parquet engine. "
-                "List-valued 'tickers' column may not round-trip correctly on read.",
-                path,
-            )
-        except Exception:
-            if tmp2 is not None and tmp2.exists():
-                tmp2.unlink(missing_ok=True)
-            raise
+        raise
 
 
 def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
@@ -687,13 +680,12 @@ def build_csv_from_symbols(
 
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
-        if not tickers:
-            # Empty ticker list: emit one row with date and empty ticker field
-            # to indicate the snapshot date exists but has no members
-            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": ""})
-        else:
-            for sym in tickers:
-                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
+        ticker_list = tickers if isinstance(tickers, list) else list(tickers)
+        if not ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": None})
+            continue
+        for sym in ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": sym})
 
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
     logger.info("  ✓ Written CSV companion: %s  (%d rows)", csv_path, len(csv_rows))
@@ -757,7 +749,11 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
-        for tkr in (tickers if isinstance(tickers, list) else list(tickers)):
+        ticker_list = tickers if isinstance(tickers, list) else list(tickers)
+        if not ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": None})
+            continue
+        for tkr in ticker_list:
             csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
@@ -860,7 +856,11 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             df_existing = pd.read_parquet(parquet_path)
             wbm_rows: dict[pd.Timestamp, list] = {}
             for date_str, tickers in snapshots:
-                ts = pd.Timestamp(date_str)
+                try:
+                    ts = pd.Timestamp(date_str)
+                except Exception as exc:
+                    logger.warning("[Hybrid] Skipping malformed snapshot date %r: %s", date_str, exc)
+                    continue
                 wbm_rows[ts] = sorted(set(tickers))
 
             wbm_dates_sorted = sorted(wbm_rows.keys())
@@ -1047,8 +1047,11 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
         )
 
         df_check = pd.read_parquet(parquet_path)
-        first_row = df_check.iloc[0]["tickers"]
-        n_syms = len(first_row) if isinstance(first_row, list) else len(list(first_row))
+        if df_check.empty:
+            n_syms = 0
+        else:
+            first_row = df_check.iloc[0]["tickers"]
+            n_syms = len(first_row) if isinstance(first_row, list) else len(list(first_row))
         print(f"  ✓ {parquet_path}  |  {len(df_check)} snapshots  |  ~{n_syms} symbols/snapshot")
 
     print()

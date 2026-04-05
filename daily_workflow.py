@@ -61,11 +61,6 @@ BUG FIXES (murder board):
 from __future__ import annotations
 import importlib.util
 
-if importlib.util.find_spec("dotenv") is not None:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
 import argparse
 import copy
 import hashlib
@@ -166,19 +161,20 @@ class CircuitBreaker:
         """Load persisted count from disk; silently ignore missing file."""
         json_path = pathlib.Path(path)
         lock_path = pathlib.Path(_CIRCUIT_BREAKER_LOCK_FILE)
-        if not json_path.exists() and lock_path.exists():
-            logger.warning("circuit_breaker.lock found without JSON; treating count as 1")  # ARCH-FIX-10
-            self.count = 1
-            return
-        try:
-            if json_path.exists():
-                self.count = int(json.loads(json_path.read_text(encoding="utf-8")).get("consecutive_empty", 0))
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.error("Failed to parse circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
-            self.count = 1 if lock_path.exists() else 0
-        except OSError as exc:
-            logger.warning("Failed to read circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
-            self.count = 1 if lock_path.exists() else 0
+        with self._lock:
+            if not json_path.exists() and lock_path.exists():
+                logger.warning("circuit_breaker.lock found without JSON; treating count as 1")  # ARCH-FIX-10
+                self.count = 1
+                return
+            try:
+                if json_path.exists():
+                    self.count = int(json.loads(json_path.read_text(encoding="utf-8")).get("consecutive_empty", 0))
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.error("Failed to parse circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+                self.count = 1 if lock_path.exists() else 0
+            except OSError as exc:
+                logger.warning("Failed to read circuit breaker state %s: %s", json_path, exc)  # ARCH-FIX-7
+                self.count = 1 if lock_path.exists() else 0
 
     def save(self, path: str) -> None:
         """Persist count to disk; log error on failure, write lock sentinel."""
@@ -527,7 +523,7 @@ def load_optimized_config() -> UltimateConfig:
     """
     cfg = UltimateConfig()
     if os.path.exists("data/optimal_cfg.json"):
-        with open("data/optimal_cfg.json", "r") as f:
+        with open("data/optimal_cfg.json", "r", encoding="utf-8") as f:
             try:
                 best_params = json.load(f)
             except json.JSONDecodeError as e:
@@ -706,7 +702,7 @@ def _get_custom_universe() -> List[str]:
     for f in files:
         if os.path.exists(f):
             try:
-                with open(f, "r") as file:
+                with open(f, "r", encoding="utf-8") as file:
                     content = file.read().replace(",", "\n")
                     tickers = [line.strip().upper() for line in content.split("\n") if line.strip()]
                     tickers = [t for t in tickers if t not in ("SYMBOL", "TICKER", "")]
@@ -826,15 +822,21 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             # dividend_ledger marker keyed by date:ratio.
             if COLUMN_STOCK_SPLITS in row.columns:
                 split_series = row[COLUMN_STOCK_SPLITS].fillna(0.0)
-                positive_splits = split_series[split_series > 0]
+                positive_splits = split_series[split_series > 0].sort_index()
                 if not positive_splits.empty and sym in state.shares:
-                    # Determine which splits are new (not yet applied)
+                    marker_key = f"split:{sym}"
+                    raw_markers = state.dividend_ledger.get(marker_key, "")
+                    if isinstance(raw_markers, str):
+                        applied_event_ids = {m for m in raw_markers.split("|") if m}
+                    elif isinstance(raw_markers, (list, tuple, set)):
+                        applied_event_ids = {str(v) for v in raw_markers if str(v)}
+                    else:
+                        raw = str(raw_markers or "")
+                        applied_event_ids = {m for m in raw.split("|") if m}
                     for split_date, split_val in positive_splits.items():
                         split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
-                        marker_key = f"split:{sym}"
-                        last_marker = state.dividend_ledger.get(marker_key, "")
                         event_id = f"{split_date_str}:{split_val:.8f}"
-                        if event_id == last_marker:
+                        if event_id in applied_event_ids:
                             continue  # already applied — skip
 
                         old_shares = state.shares[sym]
@@ -855,7 +857,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                         )
                         state.shares[sym] = new_shares
                         state.entry_prices[sym] = round(new_entry, 4)
-                        state.dividend_ledger[marker_key] = event_id
+                        applied_event_ids.add(event_id)
+                        state.dividend_ledger[marker_key] = "|".join(sorted(applied_event_ids))
                         adjusted.append(sym)
 
             state.last_known_prices[sym] = current_price
@@ -1009,11 +1012,18 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
         }
         try:
             tmp = f"{risk_file}.tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(risk_payload, f, indent=2, sort_keys=True)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
+            if os.name == "posix":
+                dir_path = os.path.dirname(risk_file) or "."
+                dir_fd = os.open(dir_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except (OSError, IOError, TypeError, ValueError) as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
             if os.path.exists(tmp):
@@ -1031,7 +1041,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
     try:
         _rotate_backup_chain(state_file=state_file, generations=BACKUP_GENERATIONS)
 
-        with tmp_file.open("w") as f:
+        with tmp_file.open("w", encoding="utf-8") as f:
             json.dump(state.to_dict(), f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
@@ -1064,13 +1074,18 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                 logger.warning("Could not remove stale paper-mode risk overlay for '%s': %s", name, exc)
         _clear_pending_sentinel(name)
 
-    except (OSError, IOError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+    except (OSError, IOError, TypeError, ValueError, RuntimeError) as exc:
         logger.error("Durable save failed for '%s': %s", name, exc)
         if tmp_file.exists():
             try:
                 os.remove(tmp_file)
             except OSError as cleanup_exc:
                 logger.debug("Cleanup failed for tmp state file '%s': %s", tmp_file, cleanup_exc)
+        try:
+            _clear_pending_sentinel(name)
+        except Exception as sentinel_exc:
+            logger.debug("Cleanup failed for pending sentinel '%s': %s", name, sentinel_exc)
+        raise
 def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     """_apply_risk_overlay operation.
 
@@ -1088,7 +1103,7 @@ def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     if not os.path.exists(risk_file):
         return ps
     try:
-        with open(risk_file) as rf:
+        with open(risk_file, "r", encoding="utf-8") as rf:
             risk = json.load(rf)
 
         def _ri(key, fallback):
@@ -1166,7 +1181,7 @@ def load_portfolio_state(name: str) -> PortfolioState:
         if os.path.exists(path):
             found_any_state_file = True
             try:
-                with open(path) as f:
+                with open(path, "r", encoding="utf-8") as f:
                     ps = PortfolioState.from_dict(json.load(f))
                 if PAPER_MODE:
                     return _apply_risk_overlay(ps, name)
@@ -1447,8 +1462,8 @@ def _run_scan(
                 cfg.REBALANCE_FREQ,
             )
 
-        end_date   = datetime.today().strftime("%Y-%m-%d")
-        start_date = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+        end_date   = session_date.strftime("%Y-%m-%d")
+        start_date = (session_date - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
 
         held_syms  = {to_ns(s) for s in state.shares.keys()}
         all_syms   = list({to_ns(t) for t in universe} | held_syms | {MARKET_INDEX_NSEI, MARKET_INDEX_CRSLDX})
@@ -1737,10 +1752,10 @@ def _run_scan(
         # always safer to exit a position than to hold it with a stale price.
         _STALE_PRICE_DAYS = 2  # trading days
         _rebalance_stale_held: list = []
-        if rebalance_allowed and (optimization_succeeded or apply_decay) and not _force_full_cash:
+        if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             valid_days = None
             expected_session_date = pd.Timestamp.now(tz=TIMEZONE_IST).normalize()
-            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).tz_localize(None)
+            calendar_window_start = (expected_session_date - pd.Timedelta(days=366)).replace(tzinfo=None)
             try:
                 import pandas_market_calendars as mcal
 
@@ -1750,9 +1765,9 @@ def _run_scan(
                     end_date=expected_session_date,
                 )
                 if len(valid_days) > 0:
-                    expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert(TIMEZONE_IST).tz_localize(None).normalize()
+                    expected_session_date = pd.Timestamp(valid_days[-1]).tz_convert(TIMEZONE_IST).normalize().replace(tzinfo=None)
                 else:
-                    expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
+                    expected_session_date = (expected_session_date - pd.offsets.BDay(1)).replace(tzinfo=None)
             except Exception:
                 expected_session_date = (expected_session_date - pd.offsets.BDay(1)).tz_localize(None)
 
@@ -1760,7 +1775,7 @@ def _run_scan(
             if valid_days is not None and len(valid_days) > 0:
                 trusted_close_index = pd.DatetimeIndex(valid_days)
                 if trusted_close_index.tz is not None:
-                    trusted_close_index = trusted_close_index.tz_convert(TIMEZONE_IST).tz_localize(None)
+                    trusted_close_index = trusted_close_index.tz_localize(None)
                 trusted_close_index = trusted_close_index.normalize()
                 trusted_close_index = trusted_close_index[trusted_close_index <= expected_session_date]
 
@@ -1780,7 +1795,7 @@ def _run_scan(
                     _last_ts = _chk_df.index[-1]
                     # Normalise timezone before comparison
                     if hasattr(_last_ts, "tzinfo") and _last_ts.tzinfo is not None:
-                        _last_ts = _last_ts.tz_convert("UTC").tz_localize(None)
+                        _last_ts = _last_ts.tz_convert(TIMEZONE_IST).replace(tzinfo=None)
                     _last_ts = pd.Timestamp(_last_ts)
                     # BUG-FIX-MONDAY: use the close index (actual NSE trading
                     # calendar) as the business-day ruler rather than raw calendar
@@ -1815,21 +1830,20 @@ def _run_scan(
             # so CVaR execution avoids fake realizations at stale prices.
             if _rebalance_stale_held and (_force_full_cash or apply_decay):
                 for _s_bare, _ in _rebalance_stale_held:
-                    _s = to_ns(_s_bare)
-                    if _s in active_idx:
-                        _s_idx = active_idx[_s]
-                        _s_shares = state.shares.get(_s, 0)
+                    if _s_bare in active_idx:
+                        _s_idx = active_idx[_s_bare]
+                        _s_shares = state.shares.get(_s_bare, 0)
                         _s_px = max(float(prices[_s_idx]), 1e-6)
                         _mtm_w = (_s_shares * _s_px) / max(pv, 1.0)
                         weights[_s_idx] = _mtm_w
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             pending = _load_pending_sentinel(name=name)  # ARCH-FIX-3
-            if pending and pending.get("date") == today.strftime("%Y-%m-%d"):
+            if pending and pending.get("date") == session_date.strftime("%Y-%m-%d"):
                 logger.warning("Rebalance already committed for today, skipping")
                 return state, market_data
             token = str(uuid.uuid4())
-            if not _try_claim_pending_sentinel(name=name, token=token, date_str=today.strftime("%Y-%m-%d")):
+            if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
                 logger.warning("Rebalance claim already exists for today, skipping")
                 return state, market_data
             _write_pending_sentinel(
@@ -2645,9 +2659,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
-
-
 
 
 
