@@ -67,6 +67,8 @@ import pandas as pd
 import scipy.sparse as sp
 from sklearn.covariance import LedoitWolf
 
+from shared_utils import normalize_ns_ticker
+
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
 EPSILON = 1e-6
@@ -90,9 +92,8 @@ def _ghost_seed_for(sym: str) -> int:
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
 
 def to_ns(sym: str) -> str:
-    if sym.startswith("^") or sym.endswith(".NS"):
-        return sym
-    return f"{sym}.NS"
+    """Backward-compatible alias for shared ticker normalization."""
+    return normalize_ns_ticker(sym)
 
 
 def to_bare(sym: str) -> str:

@@ -52,6 +52,8 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from shared_utils import compute_notional_volume
+
 if TYPE_CHECKING:
     from momentum_engine import UltimateConfig
 
@@ -287,7 +289,7 @@ def compute_single_adv(df: pd.DataFrame, cfg: Optional['UltimateConfig'] = None)
         if "Close" not in df.columns or "Volume" not in df.columns:
             return 0.0
 
-        notional = df["Close"] * df["Volume"]
+        notional = compute_notional_volume(df)
         if notional.empty:
             return 0.0
 
@@ -327,7 +329,7 @@ def compute_adv(
         ns_sym = to_ns(symbol)
         df = market_data.get(ns_sym)
         if df is not None and "Close" in df.columns and "Volume" in df.columns:
-            notional_cols[symbol] = (df["Close"] * df["Volume"]).clip(lower=0)
+            notional_cols[symbol] = compute_notional_volume(df)
 
     if not notional_cols:
         return np.zeros(len(active_symbols), dtype=float)
