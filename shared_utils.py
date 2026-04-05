@@ -109,6 +109,16 @@ def fetch_nse_csv(
             raise last_error
         raise requests.RequestException("Failed to fetch CSV: no content retrieved")
 
+    # Guard against HTML/XML/challenge pages before attempting CSV parsing
+    # Check first ~2KB for common HTML/XML markers (case-insensitive)
+    sample = response_content[:2048].lower()
+    html_markers = (b'<!doctype', b'<html', b'<script', b'<meta', b'<?xml')
+    if any(marker in sample for marker in html_markers):
+        raise ValueError(
+            "Received HTML/XML content instead of CSV. "
+            "The endpoint may have returned an error page or challenge."
+        )
+
     # Parse CSV outside retry loop to avoid retrying parse errors
     if encoding is not None:
         return pd.read_csv(io.BytesIO(response_content), encoding=encoding)
