@@ -831,7 +831,8 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                     elif isinstance(raw_markers, (list, tuple, set)):
                         applied_event_ids = {str(v) for v in raw_markers if str(v)}
                     else:
-                        applied_event_ids = set()
+                        raw = str(raw_markers or "")
+                        applied_event_ids = {m for m in raw.split("|") if m}
                     for split_date, split_val in positive_splits.items():
                         split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
                         event_id = f"{split_date_str}:{split_val:.8f}"
@@ -2647,7 +2648,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

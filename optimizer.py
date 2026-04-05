@@ -864,8 +864,8 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
         required_start = _actual_warmup_start,
         required_end   = _fetch_end,
     )
-    load_or_fetch_params = inspect.signature(load_or_fetch).parameters
-    if cfg is not None and "cfg" in load_or_fetch_params:
+    sig = inspect.signature(load_or_fetch)
+    if cfg is not None and "cfg" in sig.parameters:
         kwargs["cfg"] = cfg
     market_data = load_or_fetch(**kwargs)
 

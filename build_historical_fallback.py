@@ -375,32 +375,29 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     collisions across concurrent writers.
     """
     path = Path(path)
+    engine = "pyarrow"
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        engine = None
+        logger.warning(
+            "[BHF] pyarrow not available; writing %s with default parquet engine. "
+            "List-valued 'tickers' column may not round-trip correctly on read.",
+            path,
+        )
+
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
     tmp = Path(tmp_path)
     try:
         os.close(fd)
-        import pyarrow  # noqa: F401
-        df.to_parquet(tmp, engine="pyarrow")
+        if engine == "pyarrow":
+            df.to_parquet(tmp, engine="pyarrow")
+        else:
+            df.to_parquet(tmp)
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
-        fd2 = None
-        tmp2 = None
-        try:
-            fd2, tmp_path2 = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
-            tmp2 = Path(tmp_path2)
-            os.close(fd2)
-            df.to_parquet(tmp2)
-            os.replace(tmp2, path)
-            logger.warning(
-                "[BHF] pyarrow not available; writing %s with default parquet engine. "
-                "List-valued 'tickers' column may not round-trip correctly on read.",
-                path,
-            )
-        except Exception:
-            if tmp2 is not None and tmp2.exists():
-                tmp2.unlink(missing_ok=True)
-            raise
+        raise
 
 
 def _atomic_write_csv(df: "pd.DataFrame", path, **kwargs) -> None:
@@ -760,9 +757,10 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
     csv_rows = []
     for d, tickers in snapshot_df["tickers"].items():
         ticker_list = tickers if isinstance(tickers, list) else list(tickers)
-        if ticker_list:
-            for tkr in ticker_list:
-                csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
+        if not ticker_list:
+            continue
+        for tkr in ticker_list:
+            csv_rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "ticker": tkr})
     _atomic_write_csv(pd.DataFrame(csv_rows), csv_path, index=False)
 
     logger.info("  ✓ Written: %s  (%d rows)", output_path, len(snapshot_df))

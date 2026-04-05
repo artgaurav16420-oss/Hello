@@ -762,7 +762,10 @@ def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
             rows = vals.get("data", []) if isinstance(vals, dict) else vals
             maxlen_raw = vals.get("maxlen", default_maxlen) if isinstance(vals, dict) else default_maxlen
             maxlen = int(maxlen_raw) if maxlen_raw is not None else default_maxlen
-            out[str(k)] = deque(((pd.Timestamp(d), float(vol)) for d, vol in rows), maxlen=maxlen)
+            out[str(k)] = deque(
+                ((pd.Timestamp(d), float(vol)) for d, vol in rows),
+                maxlen=maxlen,
+            )
         except Exception:
             logger.warning("PortfolioState.from_dict: skipping malformed vol_hist entry for %s", k)
     return out

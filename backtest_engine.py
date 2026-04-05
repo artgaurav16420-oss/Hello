@@ -256,7 +256,10 @@ class BacktestEngine:
 
                     self.state.shares[sym] = new_shares
                     split_denom = max(split_ratio, 1e-12)
-                    if sym not in self.state.entry_prices:
+                    if sym in self.state.entry_prices:
+                        old_entry = float(self.state.entry_prices[sym])
+                        self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
+                    else:
                         logger.warning(
                             "[Backtest] Missing entry price for %s during split adjustment on %s; "
                             "using current price as fallback instead of inferring a pre-split entry.",
@@ -264,9 +267,7 @@ class BacktestEngine:
                             date,
                         )
                         old_entry = float(price_now * split_denom)
-                    else:
-                        old_entry = float(self.state.entry_prices[sym])
-                    self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
+                        self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
                     pending_splits.pop(sym, None)
 
             # BUG-BE-06: Rebalance runs before dividend sweep so T+0 reinvestment
@@ -1185,7 +1186,7 @@ def build_precomputed_matrices(
     # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
-    returns = (returns_base / returns_base.shift(1) - 1).clip(lower=-0.99)
+    returns = returns_base.pct_change(fill_method=None).clip(lower=-0.99)
     common_idx = returns.index.intersection(close.index)
     close = close.reindex(common_idx)
     close_adj = close_adj.reindex(common_idx)
@@ -1908,4 +1909,3 @@ def _compute_metrics(
         "hit_rate": round(hit_rate, 2),
         "turnover": round(turnover, 4),
     }
-

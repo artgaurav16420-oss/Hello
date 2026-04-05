@@ -386,11 +386,15 @@ def _load_historical_universe_df(hist_file: Path) -> pd.DataFrame:
         if mtime_after != mtime:
             _HISTORICAL_UNIVERSE_DF_CACHE.pop(hist_file, None)
             _HISTORICAL_UNIVERSE_DATES_CACHE.pop(hist_file, None)
-            universe_type = hist_file.stem.removeprefix("historical_")
-            with _UNIVERSE_LOOKUP_CACHE_LOCK:
-                stale_keys = [key for key in _UNIVERSE_LOOKUP_CACHE if key[0] == universe_type]
-                for key in stale_keys:
-                    _UNIVERSE_LOOKUP_CACHE.pop(key, None)
+            stale_universe_type = hist_file.stem.removeprefix("historical_")
+            if stale_universe_type:
+                with _UNIVERSE_LOOKUP_CACHE_LOCK:
+                    stale_keys = [
+                        key for key in _UNIVERSE_LOOKUP_CACHE
+                        if key[0] == stale_universe_type
+                    ]
+                    for key in stale_keys:
+                        _UNIVERSE_LOOKUP_CACHE.pop(key, None)
             return df
         if len(_HISTORICAL_UNIVERSE_DF_CACHE) >= _HISTORICAL_CACHE_MAXSIZE:
             oldest_key = next(iter(_HISTORICAL_UNIVERSE_DF_CACHE))
