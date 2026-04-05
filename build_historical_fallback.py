@@ -375,25 +375,19 @@ def _atomic_write_parquet(df: "pd.DataFrame", path) -> None:
     collisions across concurrent writers.
     """
     path = Path(path)
-    engine = "pyarrow"
     try:
         import pyarrow  # noqa: F401
-    except ImportError:
-        engine = None
-        logger.warning(
-            "[BHF] pyarrow not available; writing %s with default parquet engine. "
-            "List-valued 'tickers' column may not round-trip correctly on read.",
-            path,
-        )
+    except ImportError as e:
+        raise ImportError(
+            f"pyarrow is required to write {path}. "
+            "Install it with: pip install pyarrow"
+        ) from e
 
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp.parquet", prefix=".tmp_")
     tmp = Path(tmp_path)
     try:
         os.close(fd)
-        if engine == "pyarrow":
-            df.to_parquet(tmp, engine="pyarrow")
-        else:
-            df.to_parquet(tmp)
+        df.to_parquet(tmp, engine="pyarrow")
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
