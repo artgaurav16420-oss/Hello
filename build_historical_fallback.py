@@ -23,7 +23,6 @@ import argparse
 import io
 import logging
 import os
-import tempfile
 import threading
 import time
 import random

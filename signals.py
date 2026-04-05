@@ -544,7 +544,6 @@ def generate_signals(
 
         activity_window = max(cfg.CONTINUITY_ACTIVITY_WINDOW, 1)
         stale_sessions = max(cfg.CONTINUITY_STALE_SESSIONS, 1)
-        min_nonzero_days = max(cfg.CONTINUITY_MIN_NONZERO_DAYS, 1)
         flat_ret_eps = cfg.CONTINUITY_FLAT_RET_EPS
         continuity_min_adv = cfg.CONTINUITY_MIN_ADV_NOTIONAL
 
@@ -563,9 +562,6 @@ def generate_signals(
         _max_win = max(activity_window, stale_sessions)
         _recent_window_df = signal_log_rets[active_symbols].tail(_max_win)
         # --- Vectorized continuity bonus (replaces serial for-loop) ---
-        recent_rets_full = _recent_window_df.tail(activity_window)
-        has_recent_activity = (recent_rets_full.abs() > flat_ret_eps).sum(axis=0).values >= min_nonzero_days  # noqa: F841 (retained for future use)
-
         stale_rets_full = _recent_window_df.tail(stale_sessions)
         # is_stale: all stale_sessions rows are present, non-NaN, and flat
         if len(stale_rets_full) == stale_sessions:
