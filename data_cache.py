@@ -76,7 +76,6 @@ _RATE_LIMITED = object()
 _MAX_RATE_LIMIT_RETRIES = 5
 _MANIFEST_LOCK_POLL_SEC = 0.1
 _MANIFEST_LOCK_TIMEOUT_SEC = 30.0
-_SUSPENSION_GAP_DAYS = 7
 
 _DEFAULT_CACHE_DIR = Path(os.getenv("DATA_CACHE_DIR", "data/cache"))
 CACHE_DIR: Path | None = _DEFAULT_CACHE_DIR
@@ -1952,7 +1951,7 @@ def _build_manifest_entry(df: pd.DataFrame) -> dict:
         "fetched_at": pd.Timestamp.now(tz=TIMEZONE_IST).isoformat(),
         "rows": len(df),
         "last_date": df.index[-1].strftime("%Y-%m-%d"),
-        "suspended": max_gap_days > _SUSPENSION_GAP_DAYS,
+        "suspended": max_gap_days > 7,
         "max_gap_days": max_gap_days,
     }
 
