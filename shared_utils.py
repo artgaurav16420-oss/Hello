@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import os
 import tempfile
@@ -155,7 +156,12 @@ def atomic_write_file(
     if fsync_dir and os.name == "posix":
         dir_fd = os.open(str(dst.parent), getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(dir_fd)
+            try:
+                os.fsync(dir_fd)
+            except OSError as e:
+                # Ignore unsupported-filesystem errors
+                if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                    raise
         finally:
             os.close(dir_fd)
     return dst
