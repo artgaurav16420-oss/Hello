@@ -876,6 +876,7 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     out = out[out["date"].notna()].copy()
     out["ticker"] = out["ticker"].astype(str).str.strip().map(normalize_ns_ticker)
+    out = out[out["ticker"] != ""]
     out = out[["date", "ticker"]].drop_duplicates().sort_values(["date", "ticker"]).reset_index(drop=True)
     return out
 
@@ -984,6 +985,7 @@ def main() -> None:
 
         tmp.columns = [c.lower() for c in tmp.columns]
         tmp["ticker"] = tmp["ticker"].astype(str).map(normalize_ns_ticker)
+        tmp = tmp[tmp["ticker"] != ""]
         tmp[["date", "ticker"]].to_csv(normalized_csv, index=False)
         build_parquet_from_csv(str(normalized_csv), str(parquet_out))
 

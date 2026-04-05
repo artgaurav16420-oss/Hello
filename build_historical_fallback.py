@@ -483,7 +483,8 @@ def fetch_nifty500_current() -> List[str]:
     for url in NSE_SOURCES["nifty500"]:
         logger.info("  Trying: %s", url)
         try:
-            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS)
+            session = _get_nse_session()
+            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS, session=session)
             df.columns = [c.strip().upper() for c in df.columns]
             sym_col = next((c for c in ["SYMBOL", "TICKER", "COMPANY SYMBOL"] if c in df.columns), None)
             if sym_col is None:
@@ -493,6 +494,9 @@ def fetch_nifty500_current() -> List[str]:
             if len(syms) >= 100:
                 logger.info("  ✓ Fetched %d Nifty 500 symbols.", len(syms))
                 return sorted(syms)
+        except requests.ConnectionError as exc:
+            logger.warning("  Connection error for %s, invalidating session: %s", url, exc)
+            _invalidate_nse_session()
         except Exception as exc:
             logger.warning("  Parse error: %s", exc, exc_info=True)
 
@@ -505,7 +509,8 @@ def fetch_nse_total_current() -> List[str]:
     for url in NSE_SOURCES["nse_total"]:
         logger.info("  Trying: %s", url)
         try:
-            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS)
+            session = _get_nse_session()
+            df = fetch_nse_csv(url, timeout=20, headers=NSE_HEADERS, session=session)
             df.columns = [c.strip().upper() for c in df.columns]
             if "SERIES" in df.columns:
                 df = df[df["SERIES"].str.strip() == "EQ"]
@@ -516,6 +521,9 @@ def fetch_nse_total_current() -> List[str]:
             if len(syms) >= 500:
                 logger.info("  ✓ Fetched %d NSE Total equity symbols.", len(syms))
                 return sorted(syms)
+        except requests.ConnectionError as exc:
+            logger.warning("  Connection error for %s, invalidating session: %s", url, exc)
+            _invalidate_nse_session()
         except Exception as exc:
             logger.warning("  Parse error: %s", exc, exc_info=True)
 
