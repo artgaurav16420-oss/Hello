@@ -24,7 +24,6 @@ BUG FIXES (murder board):
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
@@ -32,12 +31,23 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import data_cache
+from shared_constants import TIMEZONE_IST
+from shared_utils import (
+    NSE_URL_EQUITY_MASTER_CSV,
+    NSE_URL_NIFTY500_CSV,
+    atomic_write_file,
+    compute_notional_volume,
+    fetch_nse_csv,
+    normalize_ns_ticker,
+)
+
 data_cache.configure_data_cache()
 CACHE_DIR = data_cache.CACHE_DIR
 
@@ -47,7 +57,6 @@ DATA_DIR             = Path("data")
 UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
-_ADV_MAX_WORKERS     = 1  # Reserved for future parallel ADV fetching. Currently unused; single-threaded fetch avoids data-provider rate-limit issues.
 
 # Default timeout for individual yfinance sector info calls (seconds).
 # Overridden by cfg.SECTOR_FETCH_TIMEOUT when available.
@@ -557,17 +566,14 @@ def _save_universe_cache(data: dict) -> None:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = UNIVERSE_CACHE_FILE.with_name(UNIVERSE_CACHE_FILE.name + ".tmp")
     try:
-        with temp_file.open("w", encoding="utf-8") as file:
-            json.dump(data, file, indent=2)
-            # FIX-BUG-12: flush userspace buffer then fsync to kernel before the
-            # atomic rename, matching the hardened pattern in save_portfolio_state
-            # and _save_manifest.  Without this, a crash between write() and rename()
-            # can leave a zero-byte or partially-written universe cache file.
-            file.flush()
-            os.fsync(file.fileno())
-        temp_file.replace(UNIVERSE_CACHE_FILE)
+        atomic_write_file(
+            UNIVERSE_CACHE_FILE,
+            lambda tmp: tmp.write_text(json.dumps(data, indent=2), encoding="utf-8"),
+            suffix=".tmp.json",
+            fsync_file=True,
+            fsync_dir=True,
+        )
     except Exception as exc:
         logger.error("[Universe] Failed to save cache: %s", exc)
 
@@ -594,7 +600,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    from momentum_engine import UltimateConfig, to_ns
+    from momentum_engine import UltimateConfig
     from data_cache import load_or_fetch
 
     if cfg is None:
@@ -603,7 +609,12 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
     lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
 
-    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    try:
+        tz_ist = ZoneInfo(TIMEZONE_IST)
+    except ZoneInfoNotFoundError:
+        # Fallback to fixed offset UTC+05:30 when IANA database is unavailable
+        tz_ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz_ist)
     end_date = now_ist.strftime("%Y-%m-%d")
     start_date = (now_ist - timedelta(days=max(150, lookback * 2))).strftime("%Y-%m-%d")
 
@@ -636,7 +647,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
             #   - Only a TOTAL chunk failure (zero symbols returned) is an error
             #     worthy of appending to chunk_failures and eventually raising
             #     UniverseFetchError.
-            expected_ns = {to_ns(s) for s in chunk}
+            expected_ns = {normalize_ns_ticker(s) for s in chunk}
             returned_ns = set(data.keys())
             missing_ns  = expected_ns - returned_ns
             if missing_ns:
@@ -653,11 +664,11 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
                     f"(size={len(chunk)}): {list(chunk)[:3]}"
                 )
             for symbol in chunk:
-                ns_sym = to_ns(symbol)
+                ns_sym = normalize_ns_ticker(symbol)
                 if ns_sym in data:
                     frame = data[ns_sym]
                     if "Close" in frame.columns and "Volume" in frame.columns:
-                        notional = (frame["Close"] * frame["Volume"]).clip(lower=0)
+                        notional = compute_notional_volume(frame)
                         adv = float(notional.tail(lookback).mean()) if notional.notna().any() else 0.0
                     else:
                         adv = 0.0
@@ -702,26 +713,8 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
 # ─── Network Fetchers ─────────────────────────────────────────────────────────
 
 def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
-    """_fetch_csv_with_headers operation.
-    
-    Args:
-        url (str): Input parameter.
-        timeout (float): Input parameter.
-    
-    Returns:
-        pd.DataFrame: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/csv,application/csv",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    response = requests.get(url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    return pd.read_csv(io.StringIO(response.text))
+    """Fetch CSV from an NSE endpoint using shared headers/retry behavior."""
+    return fetch_nse_csv(url, timeout=timeout)
 
 def _fetch_cached_universe(
     cache_key: str,
