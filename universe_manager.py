@@ -32,7 +32,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -723,6 +723,73 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     response.raise_for_status()
     return pd.read_csv(io.StringIO(response.text))
 
+def _fetch_cached_universe(
+    cache_key: str,
+    csv_url: str,
+    *,
+    fetch_label: str,
+    stale_label: str,
+    failure_label: str,
+    failure_message: str,
+    ticker_extractor: Callable[[pd.DataFrame], List[str]],
+    cfg=None,
+    apply_adv_filter: bool = False,
+) -> List[str]:
+    """Fetch a ticker universe with cache + stale-cache fallback handling."""
+    with _UNIVERSE_CACHE_FILE_LOCK:
+        cache = _load_universe_cache()
+        entry = cache.get(cache_key, {})
+
+    if entry:
+        if _is_cache_entry_fresh(entry.get("fetched_at")):
+            return entry["tickers"]
+
+    try:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            fresh_entry = cache.get(cache_key, {})
+            if fresh_entry and _is_cache_entry_fresh(fresh_entry.get("fetched_at")):
+                return fresh_entry["tickers"]
+        logger.info("[Universe] Fetching fresh %s...", fetch_label)
+        df = _fetch_csv_with_headers(csv_url)
+        df.columns = [col.strip().upper() for col in df.columns]
+
+        tickers = ticker_extractor(df)
+        if apply_adv_filter:
+            tickers = _apply_adv_filter(tickers, cfg=cfg)
+
+        filter_status = "post-ADV-filter" if apply_adv_filter else "unfiltered"
+        logger.info(
+            "[Universe] Cached %d constituents for %s (%s).",
+            len(tickers),
+            cache_key,
+            filter_status,
+        )
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            cache = _load_universe_cache()
+            cache[cache_key] = {
+                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+                "tickers": tickers,
+            }
+            _save_universe_cache(cache)
+        return tickers
+
+    except Exception as exc:
+        # Broad catch is intentional: network, CSV parsing, and cache I/O errors
+        # should all trigger stale-cache fallback when available.
+        logger.error("[Universe] %s fetch failed: %s", failure_label, exc)
+        if entry:
+            logger.warning(
+                "[Universe] Using stale cache for %s (fetched_at=%s).",
+                stale_label,
+                entry.get("fetched_at", "unknown"),
+            )
+            return entry["tickers"]
+
+        error = UniverseFetchError(failure_message)
+        error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
+        raise error from exc
+
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     """fetch_nse_equity_universe operation.
     
@@ -736,52 +803,17 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    with _UNIVERSE_CACHE_FILE_LOCK:
-        cache = _load_universe_cache()
-        entry = cache.get("total_equity", {})
-
-    if entry:
-        if _is_cache_entry_fresh(entry.get("fetched_at")):
-            return entry["tickers"]
-
-    try:
-        with _UNIVERSE_CACHE_FILE_LOCK:
-            cache = _load_universe_cache()
-            fresh_entry = cache.get("total_equity", {})
-            if fresh_entry and _is_cache_entry_fresh(fresh_entry.get("fetched_at")):
-                return fresh_entry["tickers"]
-        logger.info("[Universe] Fetching fresh NSE total equity master...")
-        df = _fetch_csv_with_headers("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
-        df.columns = [col.strip().upper() for col in df.columns]
-
-        equity_df = df[df["SERIES"] == "EQ"]
-        tickers = equity_df["SYMBOL"].unique().tolist()
-        if apply_adv_filter:
-            tickers = _apply_adv_filter(tickers, cfg=cfg)
-
-        filter_status = "post-ADV-filter" if apply_adv_filter else "unfiltered"
-        logger.info("[Universe] Cached %d raw EQ constituents (%s).", len(tickers), filter_status)
-        with _UNIVERSE_CACHE_FILE_LOCK:
-            cache = _load_universe_cache()
-            cache["total_equity"] = {
-                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-                "tickers":    tickers,
-            }
-            _save_universe_cache(cache)
-        return tickers
-
-    except Exception as exc:
-        logger.error("[Universe] NSE master fetch failed: %s", exc)
-        if entry:
-            logger.warning(
-                "[Universe] Using stale cache for NSE Total Equity (fetched_at=%s).",
-                entry.get("fetched_at", "unknown"),
-            )
-            return entry["tickers"]
-
-        error = UniverseFetchError("Failed to fetch NSE Total Equity from origin.")
-        error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error from exc
+    return _fetch_cached_universe(
+        "total_equity",
+        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+        fetch_label="NSE total equity master",
+        stale_label="NSE Total Equity",
+        failure_label="NSE master",
+        failure_message="Failed to fetch NSE Total Equity from origin.",
+        ticker_extractor=lambda df: df[df["SERIES"] == "EQ"]["SYMBOL"].unique().tolist(),
+        cfg=cfg,
+        apply_adv_filter=apply_adv_filter,
+    )
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     """get_nifty500 operation.
@@ -796,49 +828,17 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     Raises:
         Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    with _UNIVERSE_CACHE_FILE_LOCK:
-        cache = _load_universe_cache()
-        entry = cache.get("nifty500", {})
-
-    if entry:
-        if _is_cache_entry_fresh(entry.get("fetched_at")):
-            return entry["tickers"]
-
-    try:
-        with _UNIVERSE_CACHE_FILE_LOCK:
-            cache = _load_universe_cache()
-            fresh_entry = cache.get("nifty500", {})
-            if fresh_entry and _is_cache_entry_fresh(fresh_entry.get("fetched_at")):
-                return fresh_entry["tickers"]
-        logger.info("[Universe] Fetching fresh Nifty 500 constituents...")
-        df = _fetch_csv_with_headers("https://archives.nseindia.com/content/indices/ind_nifty500list.csv")
-        df.columns = [col.strip().upper() for col in df.columns]
-
-        tickers = df["SYMBOL"].unique().tolist()
-        if apply_adv_filter:
-            tickers = _apply_adv_filter(tickers, cfg=cfg)
-
-        with _UNIVERSE_CACHE_FILE_LOCK:
-            cache = _load_universe_cache()
-            cache["nifty500"] = {
-                "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-                "tickers": tickers
-            }
-            _save_universe_cache(cache)
-        return tickers
-
-    except Exception as exc:
-        logger.error("[Universe] Nifty 500 fetch failed: %s", exc)
-        if entry:
-            logger.warning(
-                "[Universe] Using stale cache for Nifty 500 (fetched_at=%s).",
-                entry.get("fetched_at", "unknown"),
-            )
-            return entry["tickers"]
-
-        error = UniverseFetchError("Failed to fetch Nifty 500 from origin.")
-        error.fallback_universe = list(_HARD_FLOOR_UNIVERSE)
-        raise error from exc
+    return _fetch_cached_universe(
+        "nifty500",
+        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+        fetch_label="Nifty 500 constituents",
+        stale_label="Nifty 500",
+        failure_label="Nifty 500",
+        failure_message="Failed to fetch Nifty 500 from origin.",
+        ticker_extractor=lambda df: df["SYMBOL"].unique().tolist(),
+        cfg=cfg,
+        apply_adv_filter=apply_adv_filter,
+    )
 
 def get_sector_map(tickers: List[str], use_cache: bool = True, cfg=None) -> Dict[str, str]:
     """
