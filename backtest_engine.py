@@ -131,6 +131,24 @@ class BacktestEngine:
         self._rebal_rows = []
         self.trades = []
 
+    def _compute_portfolio_value_and_gross_exposure(
+        self,
+        valuation_close: pd.Series,
+        cfg: UltimateConfig,
+    ) -> tuple[float, float]:
+        """Compute current portfolio value and gross exposure ratio."""
+        invested_notional = sum(
+            self.state.shares.get(sym, 0) * (
+                float(valuation_close[sym])
+                if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
+                else _ffill_price(self.state, sym, cfg)
+            )
+            for sym in self.state.shares
+        )
+        pv = self.state.cash + invested_notional
+        gross_exposure = invested_notional / max(pv, 1e-6)
+        return pv, gross_exposure
+
     def run(
         self,
         close:           pd.DataFrame,
@@ -416,13 +434,9 @@ class BacktestEngine:
             for sym in active_symbols
         ])
 
-        pv = self.state.cash + sum(
-            self.state.shares.get(sym, 0) * (
-                float(valuation_close[sym])
-                if (sym in close.columns and pd.notna(valuation_close[sym]))
-                else _ffill_price(self.state, sym, cfg)
-            )
-            for sym in self.state.shares
+        pv, gross_exposure = self._compute_portfolio_value_and_gross_exposure(
+            valuation_close=valuation_close,
+            cfg=cfg,
         )
         prev_w_dict = _build_prev_weights(self.state, active_symbols, pv)
 
@@ -433,15 +447,6 @@ class BacktestEngine:
             realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
         else:
             realised_cvar = 0.0
-
-        gross_exposure = sum(
-            self.state.shares.get(sym, 0) * (
-                float(valuation_close[sym])
-                if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
-                else _ffill_price(self.state, sym, cfg)
-            )
-            for sym in self.state.shares
-        ) / max(pv, 1e-6)
 
         self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
 

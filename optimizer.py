@@ -54,14 +54,14 @@ from universe_manager import get_nifty500, fetch_nse_equity_universe, get_histor
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+logger = logging.getLogger("Optimizer")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
+    except (AttributeError, OSError, ValueError) as exc:
+        logger.debug("stdout.reconfigure unavailable; continuing with default stdout settings (%s)", exc)
         pass
-
-logger = logging.getLogger("Optimizer")
 
 
 def _utc_today() -> pd.Timestamp:
@@ -840,6 +840,8 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
                 get_historical_universe(normalized_universe, pd.Timestamp(target_date))
             )
     except Exception as exc:
+        # Broad catch is intentional: historical source resolution spans file,
+        # parser, and provider paths and this preload step is non-fatal.
         logger.warning(
             "Historical universe preload failed for %s (%s). Falling back to base universe only.",
             normalized_universe, exc,
@@ -984,7 +986,8 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
 
     try:
         os.replace(temp_path, filepath)
-    except Exception:
+    except OSError as exc:
+        logger.exception("Failed to atomically replace config file %s with temp file %s.", filepath, temp_path)
         try:
             os.unlink(temp_path)
         except OSError:
@@ -1061,6 +1064,8 @@ def _set_trial_error_class_user_attr(
         if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
             study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
     except Exception as e:
+        # Broad catch is intentional: Optuna backends expose heterogeneous
+        # storage-layer exceptions that should not break optimization flow.
         logger.error(
             "Failed to set trial user attribute 'error_class'=%r for trial %s: %s (storage=%s)",
             error_class,
@@ -1382,6 +1387,8 @@ def run_optimization(
             callbacks         = [_error_triage_callback_factory(), _best_trial_callback],
         )
     except Exception:
+        # Broad catch is intentional: this is the top-level optimizer guardrail
+        # to log and re-raise any unexpected internal failure mode.
         logger.exception("Optimization aborted due to unexpected internal error.")
         raise
 
@@ -1526,6 +1533,11 @@ def run_optimization(
                 oos_results_list.append((oos_calmar, trial_candidate, trial_candidate.params, m))
 
         except Exception as exc:
+            logger.exception(
+                "OOS evaluation failed for trial %s (rank=%s). Marking row as ERROR.",
+                trial_candidate.number,
+                rank,
+            )
             print(
                 f"  {rank:>4}  #{trial_candidate.number:>5}  "
                 f"{trial_candidate.values[0]:>9.4f}  "

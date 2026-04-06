@@ -766,8 +766,12 @@ def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
                 ((pd.Timestamp(d), float(vol)) for d, vol in rows),
                 maxlen=maxlen,
             )
-        except Exception:
-            logger.warning("PortfolioState.from_dict: skipping malformed vol_hist entry for %s", k)
+        except (TypeError, ValueError, KeyError, IndexError) as exc:
+            logger.warning(
+                "PortfolioState.from_dict: skipping malformed vol_hist entry for %s (%s)",
+                k,
+                exc,
+            )
     return out
 
 
@@ -783,6 +787,9 @@ def _state_get(
     try:
         return converter(payload[key]) if key in payload else default
     except Exception as exc:
+        # Broad catch is intentional: converter is caller-provided and may raise
+        # arbitrary exception types depending on the target field.
+        logger.warning("PortfolioState.from_dict: field '%s' failed conversion (%s); using default.", key, exc)
         msg = f"{key}: {exc}"
         if key in risk_control_fields:
             risk_control_errors.append(msg)
@@ -2138,6 +2145,8 @@ class InstitutionalRiskEngine:
                 assert self._solver is not None
                 res = self._solver.solve()
             except Exception as exc:
+                # Broad catch is intentional here: third-party solver bindings can
+                # raise heterogeneous runtime exceptions across versions/platforms.
                 logger.error(
                     "[Optimizer] OSQP solve() raised an exception: %s — "
                     "invalidating solver cache to force fresh setup on next call.", exc
@@ -2173,6 +2182,12 @@ class InstitutionalRiskEngine:
             try:
                 res = self._solver.solve()
             except Exception as exc:
+                # Broad catch is intentional here for the same reason as the
+                # first pass solve() call above.
+                logger.error(
+                    "[Optimizer] OSQP second-pass solve() raised an exception: %s — "
+                    "invalidating solver cache to force fresh setup on next call.", exc
+                )
                 self._solver = None
                 self._solver_shape = None
                 self._solver_nnz = None
