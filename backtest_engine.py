@@ -114,17 +114,11 @@ class BacktestResults:
 class BacktestEngine:
     """BacktestEngine type used by the backtesting system."""
     def __init__(self, engine: InstitutionalRiskEngine, initial_cash: float = 1_000_000):
-        """__init__ operation.
-        
+        """Initialize the instance.
+
         Args:
-            engine (InstitutionalRiskEngine): Input parameter.
-            initial_cash (float): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            engine (InstitutionalRiskEngine): Input value used by this function.
+            initial_cash (float): Input value used by this function.
         """
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
@@ -164,30 +158,27 @@ class BacktestEngine:
         # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
         # runs; without clearing per-run buffers, equity/trade/rebalance state
         # accumulates and contaminates subsequent outputs.
-        """run operation.
-        
+        """Run.
+
         Args:
-            close (pd.DataFrame): Input parameter.
-            volume (pd.DataFrame): Input parameter.
-            returns (pd.DataFrame): Input parameter.
-            rebalance_dates (pd.DatetimeIndex): Input parameter.
-            start_date (str): Input parameter.
-            end_date (Optional[str]): Input parameter.
-            idx_df (Optional[pd.DataFrame]): Input parameter.
-            sector_map (Optional[dict]): Input parameter.
-            open_px (Optional[pd.DataFrame]): Input parameter.
-            high_px (Optional[pd.DataFrame]): Input parameter.
-            low_px (Optional[pd.DataFrame]): Input parameter.
-            dividends (Optional[pd.DataFrame]): Input parameter.
-            splits (Optional[pd.DataFrame]): Input parameter.
-            universe_by_rebalance_date (Optional[Dict[pd.Timestamp, set[str]]]): Input parameter.
-            log_rets_arr (Optional[np.ndarray]): Input parameter.
-        
+            close (pd.DataFrame): Price series/values aligned with the active symbols.
+            volume (pd.DataFrame): Liquidity/volume inputs used in sizing or filtering.
+            returns (pd.DataFrame): Return series or return-based metric input.
+            rebalance_dates (pd.DatetimeIndex): Date/time boundary or timestamp used by this function.
+            start_date (str): Date/time boundary or timestamp used by this function.
+            end_date (Optional[str]): Date/time boundary or timestamp used by this function.
+            idx_df (Optional[pd.DataFrame]): Data payload consumed by this function.
+            sector_map (Optional[dict]): Input value used by this function.
+            open_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            high_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            low_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            dividends (Optional[pd.DataFrame]): Date/time boundary or timestamp used by this function.
+            splits (Optional[pd.DataFrame]): Date/time boundary or timestamp used by this function.
+            universe_by_rebalance_date (Optional[Dict[pd.Timestamp, set[str]]]): Ticker symbols/universe members to process.
+            log_rets_arr (Optional[np.ndarray]): Date/time boundary or timestamp used by this function.
+
         Returns:
-            pd.DataFrame: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            pd.DataFrame: Result produced by this function.
         """
         self._reset_run_state()
         # Guard against stale values left by a prior state.from_dict()
@@ -322,29 +313,26 @@ class BacktestEngine:
         date_pos: Optional[int] = None,
         log_rets_arr: Optional[np.ndarray] = None,
     ) -> None:
-        """_run_rebalance operation.
-        
+        """Run rebalance.
+
         Args:
-            date (pd.Timestamp): Input parameter.
-            close (pd.DataFrame): Input parameter.
-            volume (pd.DataFrame): Input parameter.
-            returns (pd.DataFrame): Input parameter.
-            symbols (List[str]): Input parameter.
-            prices_t (np.ndarray): Input parameter.
-            idx_df (Optional[pd.DataFrame]): Input parameter.
-            sector_map (Optional[dict]): Input parameter.
-            open_px (Optional[pd.DataFrame]): Input parameter.
-            high_px (Optional[pd.DataFrame]): Input parameter.
-            low_px (Optional[pd.DataFrame]): Input parameter.
-            member_universe (Optional[set[str]]): Input parameter.
-            date_pos (Optional[int]): Input parameter.
-            log_rets_arr (Optional[np.ndarray]): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
+            date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+            close (pd.DataFrame): Price series/values aligned with the active symbols.
+            volume (pd.DataFrame): Liquidity/volume inputs used in sizing or filtering.
+            returns (pd.DataFrame): Return series or return-based metric input.
+            symbols (List[str]): Ticker symbols/universe members to process.
+            prices_t (np.ndarray): Price series/values aligned with the active symbols.
+            idx_df (Optional[pd.DataFrame]): Data payload consumed by this function.
+            sector_map (Optional[dict]): Input value used by this function.
+            open_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            high_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            low_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+            member_universe (Optional[set[str]]): Ticker symbols/universe members to process.
+            date_pos (Optional[int]): Date/time boundary or timestamp used by this function.
+            log_rets_arr (Optional[np.ndarray]): Date/time boundary or timestamp used by this function.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            ValueError: Raised when input validation, I/O, or runtime checks fail.
         """
         cfg = self.engine.cfg
         # TODO(refactor follow-up): structural placeholder hooks.
@@ -680,17 +668,14 @@ class BacktestEngine:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
-    """_compute_warmup_start operation.
-    
+    """Compute warmup start.
+
     Args:
-        start_date (str): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        start_date (str): Date/time boundary or timestamp used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
     Returns:
-        str: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: Result produced by this function.
     """
     halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
     cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
@@ -753,21 +738,18 @@ def _build_adv_vector(
     cfg: Optional[UltimateConfig] = None,
     return_notional: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, pd.DataFrame]:
-    """_build_adv_vector operation.
-    
+    """Build adv vector.
+
     Args:
-        symbols (List[str]): Input parameter.
-        close (pd.DataFrame): Input parameter.
-        volume (pd.DataFrame): Input parameter.
-        date (pd.Timestamp): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-        return_notional (bool): Input parameter.
-    
+        symbols (List[str]): Ticker symbols/universe members to process.
+        close (pd.DataFrame): Price series/values aligned with the active symbols.
+        volume (pd.DataFrame): Liquidity/volume inputs used in sizing or filtering.
+        date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+        cfg (Optional[UltimateConfig]): Configuration settings controlling behavior for this call.
+        return_notional (bool): Return series or return-based metric input.
+
     Returns:
-        np.ndarray | tuple[np.ndarray, pd.DataFrame]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray | tuple[np.ndarray, pd.DataFrame]: Result produced by this function.
     """
     adv_zero_reasons: dict[str, list[str]] = {
         "missing_column": [],
@@ -850,17 +832,14 @@ def _build_adv_vector(
 
 
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
-    """_build_sector_labels operation.
-    
+    """Build sector labels.
+
     Args:
-        sel_syms (List[str]): Input parameter.
-        sector_map (Optional[dict]): Input parameter.
-    
+        sel_syms (List[str]): Ticker symbols/universe members to process.
+        sector_map (Optional[dict]): Input value used by this function.
+
     Returns:
-        Optional[np.ndarray]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[np.ndarray]: Result produced by this function.
     """
     if not sector_map:
         return None
@@ -890,22 +869,19 @@ def _execution_prices(
     low_px: Optional[pd.DataFrame],
     return_open_fallback_mask: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """_execution_prices operation.
-    
+    """Internal helper to execution prices.
+
     Args:
-        symbols (List[str]): Input parameter.
-        date (pd.Timestamp): Input parameter.
-        close_prices (np.ndarray): Input parameter.
-        open_px (Optional[pd.DataFrame]): Input parameter.
-        high_px (Optional[pd.DataFrame]): Input parameter.
-        low_px (Optional[pd.DataFrame]): Input parameter.
-        return_open_fallback_mask (bool): Input parameter.
-    
+        symbols (List[str]): Ticker symbols/universe members to process.
+        date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+        close_prices (np.ndarray): Price series/values aligned with the active symbols.
+        open_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+        high_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+        low_px (Optional[pd.DataFrame]): Price series/values aligned with the active symbols.
+        return_open_fallback_mask (bool): Price series/values aligned with the active symbols.
+
     Returns:
-        np.ndarray | tuple[np.ndarray, np.ndarray]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray | tuple[np.ndarray, np.ndarray]: Result produced by this function.
     """
     exec_px = close_prices.copy()
     open_fallback_mask = np.zeros(len(symbols), dtype=bool)
@@ -928,17 +904,14 @@ def _execution_prices(
 
 
 def _detect_suspension_gaps(df: pd.DataFrame, threshold_days: int) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    """_detect_suspension_gaps operation.
+    """Internal helper to detect suspension gaps.
 
     Args:
-        df (pd.DataFrame): Input parameter.
-        threshold_days (int): Input parameter.
+        df (pd.DataFrame): Data payload consumed by this function.
+        threshold_days (int): Input value used by this function.
 
     Returns:
-        List[Tuple[pd.Timestamp, pd.Timestamp]]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[Tuple[pd.Timestamp, pd.Timestamp]]: Result produced by this function.
     """
     if len(df) < 2:
         return []
@@ -965,20 +938,17 @@ def _generate_synthetic_fill(
     pre_gap_df: pd.DataFrame,
     has_adj_close: bool,
 ) -> pd.DataFrame:
-    """_generate_synthetic_fill operation.
+    """Internal helper to generate synthetic fill.
 
     Args:
-        ticker (str): Input parameter.
-        gap_start (pd.Timestamp): Input parameter.
-        gap_end (pd.Timestamp): Input parameter.
-        pre_gap_df (pd.DataFrame): Input parameter.
-        has_adj_close (bool): Input parameter.
+        ticker (str): Ticker symbols/universe members to process.
+        gap_start (pd.Timestamp): Date/time boundary or timestamp used by this function.
+        gap_end (pd.Timestamp): Date/time boundary or timestamp used by this function.
+        pre_gap_df (pd.DataFrame): Data payload consumed by this function.
+        has_adj_close (bool): Price series/values aligned with the active symbols.
 
     Returns:
-        pd.DataFrame: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pd.DataFrame: Result produced by this function.
     """
     gap_idx = pd.bdate_range(gap_start, gap_end)
     synth_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)].difference(pre_gap_df.index)
@@ -1074,19 +1044,19 @@ def _deduplicate_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: UltimateConfig) -> pd.Series:
-    """_extract_series_for_symbol operation.
+    """Internal helper to extract series for symbol.
 
     Args:
-        market_data (dict): Input parameter.
-        sym (str): Input parameter.
-        column (str): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        market_data (dict): Data payload consumed by this function.
+        sym (str): Input value used by this function.
+        column (str): Input value used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
 
     Returns:
-        pd.Series: Result of this operation.
+        pd.Series: Result produced by this function.
 
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
     """
     key = sym if sym.endswith(".NS") else f"{sym}.NS"
     row = market_data.get(key)
@@ -1121,18 +1091,18 @@ def build_precomputed_matrices(
     cfg: Optional[UltimateConfig] = None,
     symbols: Optional[set[str]] = None,
 ) -> dict:
-    """build_precomputed_matrices operation.
-    
+    """Build precomputed matrices.
+
     Args:
-        market_data (dict): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-        symbols (Optional[set[str]]): Input parameter.
-    
+        market_data (dict): Data payload consumed by this function.
+        cfg (Optional[UltimateConfig]): Configuration settings controlling behavior for this call.
+        symbols (Optional[set[str]]): Ticker symbols/universe members to process.
+
     Returns:
-        dict: Result of this operation.
-    
+        dict: Constructed object/value ready for downstream use.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
     """
     if cfg is None:
         cfg = UltimateConfig()
@@ -1220,20 +1190,17 @@ def _resolve_universe_by_date(
     all_target_dates: pd.DatetimeIndex,
     cfg: UltimateConfig,
 ) -> Tuple[set[str], Dict[pd.Timestamp, set[str]], str]:
-    """_resolve_universe_by_date operation.
+    """Resolve universe by date.
 
     Args:
-        market_data (dict): Input parameter.
-        universe_type (Optional[str]): Input parameter.
-        universe (Optional[List[str]]): Input parameter.
-        all_target_dates (pd.DatetimeIndex): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        market_data (dict): Data payload consumed by this function.
+        universe_type (Optional[str]): Ticker symbols/universe members to process.
+        universe (Optional[List[str]]): Ticker symbols/universe members to process.
+        all_target_dates (pd.DatetimeIndex): Date/time boundary or timestamp used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
 
     Returns:
-        Tuple[set[str], Dict[pd.Timestamp, set[str]], str]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[set[str], Dict[pd.Timestamp, set[str]], str]: Result produced by this function.
     """
     def _normalize_symbol(sym: str) -> str:
         s = str(sym).strip().upper()
@@ -1294,7 +1261,23 @@ def _prepare_backtest_matrices(
     cfg: UltimateConfig,
     precomputed_matrices: Optional[dict],
 ) -> Dict[str, pd.DataFrame]:
-    """_prepare_backtest_matrices operation."""
+    """Internal helper to prepare backtest matrices.
+
+    Args:
+        market_data (dict): Data payload consumed by this function.
+        union_universe (set[str]): Ticker symbols/universe members to process.
+        warmup_start (str): Date/time boundary or timestamp used by this function.
+        end_date (str): Date/time boundary or timestamp used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+        precomputed_matrices (Optional[dict]): Input value used by this function.
+
+    Returns:
+        Dict[str, pd.DataFrame]: Result produced by this function.
+
+    Raises:
+        KeyError: Raised when input validation, I/O, or runtime checks fail.
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
+    """
     matrices = precomputed_matrices
     if matrices:
         selected = sorted(union_universe)
@@ -1372,7 +1355,16 @@ def _snap_rebalance_dates_to_holidays(
     all_target_dates: pd.DatetimeIndex,
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]],
 ) -> Tuple[pd.DatetimeIndex, Dict[pd.Timestamp, set[str]]]:
-    """_snap_rebalance_dates_to_holidays operation."""
+    """Internal helper to snap rebalance dates to holidays.
+
+    Args:
+        close_index (pd.DatetimeIndex): Price series/values aligned with the active symbols.
+        all_target_dates (pd.DatetimeIndex): Date/time boundary or timestamp used by this function.
+        universe_by_rebalance_date (Dict[pd.Timestamp, set[str]]): Ticker symbols/universe members to process.
+
+    Returns:
+        Tuple[pd.DatetimeIndex, Dict[pd.Timestamp, set[str]]]: Result produced by this function.
+    """
     trading_index = pd.to_datetime(close_index)
     valid = []
     for target in all_target_dates:
@@ -1432,13 +1424,15 @@ def _rebal_filter_universe(
     symbols: List[str],
     member_universe: Optional[set[str]],
 ) -> _RebalFilterHookPayload:
-    """_rebal_filter_universe operation.
+    """Internal helper to rebal filter universe.
 
-    TODO: implement steps 1-2 of rebalance flow:
-    - apply date/member universe eligibility
-    - include currently held symbols even if not in fresh universe
-    - return normalized symbol list and index mappings consumed by later phases
-    Current behavior: returns opaque payload and caller ignores return value.
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        symbols (List[str]): Ticker symbols/universe members to process.
+        member_universe (Optional[set[str]]): Ticker symbols/universe members to process.
+
+    Returns:
+        _RebalFilterHookPayload: Result produced by this function.
     """
     return {
         "state_cash": float(state.cash),
@@ -1454,13 +1448,17 @@ def _rebal_build_valuation(
     date: pd.Timestamp,
     active_symbols: List[str],
 ) -> _RebalValuationHookPayload:
-    """_rebal_build_valuation operation.
+    """Internal helper to rebal build valuation.
 
-    TODO: implement steps 3-6:
-    - build ADV vector and valuation-price series
-    - compute portfolio value and previous weights
-    - return valuation bundle for CVaR/optimizer phases
-    Current behavior: returns opaque payload and caller ignores return value.
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        close (pd.DataFrame): Price series/values aligned with the active symbols.
+        volume (pd.DataFrame): Liquidity/volume inputs used in sizing or filtering.
+        date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+
+    Returns:
+        _RebalValuationHookPayload: Result produced by this function.
     """
     _ = (state, close, volume)
     return {
@@ -1476,13 +1474,17 @@ def _rebal_check_cvar_breach(
     hist_log_rets: pd.DataFrame,
     cfg: UltimateConfig,
 ) -> _RebalCvarHookPayload:
-    """_rebal_check_cvar_breach operation.
+    """Internal helper to rebal check cvar breach.
 
-    TODO: implement steps 8-10:
-    - compute book CVaR on valuation state
-    - set soft/hard breach flags and override/decay triggers
-    - return breach decision state used by target generation phase
-    Current behavior: returns opaque payload and caller ignores return value.
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        valuation_prices (np.ndarray): Price series/values aligned with the active symbols.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+        hist_log_rets (pd.DataFrame): Date/time boundary or timestamp used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
+    Returns:
+        _RebalCvarHookPayload: Result produced by this function.
     """
     _ = (valuation_prices, hist_log_rets, cfg)
     return {
@@ -1497,13 +1499,16 @@ def _rebal_generate_targets(
     adv_vector: np.ndarray,
     cfg: UltimateConfig,
 ) -> _RebalTargetsHookPayload:
-    """_rebal_generate_targets operation.
+    """Internal helper to rebal generate targets.
 
-    TODO: implement steps 11-13:
-    - generate signals and selection set
-    - call optimizer with failure handling and decay fallback
-    - return target weights plus flags (apply_decay, forced_to_cash)
-    Current behavior: returns opaque payload and caller ignores return value.
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        hist_log_rets (pd.DataFrame): Date/time boundary or timestamp used by this function.
+        adv_vector (np.ndarray): Liquidity/volume inputs used in sizing or filtering.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
+    Returns:
+        _RebalTargetsHookPayload: Result produced by this function.
     """
     _ = (state, adv_vector, cfg)
     return {
@@ -1518,13 +1523,16 @@ def _rebal_execute_trades(
     active_symbols: List[str],
     date: pd.Timestamp,
 ) -> _RebalExecutionHookPayload:
-    """_rebal_execute_trades operation.
+    """Internal helper to rebal execute trades.
 
-    TODO: implement step 14:
-    - resolve execution prices (open/close fallback rules)
-    - invoke execute_rebalance and capture trade/slippage effects
-    - return execution summary for rebalance audit row construction
-    Current behavior: returns opaque payload and caller ignores return value.
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        target_weights (np.ndarray): Date/time boundary or timestamp used by this function.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+        date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+
+    Returns:
+        _RebalExecutionHookPayload: Result produced by this function.
     """
     _ = (state, active_symbols)
     return {
@@ -1543,7 +1551,25 @@ def run_backtest(
     universe: Optional[List[str]] = None,
     precomputed_matrices: Optional[dict] = None,
 ) -> BacktestResults:
-    """run_backtest operation."""
+    """Run backtest.
+
+    Args:
+        market_data (dict): Data payload consumed by this function.
+        universe_type (Optional[str]): Ticker symbols/universe members to process.
+        start_date (str): Date/time boundary or timestamp used by this function.
+        end_date (str): Date/time boundary or timestamp used by this function.
+        cfg (Optional[UltimateConfig]): Configuration settings controlling behavior for this call.
+        sector_map (Optional[dict]): Input value used by this function.
+        universe (Optional[List[str]]): Ticker symbols/universe members to process.
+        precomputed_matrices (Optional[dict]): Input value used by this function.
+
+    Returns:
+        BacktestResults: Result produced by this function.
+
+    Raises:
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
+    """
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
     if start_ts > end_ts:
@@ -1652,16 +1678,10 @@ def run_backtest(
         rebal_log=rebal_log,
     )
 def print_backtest_results(results: BacktestResults) -> None:
-    """print_backtest_results operation.
-    
+    """Print backtest results.
+
     Args:
-        results (BacktestResults): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        results (BacktestResults): Date/time boundary or timestamp used by this function.
     """
     m = results.metrics
     if not m:
@@ -1688,17 +1708,14 @@ def print_backtest_results(results: BacktestResults) -> None:
 
 
 def _calc_cagr(eq: pd.Series, initial: float) -> float:
-    """_calc_cagr operation.
+    """Internal helper to calc cagr.
 
     Args:
-        eq (pd.Series): Input parameter.
-        initial (float): Input parameter.
+        eq (pd.Series): Input value used by this function.
+        initial (float): Input value used by this function.
 
     Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     if eq.empty or initial <= 0 or len(eq) < 2:
         return 0.0
@@ -1713,16 +1730,13 @@ def _calc_cagr(eq: pd.Series, initial: float) -> float:
 
 
 def _calc_drawdown(eq: pd.Series) -> Tuple[pd.Series, float]:
-    """_calc_drawdown operation.
+    """Internal helper to calc drawdown.
 
     Args:
-        eq (pd.Series): Input parameter.
+        eq (pd.Series): Input value used by this function.
 
     Returns:
-        Tuple[pd.Series, float]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[pd.Series, float]: Result produced by this function.
     """
     if eq.empty:
         return pd.Series(dtype=float), 0.0
@@ -1731,17 +1745,14 @@ def _calc_drawdown(eq: pd.Series) -> Tuple[pd.Series, float]:
 
 
 def _calc_sharpe_sortino(daily_returns: pd.Series, periods_per_year: int) -> Tuple[float, float]:
-    """_calc_sharpe_sortino operation.
+    """Internal helper to calc sharpe sortino.
 
     Args:
-        daily_returns (pd.Series): Input parameter.
-        periods_per_year (int): Input parameter.
+        daily_returns (pd.Series): Return series or return-based metric input.
+        periods_per_year (int): Date/time boundary or timestamp used by this function.
 
     Returns:
-        Tuple[float, float]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[float, float]: Result produced by this function.
     """
     if len(daily_returns) <= 1 or daily_returns.std() <= 0:
         return 0.0, 0.0
@@ -1756,17 +1767,14 @@ def _calc_sharpe_sortino(daily_returns: pd.Series, periods_per_year: int) -> Tup
 
 
 def _calc_calmar(cagr: float, max_dd: float) -> float:
-    """_calc_calmar operation.
+    """Internal helper to calc calmar.
 
     Args:
-        cagr (float): Input parameter.
-        max_dd (float): Input parameter.
+        cagr (float): Input value used by this function.
+        max_dd (float): Input value used by this function.
 
     Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     if max_dd >= 0.0:
         return cagr
@@ -1774,16 +1782,13 @@ def _calc_calmar(cagr: float, max_dd: float) -> float:
 
 
 def _calc_hit_rate(trades: List[Trade]) -> float:
-    """_calc_hit_rate operation.
+    """Internal helper to calc hit rate.
 
     Args:
-        trades (List[Trade]): Input parameter.
+        trades (List[Trade]): Input value used by this function.
 
     Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     round_trip_pnls: List[float] = []
     buy_queue: Dict[str, List[tuple[int, float]]] = {}
@@ -1815,18 +1820,15 @@ def _calc_hit_rate(trades: List[Trade]) -> float:
 
 
 def _calc_turnover(trades: List[Trade], eq: pd.Series, years: float) -> float:
-    """_calc_turnover operation.
+    """Internal helper to calc turnover.
 
     Args:
-        trades (List[Trade]): Input parameter.
-        eq (pd.Series): Input parameter.
-        years (float): Input parameter.
+        trades (List[Trade]): Input value used by this function.
+        eq (pd.Series): Input value used by this function.
+        years (float): Input value used by this function.
 
     Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     if not trades or eq.empty:
         return 0.0
@@ -1848,19 +1850,16 @@ def _compute_metrics(
     periods_per_year: int = 252,
     trades: Optional[List[Trade]] = None,
 ) -> Dict:
-    """_compute_metrics operation.
+    """Compute metrics.
 
     Args:
-        eq (pd.Series): Input parameter.
-        initial (float): Input parameter.
-        periods_per_year (int): Input parameter.
-        trades (Optional[List[Trade]]): Input parameter.
+        eq (pd.Series): Input value used by this function.
+        initial (float): Input value used by this function.
+        periods_per_year (int): Date/time boundary or timestamp used by this function.
+        trades (Optional[List[Trade]]): Input value used by this function.
 
     Returns:
-        Dict: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict: Result produced by this function.
     """
     if initial <= 0:
         logger.warning(
