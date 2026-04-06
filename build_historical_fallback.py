@@ -765,6 +765,12 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
 def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
+    """Run.
+
+    Args:
+        universe_arg (str): Ticker symbols/universe members to process.
+        start_date (str): Date/time boundary or timestamp used by this function.
+    """
     TODAY_UTC = pd.Timestamp.now("UTC").tz_convert(None).normalize()  # FIX-4
     want_nifty500  = universe_arg in ("both", "nifty500")
     want_nse_total = universe_arg in ("both", "nse_total")
@@ -1061,6 +1067,11 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
 
 
 def _parse_args(argv=None):
+    """Parse args.
+
+    Args:
+        argv (Any): CLI argument values to parse.
+    """
     p = argparse.ArgumentParser(description="Fallback historical universe builder for Ultimate Momentum.")
     p.add_argument(
         "--universe",

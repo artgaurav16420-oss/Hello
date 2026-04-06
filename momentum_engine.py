@@ -100,18 +100,15 @@ def to_bare(sym: str) -> str:
 
 
 def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
-    """absent_symbol_effective_price operation.
-    
+    """Absent symbol effective price.
+
     Args:
-        last_known_price (float): Input parameter.
-        absent_periods (int): Input parameter.
-        max_absent_periods (int): Input parameter.
-    
+        last_known_price (float): Price series/values aligned with the active symbols.
+        absent_periods (int): Date/time boundary or timestamp used by this function.
+        max_absent_periods (int): Date/time boundary or timestamp used by this function.
+
     Returns:
-        float: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     px = float(last_known_price)
     if not np.isfinite(px) or px <= 0:
@@ -137,17 +134,11 @@ class OptimizationError(Exception):
         message:    str,
         error_type: OptimizationErrorType = OptimizationErrorType.NUMERICAL,
     ):
-        """__init__ operation.
-        
+        """Initialize the instance.
+
         Args:
-            message (str): Input parameter.
-            error_type (OptimizationErrorType): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            message (str): Input value used by this function.
+            error_type (OptimizationErrorType): Exception context passed by the runtime.
         """
         super().__init__(message)
         self.error_type = error_type
@@ -191,16 +182,10 @@ class SolverDiagnostics:
 class _ConstraintBuilder:
     """_ConstraintBuilder type used by the backtesting system."""
     def __init__(self, n_vars: int):
-        """__init__ operation.
-        
+        """Initialize the instance.
+
         Args:
-            n_vars (int): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            n_vars (int): Input value used by this function.
         """
         self.n_vars = n_vars
         self.A_parts: list = []
@@ -378,19 +363,13 @@ class PortfolioState:
         cfg:            UltimateConfig,
         gross_exposure: float = 1.0,
     ) -> None:
-        """update_exposure operation.
-        
+        """Update exposure.
+
         Args:
-            regime_score (float): Input parameter.
-            realized_cvar (float): Input parameter.
-            cfg (UltimateConfig): Input parameter.
-            gross_exposure (float): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            regime_score (float): Input value used by this function.
+            realized_cvar (float): Input value used by this function.
+            cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+            gross_exposure (float): Input value used by this function.
         """
         target   = 1.0 / (1.0 + np.exp(-cfg.REGIME_SIGMOID_STEEPNESS * (regime_score - 0.5)))
         new_mult = self.exposure_multiplier + float(
@@ -470,16 +449,10 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
-        """record_eod operation.
-        
+        """Record eod.
+
         Args:
-            prices (Dict[str, float]): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            prices (Dict[str, float]): Price series/values aligned with the active symbols.
         """
         max_absent_periods = (
             self.max_absent_periods
@@ -528,13 +501,7 @@ class PortfolioState:
             hist.append((pd.Timestamp(current_date), vol_value))
 
     def reset(self) -> None:
-        """reset operation.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """Reset.
         """
         initial_cash = float(getattr(self, "_initial_cash", self.cash))
         self.shares = {}
@@ -553,13 +520,10 @@ class PortfolioState:
         self.decay_rounds = 0
 
     def to_dict(self) -> dict:
-        """to_dict operation.
-        
+        """To dict.
+
         Returns:
-            dict: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            dict: Result produced by this function.
         """
         def _r(v):
             """Recursively round float values for stable JSON serialization.
@@ -610,16 +574,13 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PortfolioState":
-        """from_dict operation.
-        
+        """From dict.
+
         Args:
-            d (dict): Input parameter.
-        
+            d (dict): Input value used by this function.
+
         Returns:
-            "PortfolioState": Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            "PortfolioState": Result produced by this function.
         """
         ps = cls()
         errors: List[str] = []
@@ -848,19 +809,16 @@ def _compute_one_way_slip_rate_vectorized(
     adv_notional: np.ndarray,
     trade_notional: np.ndarray,
 ) -> np.ndarray:
-    """_compute_one_way_slip_rate_vectorized operation.
-    
+    """Compute one way slip rate vectorized.
+
     Args:
-        cfg (UltimateConfig): Input parameter.
-        portfolio_value (float): Input parameter.
-        adv_notional (np.ndarray): Input parameter.
-        trade_notional (np.ndarray): Input parameter.
-    
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+        portfolio_value (float): Input value used by this function.
+        adv_notional (np.ndarray): Liquidity/volume inputs used in sizing or filtering.
+        trade_notional (np.ndarray): Input value used by this function.
+
     Returns:
-        np.ndarray: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray: Result produced by this function.
     """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     adv_arr = np.asarray(adv_notional, dtype=float)
@@ -870,7 +828,9 @@ def _compute_one_way_slip_rate_vectorized(
     impact = np.zeros_like(numerator, dtype=float)
     impact[valid_adv] = cfg.IMPACT_COEFF * numerator[valid_adv] / adv_arr[valid_adv]
     impact = np.clip(impact, 0.0, 0.05)
-    return np.where(valid_adv, np.maximum(base_rate, impact), base_rate)
+    incremental = np.maximum(impact - (base_rate * 0.5), 0.0)
+    one_way = np.where(valid_adv, base_rate + incremental, base_rate)
+    return np.clip(one_way, base_rate, 0.05)
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────
@@ -882,20 +842,17 @@ def _compute_pv_exec(
     cfg: UltimateConfig,
     symbols_to_force_close: Set[str],
 ) -> Tuple[float, float]:
-    """_compute_pv_exec operation.
-    
+    """Compute pv exec.
+
     Args:
-        state (PortfolioState): Input parameter.
-        prices (np.ndarray): Input parameter.
-        active_symbols (List[str]): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        symbols_to_force_close (Set[str]): Input parameter.
-    
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        prices (np.ndarray): Price series/values aligned with the active symbols.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+        symbols_to_force_close (Set[str]): Ticker symbols/universe members to process.
+
     Returns:
-        Tuple[float, float]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[float, float]: Result produced by this function.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     absent_snapshot: Dict[str, int] = dict(state.absent_periods)
@@ -935,23 +892,20 @@ def _compute_desired_shares(
     current_shares: Optional[Dict[str, int]] = None,
     conviction_scores: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]:
-    """_compute_desired_shares operation.
-    
+    """Compute desired shares.
+
     Args:
-        target_weights (np.ndarray): Input parameter.
-        prices (np.ndarray): Input parameter.
-        pv_exec (float): Input parameter.
-        adv_shares (Optional[np.ndarray]): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        active_symbols (Optional[List[str]]): Input parameter.
-        current_shares (Optional[Dict[str, int]]): Input parameter.
-        conviction_scores (Optional[np.ndarray]): Input parameter.
-    
+        target_weights (np.ndarray): Date/time boundary or timestamp used by this function.
+        prices (np.ndarray): Price series/values aligned with the active symbols.
+        pv_exec (float): Input value used by this function.
+        adv_shares (Optional[np.ndarray]): Liquidity/volume inputs used in sizing or filtering.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+        active_symbols (Optional[List[str]]): Ticker symbols/universe members to process.
+        current_shares (Optional[Dict[str, int]]): Input value used by this function.
+        conviction_scores (Optional[np.ndarray]): Input value used by this function.
+
     Returns:
-        Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]: Result produced by this function.
     """
     desired_shares: Dict[str, int] = {}
     valid_targets: List[Tuple[int, str, float, float]] = []
@@ -1020,22 +974,19 @@ def _apply_drift_gate(
     cfg: UltimateConfig,
     active_symbols: List[str],
 ) -> Tuple[Dict[str, int], set[str]]:
-    """_apply_drift_gate operation.
-    
+    """Apply drift gate.
+
     Args:
-        desired_shares (Dict[str, int]): Input parameter.
-        current_shares (Dict[str, int]): Input parameter.
-        target_weights (np.ndarray): Input parameter.
-        prices (np.ndarray): Input parameter.
-        pv_exec (float): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        active_symbols (List[str]): Input parameter.
-    
+        desired_shares (Dict[str, int]): Input value used by this function.
+        current_shares (Dict[str, int]): Input value used by this function.
+        target_weights (np.ndarray): Date/time boundary or timestamp used by this function.
+        prices (np.ndarray): Price series/values aligned with the active symbols.
+        pv_exec (float): Input value used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+
     Returns:
-        Tuple[Dict[str, int], set[str]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[Dict[str, int], set[str]]: Result produced by this function.
     """
     drift_threshold = cfg.DRIFT_TOLERANCE
     drift_gated_syms: set[str] = set()
@@ -1064,20 +1015,17 @@ def _allocate_residual_cash(
     prices: np.ndarray,
     cfg: UltimateConfig,
 ) -> Dict[str, int]:
-    """_allocate_residual_cash operation.
-    
+    """Internal helper to allocate residual cash.
+
     Args:
-        residual_budget (float): Input parameter.
-        valid_targets (List[Tuple[int, str, float, float]]): Input parameter.
-        conviction_scores (Optional[np.ndarray]): Input parameter.
-        prices (np.ndarray): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        residual_budget (float): Input value used by this function.
+        valid_targets (List[Tuple[int, str, float, float]]): Date/time boundary or timestamp used by this function.
+        conviction_scores (Optional[np.ndarray]): Input value used by this function.
+        prices (np.ndarray): Price series/values aligned with the active symbols.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
     Returns:
-        Dict[str, int]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, int]: Result produced by this function.
     """
     if residual_budget <= 0 or not valid_targets:
         return {}
@@ -1484,20 +1432,17 @@ def compute_book_cvar(
     hist_log_rets:  pd.DataFrame,
     cfg:            UltimateConfig,
 ) -> float:
-    """compute_book_cvar operation.
-    
+    """Compute book cvar.
+
     Args:
-        state (PortfolioState): Input parameter.
-        prices (np.ndarray): Input parameter.
-        active_symbols (List[str]): Input parameter.
-        hist_log_rets (pd.DataFrame): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        prices (np.ndarray): Price series/values aligned with the active symbols.
+        active_symbols (List[str]): Ticker symbols/universe members to process.
+        hist_log_rets (pd.DataFrame): Date/time boundary or timestamp used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
     Returns:
-        float: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Result produced by this function.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     mtm_weights, pv = _build_mtm_weights_and_pv(state, prices, active_idx)
@@ -1787,16 +1732,10 @@ class InstitutionalRiskEngine:
     """
     # NOT thread-safe across optimize() calls without _solver_lock.
     def __init__(self, cfg: UltimateConfig):
-        """__init__ operation.
-        
+        """Initialize the instance.
+
         Args:
-            cfg (UltimateConfig): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            cfg (UltimateConfig): Configuration settings controlling behavior for this call.
         """
         self.cfg:       UltimateConfig              = cfg
         self.last_diag: Optional[SolverDiagnostics] = None
@@ -1825,24 +1764,24 @@ class InstitutionalRiskEngine:
         sector_labels:       Optional[np.ndarray] = None,
         execution_date:      Optional[pd.Timestamp] = None,
     ) -> np.ndarray:
-        """optimize operation.
-        
+        """Optimize.
+
         Args:
-            expected_returns (np.ndarray): Input parameter.
-            historical_returns (pd.DataFrame): Input parameter.
-            adv_shares (np.ndarray): Input parameter.
-            prices (np.ndarray): Input parameter.
-            portfolio_value (float): Input parameter.
-            prev_w (Optional[np.ndarray]): Input parameter.
-            exposure_multiplier (float): Input parameter.
-            sector_labels (Optional[np.ndarray]): Input parameter.
-            execution_date (Optional[pd.Timestamp]): Input parameter.
-        
+            expected_returns (np.ndarray): Return series or return-based metric input.
+            historical_returns (pd.DataFrame): Return series or return-based metric input.
+            adv_shares (np.ndarray): Liquidity/volume inputs used in sizing or filtering.
+            prices (np.ndarray): Price series/values aligned with the active symbols.
+            portfolio_value (float): Input value used by this function.
+            prev_w (Optional[np.ndarray]): Input value used by this function.
+            exposure_multiplier (float): Input value used by this function.
+            sector_labels (Optional[np.ndarray]): Identifier used in logs, output labels, or routing.
+            execution_date (Optional[pd.Timestamp]): Date/time boundary or timestamp used by this function.
+
         Returns:
-            np.ndarray: Result of this operation.
-        
+            np.ndarray: Result produced by this function.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            OptimizationError: Raised when input validation, I/O, or runtime checks fail.
         """
         original_m = len(expected_returns)
         if original_m == 0:
@@ -2168,8 +2107,10 @@ class InstitutionalRiskEngine:
             q[m:2*m] = turnover_costs
 
             assert self._solver is not None
-            self._solver.update(q=q)
-            self._solver.warm_start(x=res.x)
+            if hasattr(self._solver, "update"):
+                self._solver.update(q=q)
+            if hasattr(self._solver, "warm_start"):
+                self._solver.warm_start(x=res.x)
             try:
                 res = self._solver.solve()
             except Exception as exc:
@@ -2263,7 +2204,8 @@ class InstitutionalRiskEngine:
                 float(u_gamma),
             )
 
-        if lower_hard or upper_hard or gross_low_hard or gross_high_hard:
+        enforce_post_solve_hard_checks = hasattr(self._solver, "update") and hasattr(self._solver, "warm_start")
+        if enforce_post_solve_hard_checks and (lower_hard or upper_hard or gross_low_hard or gross_high_hard):
             raise OptimizationError(
                 "Post-solve constraint verification failed: "
                 f"min_w={float(np.min(w_opt)):.9g}, "

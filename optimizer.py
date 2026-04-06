@@ -144,16 +144,13 @@ DRAWDOWN_FLOOR                = 1.0  # keep consistent with backtest_engine Calm
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
-    """_stdout_supports_rupee operation.
-    
+    """Internal helper to stdout supports rupee.
+
     Args:
-        stdout (Any): Input parameter.
-    
+        stdout (Any): Input value used by this function.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: Result produced by this function.
     """
     stream = stdout if stdout is not None else getattr(sys, "stdout", None)
     if stream is None:
@@ -483,7 +480,11 @@ def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateCo
     )
 
     cvar_lb_min, cvar_lb_max, cvar_lb_step = search_space.get("CVAR_LOOKBACK", (60, 150, 10))
-    min_required_lookback = cfg.DIMENSIONALITY_MULTIPLIER * cfg.MAX_POSITIONS
+    baseline_max_positions = max(
+        int(getattr(cfg, "MAX_POSITIONS", 0)),
+        int(getattr(defaults, "MAX_POSITIONS", 0)),
+    )
+    min_required_lookback = int(getattr(cfg, "DIMENSIONALITY_MULTIPLIER", 1)) * baseline_max_positions
     effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
     if effective_cvar_lb_min > int(cvar_lb_max):
         raise optuna.TrialPruned()
@@ -501,13 +502,13 @@ def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateCo
         trial,
         "SIGNAL_LAG_DAYS",
         search_space.get("SIGNAL_LAG_DAYS"),
-        defaults.SIGNAL_LAG_DAYS,
+        int(getattr(defaults, "SIGNAL_LAG_DAYS", 0)),
     )
     cfg.MIN_EXPOSURE_FLOOR = _suggest_optional_float_param(
         trial,
         "MIN_EXPOSURE_FLOOR",
         search_space.get("MIN_EXPOSURE_FLOOR"),
-        float(defaults.MIN_EXPOSURE_FLOOR),
+        float(getattr(defaults, "MIN_EXPOSURE_FLOOR", 0.0)),
     )
     return cfg
 
@@ -585,19 +586,13 @@ class MomentumObjective:
         search_space: dict | None = None,
         precomputed_matrices: dict | None = None,
     ):
-        """__init__ operation.
-        
+        """Initialize the instance.
+
         Args:
-            market_data (dict): Input parameter.
-            universe_type (str): Input parameter.
-            search_space (dict | None): Input parameter.
-            precomputed_matrices (dict | None): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            market_data (dict): Data payload consumed by this function.
+            universe_type (str): Ticker symbols/universe members to process.
+            search_space (dict | None): Input value used by this function.
+            precomputed_matrices (dict | None): Input value used by this function.
         """
         self.market_data          = market_data
         self.universe_type        = universe_type
@@ -605,16 +600,16 @@ class MomentumObjective:
         self.precomputed_matrices = precomputed_matrices
 
     def __call__(self, trial: optuna.Trial) -> tuple[float, float]:
-        """__call__ operation.
-        
+        """Execute the callable object.
+
         Args:
-            trial (optuna.Trial): Input parameter.
-        
+            trial (optuna.Trial): Optuna optimization object for trial/study bookkeeping.
+
         Returns:
-            tuple[float, float]: Result of this operation.
-        
+            tuple[float, float]: Result produced by this function.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            TrialPruned: Raised when input validation, I/O, or runtime checks fail.
         """
         cfg = _suggest_trial_config(trial, self.search_space)
 
@@ -807,17 +802,14 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
 
 
 def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
-    """pre_load_data operation.
-    
+    """Pre load data.
+
     Args:
-        universe_type (str): Input parameter.
-        cfg (UltimateConfig | None): Input parameter.
-    
+        universe_type (str): Ticker symbols/universe members to process.
+        cfg (UltimateConfig | None): Configuration settings controlling behavior for this call.
+
     Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict: Result produced by this function.
     """
     logger.info("Initializing Data Pre-fetch phase...")
     normalized_universe = _normalize_universe_type(universe_type)
@@ -945,17 +937,14 @@ def _validate_optimal_config(params: dict) -> list[str]:
 
 
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
-    """save_optimal_config operation.
-    
+    """Save optimal config.
+
     Args:
-        best_params (dict): Input parameter.
-        filepath (str): Input parameter.
-    
-    Returns:
-        Any: Result of this operation.
-    
+        best_params (dict): Input value used by this function.
+        filepath (str): Filesystem path used for reading or writing data.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
     """
     violations = _validate_optimal_config(best_params)
     if violations:
@@ -995,16 +984,13 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
 
 def _oos_journal_path(study_name: str) -> Path:
     # ARCH-FIX-9
-    """_oos_journal_path operation.
-    
+    """Internal helper to oos journal path.
+
     Args:
-        study_name (str): Input parameter.
-    
+        study_name (str): Optuna optimization object for trial/study bookkeeping.
+
     Returns:
-        Path: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Path: Resolved filesystem path produced by this function.
     """
     cleaned = re.sub(r"[\\/]+", "_", (study_name or "").strip())
     cleaned = cleaned.replace("..", "_")
@@ -1017,22 +1003,25 @@ def _oos_journal_path(study_name: str) -> Path:
 
 
 def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
-    """_pareto_sort_key operation.
-    
+    """Internal helper to pareto sort key.
+
     Args:
-        study (optuna.Study): Input parameter.
-        trial (optuna.trial.FrozenTrial): Input parameter.
-    
+        study (optuna.Study): Optuna optimization object for trial/study bookkeeping.
+        trial (optuna.trial.FrozenTrial): Optuna optimization object for trial/study bookkeeping.
+
     Returns:
-        tuple: Result of this operation.
-    
+        tuple: Result produced by this function.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
     """
     if trial.values is None:
         raise ValueError(f"Trial #{trial.number} has no objective values for Pareto sorting.")
     normalized: list[float] = []
-    for direction, value in zip(study.directions, trial.values, strict=True):
+    directions = list(getattr(study, "directions", []))
+    if not directions:
+        directions = [optuna.study.StudyDirection.MAXIMIZE] * len(trial.values)
+    for direction, value in zip(directions, trial.values, strict=False):
         if direction == optuna.study.StudyDirection.MINIMIZE:
             normalized.append(-float(value))
         else:
@@ -1072,34 +1061,32 @@ def _set_trial_error_class_user_attr(
 
 def _error_triage_callback_factory() -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
     # ARCH-FIX-8
-    """_error_triage_callback_factory operation.
-    
+    """Internal helper to error triage callback factory.
+
     Returns:
-        callable: Result of this operation.
-    
+        Callable[[optuna.Study, optuna.trial.FrozenTrial], None]: Result produced by this function.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
     """
     consecutive_failures = {"count": 0}
 
     def _error_triage_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """_error_triage_callback operation.
-        
+        """Internal helper to error triage callback.
+
         Args:
-            study (optuna.Study): Input parameter.
-            trial (optuna.trial.FrozenTrial): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
+            study (optuna.Study): Optuna optimization object for trial/study bookkeeping.
+            trial (optuna.trial.FrozenTrial): Optuna optimization object for trial/study bookkeeping.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            RuntimeError: Raised when input validation, I/O, or runtime checks fail.
         """
         if trial.state == optuna.trial.TrialState.FAIL:
             consecutive_failures["count"] += 1
             error_class = _error_class_from_trial(trial)
             _set_trial_error_class_user_attr(study, trial, error_class)
-            if consecutive_failures["count"] > int(N_TRIALS * 0.30):
+            failure_abort_threshold = int(N_TRIALS * 0.30)
+            if N_TRIALS >= 4 and consecutive_failures["count"] > failure_abort_threshold:
                 study.stop()
                 raise RuntimeError(
                     f"Aborting: {consecutive_failures['count']} consecutive trial failures"
@@ -1260,18 +1247,15 @@ def run_optimization(
     in_memory:     bool      = False,
     study_name:    str | None = None,
 ):
-    """run_optimization operation.
-    
+    """Run optimization.
+
     Args:
-        universe_type (str): Input parameter.
-        in_memory (bool): Input parameter.
-        study_name (str | None): Input parameter.
-    
-    Returns:
-        Any: Result of this operation.
-    
+        universe_type (str): Ticker symbols/universe members to process.
+        in_memory (bool): Input value used by this function.
+        study_name (str | None): Optuna optimization object for trial/study bookkeeping.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
     """
     universe_type = _normalize_universe_type(universe_type)
     effective_storage, effective_n_jobs = _resolve_execution_mode(in_memory)
@@ -1309,17 +1293,11 @@ def run_optimization(
     logger.info("Starting %d Bayesian Trials (This may take a while)...", N_TRIALS)
 
     def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """_best_trial_callback operation.
-        
+        """Internal helper to best trial callback.
+
         Args:
-            study (optuna.Study): Input parameter.
-            trial (optuna.trial.FrozenTrial): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            study (optuna.Study): Optuna optimization object for trial/study bookkeeping.
+            trial (optuna.trial.FrozenTrial): Optuna optimization object for trial/study bookkeeping.
         """
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
@@ -1578,16 +1556,13 @@ def run_optimization(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """_parse_args operation.
-    
+    """Parse args.
+
     Args:
-        argv (list[str] | None): Input parameter.
-    
+        argv (list[str] | None): CLI argument values to parse.
+
     Returns:
-        argparse.Namespace: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        argparse.Namespace: Parsed/normalized value produced from the given inputs.
     """
     parser = argparse.ArgumentParser(
         description="Run Bayesian optimizer for momentum strategy."

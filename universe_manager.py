@@ -68,6 +68,11 @@ SECTOR_CONSTRUCTION_MATERIALS = "Construction Materials"
 class UniverseFetchError(RuntimeError):
     """Raised when primary and secondary universe data sources fail."""
     def __init__(self, message: str):
+        """Initialize the instance.
+
+        Args:
+            message (str): Input value used by this function.
+        """
         super().__init__(message)
         self.fallback_universe: List[str] = []
 
@@ -136,17 +141,14 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 # ─── Historical Universe Logic ────────────────────────────────────────────────
 
 def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
-    """_load_pit_universe_from_csv operation.
-    
+    """Load pit universe from csv.
+
     Args:
-        universe_type (str): Input parameter.
-        date (pd.Timestamp): Input parameter.
-    
+        universe_type (str): Ticker symbols/universe members to process.
+        date (pd.Timestamp): Date/time boundary or timestamp used by this function.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     if not csv_path.exists():
@@ -202,16 +204,10 @@ def _clear_all_caches() -> None:
 
 
 def _clear_historical_universe_caches(hist_file: Path) -> None:
-    """_clear_historical_universe_caches operation.
-    
+    """Internal helper to clear historical universe caches.
+
     Args:
-        hist_file (Path): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        hist_file (Path): Filesystem path used for reading or writing data.
     """
     universe_type = hist_file.stem.removeprefix("historical_")
     # Lock acquisition order must remain stable across this module:
@@ -229,16 +225,13 @@ def _clear_historical_universe_caches(hist_file: Path) -> None:
 
 
 def _coerce_historical_members(value) -> List[str]:
-    """_coerce_historical_members operation.
-    
+    """Internal helper to coerce historical members.
+
     Args:
-        value (float): Input parameter.
-    
+        value (Any): Input value used by this function.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     if isinstance(value, str):
         return [value]
@@ -251,16 +244,13 @@ def _coerce_historical_members(value) -> List[str]:
 
 
 def _normalize_historical_members(values) -> List[str]:
-    """_normalize_historical_members operation.
-    
+    """Normalize historical members.
+
     Args:
-        values (float): Input parameter.
-    
+        values (Any): Input value used by this function.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     normalized: set[str] = set()
     for t in values:
@@ -274,17 +264,14 @@ def _normalize_historical_members(values) -> List[str]:
 
 
 def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
-    """_is_cache_entry_fresh operation.
-    
+    """Return whether is cache entry fresh.
+
     Args:
-        fetched_at (str | None): Input parameter.
-        ttl_hours (int): Input parameter.
-    
+        fetched_at (str | None): Input value used by this function.
+        ttl_hours (int): Input value used by this function.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: Result produced by this function.
     """
     if not fetched_at:
         return False
@@ -316,17 +303,14 @@ def _normalize_sector_cache_entry(
     *,
     fallback_fetched_at: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """_normalize_sector_cache_entry operation.
-    
+    """Normalize sector cache entry.
+
     Args:
-        entry (Any): Input parameter.
-        fallback_fetched_at (str | None): Input parameter.
-    
+        entry (Any): Input value used by this function.
+        fallback_fetched_at (str | None): Input value used by this function.
+
     Returns:
-        tuple[str | None, str | None]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        tuple[str | None, str | None]: Result produced by this function.
     """
     if isinstance(entry, dict):
         sector = str(entry.get("sector", "Unknown") or "Unknown")
@@ -527,13 +511,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 # ─── Cache Management ─────────────────────────────────────────────────────────
 
 def _load_universe_cache() -> dict:
-    """_load_universe_cache operation.
-    
+    """Load universe cache.
+
     Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict: Result produced by this function.
     """
     if not UNIVERSE_CACHE_FILE.exists():
         return {}
@@ -545,16 +526,10 @@ def _load_universe_cache() -> dict:
         return {}
 
 def _save_universe_cache(data: dict) -> None:
-    """_save_universe_cache operation.
-    
+    """Save universe cache.
+
     Args:
-        data (dict): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        data (dict): Data payload consumed by this function.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     temp_file = UNIVERSE_CACHE_FILE.with_name(UNIVERSE_CACHE_FILE.name + ".tmp")
@@ -572,6 +547,8 @@ def _save_universe_cache(data: dict) -> None:
         logger.error("[Universe] Failed to save cache: %s", exc)
 
 def invalidate_universe_cache() -> None:
+    """Invalidate universe cache.
+    """
     if UNIVERSE_CACHE_FILE.exists():
         try:
             UNIVERSE_CACHE_FILE.unlink()
@@ -582,17 +559,18 @@ def invalidate_universe_cache() -> None:
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 
 def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
-    """_apply_adv_filter operation.
-    
+    """Apply adv filter.
+
     Args:
-        tickers (List[str]): Input parameter.
-        cfg (Any): Input parameter.
-    
+        tickers (List[str]): Ticker symbols/universe members to process.
+        cfg (Any): Configuration settings controlling behavior for this call.
+
     Returns:
-        List[str]: Result of this operation.
-    
+        List[str]: Result produced by this function.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        UniverseFetchError: Raised when input validation, I/O, or runtime checks fail.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
     """
     from momentum_engine import UltimateConfig, to_ns
     from data_cache import load_or_fetch
@@ -702,17 +680,14 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
 # ─── Network Fetchers ─────────────────────────────────────────────────────────
 
 def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
-    """_fetch_csv_with_headers operation.
-    
+    """Fetch csv with headers.
+
     Args:
-        url (str): Input parameter.
-        timeout (float): Input parameter.
-    
+        url (str): Input value used by this function.
+        timeout (float): Date/time boundary or timestamp used by this function.
+
     Returns:
-        pd.DataFrame: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pd.DataFrame: Result produced by this function.
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -724,17 +699,17 @@ def _fetch_csv_with_headers(url: str, timeout: float = 15.0) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(response.text))
 
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    """fetch_nse_equity_universe operation.
-    
+    """Fetch nse equity universe.
+
     Args:
-        cfg (Any): Input parameter.
-        apply_adv_filter (bool): Input parameter.
-    
+        cfg (Any): Configuration settings controlling behavior for this call.
+        apply_adv_filter (bool): Liquidity/volume inputs used in sizing or filtering.
+
     Returns:
-        List[str]: Result of this operation.
-    
+        List[str]: Loaded/fetched data for the requested scope.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        error: Raised when input validation, I/O, or runtime checks fail.
     """
     with _UNIVERSE_CACHE_FILE_LOCK:
         cache = _load_universe_cache()
@@ -784,17 +759,17 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
         raise error from exc
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    """get_nifty500 operation.
-    
+    """Get nifty500.
+
     Args:
-        cfg (Any): Input parameter.
-        apply_adv_filter (bool): Input parameter.
-    
+        cfg (Any): Configuration settings controlling behavior for this call.
+        apply_adv_filter (bool): Liquidity/volume inputs used in sizing or filtering.
+
     Returns:
-        List[str]: Result of this operation.
-    
+        List[str]: Result produced by this function.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        error: Raised when input validation, I/O, or runtime checks fail.
     """
     with _UNIVERSE_CACHE_FILE_LOCK:
         cache = _load_universe_cache()

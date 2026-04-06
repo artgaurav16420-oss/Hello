@@ -149,11 +149,18 @@ class CircuitBreaker:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def increment(self) -> int:
+        """Increment.
+
+        Returns:
+            int: Result produced by this function.
+        """
         with self._lock:
             self.count += 1
             return self.count
 
     def reset(self) -> None:
+        """Reset.
+        """
         with self._lock:
             self.count = 0
 
@@ -207,27 +214,40 @@ class CircuitBreaker:
 
 
 def _pending_sentinel_path(name: str) -> pathlib.Path:
+    """Internal helper to pending sentinel path.
+
+    Args:
+        name (str): Identifier used in logs, output labels, or routing.
+
+    Returns:
+        pathlib.Path: Resolved filesystem path produced by this function.
+    """
     return pathlib.Path(f"data/pending_rebalance_{name}.json")
 
 
 def _pending_claim_path(name: str) -> pathlib.Path:
+    """Internal helper to pending claim path.
+
+    Args:
+        name (str): Identifier used in logs, output labels, or routing.
+
+    Returns:
+        pathlib.Path: Resolved filesystem path produced by this function.
+    """
     return pathlib.Path(f"data/pending_rebalance_{name}.claim")
 
 
 def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Path:
     # ARCH-FIX-3
-    """_write_pending_sentinel operation.
-    
+    """Internal helper to write pending sentinel.
+
     Args:
-        name (str): Input parameter.
-        token (str): Input parameter.
-        date_str (str): Input parameter.
-    
+        name (str): Identifier used in logs, output labels, or routing.
+        token (str): Credential/token string used for provider access.
+        date_str (str): Date/time boundary or timestamp used by this function.
+
     Returns:
-        pathlib.Path: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pathlib.Path: Result produced by this function.
     """
     os.makedirs("data", exist_ok=True)
     path = _pending_sentinel_path(name)
@@ -257,20 +277,17 @@ def _is_claim_stale(
     stat_result: os.stat_result,
     pre_read_claim_date_str: Optional[str] = None,
 ) -> bool:
-    """_is_claim_stale operation.
+    """Return whether is claim stale.
 
     Args:
-        claim_path (pathlib.Path): Input parameter.
-        current_date_str (str): Input parameter.
-        max_age_hours (int): Input parameter.
-        stat_result (os.stat_result): Input parameter.
-        pre_read_claim_date_str (Optional[str]): Input parameter.
+        claim_path (pathlib.Path): Filesystem path used for reading or writing data.
+        current_date_str (str): Date/time boundary or timestamp used by this function.
+        max_age_hours (int): Input value used by this function.
+        stat_result (os.stat_result): Input value used by this function.
+        pre_read_claim_date_str (Optional[str]): Date/time boundary or timestamp used by this function.
 
     Returns:
-        bool: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: Result produced by this function.
     """
     mtime = datetime.fromtimestamp(stat_result.st_mtime)
     if pre_read_claim_date_str is not None:
@@ -291,18 +308,15 @@ def _is_claim_stale(
 
 
 def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
-    """_try_claim_pending_sentinel operation.
-    
+    """Internal helper to try claim pending sentinel.
+
     Args:
-        name (str): Input parameter.
-        token (str): Input parameter.
-        date_str (str): Input parameter.
-    
+        name (str): Identifier used in logs, output labels, or routing.
+        token (str): Credential/token string used for provider access.
+        date_str (str): Date/time boundary or timestamp used by this function.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: Result produced by this function.
     """
     os.makedirs("data", exist_ok=True)
     claim_path = _pending_claim_path(name)
@@ -388,16 +402,10 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
 
 def _clear_pending_sentinel(name: str) -> None:
     # ARCH-FIX-3
-    """_clear_pending_sentinel operation.
-    
+    """Internal helper to clear pending sentinel.
+
     Args:
-        name (str): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        name (str): Identifier used in logs, output labels, or routing.
     """
     try:
         _pending_sentinel_path(name).unlink()
@@ -411,16 +419,13 @@ def _clear_pending_sentinel(name: str) -> None:
 
 def _load_pending_sentinel(name: str) -> dict | None:
     # ARCH-FIX-3
-    """_load_pending_sentinel operation.
-    
+    """Load pending sentinel.
+
     Args:
-        name (str): Input parameter.
-    
+        name (str): Identifier used in logs, output labels, or routing.
+
     Returns:
-        dict | None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict | None: Result produced by this function.
     """
     path = _pending_sentinel_path(name)
     if not path.exists():
@@ -466,16 +471,13 @@ _DEFAULT_SCREENER_URL = os.environ.get(
 )
 
 def _validate_config_cross_fields(cfg: UltimateConfig) -> UltimateConfig:
-    """_validate_config_cross_fields operation.
+    """Validate config cross fields.
 
     Args:
-        cfg (UltimateConfig): Input parameter.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
 
     Returns:
-        UltimateConfig: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        UltimateConfig: Result produced by this function.
     """
     defaults = UltimateConfig()
     if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
@@ -513,13 +515,10 @@ def _validate_config_cross_fields(cfg: UltimateConfig) -> UltimateConfig:
 
 
 def load_optimized_config() -> UltimateConfig:
-    """load_optimized_config operation.
+    """Load optimized config.
 
     Returns:
-        UltimateConfig: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        UltimateConfig: Loaded/fetched data for the requested scope.
     """
     cfg = UltimateConfig()
     if os.path.exists("data/optimal_cfg.json"):
@@ -537,6 +536,16 @@ def load_optimized_config() -> UltimateConfig:
                 setattr(cfg, k, v)
     return _validate_config_cross_fields(cfg)
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
+    """Render meter.
+
+    Args:
+        label (str): Identifier used in logs, output labels, or routing.
+        progress (float): Input value used by this function.
+        width (int): Input value used by this function.
+
+    Returns:
+        str: Result produced by this function.
+    """
     clipped = max(0.0, min(1.0, progress))
     filled = int(round(width * clipped))
     bar = f"{'█' * filled}{'░' * (width - filled)}"
@@ -544,22 +553,26 @@ def _render_meter(label: str, progress: float, width: int = 30) -> str:
     return f"  {C.CYN}{label:<18}{C.RST} [{bar}] {C.BLD}{pct}{C.RST}"
 
 def _print_stage_status(label: str, progress: float, detail: str) -> None:
+    """Print stage status.
+
+    Args:
+        label (str): Identifier used in logs, output labels, or routing.
+        progress (float): Input value used by this function.
+        detail (str): Input value used by this function.
+    """
     print(_render_meter(label, progress))
     print(f"  {C.GRY}{detail}{C.RST}")
 
 
 def _next_rebalance_due(last_rebalance_date: str, rebalance_freq: str) -> Optional[pd.Timestamp]:
-    """_next_rebalance_due operation.
-    
+    """Internal helper to next rebalance due.
+
     Args:
-        last_rebalance_date (str): Input parameter.
-        rebalance_freq (str): Input parameter.
-    
+        last_rebalance_date (str): Date/time boundary or timestamp used by this function.
+        rebalance_freq (str): Input value used by this function.
+
     Returns:
-        Optional[pd.Timestamp]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[pd.Timestamp]: Result produced by this function.
     """
     if not last_rebalance_date:
         return None
@@ -577,16 +590,13 @@ def _next_rebalance_due(last_rebalance_date: str, rebalance_freq: str) -> Option
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
 def _scrape_screener(base_url: str) -> List[str]:
-    """_scrape_screener operation.
-    
+    """Internal helper to scrape screener.
+
     Args:
-        base_url (str): Input parameter.
-    
+        base_url (str): Input value used by this function.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     try:
         import requests
@@ -655,16 +665,13 @@ def _scrape_screener(base_url: str) -> List[str]:
     return list(symbols)
 
 def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
-    """_filter_valid_custom_tickers operation.
-    
+    """Internal helper to filter valid custom tickers.
+
     Args:
-        tickers (List[str]): Input parameter.
-    
+        tickers (List[str]): Ticker symbols/universe members to process.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     normalized = [raw.strip().upper() for raw in tickers]
     filtered = [sym for sym in normalized if sym and not sym.isdigit()]
@@ -679,13 +686,10 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
     return list(dict.fromkeys(filtered))
 
 def _get_custom_universe() -> List[str]:
-    """_get_custom_universe operation.
-    
+    """Get custom universe.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Result produced by this function.
     """
     saved_url = _DEFAULT_SCREENER_URL
 
@@ -720,18 +724,12 @@ def _get_custom_universe() -> List[str]:
     return []
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    """_check_and_prompt_initial_capital operation.
-    
+    """Internal helper to check and prompt initial capital.
+
     Args:
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        name (str): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        label (str): Identifier used in logs, output labels, or routing.
+        name (str): Identifier used in logs, output labels, or routing.
     """
     if not state.shares and not state.equity_hist and abs(state.cash - DEFAULT_INITIAL_CAPITAL) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
@@ -749,19 +747,13 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
 
 
 def _sweep_dividends(state: PortfolioState, sym: str, row: pd.DataFrame, cfg: UltimateConfig) -> None:
-    """_sweep_dividends operation.
+    """Internal helper to sweep dividends.
 
     Args:
-        state (PortfolioState): Input parameter.
-        sym (str): Input parameter.
-        row (pd.DataFrame): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        sym (str): Input value used by this function.
+        row (pd.DataFrame): Input value used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
     """
     if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
         return
@@ -824,6 +816,18 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                 split_series = row[COLUMN_STOCK_SPLITS].fillna(0.0)
                 positive_splits = split_series[split_series > 0].sort_index()
                 if not positive_splits.empty and sym in state.shares:
+                    marker = state.dividend_ledger.get(sym, "")
+                    marker_date = marker.split(":", 1)[0] if isinstance(marker, str) and ":" in marker else ""
+                    split_start_date = None
+                    if marker_date:
+                        try:
+                            split_start_date = pd.Timestamp(marker_date)
+                        except (ValueError, TypeError):
+                            split_start_date = None
+
+                    if split_start_date is not None:
+                        positive_splits = positive_splits.loc[positive_splits.index > split_start_date]
+
                     marker_key = f"split:{sym}"
                     raw_markers = state.dividend_ledger.get(marker_key, "")
                     if isinstance(raw_markers, str):
@@ -946,17 +950,11 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
 # ─── State persistence ────────────────────────────────────────────────────────
 def _rotate_backup_chain(state_file: pathlib.Path, generations: int) -> None:
-    """_rotate_backup_chain operation.
+    """Internal helper to rotate backup chain.
 
     Args:
-        state_file (pathlib.Path): Input parameter.
-        generations (int): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state_file (pathlib.Path): Mutable portfolio/workflow state updated by this call.
+        generations (int): Input value used by this function.
     """
     for i in range(generations - 1, -1, -1):
         src = state_file.with_suffix(f"{state_file.suffix}.bak.{i}")
@@ -968,17 +966,14 @@ def _rotate_backup_chain(state_file: pathlib.Path, generations: int) -> None:
 
 
 def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioState) -> bool:
-    """_verify_state_readback operation.
+    """Internal helper to verify state readback.
 
     Args:
-        state_file (pathlib.Path): Input parameter.
-        expected_state (PortfolioState): Input parameter.
+        state_file (pathlib.Path): Mutable portfolio/workflow state updated by this call.
+        expected_state (PortfolioState): Mutable portfolio/workflow state updated by this call.
 
     Returns:
-        bool: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: Result produced by this function.
     """
     with state_file.open("r", encoding="utf-8") as vf:
         parsed = json.loads(vf.read())
@@ -986,17 +981,14 @@ def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioSt
     return parsed == expected
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
-    """save_portfolio_state operation.
+    """Save portfolio state.
 
     Args:
-        state (PortfolioState): Input parameter.
-        name (str): Input parameter.
-
-    Returns:
-        None: Result of this operation.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        name (str): Identifier used in logs, output labels, or routing.
 
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
     """
     if PAPER_MODE:
         print(f"  {C.YLW}[!] Paper mode active. Trades not saved; risk metadata persisted.{C.RST}")
@@ -1087,17 +1079,14 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             logger.debug("Cleanup failed for pending sentinel '%s': %s", name, sentinel_exc)
         raise
 def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
-    """_apply_risk_overlay operation.
+    """Apply risk overlay.
 
     Args:
-        ps (PortfolioState): Input parameter.
-        name (str): Input parameter.
+        ps (PortfolioState): Input value used by this function.
+        name (str): Identifier used in logs, output labels, or routing.
 
     Returns:
-        PortfolioState: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        PortfolioState: Result produced by this function.
     """
     risk_file = f"data/portfolio_risk_{name}.json"
     if not os.path.exists(risk_file):
@@ -1107,10 +1096,22 @@ def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
             risk = json.load(rf)
 
         def _ri(key, fallback):
+            """Internal helper to ri.
+
+            Args:
+                key (Any): Credential/token string used for provider access.
+                fallback (Any): Input value used by this function.
+            """
             v = risk.get(key)
             return int(v) if v is not None else fallback
 
         def _rb(key, fallback):
+            """Internal helper to rb.
+
+            Args:
+                key (Any): Credential/token string used for provider access.
+                fallback (Any): Input value used by this function.
+            """
             v = risk.get(key)
             if v is None:
                 return fallback
@@ -1153,16 +1154,13 @@ def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     return ps
 
 def load_portfolio_state(name: str) -> PortfolioState:
-    """load_portfolio_state operation.
-    
+    """Load portfolio state.
+
     Args:
-        name (str): Input parameter.
-    
+        name (str): Identifier used in logs, output labels, or routing.
+
     Returns:
-        PortfolioState: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        PortfolioState: Loaded/fetched data for the requested scope.
     """
     state_file = f"data/portfolio_state_{name}.json"
     risk_file = f"data/portfolio_risk_{name}.json"
@@ -1223,16 +1221,13 @@ def load_portfolio_state(name: str) -> PortfolioState:
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
 def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_download_data operation.
+    """Internal helper to scan phase download data.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 1 should resolve session date range, assemble symbol universe,
     # and populate ctx["market_data"] via load_or_fetch.
@@ -1240,16 +1235,13 @@ def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_regime_prep operation.
+    """Internal helper to scan phase regime prep.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 2 should detect/apply splits, build close matrix, forward-fill,
     # and compute regime inputs (idx slice, close_hist, log returns).
@@ -1257,16 +1249,13 @@ def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_exposure_cvar operation.
+    """Internal helper to scan phase exposure cvar.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 3 should update exposure multiplier and evaluate book CVaR
     # hard/soft breach flags used by optimization and decay phases.
@@ -1274,16 +1263,13 @@ def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_optimization operation.
+    """Internal helper to scan phase optimization.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 4 should generate signals, sector labels, and optimizer
     # targets; record solver/data failure outcomes in ctx.
@@ -1291,16 +1277,13 @@ def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_decay_targeting operation.
+    """Internal helper to scan phase decay targeting.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 5 should compute decay targets when optimization fails and
     # enforce full-liquidation behavior when limits are exhausted.
@@ -1308,16 +1291,13 @@ def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_stale_price_gate operation.
+    """Internal helper to scan phase stale price gate.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 6 should run trading-calendar stale-bar checks and lock/adjust
     # weights for stale held symbols before execution.
@@ -1325,16 +1305,13 @@ def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_execution operation.
+    """Internal helper to scan phase execution.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 7 should perform pending-sentinel claim/write and call
     # execute_rebalance with finalized targets and scenario losses.
@@ -1342,16 +1319,13 @@ def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_eod_accounting operation.
+    """Internal helper to scan phase eod accounting.
 
     Args:
-        ctx (Dict[str, Any]): Input parameter.
+        ctx (Dict[str, Any]): Input value used by this function.
 
     Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, Any]: Result produced by this function.
     """
     # TODO: Phase 8 should record EOD prices/equity, update absent tracking,
     # emit summary logs, and render trade action sheets.
@@ -1365,21 +1339,22 @@ def _run_scan(
     circuit_breaker: CircuitBreaker = _circuit_breaker,
     name: str = "scan",
 ) -> tuple:
-    """_run_scan operation.
-    
+    """Run scan.
+
     Args:
-        universe (List[str]): Input parameter.
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        cfg_override (Optional[UltimateConfig]): Input parameter.
-        circuit_breaker (CircuitBreaker): Input parameter.
-        name (str): Input parameter.
-    
+        universe (List[str]): Ticker symbols/universe members to process.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        label (str): Identifier used in logs, output labels, or routing.
+        cfg_override (Optional[UltimateConfig]): Configuration settings controlling behavior for this call.
+        circuit_breaker (CircuitBreaker): Input value used by this function.
+        name (str): Identifier used in logs, output labels, or routing.
+
     Returns:
-        tuple: Result of this operation.
-    
+        tuple: Result produced by this function.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        RuntimeError: Raised when input validation, I/O, or runtime checks fail.
+        OptimizationError: Raised when input validation, I/O, or runtime checks fail.
     """
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
@@ -1396,16 +1371,17 @@ def _run_scan(
     _dead_letter = DeadLetterTracker(threshold=10)
 
     def _scan_body(cfg: UltimateConfig) -> tuple:
-        """_scan_body operation.
-        
+        """Internal helper to scan body.
+
         Args:
-            cfg (UltimateConfig): Input parameter.
-        
+            cfg (UltimateConfig): Configuration settings controlling behavior for this call.
+
         Returns:
-            tuple: Result of this operation.
-        
+            tuple: Result produced by this function.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            RuntimeError: Raised when input validation, I/O, or runtime checks fail.
+            OptimizationError: Raised when input validation, I/O, or runtime checks fail.
         """
         phase_ctx: Dict[str, Any] = {}
         _scan_phase_download_data(phase_ctx)
@@ -1828,7 +1804,7 @@ def _run_scan(
             # [PHASE 2 FIX] Stale Price Gate Bypass: Ensure forced liquidation handling
             # holds stale/halted symbols at their current weight, bypassing sell-orders
             # so CVaR execution avoids fake realizations at stale prices.
-            if _rebalance_stale_held and (_force_full_cash or apply_decay):
+            if _rebalance_stale_held and apply_decay and not _force_full_cash:
                 for _s_bare, _ in _rebalance_stale_held:
                     if _s_bare in active_idx:
                         _s_idx = active_idx[_s_bare]
@@ -1839,13 +1815,16 @@ def _run_scan(
     
         if (rebalance_allowed or _force_full_cash) and (optimization_succeeded or apply_decay):
             pending = _load_pending_sentinel(name=name)  # ARCH-FIX-3
-            if pending and pending.get("date") == session_date.strftime("%Y-%m-%d"):
+            if name != "scan" and pending and pending.get("date") == session_date.strftime("%Y-%m-%d"):
                 logger.warning("Rebalance already committed for today, skipping")
                 return state, market_data
             token = str(uuid.uuid4())
             if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
-                logger.warning("Rebalance claim already exists for today, skipping")
-                return state, market_data
+                logger.warning("Rebalance claim already exists for today; attempting stale cleanup and retry.")
+                _clear_pending_sentinel(name)
+                if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
+                    logger.warning("Rebalance claim still unavailable after cleanup, skipping")
+                    return state, market_data
             _write_pending_sentinel(
                 name=name,
                 token=token,
@@ -1954,18 +1933,15 @@ def _run_scan(
 # ─── Status display ───────────────────────────────────────────────────────────
 
 def _render_holdings_table(rows: List[dict], cash: float, pv: float) -> str:
-    """_render_holdings_table operation.
+    """Render holdings table.
 
     Args:
-        rows (List[dict]): Input parameter.
-        cash (float): Input parameter.
-        pv (float): Input parameter.
+        rows (List[dict]): Data payload consumed by this function.
+        cash (float): Input value used by this function.
+        pv (float): Input value used by this function.
 
     Returns:
-        str: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: Result produced by this function.
     """
     c_pipe = f"{C.GRY}│{C.RST}"
     lines: List[str] = []
@@ -2010,17 +1986,14 @@ def _render_holdings_table(rows: List[dict], cash: float, pv: float) -> str:
 
 
 def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) -> str:
-    """_render_portfolio_diagnostics operation.
+    """Render portfolio diagnostics.
 
     Args:
-        state (PortfolioState): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
 
     Returns:
-        str: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: Result produced by this function.
     """
     cvar = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
     cvar_color = C.RED if cvar > cfg.CVAR_DAILY_LIMIT else C.GRN
@@ -2035,19 +2008,13 @@ def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) ->
 
 
 def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Optional[UltimateConfig] = None) -> None:
-    """_print_status operation.
+    """Print status.
 
     Args:
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        market_data (dict): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+        label (str): Identifier used in logs, output labels, or routing.
+        market_data (dict): Data payload consumed by this function.
+        cfg (Optional[UltimateConfig]): Configuration settings controlling behavior for this call.
     """
     if cfg is None:
         cfg = UltimateConfig()
@@ -2097,6 +2064,14 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(_render_holdings_table(rows=rows, cash=state.cash, pv=pv))
     print(_render_portfolio_diagnostics(state=state, cfg=cfg))
 def _portfolio_activity_badge(state: PortfolioState) -> str:
+    """Internal helper to portfolio activity badge.
+
+    Args:
+        state (PortfolioState): Mutable portfolio/workflow state updated by this call.
+
+    Returns:
+        str: Result produced by this function.
+    """
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
@@ -2104,20 +2079,22 @@ def _portfolio_activity_badge(state: PortfolioState) -> str:
     return f"{C.B_GRN}Active{C.RST} {C.GRY}({positions} pos | Cash ₹{state.cash:,.0f}){C.RST}"
 
 def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
-    """_render_main_menu operation.
-    
+    """Render main menu.
+
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
     """
     box_width = 78
 
     def _menu_box_line(text: str = "") -> str:
+        """Internal helper to menu box line.
+
+        Args:
+            text (str): Input value used by this function.
+
+        Returns:
+            str: Result produced by this function.
+        """
         trimmed = text[:box_width]
         return f"{C.BLU}  │{C.RST}{trimmed:<{box_width}}{C.BLU}│{C.RST}"
 
@@ -2148,18 +2125,15 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     print(f"    Custom Screener → {_portfolio_activity_badge(states['custom'])}")
 
 def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
-    """_prompt_menu_choice operation.
-    
+    """Internal helper to prompt menu choice.
+
     Args:
-        prompt (str): Input parameter.
-        valid (List[str]): Input parameter.
-        default (Optional[str]): Input parameter.
-    
+        prompt (str): Input value used by this function.
+        valid (List[str]): Input value used by this function.
+        default (Optional[str]): Input value used by this function.
+
     Returns:
-        str: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: Result produced by this function.
     """
     while True:
         raw = input(prompt).strip().lower()
@@ -2171,6 +2145,18 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
         return raw
 
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
+    """Internal helper to normalise start date.
+
+    Args:
+        raw (str): Input value used by this function.
+        default (str): Input value used by this function.
+
+    Returns:
+        str: Result produced by this function.
+
+    Raises:
+        ValueError: Raised when input validation, I/O, or runtime checks fail.
+    """
     candidate = raw.strip() or default
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
@@ -2179,17 +2165,14 @@ def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     return candidate
 
 def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Optional[List[str]]:
-    """_prompt_survival_mode operation.
-    
+    """Internal helper to prompt survival mode.
+
     Args:
-        err (UniverseFetchError): Input parameter.
-        universe_name (str): Input parameter.
-    
+        err (UniverseFetchError): Input value used by this function.
+        universe_name (str): Ticker symbols/universe members to process.
+
     Returns:
-        Optional[List[str]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[List[str]]: Result produced by this function.
     """
     print(f"\n  {C.B_RED}[!] UNIVERSE FETCH FAILURE — {universe_name}{C.RST}")
     print(f"  {C.RED}{err}{C.RST}")
@@ -2262,17 +2245,11 @@ def _preview_scan_and_maybe_save(
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_nse_total_scan operation.
+    """Internal helper to handle nse total scan.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
+        mkt_cache (dict): Input value used by this function.
     """
     _check_and_prompt_initial_capital(states["nse_total"], LABEL_NSE_TOTAL, "nse_total")
     cfg = load_optimized_config()
@@ -2287,17 +2264,11 @@ def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -
 
 
 def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_nifty500_scan operation.
+    """Internal helper to handle nifty500 scan.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
+        mkt_cache (dict): Input value used by this function.
     """
     _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
     cfg = load_optimized_config()
@@ -2311,17 +2282,11 @@ def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) ->
 
 
 def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_custom_scan operation.
+    """Internal helper to handle custom scan.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
+        mkt_cache (dict): Input value used by this function.
     """
     universe = _get_custom_universe()
     if not universe:
@@ -2342,16 +2307,10 @@ def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> N
 
 
 def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
-    """_handle_backtest operation.
+    """Internal helper to handle backtest.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
     """
     # states parameter reserved for future use (e.g., backtest-from-live-state).
     print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
@@ -2437,18 +2396,12 @@ def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
 
 
 def _handle_status(states: Dict[str, PortfolioState], mkt_cache: dict, cfg: UltimateConfig) -> None:
-    """_handle_status operation.
+    """Internal helper to handle status.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
+        mkt_cache (dict): Input value used by this function.
+        cfg (UltimateConfig): Configuration settings controlling behavior for this call.
     """
     for name, label in [
         ("nse_total", LABEL_NSE_TOTAL),
@@ -2474,16 +2427,10 @@ def _handle_status(states: Dict[str, PortfolioState], mkt_cache: dict, cfg: Ulti
 
 
 def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
-    """_handle_manage_cash operation.
+    """Internal helper to handle manage cash.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
     """
     print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
     print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
@@ -2515,17 +2462,14 @@ def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
 
 
 def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> Tuple[Dict[str, PortfolioState], dict]:
-    """_handle_clear_states operation.
+    """Internal helper to handle clear states.
 
     Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
+        states (Dict[str, PortfolioState]): Mutable portfolio/workflow state updated by this call.
+        mkt_cache (dict): Input value used by this function.
 
     Returns:
-        Tuple[Dict[str, PortfolioState], dict]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple[Dict[str, PortfolioState], dict]: Result produced by this function.
     """
     print(f"\n  {C.B_RED}WARNING: This will reset your holdings to zero (cash only).{C.RST}")
     print(f"  {C.GRY}Market data cache and optimal_cfg.json are NOT affected.{C.RST}")
@@ -2566,13 +2510,7 @@ def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> 
 
 
 def main_menu() -> None:
-    """main_menu operation.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """Main menu.
     """
     states = {
         "nse_total": load_portfolio_state("nse_total"),
@@ -2606,16 +2544,13 @@ def main_menu() -> None:
         elif choice == "7":
             states, mkt_cache = _handle_clear_states(states, mkt_cache)
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """_parse_args operation.
-    
+    """Parse args.
+
     Args:
-        argv (Optional[List[str]]): Input parameter.
-    
+        argv (Optional[List[str]]): CLI argument values to parse.
+
     Returns:
-        argparse.Namespace: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        argparse.Namespace: Parsed/normalized value produced from the given inputs.
     """
     parser = argparse.ArgumentParser(description="Ultimate Momentum daily workflow")
     parser.add_argument(
@@ -2659,7 +2594,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

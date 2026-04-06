@@ -102,8 +102,10 @@ def compute_regime_score(
 
     sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50
+    if len(close_series) < sma_window and universe_close_hist is None:
+        return 0.6
     min_sma_periods = max(20, int(sma_window * 0.8))
-    min_fast_periods = max(10, min_sma_periods // 2)
+    min_fast_periods = min(sma_fast_window, max(10, min_sma_periods // 2))
 
     if len(close_series) >= sma_window:
         sma200 = float(close_series.rolling(window=sma_window, min_periods=min_sma_periods).mean().iloc[-1])
@@ -120,6 +122,13 @@ def compute_regime_score(
     last_price = float(close_series.iloc[-1])
 
     if sma200 <= 0 or not np.isfinite(sma200):
+        crash_override = _check_market_crash(universe_close_hist, cfg)
+        if crash_override is not None:
+            return (
+                min(0.5, crash_override)
+                if np.isclose(float(crash_override), 0.5, rtol=1e-9, atol=1e-12)
+                else crash_override
+            )
         return 0.5
 
     trend_dev_slow = (last_price / sma200) - 1.0

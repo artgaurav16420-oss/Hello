@@ -66,6 +66,12 @@ class ScanContext:
     """
 
     def __init__(self, label: str = "", correlation_id: Optional[str] = None):
+        """Initialize the instance.
+
+        Args:
+            label (str): Identifier used in logs, output labels, or routing.
+            correlation_id (Optional[str]): Input value used by this function.
+        """
         self.label = label
         self.correlation_id = str(uuid.uuid4())[:8] if correlation_id is None else correlation_id
         self._prev_id: Optional[str] = None
@@ -73,13 +79,13 @@ class ScanContext:
         self.start_time: float = 0.0
 
     def __enter__(self) -> "ScanContext":
-        """__enter__ operation.
-        
+        """Enter the context manager and initialize scoped state.
+
         Returns:
-            "ScanContext": Result of this operation.
-        
+            "ScanContext": Result produced by this function.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            RuntimeError: Raised when input validation, I/O, or runtime checks fail.
         """
         if not math.isclose(self.start_time, 0.0, rel_tol=1e-9, abs_tol=1e-12):
             raise RuntimeError("ScanContext is not reentrant; create a new instance for each scan.")
@@ -99,18 +105,12 @@ class ScanContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """__exit__ operation.
-        
+        """Exit the context manager and restore prior scoped state.
+
         Args:
-            exc_type (Any): Input parameter.
-            exc_val (Any): Input parameter.
-            exc_tb (Any): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            exc_type (Any): Exception context passed by the runtime.
+            exc_val (Any): Exception context passed by the runtime.
+            exc_tb (Any): Exception context passed by the runtime.
         """
         elapsed = time.monotonic() - self.start_time
         status  = "error" if exc_type else "ok"
@@ -152,6 +152,14 @@ class DeadLetterTracker:
     """
 
     def __init__(self, threshold: int = 10):
+        """Initialize the instance.
+
+        Args:
+            threshold (int): Input value used by this function.
+
+        Raises:
+            ValueError: Raised when input validation, I/O, or runtime checks fail.
+        """
         if threshold <= 0:
             raise ValueError(f"threshold must be > 0, got {threshold}")
         self.threshold = threshold
@@ -159,6 +167,13 @@ class DeadLetterTracker:
         self._lock = threading.Lock()
 
     def add(self, symbol: str, reason: str, detail: str = "") -> None:
+        """Add.
+
+        Args:
+            symbol (str): Ticker symbols/universe members to process.
+            reason (str): Input value used by this function.
+            detail (str): Input value used by this function.
+        """
         with self._lock:
             self._entries.append({
                 "symbol": symbol,
@@ -167,16 +182,10 @@ class DeadLetterTracker:
             })
 
     def flush(self, logger_name: str = "dead_letter") -> None:
-        """flush operation.
-        
+        """Flush.
+
         Args:
-            logger_name (str): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            logger_name (str): Identifier used in logs, output labels, or routing.
         """
         with self._lock:
             entries_snapshot = list(self._entries)
@@ -269,16 +278,13 @@ class JsonFormatter(logging.Formatter):
         return base.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     def format(self, record: logging.LogRecord) -> str:
-        """format operation.
-        
+        """Format.
+
         Args:
-            record (logging.LogRecord): Input parameter.
-        
+            record (logging.LogRecord): Data payload consumed by this function.
+
         Returns:
-            str: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            str: Result produced by this function.
         """
         try:
             # Base fields — ts is now a genuine UTC ISO-8601 string with μs.
