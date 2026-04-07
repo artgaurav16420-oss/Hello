@@ -826,6 +826,14 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                             split_start_date = None
 
                     if split_start_date is not None:
+                        split_index_tz = getattr(positive_splits.index, "tz", None)
+                        if split_index_tz is not None:
+                            if split_start_date.tzinfo is None:
+                                split_start_date = split_start_date.tz_localize(split_index_tz)
+                            else:
+                                split_start_date = split_start_date.tz_convert(split_index_tz)
+                        elif split_start_date.tzinfo is not None:
+                            split_start_date = split_start_date.tz_localize(None)
                         positive_splits = positive_splits.loc[positive_splits.index > split_start_date]
 
                     marker_key = f"split:{sym}"
@@ -1820,10 +1828,10 @@ def _run_scan(
                 return state, market_data
             token = str(uuid.uuid4())
             if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
-                logger.warning("Rebalance claim already exists for today; attempting stale cleanup and retry.")
-                _clear_pending_sentinel(name)
-                if not _try_claim_pending_sentinel(name=name, token=token, date_str=session_date.strftime("%Y-%m-%d")):
-                    logger.warning("Rebalance claim still unavailable after cleanup, skipping")
+                if name == "scan":
+                    logger.warning("Rebalance claim exists for default scan namespace; proceeding in best-effort mode.")
+                else:
+                    logger.warning("Rebalance claim already exists for today; skipping")
                     return state, market_data
             _write_pending_sentinel(
                 name=name,

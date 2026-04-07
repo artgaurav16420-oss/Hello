@@ -1021,7 +1021,12 @@ def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tu
     directions = list(getattr(study, "directions", []))
     if not directions:
         directions = [optuna.study.StudyDirection.MAXIMIZE] * len(trial.values)
-    for direction, value in zip(directions, trial.values, strict=False):
+    if len(directions) != len(trial.values):
+        raise ValueError(
+            f"Direction/value length mismatch for trial #{trial.number}: "
+            f"{len(directions)} directions vs {len(trial.values)} values"
+        )
+    for direction, value in zip(directions, trial.values, strict=True):
         if direction == optuna.study.StudyDirection.MINIMIZE:
             normalized.append(-float(value))
         else:

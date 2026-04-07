@@ -1746,6 +1746,8 @@ class InstitutionalRiskEngine:
         self._solver_lock = threading.Lock()
 
     def reset_solver(self) -> None:
+        supports_update = False
+        supports_warm_start = False
         with self._solver_lock:
             self._solver = None
             self._solver_shape = None
@@ -2107,9 +2109,11 @@ class InstitutionalRiskEngine:
             q[m:2*m] = turnover_costs
 
             assert self._solver is not None
-            if hasattr(self._solver, "update"):
+            supports_update = hasattr(self._solver, "update")
+            supports_warm_start = hasattr(self._solver, "warm_start")
+            if supports_update:
                 self._solver.update(q=q)
-            if hasattr(self._solver, "warm_start"):
+            if supports_warm_start:
                 self._solver.warm_start(x=res.x)
             try:
                 res = self._solver.solve()
@@ -2204,7 +2208,7 @@ class InstitutionalRiskEngine:
                 float(u_gamma),
             )
 
-        enforce_post_solve_hard_checks = hasattr(self._solver, "update") and hasattr(self._solver, "warm_start")
+        enforce_post_solve_hard_checks = supports_update and supports_warm_start
         if enforce_post_solve_hard_checks and (lower_hard or upper_hard or gross_low_hard or gross_high_hard):
             raise OptimizationError(
                 "Post-solve constraint verification failed: "
