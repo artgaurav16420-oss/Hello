@@ -349,7 +349,8 @@ class BacktestEngine:
             idx_df (Optional[pd.DataFrame]): Index data for regime score calculation.
             sector_map (Optional[dict]): Sector assignments for diversification.
             open_px (Optional[pd.DataFrame]): Open prices for execution modeling.
-            high_px/low_px: Daily candle ranges.
+            high_px (Optional[pd.DataFrame]): Daily high prices.
+            low_px (Optional[pd.DataFrame]): Daily low prices.
             member_universe (Optional[set]): Point-in-time members for this date.
             date_pos (Optional[int]): Pre-computed integer index of the current date.
             log_rets_arr (Optional[np.ndarray]): Log returns matrix for CVaR lookbacks.
@@ -856,7 +857,8 @@ def _execution_prices(
         date (pd.Timestamp): Execution date.
         close_prices (np.ndarray): Pre-calculated close price array for this date.
         open_px (Optional[pd.DataFrame]): Daily open prices.
-        high_px/low_px: Daily candle ranges.
+        high_px (Optional[pd.DataFrame]): Daily high prices.
+        low_px (Optional[pd.DataFrame]): Daily low prices.
         return_open_fallback_mask (bool): If True, track which symbols used the fallback.
 
     Returns:
@@ -1397,7 +1399,8 @@ def run_backtest(
     Args:
         market_data (dict): Dictionary of per-symbol DataFrames.
         universe_type (Optional[str]): Built-in universe name (e.g. 'nse500').
-        start_date/end_date (str): Evaluation window.
+        start_date (str): Evaluation start date (YYYY-MM-DD).
+        end_date (str): Evaluation end date (YYYY-MM-DD).
         cfg (Optional[UltimateConfig]): Config overrides.
         sector_map (Optional[dict]): Symbol-to-sector mapping.
         universe (Optional[List]): Explicit symbol list.
@@ -1513,6 +1516,8 @@ def run_backtest(
         metrics=_compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
         rebal_log=rebal_log,
     )
+
+
 def print_backtest_results(results: BacktestResults) -> None:
     """
     Print a formatted summary of backtest performance metrics to the console.
