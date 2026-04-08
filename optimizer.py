@@ -144,16 +144,15 @@ DRAWDOWN_FLOOR                = 1.0  # keep consistent with backtest_engine Calm
 
 
 def _stdout_supports_rupee(stdout=None) -> bool:
-    """_stdout_supports_rupee operation.
-    
+    """
+    Check if the output stream supports the Indian Rupee symbol (₹).
+    Ensures that logging doesn't crash on legacy terminals with restricted encodings.
+
     Args:
-        stdout (Any): Input parameter.
-    
+        stdout (Any): Optional stream to check; defaults to sys.stdout.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: True if the stream can safely encode the rupee symbol.
     """
     stream = stdout if stdout is not None else getattr(sys, "stdout", None)
     if stream is None:
@@ -168,12 +167,14 @@ def _stdout_supports_rupee(stdout=None) -> bool:
 
 
 def _build_sampler() -> TPESampler:
+    """Initialize the Optuna Tree-structured Parzen Estimator (TPE) sampler."""
     if OPTUNA_SEED in (None, ""):
         return TPESampler(n_ei_candidates=24, multivariate=True)
     return TPESampler(seed=int(str(OPTUNA_SEED)), n_ei_candidates=24, multivariate=True)
 
 
 def _normalize_universe_type(universe_type: str | None) -> str:
+    """Validate and normalize the requested trading universe identifier."""
     normalized_universe = (universe_type or "").strip().lower()
     if normalized_universe in {"nifty500", "nse_total"}:
         return normalized_universe
@@ -235,6 +236,7 @@ def _iter_wfo_slices(train_start: str, train_end: str):
 
 
 def _extract_rebalance_summary(rebal_log: pd.DataFrame | None) -> tuple[float, float, float, int]:
+    """Calculate aggregate statistics (exposure, CVaR, position count) from a backtest rebalance log."""
     avg_cvar = 0.0
     avg_exposure = 1.0
     avg_positions = 0.0
@@ -255,6 +257,7 @@ def _extract_rebalance_summary(rebal_log: pd.DataFrame | None) -> tuple[float, f
 
 
 def _compute_turnover_drag(turnover: float) -> tuple[float, float, float]:
+    """Compute the expected CAGR drag from round-trip trading costs and excessive churn penalties."""
     base_friction_drag = turnover * 0.30
     churn_penalty = (max(0.0, turnover - 18.0) ** 2) / 10.0
     return base_friction_drag, churn_penalty, base_friction_drag + churn_penalty
@@ -264,6 +267,10 @@ def _fitness_from_metrics(
     metrics: dict,
     rebal_log: pd.DataFrame,
 ) -> tuple[float, float, dict]:
+    """
+    Compute the scalar fitness score for an optimization trial.
+    Combines Risk-Adjusted Return, Drawdown Penalties, and Exposure Constraints.
+    """
     """
     Compute a scalar fitness score plus a diagnostics dict for logging.
 
@@ -411,6 +418,7 @@ def _fitness_from_metrics(
 
 
 def _int_bounds_with_step(bounds: tuple | list) -> tuple[int, int, int]:
+    """Helper to unpack integer search bounds with an optional step value."""
     if len(bounds) == 3:
         low, high, step = bounds
         return int(low), int(high), int(step)
@@ -419,6 +427,7 @@ def _int_bounds_with_step(bounds: tuple | list) -> tuple[int, int, int]:
 
 
 def _float_bounds_with_step(bounds: tuple | list) -> tuple[float, float, float]:
+    """Helper to unpack float search bounds with an optional step value."""
     if len(bounds) == 3:
         low, high, step = bounds
         return float(low), float(high), float(step)
@@ -432,6 +441,7 @@ def _suggest_optional_int_param(
     bounds: tuple | list | None,
     default_value: int,
 ) -> int:
+    """Suggest an integer parameter from a trial if bounds are available, else return the default."""
     if bounds is None:
         return default_value
     low, high, step = _int_bounds_with_step(bounds)
@@ -446,6 +456,7 @@ def _suggest_optional_float_param(
     bounds: tuple | list | None,
     default_value: float,
 ) -> float:
+    """Suggest a float parameter from a trial if bounds are available, else return the default."""
     if bounds is None:
         return default_value
     low, high, step = _float_bounds_with_step(bounds)
@@ -455,6 +466,7 @@ def _suggest_optional_float_param(
 
 
 def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateConfig:
+    """Generate an UltimateConfig instance from the current trial's parameter suggestions."""
     cfg = UltimateConfig()
 
     hf_min, hf_max, hf_step = _int_bounds_with_step(search_space["HALFLIFE_FAST"])
@@ -519,6 +531,7 @@ def _slice_precomputed_matrices_for_fold(
     wf_oos_end: str,
     cfg: UltimateConfig,
 ) -> dict | None:
+    """Extract the relevant date sub-slice from precomputed data matrices for a specific WFO fold."""
     if precomputed_matrices is None:
         return None
     warmup_oos_ts = pd.Timestamp(_compute_warmup_start(wf_oos_start, cfg))
@@ -542,6 +555,7 @@ def _execute_objective_fold(
     wf_oos_end: str,
     cfg: UltimateConfig,
 ) -> tuple[float, float, dict]:
+    """Run a single backtest fold and evaluate its fitness score."""
     oos = run_backtest(
         market_data=market_data,
         precomputed_matrices=fold_matrices,
@@ -554,6 +568,7 @@ def _execute_objective_fold(
 
 
 def _log_objective_fold_diag(trial_id: int, oos_year: int, diag: dict) -> None:
+    """Log detailed diagnostic metrics for a specific trial fold to the console."""
     ceiling_tag = " ⚠ CEILING HIT" if diag["ceiling_hit"] else ""
     ddgate_tag = " ⚠ DD-GATE (>40%)" if diag["dd_gate_hit"] else ""
     anomaly_tag = " ⚠ ANOMALOUS-RETURNS" if diag.get("anomaly_hit") else ""
@@ -577,7 +592,10 @@ def _log_objective_fold_diag(trial_id: int, oos_year: int, diag: dict) -> None:
 
 
 class MomentumObjective:
-    """MomentumObjective type used by the backtesting system."""
+    """
+    Optuna objective wrapper for the Momentum strategy.
+    Implements Walk-Forward Optimization (WFO) across multiple historical folds.
+    """
     def __init__(
         self,
         market_data: dict,
@@ -585,19 +603,14 @@ class MomentumObjective:
         search_space: dict | None = None,
         precomputed_matrices: dict | None = None,
     ):
-        """__init__ operation.
-        
+        """
+        Initialize the objective function with market data and search bounds.
+
         Args:
-            market_data (dict): Input parameter.
-            universe_type (str): Input parameter.
-            search_space (dict | None): Input parameter.
-            precomputed_matrices (dict | None): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            market_data (dict): Pre-loaded OHLCV data.
+            universe_type (str): Ticker set identifier.
+            search_space (dict): Valid ranges for parameter suggestions.
+            precomputed_matrices (dict): Risk and factor matrices.
         """
         self.market_data          = market_data
         self.universe_type        = universe_type
@@ -605,16 +618,14 @@ class MomentumObjective:
         self.precomputed_matrices = precomputed_matrices
 
     def __call__(self, trial: optuna.Trial) -> tuple[float, float]:
-        """__call__ operation.
-        
+        """
+        Execute the multi-fold optimization trial.
+
         Args:
-            trial (optuna.Trial): Input parameter.
-        
+            trial (optuna.Trial): The current trial instance.
+
         Returns:
-            tuple[float, float]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Tuple[float, float]: Aggregate fitness score and Calmar score across all folds.
         """
         cfg = _suggest_trial_config(trial, self.search_space)
 
@@ -710,6 +721,7 @@ class MomentumObjective:
 # ─── Orchestration ────────────────────────────────────────────────────────────
 
 def _benchmark_close_series(df: pd.DataFrame | None) -> pd.Series | None:
+    """Helper to extract a numeric 'Close' price series from a benchmark dataframe."""
     if not isinstance(df, pd.DataFrame) or df.empty or "Close" not in df.columns:
         return None
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
@@ -723,6 +735,7 @@ def _benchmark_coverage_note(
     required_start: pd.Timestamp,
     required_end: pd.Timestamp,
 ) -> str:
+    """Format a diagnostic warning if benchmark data doesn't span the required date range."""
     return (
         f"{ticker}: coverage {coverage_start.date()} -> {coverage_end.date()} does not span "
         f"{required_start.date()} -> {required_end.date()}"
@@ -730,6 +743,7 @@ def _benchmark_coverage_note(
 
 
 def _validate_regime_benchmark_data(market_data: dict, required_start: str, required_end: str) -> None:
+    """Check that vital benchmark indices (^NSEI, ^CRSLDX) are present and have sufficient history."""
     """
     Validate regime benchmark inputs.
 
@@ -807,17 +821,16 @@ def _validate_regime_benchmark_data(market_data: dict, required_start: str, requ
 
 
 def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict:
-    """pre_load_data operation.
-    
+    """
+    Perform bulk data fetching and matrix precomputation.
+    Executed before trials begin to avoid redundant I/O in the objective loop.
+
     Args:
-        universe_type (str): Input parameter.
-        cfg (UltimateConfig | None): Input parameter.
-    
+        universe_type (str): Nifty500 or other ticker set.
+        cfg (UltimateConfig): Optional override for lookback detection.
+
     Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict: Payload containing 'market_data' and 'precomputed_matrices'.
     """
     logger.info("Initializing Data Pre-fetch phase...")
     normalized_universe = _normalize_universe_type(universe_type)
@@ -890,6 +903,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
 
 def _validate_cvar_limit(params: dict, violations: list[str]) -> None:
+    """Validate that CVAR_DAILY_LIMIT is positive and within reasonable boundaries."""
     cvar = params.get("CVAR_DAILY_LIMIT")
     if cvar is None:
         return
@@ -900,6 +914,7 @@ def _validate_cvar_limit(params: dict, violations: list[str]) -> None:
 
 
 def _validate_position_limits(params: dict, violations: list[str]) -> None:
+    """Validate that position counts and weights are logical and non-negative."""
     max_pos = params.get("MAX_POSITIONS")
     if max_pos is not None and (not isinstance(max_pos, int) or max_pos < 0):
         violations.append(f"MAX_POSITIONS must be int >= 0; got {max_pos!r}")
@@ -912,6 +927,7 @@ def _validate_position_limits(params: dict, violations: list[str]) -> None:
 
 
 def _validate_signal_params(params: dict, violations: list[str]) -> None:
+    """Validate cross-field signal parameters (e.g., Fast < Slow halflife)."""
     hf = params.get("HALFLIFE_FAST")
     hs = params.get("HALFLIFE_SLOW")
     if hf is not None and hs is not None and hf > hs:
@@ -925,6 +941,7 @@ def _validate_signal_params(params: dict, violations: list[str]) -> None:
 
 
 def _validate_risk_params(params: dict, violations: list[str]) -> None:
+    """Validate exposure floors and risk aversion multipliers."""
     exp_floor = params.get("MIN_EXPOSURE_FLOOR")
     if exp_floor is not None and (
         not isinstance(exp_floor, (int, float)) or not (0.0 <= exp_floor <= 1.0)
@@ -947,17 +964,13 @@ def _validate_optimal_config(params: dict) -> list[str]:
 
 
 def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.json"):
-    """save_optimal_config operation.
-    
+    """
+    Persist the winning parameters to a JSON file.
+    Performs atomic file writing to prevent corruption on interruption.
+
     Args:
-        best_params (dict): Input parameter.
-        filepath (str): Input parameter.
-    
-    Returns:
-        Any: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        best_params (dict): Map of parameter names to optimized values.
+        filepath (str): Target filesystem path.
     """
     violations = _validate_optimal_config(best_params)
     if violations:
@@ -997,18 +1010,7 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
 
 
 def _oos_journal_path(study_name: str) -> Path:
-    # ARCH-FIX-9
-    """_oos_journal_path operation.
-    
-    Args:
-        study_name (str): Input parameter.
-    
-    Returns:
-        Path: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Generate a sanitized filesystem path for the OOS tournament results journal."""
     cleaned = re.sub(r"[\\/]+", "_", (study_name or "").strip())
     cleaned = cleaned.replace("..", "_")
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
@@ -1020,18 +1022,7 @@ def _oos_journal_path(study_name: str) -> Path:
 
 
 def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tuple:
-    """_pareto_sort_key operation.
-    
-    Args:
-        study (optuna.Study): Input parameter.
-        trial (optuna.trial.FrozenTrial): Input parameter.
-    
-    Returns:
-        tuple: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Calculate a sortable key for multi-objective Pareto front identification."""
     if trial.values is None:
         raise ValueError(f"Trial #{trial.number} has no objective values for Pareto sorting.")
     normalized: list[float] = []
@@ -1045,10 +1036,12 @@ def _pareto_sort_key(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> tu
 
 
 def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
+    """Retrieve best trials from the study sorted deterministically by Pareto performance."""
     return sorted(study.best_trials, key=lambda t: _pareto_sort_key(study, t), reverse=True)
 
 
 def _error_class_from_trial(trial: optuna.trial.FrozenTrial) -> str:
+    """Extract a high-level error category from a failed trial's system attributes."""
     fail_reason = trial.system_attrs.get("fail_reason")
     if fail_reason:
         return fail_reason.split(":", 1)[0]
@@ -1060,6 +1053,7 @@ def _set_trial_error_class_user_attr(
     trial: optuna.trial.FrozenTrial,
     error_class: str,
 ) -> None:
+    """Persist the categorized error class back to the Optuna storage for visualization."""
     try:
         if hasattr(study, "_storage") and hasattr(trial, "_trial_id"):
             study._storage.set_trial_user_attr(trial._trial_id, "error_class", error_class)
@@ -1076,30 +1070,11 @@ def _set_trial_error_class_user_attr(
 
 
 def _error_triage_callback_factory() -> Callable[[optuna.Study, optuna.trial.FrozenTrial], None]:
-    # ARCH-FIX-8
-    """_error_triage_callback_factory operation.
-    
-    Returns:
-        callable: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Create a callback that monitors consecutive failures and aborts if the study becomes unstable."""
     consecutive_failures = {"count": 0}
 
     def _error_triage_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """_error_triage_callback operation.
-        
-        Args:
-            study (optuna.Study): Input parameter.
-            trial (optuna.trial.FrozenTrial): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Internal callback to increment failure counters and classify errors."""
         if trial.state == optuna.trial.TrialState.FAIL:
             consecutive_failures["count"] += 1
             error_class = _error_class_from_trial(trial)
@@ -1116,6 +1091,7 @@ def _error_triage_callback_factory() -> Callable[[optuna.Study, optuna.trial.Fro
 
 
 def _resolve_execution_mode(in_memory: bool) -> tuple[str, int]:
+    """Determine the Optuna storage engine and worker count based on flags."""
     if in_memory:
         logger.info(
             "In-memory mode: storage=sqlite:///:memory:, n_jobs=%d. "
@@ -1127,12 +1103,14 @@ def _resolve_execution_mode(in_memory: bool) -> tuple[str, int]:
 
 
 def _unpack_preloaded_payload(preloaded_payload: Any) -> tuple[dict, dict | None]:
+    """Unpack pre-fetched market and matrix data from the bulk payload."""
     if isinstance(preloaded_payload, dict) and "market_data" in preloaded_payload:
         return preloaded_payload["market_data"], preloaded_payload.get("precomputed_matrices")
     return preloaded_payload, None
 
 
 def _force_single_worker_if_needed(n_jobs: int) -> int:
+    """Enforce single-worker execution if safety requirements are met."""
     if n_jobs != 1:
         logger.warning(
             "OPTUNA_N_JOBS=%d: forced to 1. For parallelism run multiple "
@@ -1144,6 +1122,7 @@ def _force_single_worker_if_needed(n_jobs: int) -> int:
 
 
 def _enable_sqlite_wal(storage: str) -> None:
+    """Enable Write-Ahead Logging for SQLite to improve concurrency."""
     if not storage.startswith("sqlite:///"):
         return
     db_path = re.sub(r"^sqlite:///", "", storage.split("?")[0])
@@ -1154,6 +1133,7 @@ def _enable_sqlite_wal(storage: str) -> None:
 
 
 def _create_optimization_study(study_name: str, storage: str) -> optuna.Study:
+    """Create or resume a multi-objective Optuna study."""
     study = optuna.create_study(
         study_name=study_name,
         directions=["maximize", "maximize"],
@@ -1167,6 +1147,7 @@ def _create_optimization_study(study_name: str, storage: str) -> optuna.Study:
 
 
 def _current_oos_meta(universe_type: str) -> dict[str, float | str]:
+    """Generate a metadata block for the current OOS validation context."""
     return {
         "universe_type": universe_type,
         "test_start": TEST_START,
@@ -1177,6 +1158,7 @@ def _current_oos_meta(universe_type: str) -> dict[str, float | str]:
 
 
 def _load_oos_journal_records(journal_path: Path, current_meta: dict[str, float | str]) -> dict[int, dict]:
+    """Load and validate previously completed OOS results from a local journal file."""
     completed_trial_ids: dict[int, dict] = {}
     if not journal_path.exists():
         return completed_trial_ids
@@ -1234,6 +1216,7 @@ def _build_oos_cfg_from_trial(
     trial_candidate: optuna.trial.FrozenTrial,
     valid_fields: dict,
 ) -> UltimateConfig:
+    """Combine trial parameters and resolved defaults into a final config for OOS validation."""
     oos_cfg = UltimateConfig()
     resolved_cfg = trial_candidate.user_attrs.get("resolved_cfg", {})
     for k, v in resolved_cfg.items():
@@ -1249,6 +1232,7 @@ def _clip_oos_matrices(
     precomputed_matrices: dict | None,
     warmup_start: str,
 ) -> dict:
+    """Restrict precomputed matrices to the specific period required for OOS validation."""
     if precomputed_matrices is None:
         return {}
     clipped_matrices: dict = {}
@@ -1265,18 +1249,14 @@ def run_optimization(
     in_memory:     bool      = False,
     study_name:    str | None = None,
 ):
-    """run_optimization operation.
-    
+    """
+    Orchestrate the complete Bayesian parameter optimization workflow.
+    Includes data pre-fetch, IS trials, and final OOS tournament selection.
+
     Args:
-        universe_type (str): Input parameter.
-        in_memory (bool): Input parameter.
-        study_name (str | None): Input parameter.
-    
-    Returns:
-        Any: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        universe_type (str): Symbols to optimize (nifty500 or nse_total).
+        in_memory (bool): If True, trial history is not saved to disk.
+        study_name (str): Custom name for the Optuna study instance.
     """
     universe_type = _normalize_universe_type(universe_type)
     effective_storage, effective_n_jobs = _resolve_execution_mode(in_memory)
@@ -1314,18 +1294,7 @@ def run_optimization(
     logger.info("Starting %d Bayesian Trials (This may take a while)...", N_TRIALS)
 
     def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """_best_trial_callback operation.
-        
-        Args:
-            study (optuna.Study): Input parameter.
-            trial (optuna.trial.FrozenTrial): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Log a formatted summary whenever a new historically 'best' trial is identified."""
         if trial.state != optuna.trial.TrialState.COMPLETE:
             return
         ranked_best = _deterministic_best_trials(study)
@@ -1590,17 +1559,7 @@ def run_optimization(
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """_parse_args operation.
-    
-    Args:
-        argv (list[str] | None): Input parameter.
-    
-    Returns:
-        argparse.Namespace: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Parse command line arguments for the optimizer entry point."""
     parser = argparse.ArgumentParser(
         description="Run Bayesian optimizer for momentum strategy."
     )

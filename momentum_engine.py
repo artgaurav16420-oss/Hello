@@ -101,18 +101,18 @@ def to_bare(sym: str) -> str:
 
 
 def absent_symbol_effective_price(last_known_price: float, absent_periods: int, max_absent_periods: int) -> float:
-    """absent_symbol_effective_price operation.
-    
+    """
+    Calculate the effective price for a symbol that has been absent from market data.
+    Applies a linear haircut to the last known price based on how long it has been missing.
+    If absent_periods >= max_absent_periods, the effective price becomes 0.0.
+
     Args:
-        last_known_price (float): Input parameter.
-        absent_periods (int): Input parameter.
-        max_absent_periods (int): Input parameter.
-    
+        last_known_price (float): The final valid price recorded for the symbol.
+        absent_periods (int): Number of consecutive periods the symbol has been missing.
+        max_absent_periods (int): Maximum allowed absence before the price is zeroed.
+
     Returns:
-        float: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: The haircut-adjusted price.
     """
     px = float(last_known_price)
     if not np.isfinite(px) or px <= 0:
@@ -126,9 +126,12 @@ def absent_symbol_effective_price(last_known_price: float, absent_periods: int, 
 # ─── Enumerations & exceptions ────────────────────────────────────────────────
 
 class OptimizationErrorType(Enum):
-    NUMERICAL  = auto()
-    INFEASIBLE = auto()
-    DATA       = auto()
+    """
+    Categories of failures during the portfolio optimization process.
+    """
+    NUMERICAL  = auto()  # Solver failed due to numerical instability or ill-conditioned matrices.
+    INFEASIBLE = auto()  # No solution exists that satisfies all provided constraints.
+    DATA       = auto()  # Missing or invalid input data (covariances, returns, etc.).
 
 
 class OptimizationError(Exception):
@@ -138,17 +141,12 @@ class OptimizationError(Exception):
         message:    str,
         error_type: OptimizationErrorType = OptimizationErrorType.NUMERICAL,
     ):
-        """__init__ operation.
-        
+        """
+        Initialize an optimization error.
+
         Args:
-            message (str): Input parameter.
-            error_type (OptimizationErrorType): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            message (str): Descriptive error message.
+            error_type (OptimizationErrorType): The failure category.
         """
         super().__init__(message)
         self.error_type = error_type
@@ -168,7 +166,20 @@ class Trade:
 
 @dataclass
 class SolverDiagnostics:
-    """SolverDiagnostics type used by the backtesting system."""
+    """
+    Metadata and convergence statistics from the OSQP solver execution.
+    Used for monitoring solver health and identifying binding constraints.
+
+    Attributes:
+        status (str): Solver exit status (e.g., 'solved', 'infeasible').
+        gamma_intent (float): The targeted portfolio exposure.
+        actual_weight (float): The sum of optimized weights.
+        l_gamma/u_gamma: Bounds on total exposure.
+        cvar_value (float): Realized CVaR of the optimized portfolio.
+        slack_value (float): Magnitude of slack variables used to satisfy CVaR.
+        adv_binding_count (int): Number of symbols hitting the ADV liquidity cap.
+        ridge_applied (float): Amount of Tikhonov regularization added to the covariance matrix.
+    """
     status:            str
     gamma_intent:      float
     actual_weight:     float
@@ -184,36 +195,32 @@ class SolverDiagnostics:
 
     @property
     def budget_utilisation(self) -> float:
+        """Percentage of the upper exposure bound utilized by the solver."""
         return self.actual_weight / self.u_gamma if self.u_gamma > 0 else 0.0
 
 
 # ─── Matrix Building Helper ───────────────────────────────────────────────────
 
 class _ConstraintBuilder:
-    """_ConstraintBuilder type used by the backtesting system."""
+    """
+    Utility to assemble multiple linear constraints into the sparse format required by OSQP.
+    Stack matrices vertically and flattens bound vectors.
+    """
     def __init__(self, n_vars: int):
-        """__init__ operation.
-        
-        Args:
-            n_vars (int): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Initialize the builder for a fixed number of optimization variables."""
         self.n_vars = n_vars
         self.A_parts: list = []
         self.l_parts: list = []
         self.u_parts: list = []
 
     def add_constraint(self, A_matrix, lower_bound, upper_bound):
+        """Append a new constraint block (A, l, u) to the system."""
         self.A_parts.append(A_matrix)
         self.l_parts.append(lower_bound)
         self.u_parts.append(upper_bound)
 
     def build(self) -> Tuple[sp.csc_matrix, np.ndarray, np.ndarray]:
+        """Finalize and return the vertically stacked constraint system."""
         A = sp.vstack(self.A_parts, format="csc")
         lower = np.concatenate([np.atleast_1d(b) for b in self.l_parts]).astype(float, copy=False)
         upper = np.concatenate([np.atleast_1d(b) for b in self.u_parts]).astype(float, copy=False)
@@ -224,8 +231,10 @@ class _ConstraintBuilder:
 
 @dataclass
 class UltimateConfig:
-    # Portfolio construction
-    """UltimateConfig type used by the backtesting system."""
+    """
+    Global configuration schema for the Institutional Risk Engine.
+    Controls sizing constraints, risk thresholds, and execution modeling.
+    """
     INITIAL_CAPITAL:          float = 1_000_000.0
     MAX_POSITIONS:            int   = 10
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20
@@ -334,7 +343,10 @@ DEFAULT_MAX_ABSENT_PERIODS = int(UltimateConfig.MAX_ABSENT_PERIODS)
 
 @dataclass
 class PortfolioState:
-    """PortfolioState type used by the backtesting system."""
+    """
+    Representation of the current live state of the trading portfolio.
+    Tracks cash, shares, trade history, and risk control parameters.
+    """
     RISK_CONTROL_FIELDS: ClassVar[Tuple[str, ...]] = (
         "override_active",
         "override_cooldown",
@@ -364,6 +376,7 @@ class PortfolioState:
     last_rebalance_date:  str              = ""
 
     def __post_init__(self) -> None:
+        """Initialize transient private state and default caps after dataclass instantiation."""
         self._initial_cash = float(self.cash)
         self._initial_exposure_multiplier = float(self.exposure_multiplier)
         if self.equity_hist_cap is None:
@@ -378,19 +391,15 @@ class PortfolioState:
         cfg:            UltimateConfig,
         gross_exposure: float = 1.0,
     ) -> None:
-        """update_exposure operation.
-        
+        """
+        Dynamically adjust the portfolio's exposure multiplier based on regime and risk.
+        Implements a sigmoid regime response and an immediate override (halving) if CVaR limits are breached.
+
         Args:
-            regime_score (float): Input parameter.
-            realized_cvar (float): Input parameter.
-            cfg (UltimateConfig): Input parameter.
-            gross_exposure (float): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            regime_score (float): Probability of a favorable market regime [0, 1].
+            realized_cvar (float): The current portfolio's realized Conditional Value-at-Risk.
+            cfg (UltimateConfig): Configuration for risk limits and deleveraging speeds.
+            gross_exposure (float): Current total proportional exposure (sum of |weights|).
         """
         target   = 1.0 / (1.0 + np.exp(-cfg.REGIME_SIGMOID_STEEPNESS * (regime_score - 0.5)))
         new_mult = self.exposure_multiplier + float(
@@ -470,16 +479,12 @@ class PortfolioState:
         return round(max(0.0, -float(tail.mean())), 10) if not tail.empty else 0.0
 
     def record_eod(self, prices: Dict[str, float]) -> None:
-        """record_eod operation.
-        
+        """
+        Update the portfolio's equity history at the end of a trading session.
+        Calculates Net Asset Value (NAV) using current prices and handles missing data.
+
         Args:
-            prices (Dict[str, float]): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            prices (Dict[str, float]): Map of symbol to current closing price.
         """
         max_absent_periods = (
             self.max_absent_periods
@@ -514,6 +519,7 @@ class PortfolioState:
             self.equity_hist = self.equity_hist[-self._equity_hist_cap:]
 
     def record_volatility(self, current_date: pd.Timestamp, vol_by_symbol: Dict[str, float], cap: int) -> None:
+        """Record realized volatility for symbols to be used in CVaR estimates."""
         effective_cap = int(cap)
         for sym, vol in vol_by_symbol.items():
             vol_value = float(vol)
@@ -528,14 +534,7 @@ class PortfolioState:
             hist.append((pd.Timestamp(current_date), vol_value))
 
     def reset(self) -> None:
-        """reset operation.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Clear all holdings and history, resetting capital to the initial balance."""
         initial_cash = float(getattr(self, "_initial_cash", self.cash))
         self.shares = {}
         self.cash = initial_cash
@@ -553,14 +552,7 @@ class PortfolioState:
         self.decay_rounds = 0
 
     def to_dict(self) -> dict:
-        """to_dict operation.
-        
-        Returns:
-            dict: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Serialize the entire portfolio state into a primitive dictionary for storage."""
         def _r(v):
             """Recursively round float values for stable JSON serialization.
 
@@ -610,16 +602,9 @@ class PortfolioState:
 
     @classmethod
     def from_dict(cls, d: dict) -> "PortfolioState":
-        """from_dict operation.
-        
-        Args:
-            d (dict): Input parameter.
-        
-        Returns:
-            "PortfolioState": Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+        """
+        Deserialize and restore a PortfolioState from a dictionary.
+        Performs type validation and applies defaults for missing fields.
         """
         ps = cls()
         errors: List[str] = []
@@ -709,6 +694,7 @@ class PortfolioState:
 
 
 def _as_bool_flag(value: Any) -> bool:
+    """Safely cast various input types (str, int) to a boolean flag."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -726,6 +712,7 @@ def _as_bool_flag(value: Any) -> bool:
 
 
 def _as_nonneg_int(value: Any) -> int:
+    """Parse a non-negative integer, raising ValueError if negative or unparseable."""
     parsed = int(value)
     if parsed < 0:
         raise ValueError(f"value must be non-negative, got {parsed}")
@@ -733,12 +720,14 @@ def _as_nonneg_int(value: Any) -> int:
 
 
 def _as_optional_nonneg_int(value: Any) -> Optional[int]:
+    """Parse an optional non-negative integer (handles None)."""
     if value is None:
         return None
     return _as_nonneg_int(value)
 
 
 def _load_equity_hist_cap(payload: dict) -> Optional[int]:
+    """Helper to extract and validate the history cap from a state payload."""
     if "equity_hist_cap" not in payload:
         return None
     value = payload.get("equity_hist_cap")
@@ -755,6 +744,7 @@ def _load_equity_hist_cap(payload: dict) -> Optional[int]:
 
 
 def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
+    """Deserialize volatility history deques from a list-based representation."""
     default_maxlen = max(500, int(UltimateConfig().CVAR_LOOKBACK * 2))
     out: Dict[str, deque] = {}
     for k, vals in value.items():
@@ -784,6 +774,10 @@ def _state_get(
     errors: List[str],
     risk_control_errors: List[str],
 ) -> Any:
+    """
+    Robust field extractor for state dictionary.
+    Tracks whether errors occurred in sensitive risk-control fields.
+    """
     try:
         return converter(payload[key]) if key in payload else default
     except Exception as exc:
@@ -799,6 +793,7 @@ def _state_get(
 
 
 def activate_override_on_stress(state: PortfolioState, cfg: UltimateConfig) -> None:
+    """Manually trigger a risk override, halving exposure and starting a cooldown period."""
     state.override_active = True
     state.override_cooldown = max(state.override_cooldown, 4)
     state.exposure_multiplier = float(max(cfg.MIN_EXPOSURE_FLOOR, state.exposure_multiplier * 0.5))
@@ -855,19 +850,17 @@ def _compute_one_way_slip_rate_vectorized(
     adv_notional: np.ndarray,
     trade_notional: np.ndarray,
 ) -> np.ndarray:
-    """_compute_one_way_slip_rate_vectorized operation.
-    
+    """
+    Vectorized version of slippage calculation for bulk optimization constraints.
+
     Args:
-        cfg (UltimateConfig): Input parameter.
-        portfolio_value (float): Input parameter.
-        adv_notional (np.ndarray): Input parameter.
-        trade_notional (np.ndarray): Input parameter.
-    
+        cfg (UltimateConfig): Configuration for slippage parameters.
+        portfolio_value (float): Total portfolio value.
+        adv_notional (np.ndarray): Matrix/array of symbol ADV values.
+        trade_notional (np.ndarray): Matrix/array of intended trade sizes.
+
     Returns:
-        np.ndarray: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray: Matrix of calculated one-way slippage rates.
     """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     adv_arr = np.asarray(adv_notional, dtype=float)
@@ -889,20 +882,19 @@ def _compute_pv_exec(
     cfg: UltimateConfig,
     symbols_to_force_close: Set[str],
 ) -> Tuple[float, float]:
-    """_compute_pv_exec operation.
-    
+    """
+    Calculate the execution-time Portfolio Value (PV).
+    Determines both current PV and T-1 PV using execution prices.
+
     Args:
-        state (PortfolioState): Input parameter.
-        prices (np.ndarray): Input parameter.
-        active_symbols (List[str]): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        symbols_to_force_close (Set[str]): Input parameter.
-    
+        state (PortfolioState): Current portfolio holdings.
+        prices (np.ndarray): Execution prices for active symbols.
+        active_symbols (List[str]): Symbols in the current optimization matrix.
+        cfg (UltimateConfig): Config for absence modeling.
+        symbols_to_force_close (Set[str]): Symbols being liquidated.
+
     Returns:
-        Tuple[float, float]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple: (pv_exec, pv_t1).
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     absent_snapshot: Dict[str, int] = dict(state.absent_periods)
@@ -942,23 +934,22 @@ def _compute_desired_shares(
     current_shares: Optional[Dict[str, int]] = None,
     conviction_scores: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]:
-    """_compute_desired_shares operation.
-    
+    """
+    Convert optimized target weights into integer share counts.
+    Applies ADV caps and filters for valid targets (non-zero conviction).
+
     Args:
-        target_weights (np.ndarray): Input parameter.
-        prices (np.ndarray): Input parameter.
-        pv_exec (float): Input parameter.
-        adv_shares (Optional[np.ndarray]): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        active_symbols (Optional[List[str]]): Input parameter.
-        current_shares (Optional[Dict[str, int]]): Input parameter.
-        conviction_scores (Optional[np.ndarray]): Input parameter.
-    
+        target_weights (np.ndarray): Vector of floating point weights.
+        prices (np.ndarray): Current execution prices.
+        pv_exec (float): Portfolio value for sizing.
+        adv_shares (Optional[np.ndarray]): Per-symbol liquidity limits.
+        cfg (UltimateConfig): Configuration schema.
+        active_symbols (Optional[List]): Symbol names.
+        current_shares (Optional[Dict]): Existing holdings.
+        conviction_scores (Optional[np.ndarray]): Alpha/signal scores for ranking.
+
     Returns:
-        Tuple[Dict[str, int], List[Tuple[int, str, float, float]]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple: (Map of symbol to shares, List of (index, symbol, price, score) for buy allocation).
     """
     desired_shares: Dict[str, int] = {}
     valid_targets: List[Tuple[int, str, float, float]] = []
@@ -988,6 +979,7 @@ def _desired_shares_from_weight(
     old_shares: int,
     price: float,
 ) -> int:
+    """Calculate the integer share count required to reach a target weight."""
     if target_weight * pv_exec > current_notional:
         buy_notional = max(0.0, target_weight * pv_exec - current_notional)
         return old_shares + int(np.floor(buy_notional / max(price, 1e-9)))
@@ -1005,6 +997,7 @@ def _apply_adv_share_cap(
     index: int,
     cfg: UltimateConfig,
 ) -> int:
+    """Enforce liquidity constraints by capping total holdings at a percentage of ADV."""
     if adv_shares is None or index >= len(adv_shares):
         return shares
     adv_notional = float(adv_shares[index])
@@ -1027,22 +1020,21 @@ def _apply_drift_gate(
     cfg: UltimateConfig,
     active_symbols: List[str],
 ) -> Tuple[Dict[str, int], set[str]]:
-    """_apply_drift_gate operation.
-    
+    """
+    Apply a drift tolerance gate to minimize unnecessary small trades.
+    If the intended weight change is below a threshold, holdings are kept as-is.
+
     Args:
-        desired_shares (Dict[str, int]): Input parameter.
-        current_shares (Dict[str, int]): Input parameter.
-        target_weights (np.ndarray): Input parameter.
-        prices (np.ndarray): Input parameter.
-        pv_exec (float): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-        active_symbols (List[str]): Input parameter.
-    
+        desired_shares (Dict[str, int]): Proposed share counts.
+        current_shares (Dict[str, int]): Existing share counts.
+        target_weights (np.ndarray): Target weight vector.
+        prices (np.ndarray): Asset prices.
+        pv_exec (float): Portfolio value.
+        cfg (UltimateConfig): Config for DRIFT_TOLERANCE.
+        active_symbols (List[str]): List of active symbol names.
+
     Returns:
-        Tuple[Dict[str, int], set[str]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple: (Updated share counts, set of symbols that were gated).
     """
     drift_threshold = cfg.DRIFT_TOLERANCE
     drift_gated_syms: set[str] = set()
@@ -1071,20 +1063,19 @@ def _allocate_residual_cash(
     prices: np.ndarray,
     cfg: UltimateConfig,
 ) -> Dict[str, int]:
-    """_allocate_residual_cash operation.
-    
+    """
+    Distribute unallocated cash among buy candidates based on conviction scores.
+    Maximizes capital efficiency by filling fractional weight gaps.
+
     Args:
-        residual_budget (float): Input parameter.
-        valid_targets (List[Tuple[int, str, float, float]]): Input parameter.
-        conviction_scores (Optional[np.ndarray]): Input parameter.
-        prices (np.ndarray): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        residual_budget (float): Remaining cash to deploy.
+        valid_targets (List): Candidates for additional buying.
+        conviction_scores (Optional[np.ndarray]): Ranking scores.
+        prices (np.ndarray): Asset prices.
+        cfg (UltimateConfig): Config overrides.
+
     Returns:
-        Dict[str, int]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict: Incremental shares to add for each symbol.
     """
     if residual_budget <= 0 or not valid_targets:
         return {}
@@ -1491,20 +1482,19 @@ def compute_book_cvar(
     hist_log_rets:  pd.DataFrame,
     cfg:            UltimateConfig,
 ) -> float:
-    """compute_book_cvar operation.
-    
+    """
+    Calculate the current portfolio's Conditional Value-at-Risk (CVaR).
+    Uses a historical simulation approach with ghost synthesis for symbols with insufficient history.
+
     Args:
-        state (PortfolioState): Input parameter.
-        prices (np.ndarray): Input parameter.
-        active_symbols (List[str]): Input parameter.
-        hist_log_rets (pd.DataFrame): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        state (PortfolioState): Current holdings and volatility history.
+        prices (np.ndarray): Mark-to-market prices for active symbols.
+        active_symbols (List[str]): List of symbol names in the pricing vector.
+        hist_log_rets (pd.DataFrame): Historical log returns for market assets.
+        cfg (UltimateConfig): Configuration for lookbacks and confidence levels.
+
     Returns:
-        float: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        float: Expected loss in the worst (1 - alpha)% of scenarios.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     mtm_weights, pv = _build_mtm_weights_and_pv(state, prices, active_idx)
@@ -1559,6 +1549,7 @@ def _prepare_cvar_returns(hist_log_rets: pd.DataFrame, held_syms: List[str], t_c
 
 
 def _record_current_volatility(state: PortfolioState, hist_log_rets: pd.DataFrame, cfg: UltimateConfig) -> None:
+    """Update volatility history buffers with latest rolling standard deviations."""
     vol_window = max(5, cfg.GHOST_VOL_LOOKBACK)
     if hist_log_rets.empty:
         return
@@ -1576,6 +1567,7 @@ def _record_current_volatility(state: PortfolioState, hist_log_rets: pd.DataFram
 
 
 def _row_seeds_from_index(index: pd.Index, sym_base_seed: int) -> np.ndarray:
+    """Generate daily-varying seeds for deterministic Monte Carlo synthesis."""
     if hasattr(index, "asi8"):
         idx = pd.DatetimeIndex(index)
         if idx.tz is None:
@@ -1594,6 +1586,7 @@ def _ghost_vol_series_for_symbol(
     index: pd.Index,
     cfg: UltimateConfig,
 ) -> np.ndarray:
+    """Construct a volatility time-series for a ghost asset using last known values."""
     vol_series = np.full(len(index), float(cfg.GHOST_VOL_FALLBACK), dtype=float)
     sym_hist = list(state.vol_hist.get(sym, deque()))
     if not sym_hist:
@@ -1619,6 +1612,7 @@ def _apply_ghost_return_synthesis(
     active_idx: Dict[str, int],
     cfg: UltimateConfig,
 ) -> None:
+    """Fill missing return data with synthetic normally distributed noise (Ghosting)."""
     ghost_mask = np.array([(s not in active_idx) or (s in rets.columns and rets[s].isna().all()) for s in held_syms])
     if not ghost_mask.any():
         return
@@ -1672,6 +1666,7 @@ def compute_decay_targets(
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 
 def raw_rets_empty_after_sanitization(historical_returns: pd.DataFrame) -> bool:
+    """Check if the return dataframe is empty or entirely non-finite."""
     return historical_returns.replace([np.inf, -np.inf], np.nan).empty
 
 
@@ -1684,6 +1679,7 @@ def _validate_optimizer_input_shapes(
     sector_labels: Optional[np.ndarray],
     portfolio_value: float,
 ) -> None:
+    """Perform structural and sanity checks on all optimizer inputs to prevent logic crashes."""
     original_m = len(expected_returns)
     if len(prices) != original_m or len(adv_shares) != original_m:
         raise OptimizationError(
@@ -1724,6 +1720,7 @@ def _apply_history_gate(
     raw_rets: pd.DataFrame,
     cfg: UltimateConfig,
 ) -> Tuple[pd.DataFrame, np.ndarray, List[str], int, int]:
+    """Excludes assets from optimization if they lack sufficient valid historical data points."""
     lookback = min(max(int(cfg.HISTORY_GATE), 1), len(raw_rets))
     min_valid_ratio = 0.70
     required_count = max(1, int(np.ceil(lookback * min_valid_ratio)))
@@ -1736,6 +1733,7 @@ def _apply_history_gate(
 
 
 def _fill_missing_returns(clean_rets: pd.DataFrame) -> pd.DataFrame:
+    """Fill non-systemic NaNs with cross-sectional row means (market-neutral proxy)."""
     row_means = clean_rets.mean(axis=1)
     return clean_rets.apply(lambda col: col.fillna(row_means)).fillna(0.0)
 
@@ -1744,6 +1742,7 @@ def _drop_zero_volatility_columns(
     clean_rets: pd.DataFrame,
     kept_indices: np.ndarray,
 ) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Remove assets with zero variance to avoid singular covariance matrix issues."""
     col_stds = clean_rets.std()
     valid_vol_mask = col_stds >= 1e-10
     if not valid_vol_mask.any():
@@ -1760,6 +1759,7 @@ def _compute_exposure_bounds(
     adv_limit: np.ndarray,
     sector_labels: Optional[np.ndarray],
 ) -> Tuple[float, float, float]:
+    """Calculate the lower and upper bounds for total portfolio gross exposure."""
     gamma = float(np.clip(exposure_multiplier, cfg.MIN_EXPOSURE_FLOOR, 1.0))
     l_gamma = max(cfg.MIN_EXPOSURE_FLOOR, gamma * (1.0 - cfg.CAPITAL_ELASTICITY))
     u_gamma = min(1.0, gamma)
@@ -1794,16 +1794,11 @@ class InstitutionalRiskEngine:
     """
     # NOT thread-safe across optimize() calls without _solver_lock.
     def __init__(self, cfg: UltimateConfig):
-        """__init__ operation.
-        
+        """
+        Initialize the institutional risk engine.
+
         Args:
-            cfg (UltimateConfig): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            cfg (UltimateConfig): Configuration schema for limits and penalties.
         """
         self.cfg:       UltimateConfig              = cfg
         self.last_diag: Optional[SolverDiagnostics] = None
@@ -1832,24 +1827,26 @@ class InstitutionalRiskEngine:
         sector_labels:       Optional[np.ndarray] = None,
         execution_date:      Optional[pd.Timestamp] = None,
     ) -> np.ndarray:
-        """optimize operation.
-        
+        """
+        Solve the portfolio optimization problem using OSQP.
+        Implements traditional Markowitz objective with CVaR constraints and ADV caps.
+
         Args:
-            expected_returns (np.ndarray): Input parameter.
-            historical_returns (pd.DataFrame): Input parameter.
-            adv_shares (np.ndarray): Input parameter.
-            prices (np.ndarray): Input parameter.
-            portfolio_value (float): Input parameter.
-            prev_w (Optional[np.ndarray]): Input parameter.
-            exposure_multiplier (float): Input parameter.
-            sector_labels (Optional[np.ndarray]): Input parameter.
-            execution_date (Optional[pd.Timestamp]): Input parameter.
-        
+            expected_returns (np.ndarray): Vector of expected alpha/returns.
+            historical_returns (pd.DataFrame): Asset return history (T x m).
+            adv_shares (np.ndarray): Average daily volume in shares.
+            prices (np.ndarray): Current asset prices.
+            portfolio_value (float): Current total portfolio Net Asset Value.
+            prev_w (Optional[np.ndarray]): Starting weights for turnover penalization.
+            exposure_multiplier (float): Target gross exposure scaling.
+            sector_labels (Optional[np.ndarray]): Vector of sector IDs for concentration capping.
+            execution_date (Optional[Timestamp]): Current simulation date.
+
         Returns:
-            np.ndarray: Result of this operation.
-        
+            np.ndarray: Optimized weight vector.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            OptimizationError: If no feasible solution is found or data is invalid.
         """
         original_m = len(expected_returns)
         if original_m == 0:

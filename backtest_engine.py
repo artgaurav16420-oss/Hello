@@ -91,6 +91,15 @@ _SUSPENSION_GAP_DAYS = 30
 
 @dataclass
 class BacktestResults:
+    """
+    Container for backtest execution results.
+
+    Attributes:
+        equity_curve (pd.Series): Time series of portfolio equity values, typically at rebalance frequency.
+        trades (List[Trade]): List of all executed trades during the backtest.
+        metrics (Dict): Dictionary of computed performance metrics (CAGR, Sharpe, etc.).
+        rebal_log (pd.DataFrame): Log of rebalance events including regime scores and exposures.
+    """
     equity_curve: pd.Series
     trades:       List[Trade]
     metrics:      Dict
@@ -102,17 +111,12 @@ class BacktestResults:
 class BacktestEngine:
     """BacktestEngine type used by the backtesting system."""
     def __init__(self, engine: InstitutionalRiskEngine, initial_cash: float = 1_000_000):
-        """__init__ operation.
-        
+        """
+        Initialize the backtest engine with a risk engine and initial capital.
+
         Args:
-            engine (InstitutionalRiskEngine): Input parameter.
-            initial_cash (float): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            engine (InstitutionalRiskEngine): The core risk/optimization engine to use.
+            initial_cash (float): Initial cash balance for the portfolio. Defaults to 1,000,000.
         """
         self.engine              = engine
         self.state               = PortfolioState(cash=initial_cash)
@@ -124,6 +128,10 @@ class BacktestEngine:
         self._rebal_rows: list     = []
 
     def _reset_run_state(self) -> None:
+        """
+        Reset the engine's internal state to prepare for a fresh backtest run.
+        Clears trade history, equity tracking, and resets the solver.
+        """
         self.state.reset()
         self.engine.reset_solver()
         self._eq_dates = []
@@ -170,30 +178,28 @@ class BacktestEngine:
         # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
         # runs; without clearing per-run buffers, equity/trade/rebalance state
         # accumulates and contaminates subsequent outputs.
-        """run operation.
-        
+        """
+        Execute the main backtest loop across the specified date range.
+
         Args:
-            close (pd.DataFrame): Input parameter.
-            volume (pd.DataFrame): Input parameter.
-            returns (pd.DataFrame): Input parameter.
-            rebalance_dates (pd.DatetimeIndex): Input parameter.
-            start_date (str): Input parameter.
-            end_date (Optional[str]): Input parameter.
-            idx_df (Optional[pd.DataFrame]): Input parameter.
-            sector_map (Optional[dict]): Input parameter.
-            open_px (Optional[pd.DataFrame]): Input parameter.
-            high_px (Optional[pd.DataFrame]): Input parameter.
-            low_px (Optional[pd.DataFrame]): Input parameter.
-            dividends (Optional[pd.DataFrame]): Input parameter.
-            splits (Optional[pd.DataFrame]): Input parameter.
-            universe_by_rebalance_date (Optional[Dict[pd.Timestamp, set[str]]]): Input parameter.
-            log_rets_arr (Optional[np.ndarray]): Input parameter.
-        
+            close (pd.DataFrame): Daily close prices matrix (Date x Symbol).
+            volume (pd.DataFrame): Daily volume matrix (Date x Symbol).
+            returns (pd.DataFrame): Daily returns matrix (Date x Symbol).
+            rebalance_dates (pd.DatetimeIndex): Exact dates to perform rebalances.
+            start_date (str): Backtest evaluation start date (YYYY-MM-DD).
+            end_date (Optional[str]): Backtest evaluation end date (YYYY-MM-DD).
+            idx_df (Optional[pd.DataFrame]): Benchmark index data for regime detection.
+            sector_map (Optional[dict]): Mapping of symbols to their respective sectors.
+            open_px (Optional[pd.DataFrame]): Daily open prices for execution modeling.
+            high_px (Optional[pd.DataFrame]): Daily high prices.
+            low_px (Optional[pd.DataFrame]): Daily low prices.
+            dividends (Optional[pd.DataFrame]): Dividend cash payments (Date x Symbol).
+            splits (Optional[pd.DataFrame]): Stock split ratios (Date x Symbol).
+            universe_by_rebalance_date (Optional[Dict]): Point-in-time universe membership.
+            log_rets_arr (Optional[np.ndarray]): Pre-computed log returns for CVaR logic.
+
         Returns:
-            pd.DataFrame: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            pd.DataFrame: A dataframe containing the daily 'equity' curve.
         """
         self._reset_run_state()
         # Guard against stale values left by a prior state.from_dict()
@@ -328,29 +334,26 @@ class BacktestEngine:
         date_pos: Optional[int] = None,
         log_rets_arr: Optional[np.ndarray] = None,
     ) -> None:
-        """_run_rebalance operation.
-        
+        """
+        Internal rebalance handler called for each rebalance date.
+        Generates signals, optimizes weights, and executes trades while managing
+        risk breaches and decay liquidations.
+
         Args:
-            date (pd.Timestamp): Input parameter.
-            close (pd.DataFrame): Input parameter.
-            volume (pd.DataFrame): Input parameter.
-            returns (pd.DataFrame): Input parameter.
-            symbols (List[str]): Input parameter.
-            prices_t (np.ndarray): Input parameter.
-            idx_df (Optional[pd.DataFrame]): Input parameter.
-            sector_map (Optional[dict]): Input parameter.
-            open_px (Optional[pd.DataFrame]): Input parameter.
-            high_px (Optional[pd.DataFrame]): Input parameter.
-            low_px (Optional[pd.DataFrame]): Input parameter.
-            member_universe (Optional[set[str]]): Input parameter.
-            date_pos (Optional[int]): Input parameter.
-            log_rets_arr (Optional[np.ndarray]): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            date (pd.Timestamp): The rebalance effective date.
+            close (pd.DataFrame): Full close prices history.
+            volume (pd.DataFrame): Full volume history for ADV computation.
+            returns (pd.DataFrame): Full returns history.
+            symbols (List[str]): List of active symbols in the current matrix.
+            prices_t (np.ndarray): Array of current prices for all symbols.
+            idx_df (Optional[pd.DataFrame]): Index data for regime score calculation.
+            sector_map (Optional[dict]): Sector assignments for diversification.
+            open_px (Optional[pd.DataFrame]): Open prices for execution modeling.
+            high_px (Optional[pd.DataFrame]): Daily high prices.
+            low_px (Optional[pd.DataFrame]): Daily low prices.
+            member_universe (Optional[set]): Point-in-time members for this date.
+            date_pos (Optional[int]): Pre-computed integer index of the current date.
+            log_rets_arr (Optional[np.ndarray]): Log returns matrix for CVaR lookbacks.
         """
         cfg = self.engine.cfg
 
@@ -634,17 +637,16 @@ class BacktestEngine:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
-    """_compute_warmup_start operation.
-    
+    """
+    Compute the date to start fetching data from to satisfy warm-up requirements.
+    Calculates the maximum lookback needed for CVaR, momentum, and regime scores.
+
     Args:
-        start_date (str): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-    
+        start_date (str): The requested backtest start date.
+        cfg (UltimateConfig): Configuration object containing lookback parameters.
+
     Returns:
-        str: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: ISO date string for the warm-up start.
     """
     halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
     cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
@@ -707,21 +709,20 @@ def _build_adv_vector(
     cfg: Optional[UltimateConfig] = None,
     return_notional: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, pd.DataFrame]:
-    """_build_adv_vector operation.
-    
+    """
+    Compute the Average Daily Value (ADV) for a list of symbols on a given date.
+    Used for liquidity gating and sizing constraints.
+
     Args:
-        symbols (List[str]): Input parameter.
-        close (pd.DataFrame): Input parameter.
-        volume (pd.DataFrame): Input parameter.
-        date (pd.Timestamp): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-        return_notional (bool): Input parameter.
-    
+        symbols (List[str]): Symbols to process.
+        close (pd.DataFrame): Daily close prices.
+        volume (pd.DataFrame): Daily volumes.
+        date (pd.Timestamp): Target rebalance date (ADV is computed up to T-1).
+        cfg (Optional[UltimateConfig]): Config for ADV_LOOKBACK.
+        return_notional (bool): If True, also returns the underlying daily notional matrix.
+
     Returns:
-        np.ndarray | tuple[np.ndarray, pd.DataFrame]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray | tuple: ADV vector, or (ADV vector, notional DataFrame).
     """
     adv_zero_reasons: dict[str, list[str]] = {
         "missing_column": [],
@@ -804,17 +805,16 @@ def _build_adv_vector(
 
 
 def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
-    """_build_sector_labels operation.
-    
+    """
+    Map symbols to integer indices representing their respective sectors.
+    Used for sector concentration constraints in the optimizer.
+
     Args:
-        sel_syms (List[str]): Input parameter.
-        sector_map (Optional[dict]): Input parameter.
-    
+        sel_syms (List[str]): List of selected symbols for the optimizer.
+        sector_map (Optional[dict]): Dictionary mapping symbols to sector strings.
+
     Returns:
-        Optional[np.ndarray]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[np.ndarray]: Integer array of sector labels, or None if no map provided.
     """
     if not sector_map:
         return None
@@ -828,6 +828,10 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
 
 
 def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:
+    """
+    Perform a forward-fill of prices for symbols with data gaps.
+    Applies a haircut to the last known price based on the duration of the absence.
+    """
     px = state.last_known_prices.get(sym)
     if px is None or not np.isfinite(px):
         return 0.0
@@ -844,22 +848,21 @@ def _execution_prices(
     low_px: Optional[pd.DataFrame],
     return_open_fallback_mask: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """_execution_prices operation.
-    
+    """
+    Determine the optimal execution price for a set of symbols on a given date.
+    Prefers Open price if available, otherwise falls back to Close.
+
     Args:
-        symbols (List[str]): Input parameter.
-        date (pd.Timestamp): Input parameter.
-        close_prices (np.ndarray): Input parameter.
-        open_px (Optional[pd.DataFrame]): Input parameter.
-        high_px (Optional[pd.DataFrame]): Input parameter.
-        low_px (Optional[pd.DataFrame]): Input parameter.
-        return_open_fallback_mask (bool): Input parameter.
-    
+        symbols (List[str]): Symbols to process.
+        date (pd.Timestamp): Execution date.
+        close_prices (np.ndarray): Pre-calculated close price array for this date.
+        open_px (Optional[pd.DataFrame]): Daily open prices.
+        high_px (Optional[pd.DataFrame]): Daily high prices.
+        low_px (Optional[pd.DataFrame]): Daily low prices.
+        return_open_fallback_mask (bool): If True, track which symbols used the fallback.
+
     Returns:
-        np.ndarray | tuple[np.ndarray, np.ndarray]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        np.ndarray | tuple: Execution price vector, optionally with the fallback mask.
     """
     exec_px = close_prices.copy()
     open_fallback_mask = np.zeros(len(symbols), dtype=bool)
@@ -882,17 +885,16 @@ def _execution_prices(
 
 
 def _detect_suspension_gaps(df: pd.DataFrame, threshold_days: int) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    """_detect_suspension_gaps operation.
+    """
+    Identify prolonged gaps in time series data exceeding a threshold.
+    Used to trigger synthetic holiday/halt simulations.
 
     Args:
-        df (pd.DataFrame): Input parameter.
-        threshold_days (int): Input parameter.
+        df (pd.DataFrame): Input time series (typically OHLCV).
+        threshold_days (int): Gap size in calendar days to flag.
 
     Returns:
-        List[Tuple[pd.Timestamp, pd.Timestamp]]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[Tuple]: List of (start, end) timestamps for detected gaps.
     """
     if len(df) < 2:
         return []
@@ -919,20 +921,19 @@ def _generate_synthetic_fill(
     pre_gap_df: pd.DataFrame,
     has_adj_close: bool,
 ) -> pd.DataFrame:
-    """_generate_synthetic_fill operation.
+    """
+    Generate synthetic price history for a trading halt using Brownian motion.
+    Maintains statistical continuity of the price path during delistings or suspensions.
 
     Args:
-        ticker (str): Input parameter.
-        gap_start (pd.Timestamp): Input parameter.
-        gap_end (pd.Timestamp): Input parameter.
-        pre_gap_df (pd.DataFrame): Input parameter.
-        has_adj_close (bool): Input parameter.
+        ticker (str): Symbol being processed.
+        gap_start (pd.Timestamp): Last known valid price date.
+        gap_end (pd.Timestamp): Resumption date (or end of window).
+        pre_gap_df (pd.DataFrame): History leading up to the halt.
+        has_adj_close (bool): Whether to generate adjusted close values.
 
     Returns:
-        pd.DataFrame: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pd.DataFrame: Synthetic OHLCV rows to fill the gap.
     """
     gap_idx = pd.bdate_range(gap_start, gap_end)
     synth_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)].difference(pre_gap_df.index)
@@ -1017,6 +1018,10 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 
 def apply_halt_simulation(market_data: dict) -> dict:
+    """
+    Apply in-memory suspension repairs to all symbols in a market data dictionary.
+    Ensures backtests don't 'look ahead' through data gaps or benefit from delistings.
+    """
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
 
@@ -1028,19 +1033,17 @@ def _deduplicate_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: UltimateConfig) -> pd.Series:
-    """_extract_series_for_symbol operation.
+    """
+    Extract a specific data column for a symbol, applying forward-fills and price adjustments.
 
     Args:
-        market_data (dict): Input parameter.
-        sym (str): Input parameter.
-        column (str): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        market_data (dict): Source dictionary of DataFrames.
+        sym (str): Target symbol.
+        column (str): Column name (close, open, volume, etc.).
+        cfg (UltimateConfig): Config for price adjustment settings.
 
     Returns:
-        pd.Series: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pd.Series: Cleaned and aligned time series for the requested attribute.
     """
     key = sym if sym.endswith(".NS") else f"{sym}.NS"
     row = market_data.get(key)
@@ -1075,18 +1078,17 @@ def build_precomputed_matrices(
     cfg: Optional[UltimateConfig] = None,
     symbols: Optional[set[str]] = None,
 ) -> dict:
-    """build_precomputed_matrices operation.
-    
+    """
+    Transform raw per-symbol market data into cross-sectional matrices.
+    Used by the backtest engine to access data via efficient vectorized slices.
+
     Args:
-        market_data (dict): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-        symbols (Optional[set[str]]): Input parameter.
-    
+        market_data (dict): Dictionary mapping symbols to DataFrames.
+        cfg (Optional[UltimateConfig]): Config for price adjustment logic.
+        symbols (Optional[set]): Subset of symbols to include.
+
     Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict: Mapping of matrix names (close, volume, etc.) to aligned DataFrames.
     """
     if cfg is None:
         cfg = UltimateConfig()
@@ -1174,22 +1176,22 @@ def _resolve_universe_by_date(
     all_target_dates: pd.DatetimeIndex,
     cfg: UltimateConfig,
 ) -> Tuple[set[str], Dict[pd.Timestamp, set[str]], str]:
-    """_resolve_universe_by_date operation.
+    """
+    Resolve the constituent symbols for each rebalance date in the backtest.
+    Supports either a static universe or dynamic historical snapshots.
 
     Args:
-        market_data (dict): Input parameter.
-        universe_type (Optional[str]): Input parameter.
-        universe (Optional[List[str]]): Input parameter.
-        all_target_dates (pd.DatetimeIndex): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        market_data (dict): Source market data to check for history availability.
+        universe_type (Optional[str]): Name of the universe (e.g., 'nse500').
+        universe (Optional[List[str]]): Explicit list of symbols (overrides universe_type).
+        all_target_dates (pd.DatetimeIndex): Rebalance dates to resolve symbols for.
+        cfg (UltimateConfig): Config for HISTORY_GATE gating.
 
     Returns:
-        Tuple[set[str], Dict[pd.Timestamp, set[str]], str]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Tuple: (union of all symbols, constituents per date, selected universe type string).
     """
     def _normalize_symbol(sym: str) -> str:
+        """Strip suffixes and ensure uppercase formatting for consistency."""
         s = str(sym).strip().upper()
         return s[:-3] if s.endswith(".NS") else s
 
@@ -1248,7 +1250,21 @@ def _prepare_backtest_matrices(
     cfg: UltimateConfig,
     precomputed_matrices: Optional[dict],
 ) -> Dict[str, pd.DataFrame]:
-    """_prepare_backtest_matrices operation."""
+    """
+    Prepare and clip OHLCV matrices for the backtest date range.
+    Ensures all matrices are aligned on the same date index and symbol columns.
+
+    Args:
+        market_data (dict): Raw source data.
+        union_universe (set): Set of all symbols ever active in the test.
+        warmup_start (str): Start date including warm-up period.
+        end_date (str): Test end date.
+        cfg (UltimateConfig): Config for building matrices from scratch if needed.
+        precomputed_matrices (Optional[dict]): Pre-built matrices if available.
+
+    Returns:
+        Dict: Clipped and aligned DataFrames (close, open, high, low, etc.).
+    """
     matrices = precomputed_matrices
     if matrices:
         selected = sorted(union_universe)
@@ -1326,7 +1342,18 @@ def _snap_rebalance_dates_to_holidays(
     all_target_dates: pd.DatetimeIndex,
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]],
 ) -> Tuple[pd.DatetimeIndex, Dict[pd.Timestamp, set[str]]]:
-    """_snap_rebalance_dates_to_holidays operation."""
+    """
+    Align theoretical rebalance dates with the nearest preceding valid trading day.
+    Handles holiday collisions by merging universe members if multiple targets snap to the same day.
+
+    Args:
+        close_index (pd.DatetimeIndex): Master trading calendar from price data.
+        all_target_dates (pd.DatetimeIndex): Theoretical (e.g. weekly) rebalance dates.
+        universe_by_rebalance_date (Dict): Point-in-time members for theoretical dates.
+
+    Returns:
+        Tuple: (Snapped DatetimeIndex, Updated universe mapping with snapped keys).
+    """
     trading_index = pd.to_datetime(close_index)
     valid = []
     for target in all_target_dates:
@@ -1365,7 +1392,23 @@ def run_backtest(
     universe: Optional[List[str]] = None,
     precomputed_matrices: Optional[dict] = None,
 ) -> BacktestResults:
-    """run_backtest operation."""
+    """
+    The primary entry point for executing a standalone backtest.
+    Orchestrates data preparation, universe resolution, and engine execution.
+
+    Args:
+        market_data (dict): Dictionary of per-symbol DataFrames.
+        universe_type (Optional[str]): Built-in universe name (e.g. 'nse500').
+        start_date (str): Evaluation start date (YYYY-MM-DD).
+        end_date (str): Evaluation end date (YYYY-MM-DD).
+        cfg (Optional[UltimateConfig]): Config overrides.
+        sector_map (Optional[dict]): Symbol-to-sector mapping.
+        universe (Optional[List]): Explicit symbol list.
+        precomputed_matrices (Optional[dict]): Cached matrices to skip preparation.
+
+    Returns:
+        BacktestResults: Results container including equity curve, trades, and metrics.
+    """
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
     if start_ts > end_ts:
@@ -1473,17 +1516,12 @@ def run_backtest(
         metrics=_compute_metrics(eq_daily, cfg.INITIAL_CAPITAL, cfg.SIGNAL_ANNUAL_FACTOR, trades=bt.trades),
         rebal_log=rebal_log,
     )
+
+
 def print_backtest_results(results: BacktestResults) -> None:
-    """print_backtest_results operation.
-    
-    Args:
-        results (BacktestResults): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Print a formatted summary of backtest performance metrics to the console.
+    Includes CAGR, Sharpe, Sortino, Max Drawdown, Calmar, and Hit Rate.
     """
     m = results.metrics
     if not m:
@@ -1510,17 +1548,9 @@ def print_backtest_results(results: BacktestResults) -> None:
 
 
 def _calc_cagr(eq: pd.Series, initial: float) -> float:
-    """_calc_cagr operation.
-
-    Args:
-        eq (pd.Series): Input parameter.
-        initial (float): Input parameter.
-
-    Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Calculate the Compound Annual Growth Rate (CAGR).
+    Uses actual calendar days elapsed for higher accuracy on irregular intervals.
     """
     if eq.empty or initial <= 0 or len(eq) < 2:
         return 0.0
@@ -1535,16 +1565,8 @@ def _calc_cagr(eq: pd.Series, initial: float) -> float:
 
 
 def _calc_drawdown(eq: pd.Series) -> Tuple[pd.Series, float]:
-    """_calc_drawdown operation.
-
-    Args:
-        eq (pd.Series): Input parameter.
-
-    Returns:
-        Tuple[pd.Series, float]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Compute rolling drawdown percentage and the maximum drawdown over the peak.
     """
     if eq.empty:
         return pd.Series(dtype=float), 0.0
@@ -1553,17 +1575,9 @@ def _calc_drawdown(eq: pd.Series) -> Tuple[pd.Series, float]:
 
 
 def _calc_sharpe_sortino(daily_returns: pd.Series, periods_per_year: int) -> Tuple[float, float]:
-    """_calc_sharpe_sortino operation.
-
-    Args:
-        daily_returns (pd.Series): Input parameter.
-        periods_per_year (int): Input parameter.
-
-    Returns:
-        Tuple[float, float]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Calculate annualized Sharpe and Sortino ratios.
+    Sortino uses downside deviation (negative returns only) as the risk proxy.
     """
     if len(daily_returns) <= 1 or daily_returns.std() <= 0:
         return 0.0, 0.0
@@ -1578,17 +1592,8 @@ def _calc_sharpe_sortino(daily_returns: pd.Series, periods_per_year: int) -> Tup
 
 
 def _calc_calmar(cagr: float, max_dd: float) -> float:
-    """_calc_calmar operation.
-
-    Args:
-        cagr (float): Input parameter.
-        max_dd (float): Input parameter.
-
-    Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Calculate the Calmar Ratio (CAGR / |Max Drawdown|).
     """
     if max_dd >= 0.0:
         return cagr
@@ -1596,16 +1601,9 @@ def _calc_calmar(cagr: float, max_dd: float) -> float:
 
 
 def _calc_hit_rate(trades: List[Trade]) -> float:
-    """_calc_hit_rate operation.
-
-    Args:
-        trades (List[Trade]): Input parameter.
-
-    Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Calculate the percentage of profitable trades (round-trips).
+    Uses a FIFO (First-In-First-Out) queue to match sells against buys.
     """
     round_trip_pnls: List[float] = []
     buy_queue: Dict[str, List[tuple[int, float]]] = {}
@@ -1637,18 +1635,9 @@ def _calc_hit_rate(trades: List[Trade]) -> float:
 
 
 def _calc_turnover(trades: List[Trade], eq: pd.Series, years: float) -> float:
-    """_calc_turnover operation.
-
-    Args:
-        trades (List[Trade]): Input parameter.
-        eq (pd.Series): Input parameter.
-        years (float): Input parameter.
-
-    Returns:
-        float: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Calculate annualized portfolio turnover.
+    Turnover = (Avg (Buys, Sells) / Avg Equity) / Years.
     """
     if not trades or eq.empty:
         return 0.0
@@ -1670,19 +1659,17 @@ def _compute_metrics(
     periods_per_year: int = 252,
     trades: Optional[List[Trade]] = None,
 ) -> Dict:
-    """_compute_metrics operation.
+    """
+    Aggregate all performance metrics for a backtest run.
 
     Args:
-        eq (pd.Series): Input parameter.
-        initial (float): Input parameter.
-        periods_per_year (int): Input parameter.
-        trades (Optional[List[Trade]]): Input parameter.
+        eq (pd.Series): Daily equity curve.
+        initial (float): Starting capital.
+        periods_per_year (int): Annualization factor (e.g. 252 for daily).
+        trades (Optional[List]): Trade history for turnover and hit rate.
 
     Returns:
-        Dict: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict: Final performance dashboard.
     """
     if initial <= 0:
         logger.warning(

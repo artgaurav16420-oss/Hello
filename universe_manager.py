@@ -145,17 +145,17 @@ STATIC_NSE_SECTORS: Dict[str, str] = {
 # ─── Historical Universe Logic ────────────────────────────────────────────────
 
 def _load_pit_universe_from_csv(universe_type: str, date: pd.Timestamp) -> List[str]:
-    """_load_pit_universe_from_csv operation.
-    
+    """
+    Load point-in-time members from a legacy CSV record.
+
+    Used as a fallback when the primary Parquet snapshots are missing.
+
     Args:
-        universe_type (str): Input parameter.
-        date (pd.Timestamp): Input parameter.
-    
+        universe_type (str): Key for the universe (e.g. 'nifty500').
+        date (pd.Timestamp): Evaluation date to look for.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Constituents active on or before the given date.
     """
     csv_path = DATA_DIR / f"historical_{universe_type}.csv"
     if not csv_path.exists():
@@ -211,16 +211,10 @@ def _clear_all_caches() -> None:
 
 
 def _clear_historical_universe_caches(hist_file: Path) -> None:
-    """_clear_historical_universe_caches operation.
+    """
+    Invalidate in-memory caches for a specific historical file.
     
-    Args:
-        hist_file (Path): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    Called when a file mtime change is detected on disk.
     """
     universe_type = hist_file.stem.removeprefix("historical_")
     # Lock acquisition order must remain stable across this module:
@@ -238,16 +232,8 @@ def _clear_historical_universe_caches(hist_file: Path) -> None:
 
 
 def _coerce_historical_members(value) -> List[str]:
-    """_coerce_historical_members operation.
-    
-    Args:
-        value (float): Input parameter.
-    
-    Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Coerce various types (Series, lists, sets) into a standard string list.
     """
     if isinstance(value, str):
         return [value]
@@ -260,16 +246,8 @@ def _coerce_historical_members(value) -> List[str]:
 
 
 def _normalize_historical_members(values) -> List[str]:
-    """_normalize_historical_members operation.
-    
-    Args:
-        values (float): Input parameter.
-    
-    Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Clean, deduplicate and sort a list of raw ticker strings.
     """
     normalized: set[str] = set()
     for t in values:
@@ -283,17 +261,15 @@ def _normalize_historical_members(values) -> List[str]:
 
 
 def _is_cache_entry_fresh(fetched_at: str | None, ttl_hours: int = UNIVERSE_CACHE_TTL_H) -> bool:
-    """_is_cache_entry_fresh operation.
-    
+    """
+    Check if a cache record is within the TTL threshold.
+
     Args:
-        fetched_at (str | None): Input parameter.
-        ttl_hours (int): Input parameter.
-    
+        fetched_at (str | None): ISO-8601 timestamp from the cache.
+        ttl_hours (int): Allowed age in hours.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: True if fresh, False if expired or invalid.
     """
     if not fetched_at:
         return False
@@ -325,17 +301,8 @@ def _normalize_sector_cache_entry(
     *,
     fallback_fetched_at: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """_normalize_sector_cache_entry operation.
-    
-    Args:
-        entry (Any): Input parameter.
-        fallback_fetched_at (str | None): Input parameter.
-    
-    Returns:
-        tuple[str | None, str | None]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+    """
+    Normalize diverse sector cache formats into (sector, fetched_at) tuple.
     """
     if isinstance(entry, dict):
         sector = str(entry.get("sector", "Unknown") or "Unknown")
@@ -536,14 +503,7 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 # ─── Cache Management ─────────────────────────────────────────────────────────
 
 def _load_universe_cache() -> dict:
-    """_load_universe_cache operation.
-    
-    Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Load the JSON universe cache from disk."""
     if not UNIVERSE_CACHE_FILE.exists():
         return {}
     try:
@@ -554,17 +514,7 @@ def _load_universe_cache() -> dict:
         return {}
 
 def _save_universe_cache(data: dict) -> None:
-    """_save_universe_cache operation.
-    
-    Args:
-        data (dict): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Atomically write the universe cache to disk."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         atomic_write_file(
@@ -588,17 +538,17 @@ def invalidate_universe_cache() -> None:
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 
 def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
-    """_apply_adv_filter operation.
-    
+    """
+    Filter a list of tickers by Average Daily Value (ADV) crores.
+
+    Uses historical data from the provider to compute median notional volume.
+
     Args:
-        tickers (List[str]): Input parameter.
-        cfg (Any): Input parameter.
-    
+        tickers (List[str]): Candidate symbols.
+        cfg (Any): Strategy configuration for thresholds.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Symbols that passed the liquidity gate.
     """
     from momentum_engine import UltimateConfig
     from data_cache import load_or_fetch
@@ -784,17 +734,12 @@ def _fetch_cached_universe(
         raise error from exc
 
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    """fetch_nse_equity_universe operation.
+    """
+    Retrieve the full list of equities listed on the NSE master.
     
     Args:
-        cfg (Any): Input parameter.
-        apply_adv_filter (bool): Input parameter.
-    
-    Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        cfg (Any): Optional strategy config.
+        apply_adv_filter (bool): If True, run liquidity gate on the results.
     """
     return _fetch_cached_universe(
         "total_equity",
@@ -809,17 +754,12 @@ def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[
     )
 
 def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
-    """get_nifty500 operation.
-    
+    """
+    Retrieve current constituents of the Nifty 500 index.
+
     Args:
-        cfg (Any): Input parameter.
-        apply_adv_filter (bool): Input parameter.
-    
-    Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        cfg (Any): Optional strategy config.
+        apply_adv_filter (bool): If True, run liquidity gate on the results.
     """
     return _fetch_cached_universe(
         "nifty500",
