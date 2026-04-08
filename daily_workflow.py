@@ -692,7 +692,7 @@ def _get_custom_universe() -> List[str]:
     return []
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    """Interactive prompt for starting capital if a portfolio is fresh unitialized."""
+    """Interactive prompt for starting capital if a portfolio is fresh uninitialized."""
     if not state.shares and not state.equity_hist and abs(state.cash - DEFAULT_INITIAL_CAPITAL) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
         try:
@@ -2440,6 +2440,5 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
