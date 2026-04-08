@@ -522,6 +522,8 @@ def load_optimized_config() -> UltimateConfig:
                     continue
                 setattr(cfg, k, v)
     return _validate_config_cross_fields(cfg)
+
+
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
     """Render a colored ANSI progress bar with a percentage label."""
     clipped = max(0.0, min(1.0, progress))
@@ -1293,9 +1295,12 @@ def _run_scan(
     def _scan_body(cfg: UltimateConfig) -> tuple:
         """
         Internal closure for the scan execution logic.
-        
+
         Args:
             cfg (UltimateConfig): Validated configuration to use for this run.
+
+        Returns:
+            tuple: (modified_state, market_data_dict)
         """
         phase_ctx: Dict[str, Any] = {}
         _scan_phase_download_data(phase_ctx)
@@ -1977,6 +1982,8 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     rows.sort(key=lambda x: float(x.get("weight", 0.0) or 0.0), reverse=True)
     print(_render_holdings_table(rows=rows, cash=state.cash, pv=pv))
     print(_render_portfolio_diagnostics(state=state, cfg=cfg))
+
+
 def _portfolio_activity_badge(state: PortfolioState) -> str:
     """Return a colored 'Active' or 'Idle' string for use in menus."""
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
@@ -2043,7 +2050,14 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     """
     Validate and return a date string in YYYY-MM-DD format.
-    
+
+    Args:
+        raw (str): Raw date string from user input.
+        default (str): Fallback date string if raw is empty.
+
+    Returns:
+        str: A validated date string in YYYY-MM-DD format.
+
     Raises:
         ValueError: If the date format is invalid.
     """
@@ -2396,6 +2410,8 @@ def main_menu() -> None:
             _handle_manage_cash(states)
         elif choice == "7":
             states, mkt_cache = _handle_clear_states(states, mkt_cache)
+
+
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse command-line arguments for the daily workflow."""
     parser = argparse.ArgumentParser(description="Ultimate Momentum daily workflow")
@@ -2440,5 +2456,4 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
