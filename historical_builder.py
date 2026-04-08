@@ -156,10 +156,14 @@ def _extract_symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
     """
     Extract NSE ticker symbols from an ind_nifty500list.csv DataFrame.
 
-    The NSE CSV has columns:
-        Company Name | Industry | Symbol | Series | ISIN Code
+    Searches for known symbol column names and falls back to a regex scan
+    across all columns if a direct match is not found.
 
-    Returns a sorted list of .NS-suffixed tickers.
+    Args:
+        df (pd.DataFrame): Raw CSV data from NSE/Wayback.
+
+    Returns:
+        list[str]: Sorted list of .NS-suffixed tickers.
     """
     # Normalise column names
     df.columns = [str(c).strip().lower() for c in df.columns]

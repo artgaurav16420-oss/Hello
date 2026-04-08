@@ -371,13 +371,15 @@ class _ManifestProcessFileLock:
             return False
 
     def __enter__(self) -> "_ManifestProcessFileLock":
-        """__enter__ operation.
-        
+        """
+        Acquire the manifest lock synchronously.
+        Implements polling and stale-lock recovery.
+
         Returns:
-            "_ManifestProcessFileLock": Result of this operation.
-        
+            _ManifestProcessFileLock: This lock instance.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            TimeoutError: If the lock cannot be acquired within the configured interval.
         """
         deadline = time.monotonic() + max(0.0, float(self._timeout_s))
         stale_check_attempted = False
@@ -490,18 +492,16 @@ class DataProvider(ABC):
 
     @abstractmethod
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """download operation.
-        
+        """
+        Download historical data for the given symbols and date range.
+
         Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
+            tickers (List[str]): List of standardized symbol names.
+            start (str): Start date string (YYYY-MM-DD).
+            end (str): End date string (YYYY-MM-DD).
+
         Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Optional[pd.DataFrame]: Multi-indexed OHLCV dataframe, or None on failure.
         """
         raise NotImplementedError
 
@@ -535,42 +535,15 @@ class GrowwProvider(DataProvider):
             self._session = None
 
     def __enter__(self) -> "GrowwProvider":
-        """__enter__ operation.
-        
-        Returns:
-            "GrowwProvider": Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Initialize the Groww HTTP session on context entry."""
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        # FIX-GROWW-SESSION-LEAK: always close on context-manager exit.
-        """__exit__ operation.
-        
-        Args:
-            exc_type (Any): Input parameter.
-            exc (Any): Input parameter.
-            tb (Any): Input parameter.
-        
-        Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Close the Groww HTTP session on context exit."""
         self.close()
 
     def _get_session(self) -> requests.Session:
-        """_get_session operation.
-        
-        Returns:
-            requests.Session: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Create and configure a persistent requests.Session for Groww API calls."""
         if self._session is None:
             self._session = requests.Session()
             self._session.headers.update({
@@ -582,6 +555,7 @@ class GrowwProvider(DataProvider):
 
     @staticmethod
     def _to_groww_symbol(ticker: str) -> Optional[str]:
+        """Map a standardized NS/BO ticker to a Groww-specific symbol name."""
         if any(ticker.startswith(p) for p in _GROWW_INDEX_PREFIXES):
             return None
         for sfx in (".NS", ".BO", ".BSE"):
@@ -694,6 +668,7 @@ class GrowwProvider(DataProvider):
 
     @staticmethod
     def _candles_to_rows(all_candles: List[list]) -> List[Dict[str, float | pd.Timestamp]]:
+        """Convert raw Groww JSON candles into a list of standardized record dictionaries."""
         rows: List[Dict[str, float | pd.Timestamp]] = []
         for c in all_candles:
             if not isinstance(c, list) or len(c) < 6:
@@ -728,18 +703,16 @@ class GrowwProvider(DataProvider):
         field: str,
         ticker: str,
     ) -> Optional[pd.Series]:
-        """_extract_batch_series operation.
-        
+        """
+        Extract a specific OHLC field for a single ticker from a Multi-indexed yfinance batch.
+
         Args:
-            batch_df (pd.DataFrame): Input parameter.
-            field (str): Input parameter.
-            ticker (str): Input parameter.
-        
+            batch_df (pd.DataFrame): The multi-symbol dataframe from yf.download.
+            field (str): The column field (e.g., 'Close', 'Adj Close').
+            ticker (str): The specific symbol to extract.
+
         Returns:
-            Optional[pd.Series]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Optional[pd.Series]: Specialized numeric series or None if missing.
         """
         if batch_df is None or batch_df.empty or field not in batch_df.columns:
             return None
@@ -841,19 +814,7 @@ class GrowwProvider(DataProvider):
         ns_ticker: str,
         yf_raw: pd.DataFrame,
     ) -> tuple[pd.Series, pd.Series]:
-        """_extract_actions_from_batches operation.
-        
-        Args:
-            index (pd.DatetimeIndex): Input parameter.
-            ns_ticker (str): Input parameter.
-            yf_raw (pd.DataFrame): Input parameter.
-        
-        Returns:
-            tuple[pd.Series, pd.Series]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Extract dividend and split series from a yfinance batch snapshot."""
         dividends = self._extract_batch_series(yf_raw, COLUMN_DIVIDENDS, ns_ticker)
         splits = self._extract_batch_series(yf_raw, COLUMN_STOCK_SPLITS, ns_ticker)
 
@@ -868,18 +829,19 @@ class GrowwProvider(DataProvider):
         return div_series, split_series
 
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """download operation.
+        """
+        Execute parallel Groww+YFinance composite download.
         
+        Downloads raw daily candles from Groww and corporate actions from yfinance,
+        then aligns and back-adjusts the series to produce professional-grade OHLCV.
+
         Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
+            tickers (List[str]): List of standardized symbol names.
+            start (str): Start date string (YYYY-MM-DD).
+            end (str): End date string (YYYY-MM-DD).
+
         Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Optional[pd.DataFrame]: Multi-indexed OHLCV dataframe, or None if no data found.
         """
         if not self.api_token:
             return None
@@ -985,19 +947,7 @@ class YFinanceProvider(DataProvider):
         return result
 
     def _download_batch(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """_download_batch operation.
-        
-        Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
-        Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Internal helper for standard yfinance batch download."""
         try:
             return _safe_yf_download(
                 tickers,
@@ -1012,19 +962,7 @@ class YFinanceProvider(DataProvider):
             return None
 
     def _download_individual(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """_download_individual operation.
-        
-        Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
-        Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Fallback helper to fetch tickers one-by-one when batch request is throttled or corrupted."""
         frames: Dict[str, pd.DataFrame] = {}
         for ticker in tickers:
             single = self._download_batch([ticker], start, end)
@@ -1120,20 +1058,7 @@ class SecondaryProvider(DataProvider):
         return _normalize_history_index(combined)
 
     def _download_single(self, symbol: str, api_key: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        """_download_single operation.
-        
-        Args:
-            symbol (str): Input parameter.
-            api_key (str): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
-        Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Internal helper for AlphaVantage HTTP request."""
         params = {
             "function": "TIME_SERIES_DAILY_ADJUSTED",
             "symbol":   symbol,
@@ -1189,17 +1114,7 @@ class SecondaryProvider(DataProvider):
 # ─── Index normalization ──────────────────────────────────────────────────────
 
 def _normalize_history_index(df: pd.DataFrame) -> pd.DataFrame:
-    """_normalize_history_index operation.
-    
-    Args:
-        df (pd.DataFrame): Input parameter.
-    
-    Returns:
-        pd.DataFrame: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Normalize dataframe handle: ensure UTC-IST conversion, no duplicates, and sorted dates."""
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -1229,19 +1144,7 @@ def _extract_ticker_frame(
     *,
     is_single_request: bool = False,
 ) -> Optional[pd.DataFrame]:
-    """_extract_ticker_frame operation.
-    
-    Args:
-        raw_data (pd.DataFrame): Input parameter.
-        ticker (str): Input parameter.
-        is_single_request (bool): Input parameter.
-    
-    Returns:
-        Optional[pd.DataFrame]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Extract a single ticker's OHLCV data from a variety of raw producer structures."""
     if raw_data is None or raw_data.empty:
         return None
 
@@ -1281,20 +1184,7 @@ def _download_with_timeout(
     end: str,
     provider: Optional[DataProvider] = None,
 ) -> Optional[pd.DataFrame]:
-    """_download_with_timeout operation.
-    
-    Args:
-        tickers (List[str]): Input parameter.
-        start (str): Input parameter.
-        end (str): Input parameter.
-        provider (Optional[DataProvider]): Input parameter.
-    
-    Returns:
-        Optional[pd.DataFrame]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Execute download through a provider with exponential backoff on retryable failures."""
     max_retries = 3
     errors: list = []
     for attempt in range(max_retries):
@@ -1316,14 +1206,7 @@ def _download_with_timeout(
 
 
 def _load_manifest() -> dict:
-    """_load_manifest operation.
-    
-    Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Load the cache manifest file from disk; returns an empty schema if missing or corrupt."""
     _ensure_cache_paths_configured()
     default_manifest = {"schema_version": 1, "entries": {}}
     assert MANIFEST_FILE is not None
@@ -1345,17 +1228,7 @@ def _load_manifest() -> dict:
 
 
 def _save_manifest(manifest_data: dict) -> None:
-    """_save_manifest operation.
-    
-    Args:
-        manifest_data (dict): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Commit the manifest state to disk using an atomic write-and-replace strategy."""
     _ensure_cache_paths_configured()
     assert CACHE_DIR is not None and MANIFEST_FILE is not None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1375,14 +1248,7 @@ def _save_manifest(manifest_data: dict) -> None:
 
 
 def invalidate_cache() -> None:
-    """invalidate_cache operation.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Delete the manifest file to force a full re-download of all cached symbols on next run."""
     _ensure_cache_paths_configured()
     assert MANIFEST_FILE is not None
     if MANIFEST_FILE.exists():
@@ -1422,19 +1288,7 @@ def _has_required_ohlcv_columns(df: pd.DataFrame, ticker: Optional[str]) -> bool
 
 
 def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None) -> bool:
-    """_is_valid_dataframe operation.
-    
-    Args:
-        df (pd.DataFrame): Input parameter.
-        ticker (Optional[str]): Input parameter.
-        cfg (Any): Input parameter.
-    
-    Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Validate that a dataframe meets the minimum structural requirements (rows, dates, columns)."""
     min_rows = _minimum_history_rows(cfg)
     if df is None or df.empty or len(df) < min_rows:
         return False
@@ -1447,17 +1301,7 @@ def _is_valid_dataframe(df: pd.DataFrame, ticker: Optional[str] = None, cfg=None
 
 
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """_ensure_price_columns operation.
-    
-    Args:
-        df (pd.DataFrame): Input parameter.
-    
-    Returns:
-        pd.DataFrame: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Verify and repair OHLCV columns: handles coercion, NaN filling, and action defaults."""
     out = df.copy()
     out = out.loc[:, out.columns.notna()]
 
@@ -1467,17 +1311,7 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     def _coerce_numeric_series(series: pd.Series) -> pd.Series:
-        """_coerce_numeric_series operation.
-        
-        Args:
-            series (pd.Series): Input parameter.
-        
-        Returns:
-            pd.Series: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
-        """
+        """Helper to sanitize currency strings and convert to float64."""
         if pd.api.types.is_numeric_dtype(series):
             return series
         cleaned = (
@@ -1555,17 +1389,7 @@ def _latest_business_day() -> str:
 
 
 def _build_provider_chain(cfg=None) -> List[DataProvider]:
-    """_build_provider_chain operation.
-    
-    Args:
-        cfg (Any): Input parameter.
-    
-    Returns:
-        List[DataProvider]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Assemble the prioritized list of data providers based on runtime environment."""
     chain: List[DataProvider] = []
 
     groww_token = os.getenv("GROWW_API_TOKEN", "").strip()
@@ -1588,6 +1412,7 @@ def _build_provider_chain(cfg=None) -> List[DataProvider]:
 
 
 def _clean_ticker_symbol(ticker: Optional[str]) -> str:
+    """Standardize ticker suffix to '.NS' for NSE equities."""
     if ticker is None:
         raise ValueError("ticker list contains None")
     t_str = str(ticker).strip()
@@ -1608,10 +1433,12 @@ def _clean_ticker_symbol(ticker: Optional[str]) -> str:
 
 
 def _normalize_tickers(tickers: List[str]) -> List[str]:
+    """Clean and deduplicate a list of ticker symbols."""
     return list(dict.fromkeys(_clean_ticker_symbol(t) for t in tickers))
 
 
 def _resolve_fetch_window(required_start: str, required_end: str, cfg: Any) -> tuple[str, str]:
+    """Calculate the padded download window based on configured lookback requirements."""
     cfg_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 200) or 200)
     dynamic_padding_days = max(400, cfg_lookback * 2)
     padded_start = (pd.Timestamp(required_start) - timedelta(days=dynamic_padding_days)).strftime("%Y-%m-%d")
@@ -1633,11 +1460,11 @@ def _retry_unresolved_individually(
     Retry unresolved symbols one-by-one through the provider chain.
 
     Side effect:
-    - ``updated_tickers`` is mutated in-place with symbols successfully saved
-      during this retry pass.
+        - `updated_tickers` is mutated in-place with symbols successfully saved
+          during this retry pass.
 
     Returns:
-    - The list of symbols still unresolved after trying all providers.
+        List[str]: The list of symbols still unresolved after trying all providers.
     """
     still_missing: List[str] = []
     if not unresolved:
@@ -1675,6 +1502,7 @@ def _retry_unresolved_individually(
 
 
 def _save_manifest_entries_for_downloaded_tickers(updated_tickers: set[str], entries: dict) -> None:
+    """Thread-safe update of the global manifest with locally resolved ticker metadata."""
     if not updated_tickers:
         return
     assert _MANIFEST_LOCK_DIR is not None
@@ -1695,20 +1523,19 @@ def load_or_fetch(
     force_refresh: bool = False,
     cfg=None,
 ) -> Dict[str, pd.DataFrame]:
-    """load_or_fetch operation.
-    
+    """
+    Primary API: provide market data for a list of tickers, using cache whenever possible.
+    Downloads missing or stale symbols automatically through the fallback chain.
+
     Args:
-        tickers (List[str]): Input parameter.
-        required_start (str): Input parameter.
-        required_end (str): Input parameter.
-        force_refresh (bool): Input parameter.
-        cfg (Any): Input parameter.
-    
+        tickers (List[str]): Symbols to retrieve.
+        required_start (str): Earliest date needed in the output.
+        required_end (str): Latest date needed in the output.
+        force_refresh (bool): If True, ignores cache and downloads everything.
+        cfg (UltimateConfig): Optimization settings for lookback padding.
+
     Returns:
-        Dict[str, pd.DataFrame]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Dict[str, pd.DataFrame]: Map of symbol names to OHLCV dataframes.
     """
     _ensure_cache_paths_configured()
     assert CACHE_DIR is not None
@@ -1929,6 +1756,7 @@ def _process_chunk(
 
 
 def _save_dataframe_atomic(df: pd.DataFrame, parquet_path: Path) -> None:
+    """Write a DataFrame to Parquet using a temporary file and atomic rename."""
     assert CACHE_DIR is not None
     tmp_path = CACHE_DIR / f"{parquet_path.name}.tmp.{uuid.uuid4().hex}"
     try:
@@ -1944,6 +1772,7 @@ def _save_dataframe_atomic(df: pd.DataFrame, parquet_path: Path) -> None:
 
 
 def _build_manifest_entry(df: pd.DataFrame) -> dict:
+    """Build a metadata entry for the manifest based on a finalized DataFrame."""
     gap_series = df.index.to_series().diff().dt.days
     max_gap = gap_series.max()
     max_gap_days = int(max_gap) if pd.notna(max_gap) else 0
@@ -2041,14 +1870,7 @@ def _recover_from_stale_cache(
 
 
 def get_cache_summary() -> dict:
-    """get_cache_summary operation.
-    
-    Returns:
-        dict: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Retrieve metadata about the current cache state for diagnostic dashboarding."""
     manifest = _load_manifest()
     entries  = manifest.get("entries", {})
     groww_token = os.getenv("GROWW_API_TOKEN", "").strip()

@@ -54,7 +54,7 @@ from shared_utils import (
 
 
 def _bootstrap_env() -> None:
-    """Load env vars from `.env` with optional python-dotenv dependency."""
+    """Initialize environmental variables from .env using available loaders."""
     try:
         from dotenv import load_dotenv  # type: ignore
     except ImportError:
@@ -125,7 +125,7 @@ _NSE_SESSION_LOCK = threading.Lock()
 # FIX-MB-DUPNS: Single canonical definition of normalize_ns_ticker(). The original module had
 # two definitions; the second shadowed the first. Removed the duplicate.
 def _get_nse_session() -> requests.Session:
-    """Create and warm a singleton session for NSE requests."""
+    """Retrieve or create the singleton HTTP session used for NSE requests."""
     global _NSE_SESSION
     with _NSE_SESSION_LOCK:
         if _NSE_SESSION is None:  # FIX-10
@@ -531,24 +531,6 @@ def fetch_nse_total_current() -> List[str]:
     return []
 
 
-def fetch_via_nsepy(universe_type: str) -> List[str]:
-    """Attempt to use nsepy/nsetools if installed."""
-    try:
-        if universe_type in ("nifty500", "nse_total"):
-            try:
-                from nsetools import Nse
-                nse = Nse()
-                if universe_type == "nifty500":
-                    stocks = nse.get_index_quote("cnx nifty 500")
-                    if stocks:
-                        return sorted([t for t in (normalize_ns_ticker(s) for s in stocks.keys()) if t])
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return []
-
-
 # ─── Point-in-Time Parquet builder ────────────────────────────────────────────
 
 def build_parquet(
@@ -763,8 +745,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
 
         logger.info("Building volume-gate baseline (quarterly, current survivors)...")
         symbols = fetch_nifty500_current()
-        if not symbols:
-            symbols = fetch_via_nsepy("nifty500")
+
         if not symbols:
             logger.warning("All network sources failed — using Nifty 50 hard-floor.")
             symbols = [normalize_ns_ticker(s) for s in NIFTY50_CORE]

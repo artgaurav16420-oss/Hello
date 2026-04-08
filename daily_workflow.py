@@ -143,17 +143,24 @@ _CIRCUIT_BREAKER_LOCK_FILE = "data/circuit_breaker.lock"
 
 @dataclass
 class CircuitBreaker:
-    # ARCH-FIX-7
-    """CircuitBreaker type used by the backtesting system."""
+    """
+    Stateful circuit breaker for tracking consecutive empty-universe scans.
+    
+    Prevents silent, long-term operational drift by raising an error if the
+    system fails to identify any tradable symbols for multiple consecutive runs,
+    which usually indicates a data provider outage or universe configuration error.
+    """
     count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def increment(self) -> int:
+        """Increment count safely and return the new value."""
         with self._lock:
             self.count += 1
             return self.count
 
     def reset(self) -> None:
+        """Reset the consecutive failure count to zero."""
         with self._lock:
             self.count = 0
 
@@ -203,27 +210,28 @@ class CircuitBreaker:
 
 
 def _pending_sentinel_path(name: str) -> pathlib.Path:
+    """Return the filesystem path for a portfolio's rebalance sentinel."""
     return pathlib.Path(f"data/pending_rebalance_{name}.json")
 
 
 def _pending_claim_path(name: str) -> pathlib.Path:
+    """Return the filesystem path for a portfolio's rebalance claim lock."""
     return pathlib.Path(f"data/pending_rebalance_{name}.claim")
 
 
 def _write_pending_sentinel(name: str, token: str, date_str: str) -> pathlib.Path:
-    # ARCH-FIX-3
-    """_write_pending_sentinel operation.
-    
+    """
+    Write a JSON sentinel file indicating a rebalance intent for the session.
+
+    Used to prevent double-execution in shared storage or multi-instanced runners.
+
     Args:
-        name (str): Input parameter.
-        token (str): Input parameter.
-        date_str (str): Input parameter.
-    
+        name (str): Portfolio identifier.
+        token (str): Unique execution token (UUID).
+        date_str (str): Target session date (YYYY-MM-DD).
+
     Returns:
-        pathlib.Path: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        pathlib.Path: Path to the written sentinel file.
     """
     os.makedirs("data", exist_ok=True)
     path = _pending_sentinel_path(name)
@@ -248,20 +256,18 @@ def _is_claim_stale(
     stat_result: os.stat_result,
     pre_read_claim_date_str: Optional[str] = None,
 ) -> bool:
-    """_is_claim_stale operation.
+    """
+    Check if an existing claim file is old enough or from a different date to be overridden.
 
     Args:
-        claim_path (pathlib.Path): Input parameter.
-        current_date_str (str): Input parameter.
-        max_age_hours (int): Input parameter.
-        stat_result (os.stat_result): Input parameter.
-        pre_read_claim_date_str (Optional[str]): Input parameter.
+        claim_path (pathlib.Path): Path to the .claim file.
+        current_date_str (str): Today's target session date.
+        max_age_hours (int): Time limit for claim validity.
+        stat_result (os.stat_result): Pre-fetched stat info for the file.
+        pre_read_claim_date_str (Optional[str]): Cached date string from payload.
 
     Returns:
-        bool: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: True if the claim is considered stale and safe to bypass.
     """
     mtime = datetime.fromtimestamp(stat_result.st_mtime)
     if pre_read_claim_date_str is not None:
@@ -282,18 +288,16 @@ def _is_claim_stale(
 
 
 def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
-    """_try_claim_pending_sentinel operation.
-    
+    """
+    Attempt to acquire an exclusive filesystem claim for today's rebalance.
+
     Args:
-        name (str): Input parameter.
-        token (str): Input parameter.
-        date_str (str): Input parameter.
-    
+        name (str): Portfolio identifier.
+        token (str): Execution token.
+        date_str (str): Target session date.
+
     Returns:
-        bool: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: True if claim was successfully acquired (or safely recovered).
     """
     os.makedirs("data", exist_ok=True)
     claim_path = _pending_claim_path(name)
@@ -378,18 +382,7 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
 
 
 def _clear_pending_sentinel(name: str) -> None:
-    # ARCH-FIX-3
-    """_clear_pending_sentinel operation.
-    
-    Args:
-        name (str): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Remove both the JSON sentinel and the .claim file to finalize a rebalance session."""
     try:
         _pending_sentinel_path(name).unlink()
     except FileNotFoundError:
@@ -401,17 +394,14 @@ def _clear_pending_sentinel(name: str) -> None:
 
 
 def _load_pending_sentinel(name: str) -> dict | None:
-    # ARCH-FIX-3
-    """_load_pending_sentinel operation.
-    
+    """
+    Read the current rebalance sentinel for a portfolio if it exists.
+
     Args:
-        name (str): Input parameter.
-    
+        name (str): Portfolio identifier.
+
     Returns:
-        dict | None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        dict | None: Parsed sentinel payload or None if missing/corrupt.
     """
     path = _pending_sentinel_path(name)
     if not path.exists():
@@ -431,7 +421,10 @@ def _load_pending_sentinel(name: str) -> dict | None:
 # ─── ANSI colour palette ─────────────────────────────────────────────────────
 
 class C:
-    """C type used by the backtesting system."""
+    """
+    ANSI color palette for terminal UI.
+    Automatically disables colors if stdout is not a TTY.
+    """
     if sys.stdout.isatty():
         BLU   = "\033[34m"
         CYN   = "\033[36m"
@@ -457,16 +450,17 @@ _DEFAULT_SCREENER_URL = os.environ.get(
 )
 
 def _validate_config_cross_fields(cfg: UltimateConfig) -> UltimateConfig:
-    """_validate_config_cross_fields operation.
+    """
+    Perform cross-field validation and sanitization of strategy parameters.
+
+    Ensures values (e.g., halflives, exposure floors, CVaR limits) fall within
+    physically and mathematically sound ranges. Resets to defaults if invalid.
 
     Args:
-        cfg (UltimateConfig): Input parameter.
+        cfg (UltimateConfig): Configuration object to validate (modified in-place).
 
     Returns:
-        UltimateConfig: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        UltimateConfig: The validated configuration object.
     """
     defaults = UltimateConfig()
     if cfg.HALFLIFE_FAST > cfg.HALFLIFE_SLOW:
@@ -504,13 +498,14 @@ def _validate_config_cross_fields(cfg: UltimateConfig) -> UltimateConfig:
 
 
 def load_optimized_config() -> UltimateConfig:
-    """load_optimized_config operation.
+    """
+    Load the best-fit strategy parameters from the local JSON config.
+
+    Fallbacks to hardcoded defaults in UltimateConfig if the file is missing
+    or contains corrupted keys.
 
     Returns:
-        UltimateConfig: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        UltimateConfig: A populated configuration object.
     """
     cfg = UltimateConfig()
     if os.path.exists("data/optimal_cfg.json"):
@@ -528,6 +523,7 @@ def load_optimized_config() -> UltimateConfig:
                 setattr(cfg, k, v)
     return _validate_config_cross_fields(cfg)
 def _render_meter(label: str, progress: float, width: int = 30) -> str:
+    """Render a colored ANSI progress bar with a percentage label."""
     clipped = max(0.0, min(1.0, progress))
     filled = int(round(width * clipped))
     bar = f"{'█' * filled}{'░' * (width - filled)}"
@@ -535,22 +531,21 @@ def _render_meter(label: str, progress: float, width: int = 30) -> str:
     return f"  {C.CYN}{label:<18}{C.RST} [{bar}] {C.BLD}{pct}{C.RST}"
 
 def _print_stage_status(label: str, progress: float, detail: str) -> None:
+    """Print a progress bar followed by a detailed status message."""
     print(_render_meter(label, progress))
     print(f"  {C.GRY}{detail}{C.RST}")
 
 
 def _next_rebalance_due(last_rebalance_date: str, rebalance_freq: str) -> Optional[pd.Timestamp]:
-    """_next_rebalance_due operation.
-    
+    """
+    Calculate the next scheduled rebalance date based on freq.
+
     Args:
-        last_rebalance_date (str): Input parameter.
-        rebalance_freq (str): Input parameter.
-    
+        last_rebalance_date (str): Date of the last successful rebalance.
+        rebalance_freq (str): Pandas-style frequency string (e.g. 'W-FRI').
+
     Returns:
-        Optional[pd.Timestamp]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[pd.Timestamp]: The next deadline date, or None if input is invalid.
     """
     if not last_rebalance_date:
         return None
@@ -568,16 +563,14 @@ def _next_rebalance_due(last_rebalance_date: str, rebalance_freq: str) -> Option
 # ─── Screener.in Scraper & Prompters ─────────────────────────────────────────
 
 def _scrape_screener(base_url: str) -> List[str]:
-    """_scrape_screener operation.
-    
+    """
+    Scrape NSE ticker symbols from a Screener.in screen URL.
+
     Args:
-        base_url (str): Input parameter.
-    
+        base_url (str): The public Screener.in URL to scrape.
+
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Discovery symbols (bare tickers).
     """
     try:
         import requests
@@ -646,17 +639,7 @@ def _scrape_screener(base_url: str) -> List[str]:
     return list(symbols)
 
 def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
-    """_filter_valid_custom_tickers operation.
-    
-    Args:
-        tickers (List[str]): Input parameter.
-    
-    Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Clean and normalize a list of raw tickers to standard NSE format."""
     normalized = [raw.strip().upper() for raw in tickers]
     filtered = [sym for sym in normalized if sym and not sym.isdigit()]
     invalid_count = sum(1 for sym in normalized if sym.isdigit())
@@ -670,13 +653,11 @@ def _filter_valid_custom_tickers(tickers: List[str]) -> List[str]:
     return list(dict.fromkeys(filtered))
 
 def _get_custom_universe() -> List[str]:
-    """_get_custom_universe operation.
+    """
+    Fetch the custom universe from the configured web source or local files.
     
     Returns:
-        List[str]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        List[str]: Deduped list of valid tickers.
     """
     saved_url = _DEFAULT_SCREENER_URL
 
@@ -711,19 +692,7 @@ def _get_custom_universe() -> List[str]:
     return []
 
 def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: str) -> None:
-    """_check_and_prompt_initial_capital operation.
-    
-    Args:
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        name (str): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Interactive prompt for starting capital if a portfolio is fresh unitialized."""
     if not state.shares and not state.equity_hist and abs(state.cash - DEFAULT_INITIAL_CAPITAL) < 1.0:
         print(f"\n  {C.YLW}⚡ New portfolio detected for {label}{C.RST}")
         try:
@@ -740,19 +709,17 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
 
 
 def _sweep_dividends(state: PortfolioState, sym: str, row: pd.DataFrame, cfg: UltimateConfig) -> None:
-    """_sweep_dividends operation.
+    """
+    Check for unrecorded dividends and add them to the cash ledger.
+
+    Only runs if AUTO_ADJUST_PRICES is False, as adjusted prices already
+    reflect dividend reinvestment semantics.
 
     Args:
-        state (PortfolioState): Input parameter.
-        sym (str): Input parameter.
-        row (pd.DataFrame): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Portfolio cash ledger to update.
+        sym (str): Symbol being swept.
+        row (pd.DataFrame): Market data containing a 'Dividends' column.
+        cfg (UltimateConfig): Configuration to check if sweep is enabled.
     """
     if not getattr(cfg, "DIVIDEND_SWEEP", True) or "Dividends" not in row.columns:
         return
@@ -937,17 +904,15 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
 
 # ─── State persistence ────────────────────────────────────────────────────────
 def _rotate_backup_chain(state_file: pathlib.Path, generations: int) -> None:
-    """_rotate_backup_chain operation.
+    """
+    Perform a generational rotation of portfolio state backups.
+    
+    Copies current files to .bak.0, .bak.0 to .bak.1, etc., up to the
+    specified number of generations.
 
     Args:
-        state_file (pathlib.Path): Input parameter.
-        generations (int): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state_file (pathlib.Path): Primary state file path.
+        generations (int): Number of backup levels to maintain.
     """
     for i in range(generations - 1, -1, -1):
         src = state_file.with_suffix(f"{state_file.suffix}.bak.{i}")
@@ -959,17 +924,18 @@ def _rotate_backup_chain(state_file: pathlib.Path, generations: int) -> None:
 
 
 def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioState) -> bool:
-    """_verify_state_readback operation.
+    """
+    Verify that the file on disk matches the in-memory state exactly.
+    
+    Used immediately after a write/replace to detect filesystem-level
+    corruption or interleaved write failures.
 
     Args:
-        state_file (pathlib.Path): Input parameter.
-        expected_state (PortfolioState): Input parameter.
+        state_file (pathlib.Path): Path to the written file.
+        expected_state (PortfolioState): In-memory state to compare against.
 
     Returns:
-        bool: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        bool: True if disk content parses to a dict equal to expected_state.
     """
     with state_file.open("r", encoding="utf-8") as vf:
         parsed = json.loads(vf.read())
@@ -977,17 +943,16 @@ def _verify_state_readback(state_file: pathlib.Path, expected_state: PortfolioSt
     return parsed == expected
 
 def save_portfolio_state(state: PortfolioState, name: str) -> None:
-    """save_portfolio_state operation.
+    """
+    Persist the portfolio state to disk with atomic write and generational backups.
+
+    In Paper Mode, only risk metadata (consecutive failures, etc.) is saved to a
+    thin overlay file, keeping holdings in memory only. In standard mode, the
+    full PortfolioState is written.
 
     Args:
-        state (PortfolioState): Input parameter.
-        name (str): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Current state to persist.
+        name (str): Portfolio identifier used in filename.
     """
     if PAPER_MODE:
         print(f"  {C.YLW}[!] Paper mode active. Trades not saved; risk metadata persisted.{C.RST}")
@@ -1078,17 +1043,18 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             logger.debug("Cleanup failed for pending sentinel '%s': %s", name, sentinel_exc)
         raise
 def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
-    """_apply_risk_overlay operation.
+    """
+    Restore risk-management metadata from a paper-mode overlay file.
+    
+    Merges counters (failures, decay rounds, absent periods) into the
+    provided PortfolioState.
 
     Args:
-        ps (PortfolioState): Input parameter.
-        name (str): Input parameter.
+        ps (PortfolioState): Base portfolio state.
+        name (str): Portfolio identifier.
 
     Returns:
-        PortfolioState: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        PortfolioState: The modified portfolio state with overlay applied.
     """
     risk_file = f"data/portfolio_risk_{name}.json"
     if not os.path.exists(risk_file):
@@ -1144,16 +1110,17 @@ def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
     return ps
 
 def load_portfolio_state(name: str) -> PortfolioState:
-    """load_portfolio_state operation.
-    
+    """
+    Load the most recent valid portfolio state from the primary file or backups.
+
+    Attempts to load from the primary file first, then iterates through the
+    backup chain (.bak.0, .bak.1, etc.) if corruption is detected.
+
     Args:
-        name (str): Input parameter.
-    
+        name (str): Portfolio identifier.
+
     Returns:
-        PortfolioState: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        PortfolioState: Loaded state, or a fresh zero-balance state if no files exist.
     """
     state_file = f"data/portfolio_state_{name}.json"
     risk_file = f"data/portfolio_risk_{name}.json"
@@ -1214,138 +1181,74 @@ def load_portfolio_state(name: str) -> PortfolioState:
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
 def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_download_data operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 1 should resolve session date range, assemble symbol universe,
-    # and populate ctx["market_data"] via load_or_fetch.
+    [Draft] Phase 1: Universe assembly and market data retrieval.
+    
+    Resolves session date range and populates ctx["market_data"] via load_or_fetch.
+    """
     return ctx
 
 
 def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_regime_prep operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 2 should detect/apply splits, build close matrix, forward-fill,
-    # and compute regime inputs (idx slice, close_hist, log returns).
+    [Draft] Phase 2: Market regime and return calculation.
+    
+    Detects/applies splits, builds close matrix, and computes regime metrics.
+    """
     return ctx
 
 
 def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_exposure_cvar operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 3 should update exposure multiplier and evaluate book CVaR
-    # hard/soft breach flags used by optimization and decay phases.
+    [Draft] Phase 3: Risk and exposure assessment.
+    
+    Updates exposure multiplier and evaluates book CVaR hard/soft breach flags.
+    """
     return ctx
 
 
 def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_optimization operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 4 should generate signals, sector labels, and optimizer
-    # targets; record solver/data failure outcomes in ctx.
+    [Draft] Phase 4: Signal generation and portfolio optimization.
+    
+    Generates momentum signals and calls the solver for target weights.
+    """
     return ctx
 
 
 def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_decay_targeting operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 5 should compute decay targets when optimization fails and
-    # enforce full-liquidation behavior when limits are exhausted.
+    [Draft] Phase 5: Fallback decay targeting.
+    
+    Computes passive liquidation targets if the optimizer fails to provide a solution.
+    """
     return ctx
 
 
 def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_stale_price_gate operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 6 should run trading-calendar stale-bar checks and lock/adjust
-    # weights for stale held symbols before execution.
+    [Draft] Phase 6: Operational data quality gate.
+    
+    Checks for stale session prices and locks weights for halted symbols.
+    """
     return ctx
 
 
 def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_execution operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 7 should perform pending-sentinel claim/write and call
-    # execute_rebalance with finalized targets and scenario losses.
+    [Draft] Phase 7: Order execution and settlement.
+    
+    Claims the rebalance sentinel and invokes execute_rebalance.
+    """
     return ctx
 
 
 def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """_scan_phase_eod_accounting operation.
-
-    Args:
-        ctx (Dict[str, Any]): Input parameter.
-
-    Returns:
-        Dict[str, Any]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
     """
-    # TODO: Phase 8 should record EOD prices/equity, update absent tracking,
-    # emit summary logs, and render trade action sheets.
+    [Draft] Phase 8: Post-scan reporting and state finalization.
+    
+    Records history, updates absent trackers, and emits UI summary tables.
+    """
     return ctx
 
 def _run_scan(
@@ -1356,21 +1259,22 @@ def _run_scan(
     circuit_breaker: CircuitBreaker = _circuit_breaker,
     name: str = "scan",
 ) -> tuple:
-    """_run_scan operation.
-    
+    """
+    Execute a full strategy scan on a given universe of symbols.
+
+    Orchestrates data fetching, signal generation, optimization, and
+    rebalance execution. Handles risk gates and persistence internally.
+
     Args:
-        universe (List[str]): Input parameter.
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        cfg_override (Optional[UltimateConfig]): Input parameter.
-        circuit_breaker (CircuitBreaker): Input parameter.
-        name (str): Input parameter.
-    
+        universe (List[str]): List of bare ticker symbols to include in scan.
+        state (PortfolioState): Current portfolio state (modified in-place if rebalanced).
+        label (str): Human-readable name for this scan (e.g. 'NSE 500').
+        cfg_override (Optional[UltimateConfig]): Optional settings to bypass disk config.
+        circuit_breaker (CircuitBreaker): Safety tracker for empty-universe events.
+        name (str): Portfolio identifier for state/lock filenames.
+
     Returns:
-        tuple: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        tuple: (modified_state, market_data_dict)
     """
     scan_started_at = time.perf_counter()
     _print_stage_status("Download", 0.05, f"Preparing {len(universe):,} symbols for {label}...")
@@ -1387,16 +1291,11 @@ def _run_scan(
     _dead_letter = DeadLetterTracker(threshold=10)
 
     def _scan_body(cfg: UltimateConfig) -> tuple:
-        """_scan_body operation.
+        """
+        Internal closure for the scan execution logic.
         
         Args:
-            cfg (UltimateConfig): Input parameter.
-        
-        Returns:
-            tuple: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            cfg (UltimateConfig): Validated configuration to use for this run.
         """
         phase_ctx: Dict[str, Any] = {}
         _scan_phase_download_data(phase_ctx)
@@ -1945,18 +1844,16 @@ def _run_scan(
 # ─── Status display ───────────────────────────────────────────────────────────
 
 def _render_holdings_table(rows: List[dict], cash: float, pv: float) -> str:
-    """_render_holdings_table operation.
+    """
+    Render a formatted ANSI table of current portfolio positions.
 
     Args:
-        rows (List[dict]): Input parameter.
-        cash (float): Input parameter.
-        pv (float): Input parameter.
+        rows (List[dict]): List of position dictionaries (sym, shares, price, etc.).
+        cash (float): Available cash balance.
+        pv (float): Total portfolio value.
 
     Returns:
-        str: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: Multi-line ANSI-formatted string containing the table.
     """
     c_pipe = f"{C.GRY}│{C.RST}"
     lines: List[str] = []
@@ -2001,17 +1898,15 @@ def _render_holdings_table(rows: List[dict], cash: float, pv: float) -> str:
 
 
 def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) -> str:
-    """_render_portfolio_diagnostics operation.
-
+    """
+    Render a summary of risk metrics and internal state flags.
+    
     Args:
-        state (PortfolioState): Input parameter.
-        cfg (UltimateConfig): Input parameter.
+        state (PortfolioState): Portfolio to analyze.
+        cfg (UltimateConfig): Configuration for limit thresholds.
 
     Returns:
-        str: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: ANSI-formatted diagnostic block.
     """
     cvar = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
     cvar_color = C.RED if cvar > cfg.CVAR_DAILY_LIMIT else C.GRN
@@ -2026,19 +1921,14 @@ def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) ->
 
 
 def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Optional[UltimateConfig] = None) -> None:
-    """_print_status operation.
+    """
+    High-level status printer: fetches prices and renders holdings + diagnostics.
 
     Args:
-        state (PortfolioState): Input parameter.
-        label (str): Input parameter.
-        market_data (dict): Input parameter.
-        cfg (Optional[UltimateConfig]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        state (PortfolioState): Portfolio state to display.
+        label (str): Human-readable title for the status block.
+        market_data (dict): Latest market data (for Mark-to-Market calculation).
+        cfg (Optional[UltimateConfig]): Strategy configuration.
     """
     if cfg is None:
         cfg = UltimateConfig()
@@ -2088,6 +1978,7 @@ def _print_status(state: PortfolioState, label: str, market_data: dict, cfg: Opt
     print(_render_holdings_table(rows=rows, cash=state.cash, pv=pv))
     print(_render_portfolio_diagnostics(state=state, cfg=cfg))
 def _portfolio_activity_badge(state: PortfolioState) -> str:
+    """Return a colored 'Active' or 'Idle' string for use in menus."""
     has_activity = bool(state.shares or state.equity_hist or abs(state.cash - DEFAULT_INITIAL_CAPITAL) >= 1.0)
     if not has_activity:
         return f"{C.GRY}Idle{C.RST}"
@@ -2095,17 +1986,7 @@ def _portfolio_activity_badge(state: PortfolioState) -> str:
     return f"{C.B_GRN}Active{C.RST} {C.GRY}({positions} pos | Cash ₹{state.cash:,.0f}){C.RST}"
 
 def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
-    """_render_main_menu operation.
-    
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-    
-    Returns:
-        None: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Render the primary daily workflow interactive menu."""
     box_width = 78
 
     def _menu_box_line(text: str = "") -> str:
@@ -2139,18 +2020,16 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     print(f"    Custom Screener → {_portfolio_activity_badge(states['custom'])}")
 
 def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = None) -> str:
-    """_prompt_menu_choice operation.
+    """
+    Get and validate a user menu selection.
     
     Args:
-        prompt (str): Input parameter.
-        valid (List[str]): Input parameter.
-        default (Optional[str]): Input parameter.
-    
+        prompt (str): Text to display.
+        valid (List[str]): Allowed inputs (lowercase).
+        default (Optional[str]): Selection if input is empty.
+
     Returns:
-        str: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        str: The validated user choice.
     """
     while True:
         raw = input(prompt).strip().lower()
@@ -2162,6 +2041,12 @@ def _prompt_menu_choice(prompt: str, valid: List[str], default: Optional[str] = 
         return raw
 
 def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
+    """
+    Validate and return a date string in YYYY-MM-DD format.
+    
+    Raises:
+        ValueError: If the date format is invalid.
+    """
     candidate = raw.strip() or default
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
@@ -2170,17 +2055,15 @@ def _normalise_start_date(raw: str, default: str = "2020-01-01") -> str:
     return candidate
 
 def _prompt_survival_mode(err: UniverseFetchError, universe_name: str) -> Optional[List[str]]:
-    """_prompt_survival_mode operation.
-    
+    """
+    Handle universe fetch failures by prompting for Nifty 50 hard-floor fallback.
+
     Args:
-        err (UniverseFetchError): Input parameter.
-        universe_name (str): Input parameter.
-    
+        err (UniverseFetchError): Exception containing the fallback list.
+        universe_name (str): The name of the universe that failed to load.
+
     Returns:
-        Optional[List[str]]: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        Optional[List[str]]: Fallback symbols if confirmed, else None.
     """
     print(f"\n  {C.B_RED}[!] UNIVERSE FETCH FAILURE — {universe_name}{C.RST}")
     print(f"  {C.RED}{err}{C.RST}")
@@ -2253,18 +2136,7 @@ def _preview_scan_and_maybe_save(
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_nse_total_scan operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Perform a scan on the complete NSE equity universe."""
     _check_and_prompt_initial_capital(states["nse_total"], LABEL_NSE_TOTAL, "nse_total")
     cfg = load_optimized_config()
     universe: Optional[List[str]]
@@ -2278,18 +2150,7 @@ def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -
 
 
 def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_nifty500_scan operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Perform a scan on the Nifty 500 universe."""
     _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
     cfg = load_optimized_config()
     try:
@@ -2302,18 +2163,7 @@ def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) ->
 
 
 def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
-    """_handle_custom_scan operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Perform a scan on symbols from a custom screener or file."""
     universe = _get_custom_universe()
     if not universe:
         print(f"  {C.RED}[!] No custom universe found.{C.RST}")
@@ -2333,17 +2183,7 @@ def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> N
 
 
 def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
-    """_handle_backtest operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Orchestrate a historical strategy backtest."""
     # states parameter reserved for future use (e.g., backtest-from-live-state).
     print(f"\n  {C.CYN}Backtest — Select Universe:{C.RST}")
     print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
@@ -2428,19 +2268,7 @@ def _handle_backtest(states: Dict[str, PortfolioState]) -> None:
 
 
 def _handle_status(states: Dict[str, PortfolioState], mkt_cache: dict, cfg: UltimateConfig) -> None:
-    """_handle_status operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-        cfg (UltimateConfig): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Batch render the status of all active portfolios."""
     for name, label in [
         ("nse_total", LABEL_NSE_TOTAL),
         ("nifty", LABEL_NIFTY_500),
@@ -2465,17 +2293,7 @@ def _handle_status(states: Dict[str, PortfolioState], mkt_cache: dict, cfg: Ulti
 
 
 def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
-    """_handle_manage_cash operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Deposit or withdraw cash from a selected portfolio."""
     print(f"\n  {C.CYN}Manage Cash — Select Portfolio:{C.RST}")
     print("  [1] NSE Total  [2] Nifty 500  [3] Custom Screener")
     p_c = _prompt_menu_choice(f"  {C.CYN}Choice: {C.RST}", ["1", "2", "3"])
@@ -2506,18 +2324,7 @@ def _handle_manage_cash(states: Dict[str, PortfolioState]) -> None:
 
 
 def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> Tuple[Dict[str, PortfolioState], dict]:
-    """_handle_clear_states operation.
-
-    Args:
-        states (Dict[str, PortfolioState]): Input parameter.
-        mkt_cache (dict): Input parameter.
-
-    Returns:
-        Tuple[Dict[str, PortfolioState], dict]: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """CLI Handler: Delete local state and cache files for a clean reset."""
     print(f"\n  {C.B_RED}WARNING: This will reset your holdings to zero (cash only).{C.RST}")
     print(f"  {C.GRY}Market data cache and optimal_cfg.json are NOT affected.{C.RST}")
     print(f"  {C.GRY}Use this when you want to start a fresh portfolio with new capital.{C.RST}")
@@ -2557,14 +2364,7 @@ def _handle_clear_states(states: Dict[str, PortfolioState], mkt_cache: dict) -> 
 
 
 def main_menu() -> None:
-    """main_menu operation.
-
-    Returns:
-        None: Result of this operation.
-
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Main execution loop for the daily workflow interactive CLI."""
     states = {
         "nse_total": load_portfolio_state("nse_total"),
         "nifty": load_portfolio_state("nifty"),
@@ -2597,17 +2397,7 @@ def main_menu() -> None:
         elif choice == "7":
             states, mkt_cache = _handle_clear_states(states, mkt_cache)
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """_parse_args operation.
-    
-    Args:
-        argv (Optional[List[str]]): Input parameter.
-    
-    Returns:
-        argparse.Namespace: Result of this operation.
-    
-    Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
-    """
+    """Parse command-line arguments for the daily workflow."""
     parser = argparse.ArgumentParser(description="Ultimate Momentum daily workflow")
     parser.add_argument(
         "--paper",
