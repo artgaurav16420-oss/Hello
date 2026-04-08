@@ -825,12 +825,13 @@ def _compute_one_way_slip_rate_vectorized(
     trade_arr = np.asarray(trade_notional, dtype=float)
     numerator = np.where(np.isfinite(trade_arr) & (trade_arr > 0), trade_arr, float(portfolio_value))
     valid_adv = np.isfinite(adv_arr) & (adv_arr > 0)
-    impact = np.zeros_like(numerator, dtype=float)
-    impact[valid_adv] = cfg.IMPACT_COEFF * numerator[valid_adv] / adv_arr[valid_adv]
-    impact = np.clip(impact, 0.0, 0.05)
-    incremental = np.maximum(impact - (base_rate * 0.5), 0.0)
-    one_way = np.where(valid_adv, base_rate + incremental, base_rate)
-    return np.clip(one_way, base_rate, 0.05)
+    impact_rate = np.zeros_like(numerator, dtype=float)
+    impact_rate[valid_adv] = cfg.IMPACT_COEFF * numerator[valid_adv] / adv_arr[valid_adv]
+    # Match scalar logic: max(base_rate, min(0.05, impact_rate))
+    one_way = np.maximum(base_rate, np.minimum(0.05, impact_rate))
+    # For invalid ADV, return base_rate (matching scalar path)
+    one_way = np.where(valid_adv, one_way, base_rate)
+    return one_way
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────

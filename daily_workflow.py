@@ -1812,7 +1812,7 @@ def _run_scan(
             # [PHASE 2 FIX] Stale Price Gate Bypass: Ensure forced liquidation handling
             # holds stale/halted symbols at their current weight, bypassing sell-orders
             # so CVaR execution avoids fake realizations at stale prices.
-            if _rebalance_stale_held and apply_decay and not _force_full_cash:
+            if _rebalance_stale_held and (apply_decay or _force_full_cash):
                 for _s_bare, _ in _rebalance_stale_held:
                     if _s_bare in active_idx:
                         _s_idx = active_idx[_s_bare]
@@ -2602,7 +2602,6 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-
 
 
 

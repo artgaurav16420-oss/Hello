@@ -480,11 +480,12 @@ def _suggest_trial_config(trial: optuna.Trial, search_space: dict) -> UltimateCo
     )
 
     cvar_lb_min, cvar_lb_max, cvar_lb_step = search_space.get("CVAR_LOOKBACK", (60, 150, 10))
-    baseline_max_positions = max(
-        int(getattr(cfg, "MAX_POSITIONS", 0)),
-        int(getattr(defaults, "MAX_POSITIONS", 0)),
-    )
-    min_required_lookback = int(getattr(cfg, "DIMENSIONALITY_MULTIPLIER", 1)) * baseline_max_positions
+    # Respect intentional MAX_POSITIONS = 0; use cfg value if present, else defaults
+    if hasattr(cfg, "MAX_POSITIONS") and cfg.MAX_POSITIONS is not None:
+        resolved_max_positions = int(cfg.MAX_POSITIONS)
+    else:
+        resolved_max_positions = int(getattr(defaults, "MAX_POSITIONS", 0))
+    min_required_lookback = int(getattr(cfg, "DIMENSIONALITY_MULTIPLIER", 1)) * resolved_max_positions
     effective_cvar_lb_min = max(int(cvar_lb_min), int(min_required_lookback))
     if effective_cvar_lb_min > int(cvar_lb_max):
         raise optuna.TrialPruned()
