@@ -170,7 +170,16 @@ def _build_sampler() -> TPESampler:
     """Initialize the Optuna Tree-structured Parzen Estimator (TPE) sampler."""
     if OPTUNA_SEED in (None, ""):
         return TPESampler(n_ei_candidates=24, multivariate=True)
-    return TPESampler(seed=int(str(OPTUNA_SEED)), n_ei_candidates=24, multivariate=True)
+
+    try:
+        seed_val = int(str(OPTUNA_SEED))
+        return TPESampler(seed=seed_val, n_ei_candidates=24, multivariate=True)
+    except (ValueError, TypeError) as exc:
+        logger.warning(
+            "Malformed OPTUNA_SEED %r: %s. Returning unseeded TPESampler.", 
+            OPTUNA_SEED, exc
+        )
+        return TPESampler(n_ei_candidates=24, multivariate=True)
 
 
 def _normalize_universe_type(universe_type: str | None) -> str:
@@ -201,9 +210,17 @@ def _iter_wfo_slices(train_start: str, train_end: str):
     IS_YEARS = 2
     start    = pd.Timestamp(train_start)
     end      = pd.Timestamp(train_end)
-    for y in range(start.year + IS_YEARS, end.year + 1):
+
+    # OPTION B: Programmatically exclude the true OOS holdout year
+    # from any CV folds to ensure zero leakage.
+    effective_end = min(
+        end,
+        pd.Timestamp(TEST_START) - pd.Timedelta(days=1)
+    )
+
+    for y in range(start.year + IS_YEARS, effective_end.year + 1):
         oos_start = pd.Timestamp(f"{y}-01-01")
-        oos_end   = min(pd.Timestamp(f"{y}-12-31"), end)
+        oos_end   = min(pd.Timestamp(f"{y}-12-31"), effective_end)
         is_start  = oos_start - pd.DateOffset(years=IS_YEARS)
         is_end    = oos_start - pd.Timedelta(days=1)
 
@@ -858,7 +875,9 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     historical_union: set[str] = set()
     try:
-        for target_date in pd.date_range(TRAIN_START, TEST_END, freq="QE"):
+        # Expand universe to cover both the full training window and the holdout period.
+        expansion_end = max(pd.Timestamp(TRAIN_END), pd.Timestamp(TEST_END))
+        for target_date in pd.date_range(TRAIN_START, expansion_end, freq="QE"):
             historical_union.update(
                 get_historical_universe(normalized_universe, pd.Timestamp(target_date))
             )

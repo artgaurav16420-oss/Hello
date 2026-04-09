@@ -352,6 +352,19 @@ class UltimateConfig:
     AUTO_ADJUST_PRICES:       bool  = True         # Enables implicit backward price adjustment.
     EQUITY_HIST_CAP:          int   = 500          # Hard cap on number of periods maintained in historical equity curves to prevent O(N) CVaR scale-outs.
 
+    @property
+    def SLIPPAGE_BPS(self) -> float:
+        """Legacy alias for ROUND_TRIP_SLIPPAGE_BPS."""
+        return self.ROUND_TRIP_SLIPPAGE_BPS
+
+    @SLIPPAGE_BPS.setter
+    def SLIPPAGE_BPS(self, value: Any) -> None:
+        """Setter with numeric validation for SLIPPAGE_BPS."""
+        try:
+            self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"SLIPPAGE_BPS must be numeric, got {type(value).__name__}") from exc
+
 
 @dataclass
 class PortfolioState:
@@ -625,69 +638,32 @@ class PortfolioState:
         """
         ps = cls()
         errors: List[str] = []
-        risk_control_errors: List[str] = []
+        risk_errors: List[str] = []
 
-        ps.weights = _state_get(
-            d, "weights", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.shares = _state_get(
-            d, "shares", lambda v: {k: int(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.entry_prices = _state_get(
-            d, "entry_prices", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.equity_hist = _state_get(
-            d, "equity_hist", lambda v: [float(x) for x in v], [], cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.universe = _state_get(
-            d, "universe", list, [], cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.cash = _state_get(
-            d, "cash", float, ps.cash, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.exposure_multiplier = _state_get(
-            d, "exposure_multiplier", float, 1.0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.override_active = _state_get(
-            d, "override_active", _as_bool_flag, False, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.override_cooldown = _state_get(
-            d, "override_cooldown", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.consecutive_failures = _state_get(
-            d, "consecutive_failures", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
+        def fetch(key: str, coercer: Any, default: Any) -> Any:
+            return _deserialize_field(
+                d, key, coercer, default, cls.RISK_CONTROL_FIELDS, errors, risk_errors
+            )
+
+        ps.weights = fetch("weights", _to_float_dict, {})
+        ps.shares = fetch("shares", _to_int_dict, {})
+        ps.entry_prices = fetch("entry_prices", _to_float_dict, {})
+        ps.equity_hist = fetch("equity_hist", _to_float_list, [])
+        ps.universe = fetch("universe", list, [])
+        ps.cash = fetch("cash", float, ps.cash)
+        ps.exposure_multiplier = fetch("exposure_multiplier", float, 1.0)
+        ps.override_active = fetch("override_active", _as_bool_flag, False)
+        ps.override_cooldown = fetch("override_cooldown", _as_nonneg_int, 0)
+        ps.consecutive_failures = fetch("consecutive_failures", _as_nonneg_int, 0)
         ps.equity_hist_cap = _load_equity_hist_cap(d)
-        ps.max_absent_periods = _state_get(
-            d, "max_absent_periods", _as_optional_nonneg_int, None, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.absent_periods = _state_get(
-            d, "absent_periods", lambda v: {k: int(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.last_known_prices = _state_get(
-            d, "last_known_prices", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.last_known_volatility = _state_get(
-            d, "last_known_volatility", lambda v: {k: float(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.vol_hist = _state_get(
-            d,
-            "vol_hist",
-            _deserialize_vol_hist,
-            {},
-            cls.RISK_CONTROL_FIELDS,
-            errors,
-            risk_control_errors,
-        )
-        ps.decay_rounds = _state_get(
-            d, "decay_rounds", _as_nonneg_int, 0, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.dividend_ledger = _state_get(
-            d, "dividend_ledger", lambda v: {k: str(x) for k, x in v.items()}, {}, cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
-        ps.last_rebalance_date = _state_get(
-            d, "last_rebalance_date", str, "", cls.RISK_CONTROL_FIELDS, errors, risk_control_errors
-        )
+        ps.max_absent_periods = fetch("max_absent_periods", _as_optional_nonneg_int, None)
+        ps.absent_periods = fetch("absent_periods", _to_int_dict, {})
+        ps.last_known_prices = fetch("last_known_prices", _to_float_dict, {})
+        ps.last_known_volatility = fetch("last_known_volatility", _to_float_dict, {})
+        ps.vol_hist = fetch("vol_hist", _deserialize_vol_hist, {})
+        ps.decay_rounds = fetch("decay_rounds", _as_nonneg_int, 0)
+        ps.dividend_ledger = fetch("dividend_ledger", _to_str_dict, {})
+        ps.last_rebalance_date = fetch("last_rebalance_date", str, "")
         ps._initial_cash = float(ps.cash)
         ps._initial_exposure_multiplier = float(ps.exposure_multiplier)
         if ps.equity_hist_cap is None:
@@ -701,11 +677,11 @@ class PortfolioState:
             logger.error(
                 "PortfolioState.from_dict: %d field(s) reset to defaults: %s", len(errors), errors
             )
-        if risk_control_errors:
+        if risk_errors:
             logger.critical(
                 "PortfolioState.from_dict: %d risk-control field(s) reset to defaults: %s",
-                len(risk_control_errors),
-                risk_control_errors,
+                len(risk_errors),
+                risk_errors,
             )
         return ps
 
@@ -741,6 +717,26 @@ def _as_optional_nonneg_int(value: Any) -> Optional[int]:
     if value is None:
         return None
     return _as_nonneg_int(value)
+
+
+def _to_float_dict(v: Any) -> Dict[str, float]:
+    """Coerce a dictionary to {str: float}."""
+    return {str(k): float(x) for k, x in v.items()}
+
+
+def _to_int_dict(v: Any) -> Dict[str, int]:
+    """Coerce a dictionary to {str: int}."""
+    return {str(k): int(x) for k, x in v.items()}
+
+
+def _to_str_dict(v: Any) -> Dict[str, str]:
+    """Coerce a dictionary to {str: str}."""
+    return {str(k): str(x) for k, x in v.items()}
+
+
+def _to_float_list(v: Any) -> List[float]:
+    """Coerce an iterable to [float]."""
+    return [float(x) for x in v]
 
 
 def _load_equity_hist_cap(payload: dict) -> Optional[int]:
@@ -782,30 +778,37 @@ def _deserialize_vol_hist(value: Any) -> Dict[str, deque]:
     return out
 
 
-def _state_get(
+def _deserialize_field(
     payload: dict,
     key: str,
     converter: Any,
     default: Any,
-    risk_control_fields: Tuple[str, ...],
-    errors: List[str],
-    risk_control_errors: List[str],
+    risk_control_fields: Tuple[str, ...] = (),
+    errors: Optional[List[str]] = None,
+    risk_control_errors: Optional[List[str]] = None,
 ) -> Any:
     """
     Robust field extractor for state dictionary.
     Tracks whether errors occurred in sensitive risk-control fields.
     """
     try:
-        return converter(payload[key]) if key in payload else default
+        if key not in payload:
+            return default
+        return converter(payload[key])
     except Exception as exc:
         # Broad catch is intentional: converter is caller-provided and may raise
         # arbitrary exception types depending on the target field.
-        logger.warning("PortfolioState.from_dict: field '%s' failed conversion (%s); using default.", key, exc)
-        msg = f"{key}: {exc}"
-        if key in risk_control_fields:
-            risk_control_errors.append(msg)
-        else:
-            errors.append(msg)
+        logger.warning(
+            "PortfolioState.from_dict: field '%s' failed conversion (%s); using default.",
+            key,
+            exc,
+        )
+        if errors is not None or risk_control_errors is not None:
+            msg = f"{key}: {exc}"
+            if key in risk_control_fields and risk_control_errors is not None:
+                risk_control_errors.append(msg)
+            elif errors is not None:
+                errors.append(msg)
         return default
 
 
@@ -825,18 +828,6 @@ def compute_one_way_slip_rate(
 ) -> float:
     """
     Compute per-name one-way slippage rate including flat commission and market impact.
-
-    Args:
-        cfg (UltimateConfig): Configuration for impact coefficients and base rates.
-        portfolio_value (float): Current total portfolio Net Asset Value.
-        adv_notional (Optional[float]): Average daily volume in local currency.
-        trade_notional (Optional[float]): The estimated size of the trade being executed.
-
-    Returns:
-        float: One-way slippage rate (e.g. 0.005 for 50bps). Capped at 5%.
-
-    Raises:
-        Exception: Propagates unexpected numeric errors.
     """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
@@ -849,8 +840,6 @@ def compute_one_way_slip_rate(
 
     impact_rate = (cfg.IMPACT_COEFF * numerator) / float(adv_notional)
     # [PHASE 2 FIX] H-02: Log when the 5% market-impact cap is binding.
-    # Without this, positions sized against the cap leave no audit trail,
-    # making it impossible to distinguish genuine slippage from the cap.
     if impact_rate >= 0.05:
         logger.debug(
             "[Slippage] Impact cap binding: raw impact=%.4f%% capped to 5.00%% "

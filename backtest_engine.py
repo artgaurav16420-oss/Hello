@@ -134,7 +134,6 @@ class BacktestEngine:
         self._eq_vals  = []
         self._rebal_rows = []
         self.trades      = []
-        self.state.decay_rounds = 0
         self.engine.reset_solver()
 
     def _compute_portfolio_value_and_gross_exposure(

@@ -144,9 +144,9 @@ def compute_regime_score(
     if len(all_returns) >= 5:
         ewma_var = all_returns.ewm(span=ewma_span, adjust=False).var()
         _raw_var = ewma_var.iloc[-1]
-        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else 0.5
-
+        
         vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
+        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else vol_floor
         vol_mult = float(cfg.REGIME_VOL_MULTIPLIER) if cfg else 1.5
 
         lt_ewma_span = int(cfg.REGIME_LT_VOL_EWMA_SPAN) if cfg else 1260
@@ -280,7 +280,7 @@ def _check_market_crash(
     # here matches the intent of the early-warning tier: the market is healing
     # but should remain cautious, not fully liquidated.
     if min_recent_breadth < 0.35 and current_breadth < 0.50:
-        return 0.0
+        return 0.5
     if current_breadth < 0.45:
         return 0.5
     return None
