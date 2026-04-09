@@ -92,11 +92,29 @@ def _ghost_seed_for(sym: str) -> int:
 # ─── Symbol helpers ───────────────────────────────────────────────────────────
 
 def to_ns(sym: str) -> str:
-    """Backward-compatible alias for shared ticker normalization."""
+    """
+    Standardize a ticker to the National Stock Exchange of India (NSE) format.
+    Alias for shared_utils.normalize_ns_ticker.
+
+    Args:
+        sym (str): The raw ticker string.
+
+    Returns:
+        str: Symbol suffixed with '.NS'.
+    """
     return normalize_ns_ticker(sym)
 
 
 def to_bare(sym: str) -> str:
+    """
+    Remove the exchange suffix from a standardized ticker.
+
+    Args:
+        sym (str): Standardized symbol (e.g., 'RELIANCE.NS').
+
+    Returns:
+        str: Bare symbol name (e.g., 'RELIANCE').
+    """
     return sym[:-3] if sym.endswith(".NS") else sym
 
 
@@ -156,6 +174,17 @@ class OptimizationError(Exception):
 
 @dataclass
 class Trade:
+    """
+    Detailed record of an executed transaction within a rebalance.
+
+    Attributes:
+        symbol (str): NSE ticker symbol (without exchange suffix).
+        date (pd.Timestamp): Execution date/time.
+        delta_shares (int): Absolute change in share count.
+        exec_price (float): Final matched price after haircut/slippage.
+        slip_cost (float): Estimated notional impact of the trade.
+        direction (str): 'BUY' or 'SELL'.
+    """
     symbol:       str
     date:         pd.Timestamp
     delta_shares: int
@@ -325,10 +354,12 @@ class UltimateConfig:
 
     @property
     def SLIPPAGE_BPS(self) -> float:
+        """Alias for ROUND_TRIP_SLIPPAGE_BPS."""
         return self.ROUND_TRIP_SLIPPAGE_BPS
 
     @SLIPPAGE_BPS.setter
     def SLIPPAGE_BPS(self, value: float) -> None:
+        """Setter for SLIPPAGE_BPS that updates ROUND_TRIP_SLIPPAGE_BPS."""
         try:
             self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
         except (TypeError, ValueError) as exc:
@@ -806,19 +837,19 @@ def compute_one_way_slip_rate(
     trade_notional: Optional[float] = None,
 ) -> float:
     """
-    Compute per-name one-way slippage rate.
+    Compute per-name one-way slippage rate including flat commission and market impact.
 
-    FIX-MB-ME-02: Market impact is now scaled against trade_notional (the delta
-    notional being traded) rather than portfolio_value. Using portfolio_value as
-    the impact numerator caused systematic overestimation for small trades and
-    underestimation for large rebalances, because a 1-share trade in a large
-    portfolio received the same impact rate as a full-position rebalance.
+    Args:
+        cfg (UltimateConfig): Configuration for impact coefficients and base rates.
+        portfolio_value (float): Current total portfolio Net Asset Value.
+        adv_notional (Optional[float]): Average daily volume in local currency.
+        trade_notional (Optional[float]): The estimated size of the trade being executed.
 
-    When trade_notional is not provided (backward-compatible callers), falls back
-    to portfolio_value to preserve existing behaviour.
+    Returns:
+        float: One-way slippage rate (e.g. 0.005 for 50bps). Capped at 5%.
 
-    One-way cost = half of round-trip (ROUND_TRIP_SLIPPAGE_BPS / 2).
-    The rate returned here is applied ONCE per trade side.
+    Raises:
+        Exception: Propagates unexpected numeric errors.
     """
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
@@ -1107,18 +1138,30 @@ def execute_rebalance(
     conviction_scores: Optional[np.ndarray] = None,
     force_rebalance_trades: bool = False,
 ) -> float:
-    """Execute a portfolio rebalance, updating state in-place.
+    """
+    Execute a portfolio rebalance, updating state in-place and logging trades.
+    Implements a two-phase PV accounting strategy to handle force-closes and slippage.
 
-    FIX-MB-ME-01: Two-phase PV accounting explanation:
-    Phase 1 — pv_exec is built from cash + retained positions + ghost positions.
-              Force-close candidates are EXCLUDED here (sym not in symbols_to_force_close).
-    Phase 2 — Force-close positions are sold: proceeds (n_shares * close_price)
-              are added to pv_exec, and the sell trade is logged.
-    Settlement — state.cash = pv_exec - actual_notional - total_slippage.
-              actual_notional covers only retained (new_shares) positions, not
-              force-closed ones. The force-close proceeds were added to pv_exec
-              in Phase 2, so cash correctly reflects their liquidation without
-              needing to subtract them via actual_notional.
+
+    Args:
+        state (PortfolioState): Mutable portfolio state to be updated.
+        target_weights (np.ndarray): Optimized target weights (0.0 to 1.0).
+        prices (np.ndarray): Execution prices for active symbols.
+        active_symbols (List[str]): Symbols corresponding to the price/weight vectors.
+        cfg (UltimateConfig): Configuration for slippage and caps.
+        adv_shares (Optional[np.ndarray]): Average daily volume in shares.
+        date_context (Any): Current simulation date index for logging.
+        trade_log (Optional[List[Trade]]): List to append executed trades to.
+        apply_decay (bool): If True, indicates a risk-reduction liquidation round.
+        scenario_losses (Optional[np.ndarray]): Historical loss scenarios for CVaR check.
+        conviction_scores (Optional[np.ndarray]): Signal/Alpha ranking for residual cash filling.
+        force_rebalance_trades (bool): If True, bypasses the drift tolerance gate.
+
+    Returns:
+        float: Total slippage cost incurred during the rebalance.
+
+    Raises:
+        Exception: Propagates state-access or numeric errors during trading logic.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
 
@@ -1495,6 +1538,9 @@ def compute_book_cvar(
 
     Returns:
         float: Expected loss in the worst (1 - alpha)% of scenarios.
+
+    Raises:
+        Exception: Propagates numeric errors during ghost synthesis or tail calculation.
     """
     active_idx = {sym: i for i, sym in enumerate(active_symbols)}
     mtm_weights, pv = _build_mtm_weights_and_pv(state, prices, active_idx)
@@ -1530,6 +1576,17 @@ def _build_mtm_weights_and_pv(
     prices: np.ndarray,
     active_idx: Dict[str, int],
 ) -> Tuple[Dict[str, float], float]:
+    """
+    Compute current mark-to-market valuations for the held portfolio.
+
+    Args:
+        state (PortfolioState): Current shares and last known prices.
+        prices (np.ndarray): Vector of latest market prices.
+        active_idx (Dict[str, int]): Index mapping symbols to price vector positions.
+
+    Returns:
+        Tuple[Dict[str, float], float]: (symbol_notionals_dict, total_portfolio_value).
+    """
     mtm_weights: Dict[str, float] = {}
     pv = state.cash
     for sym, n_shares in state.shares.items():
@@ -1544,6 +1601,17 @@ def _build_mtm_weights_and_pv(
 
 
 def _prepare_cvar_returns(hist_log_rets: pd.DataFrame, held_syms: List[str], t_cvar: int) -> pd.DataFrame:
+    """
+    Slice and fill historical log returns for CVaR evaluation.
+
+    Args:
+        hist_log_rets (pd.DataFrame): Wide matrix of historical log returns.
+        held_syms (List[str]): Symbols currently in the portfolio or target universe.
+        t_cvar (int): Tail lookback window size.
+
+    Returns:
+        pd.DataFrame: Sliced returns matrix with inf/nan handled.
+    """
     rets = hist_log_rets.reindex(columns=held_syms, fill_value=np.nan)
     return rets.replace([np.inf, -np.inf], np.nan).ffill().iloc[-t_cvar:].copy()
 
@@ -1809,6 +1877,10 @@ class InstitutionalRiskEngine:
         self._solver_lock = threading.Lock()
 
     def reset_solver(self) -> None:
+        """
+        Invalidate the cached OSQP solver and its structural metadata.
+        Forces a full setup (A, P, l, u matrices) on the next optimize() call.
+        """
         with self._solver_lock:
             self._solver = None
             self._solver_shape = None
@@ -1840,7 +1912,7 @@ class InstitutionalRiskEngine:
             prev_w (Optional[np.ndarray]): Starting weights for turnover penalization.
             exposure_multiplier (float): Target gross exposure scaling.
             sector_labels (Optional[np.ndarray]): Vector of sector IDs for concentration capping.
-            execution_date (Optional[Timestamp]): Current simulation date.
+            execution_date (Optional[pd.Timestamp]): Current simulation date for look-ahead protection.
 
         Returns:
             np.ndarray: Optimized weight vector.

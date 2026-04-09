@@ -196,10 +196,20 @@ def _build_pit_csv_from_wayback(
     sleep_seconds: float = 1.0,
 ) -> bool:
     """
-    Download all monthly Wayback snapshots of `target_url`, parse each one,
-    and write a (date, ticker) CSV to `output_csv`.
+    Download all monthly Wayback snapshots of target_url and parse them.
 
-    Returns True if enough snapshots were collected, False otherwise.
+    Orchestrates the CDX query and individual snapshot downloads to
+    assemble a chronological (date, ticker) dataset. Results are saved
+    as a CSV to output_csv.
+
+    Args:
+        target_url (str): The origin NSE URL to search for in archives.
+        output_csv (Path): Filesystem path to save the assembled records.
+        start_year (int): The earliest year to include in archival search.
+        sleep_seconds (float): Rate-limiting delay between fetches.
+
+    Returns:
+        bool: True if at least _MIN_SNAPSHOTS were successfully collected.
     """
     timestamps = _wayback_cdx_snapshots(target_url, start_year=start_year)
     if len(timestamps) < _MIN_SNAPSHOTS:
@@ -886,17 +896,18 @@ def _load_master_archive(universe_type: str) -> pd.DataFrame:
 
 
 def _download_archive(universe_type: str, output_path: Path) -> Path:
-    """_download_archive operation.
-    
+    """
+    Download/verify a historical universe archive from a remote source.
+
     Args:
-        universe_type (str): Input parameter.
-        output_path (Path): Input parameter.
-    
+        universe_type (str): Key for the universe (e.g. 'nifty500').
+        output_path (Path): Filesystem path to save the downloaded parquet.
+
     Returns:
-        Path: Result of this operation.
-    
+        Path: The confirmed path to the downloaded archive.
+
     Raises:
-        Exception: Propagates runtime, validation, I/O, or provider errors.
+        RuntimeError: If the remote download fails or the file is corrupt.
     """
     urls = REMOTE_ARCHIVE_URLS.get(universe_type, [])
     if not urls:

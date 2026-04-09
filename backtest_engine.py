@@ -341,19 +341,26 @@ class BacktestEngine:
 
         Args:
             date (pd.Timestamp): The rebalance effective date.
-            close (pd.DataFrame): Full close prices history.
-            volume (pd.DataFrame): Full volume history for ADV computation.
-            returns (pd.DataFrame): Full returns history.
-            symbols (List[str]): List of active symbols in the current matrix.
-            prices_t (np.ndarray): Array of current prices for all symbols.
-            idx_df (Optional[pd.DataFrame]): Index data for regime score calculation.
-            sector_map (Optional[dict]): Sector assignments for diversification.
-            open_px (Optional[pd.DataFrame]): Open prices for execution modeling.
+            close (pd.DataFrame): Daily close prices matrix (Date x Symbol).
+            volume (pd.DataFrame): Daily volume matrix (Date x Symbol).
+            returns (pd.DataFrame): Daily returns matrix (Date x Symbol).
+            symbols (List[str]): List of all possible symbols.
+            prices_t (np.ndarray): Execution (close) prices for the current date.
+            idx_df (Optional[pd.DataFrame]): Benchmark index data for regime scores.
+            sector_map (Optional[dict]): Symbol-to-sector mapping.
+            open_px (Optional[pd.DataFrame]): Daily open prices for execution modeling.
             high_px (Optional[pd.DataFrame]): Daily high prices.
             low_px (Optional[pd.DataFrame]): Daily low prices.
-            member_universe (Optional[set]): Point-in-time members for this date.
-            date_pos (Optional[int]): Pre-computed integer index of the current date.
-            log_rets_arr (Optional[np.ndarray]): Log returns matrix for CVaR lookbacks.
+            member_universe (Optional[set[str]]): List of symbols active for this specific date.
+            date_pos (Optional[int]): Integer index of the current date in the price matrix.
+            log_rets_arr (Optional[np.ndarray]): Pre-computed log returns for CVaR lookbacks.
+
+        Returns:
+            None: Updates engine state and trade history in-place.
+
+        Raises:
+            ValueError: If duplicate timestamps are found in the data index.
+            OptimizationError: Propagates solver failures from InstitutionalRiskEngine.
         """
         cfg = self.engine.cfg
 
@@ -853,16 +860,19 @@ def _execution_prices(
     Prefers Open price if available, otherwise falls back to Close.
 
     Args:
-        symbols (List[str]): Symbols to process.
-        date (pd.Timestamp): Execution date.
-        close_prices (np.ndarray): Pre-calculated close price array for this date.
-        open_px (Optional[pd.DataFrame]): Daily open prices.
-        high_px (Optional[pd.DataFrame]): Daily high prices.
-        low_px (Optional[pd.DataFrame]): Daily low prices.
-        return_open_fallback_mask (bool): If True, track which symbols used the fallback.
+        symbols (List[str]): Standardized symbol names.
+        date (pd.Timestamp): Target execution date.
+        close_prices (np.ndarray): Close prices for all symbols for the current date.
+        open_px (Optional[pd.DataFrame]): Complete matrix of daily open prices.
+        high_px (Optional[pd.DataFrame]): Complete matrix of daily high prices.
+        low_px (Optional[pd.DataFrame]): Complete matrix of daily low prices.
+        return_open_fallback_mask (bool): If True, returns a boolean mask indicating where Close was used.
 
     Returns:
-        np.ndarray | tuple: Execution price vector, optionally with the fallback mask.
+        np.ndarray | tuple: execution价格向量, or (prices, mask).
+
+    Raises:
+        Exception: Propagates unexpected indexing or data access errors.
     """
     exec_px = close_prices.copy()
     open_fallback_mask = np.zeros(len(symbols), dtype=bool)
@@ -1272,12 +1282,34 @@ def _prepare_backtest_matrices(
         _end_ts = pd.Timestamp(end_date) if end_date else None
 
         def _clip(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Truncate a DataFrame to the requested warmup and end dates.
+
+            Args:
+                df (pd.DataFrame): Time-indexed data.
+
+            Returns:
+                pd.DataFrame: Sliced data.
+            """
             out = df.loc[_warmup_ts:] if _warmup_ts is not None else df
             if _end_ts is not None:
                 out = out.loc[:_end_ts]
             return out
 
         def _resolve_column(df: pd.DataFrame, sym: str) -> pd.Series:
+            """
+            Map a bare or suffixed symbol to a matching column in the matrix.
+
+            Args:
+                df (pd.DataFrame): Matrix of ticker columns.
+                sym (str): Ticker to resolve.
+
+            Returns:
+                pd.Series: The matched price/volume column.
+
+            Raises:
+                KeyError: If no variation of the symbol is found in df.rows.
+            """
             if sym in df.columns:
                 return df[sym]
             if isinstance(sym, str) and sym.endswith(".NS") and sym[:-3] in df.columns:
@@ -1297,6 +1329,15 @@ def _prepare_backtest_matrices(
             )
 
         def _select(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Build a sub-matrix containing only the union universe constituents.
+
+            Args:
+                df (pd.DataFrame): Source matrix.
+
+            Returns:
+                pd.DataFrame: Re-indexed matrix with resolved columns.
+            """
             return pd.DataFrame({sym: _resolve_column(df, sym) for sym in selected}, index=df.index)
 
         close = _select(_clip(matrices["close"]))
@@ -1397,17 +1438,21 @@ def run_backtest(
     Orchestrates data preparation, universe resolution, and engine execution.
 
     Args:
-        market_data (dict): Dictionary of per-symbol DataFrames.
+        market_data (dict): Dictionary mapping symbols to DataFrames.
         universe_type (Optional[str]): Built-in universe name (e.g. 'nse500').
         start_date (str): Evaluation start date (YYYY-MM-DD).
         end_date (str): Evaluation end date (YYYY-MM-DD).
-        cfg (Optional[UltimateConfig]): Config overrides.
-        sector_map (Optional[dict]): Symbol-to-sector mapping.
-        universe (Optional[List]): Explicit symbol list.
-        precomputed_matrices (Optional[dict]): Cached matrices to skip preparation.
+        cfg (Optional[UltimateConfig]): Global configuration overrides.
+        sector_map (Optional[dict]): Symbol-to-sector mapping for constraints.
+        universe (Optional[List[str]]): Specific list of symbols to backtest.
+        precomputed_matrices (Optional[dict]): Cached OHLCV matrices to skip build phase.
 
     Returns:
-        BacktestResults: Results container including equity curve, trades, and metrics.
+        BacktestResults: Results container including equity curve, trade log, and metrics.
+
+    Raises:
+        ValueError: If the date range is invalid.
+        RuntimeError: If data loading or preparation fails to produce tradable results.
     """
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)

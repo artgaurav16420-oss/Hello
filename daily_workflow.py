@@ -1066,10 +1066,12 @@ def _apply_risk_overlay(ps: PortfolioState, name: str) -> PortfolioState:
             risk = json.load(rf)
 
         def _ri(key, fallback):
+            """Get risk integer from config."""
             v = risk.get(key)
             return int(v) if v is not None else fallback
 
         def _rb(key, fallback):
+            """Get risk boolean from config."""
             v = risk.get(key)
             if v is None:
                 return fallback
@@ -1997,6 +1999,7 @@ def _render_main_menu(states: Dict[str, PortfolioState]) -> None:
     box_width = 78
 
     def _menu_box_line(text: str = "") -> str:
+        """Format ASCII box line."""
         trimmed = text[:box_width]
         return f"{C.BLU}  │{C.RST}{trimmed:<{box_width}}{C.BLU}│{C.RST}"
 

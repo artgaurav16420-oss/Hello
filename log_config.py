@@ -66,6 +66,14 @@ class ScanContext:
     """
 
     def __init__(self, label: str = "", correlation_id: Optional[str] = None):
+        """
+        Initialize the scan context.
+
+        Args:
+            label (str): Human-readable name for the scan.
+            correlation_id (Optional[str]): Unique ID for log tracing.
+                If None, a random 8-char hex string is generated.
+        """
         self.label = label
         self.correlation_id = str(uuid.uuid4())[:8] if correlation_id is None else correlation_id
         self._prev_id: Optional[str] = None
@@ -133,6 +141,13 @@ class DeadLetterTracker:
     """
 
     def __init__(self, threshold: int = 10):
+        """
+        Initialize the dead-letter tracker.
+
+        Args:
+            threshold (int): Minimum count of missing symbols required to
+                elevate the log level from WARNING to CRITICAL on flush.
+        """
         if threshold <= 0:
             raise ValueError(f"threshold must be > 0, got {threshold}")
         self.threshold = threshold
@@ -140,6 +155,14 @@ class DeadLetterTracker:
         self._lock = threading.Lock()
 
     def add(self, symbol: str, reason: str, detail: str = "") -> None:
+        """
+        Buffer a symbol/reason pair for the aggregate report.
+
+        Args:
+            symbol (str): The ticker that failed data retrieval.
+            reason (str): Classification of the failure (e.g. 'no_price').
+            detail (str): Optional context for debugging.
+        """
         with self._lock:
             self._entries.append({
                 "symbol": symbol,
@@ -282,7 +305,19 @@ class JsonFormatter(logging.Formatter):
 
 
 def load_dotenv_safe(dotenv_path: Optional[Path] = None) -> None:
-    """Best-effort .env loader that never overrides existing environment vars."""
+    """
+    Best-effort .env loader that never overrides existing environment vars.
+
+    Attempts to read key=value pairs from the specified path and set
+    them into os.environ if the key is not already present.
+
+    Args:
+        dotenv_path (Optional[Path]): Specific .env file to load.
+            Defaults to '.env' in the current working directory.
+
+    Returns:
+        None
+    """
     env_path = dotenv_path or (Path.cwd() / ".env")
     if not env_path.exists():
         return
@@ -339,25 +374,23 @@ def configure_logging(
     """
     Configure the root logger for production use.
 
-    Parameters
-    ----------
-    level:        Root log level (default INFO).
-    json_stdout:  If True, install JsonFormatter on stdout.  Set False in
-                  interactive/development mode to keep human-readable output.
-    log_file:     Optional path for a rotating JSON log file.  If None, only
-                  stdout is used.
-    max_bytes:    Rotating file max size in bytes (default 50 MB).
-    backup_count: Number of rotated files to keep (default 5).
-    force:        If True (default), remove all existing root handlers before
-                  installing new ones — the normal production behaviour.  Set to
-                  False in test environments where pytest installs its own log-
-                  capture handler that must not be dropped.  When False, this
-                  function is a no-op if the root logger already has handlers.
+    Installs the JsonFormatter on stdout (optional) and an optional
+    rotating file handler. This should be called once at process startup.
 
-    Call once at process entry-point::
+    Args:
+        level (int): Root log level (default INFO).
+        json_stdout (bool): If True, install JsonFormatter on stdout.
+            Set False in development for human-readable output.
+        log_file (Optional[str]): Path for a rotating JSON log file.
+        max_bytes (int): Rolling file max size in bytes (default 50 MB).
+        backup_count (int): Number of old log files to retain (default 5).
+        force (bool): If True, clear existing handlers before configuring.
 
-        from log_config import configure_logging
-        configure_logging(log_file="logs/momentum.log")
+    Returns:
+        None
+
+    Raises:
+        OSError: If log_file path is specified but its parent directory is not writable.
     """
     root = logging.getLogger()
 

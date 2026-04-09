@@ -181,6 +181,10 @@ _GROWW_INDEX_PREFIXES     = ("^",)
 
 
 def _ensure_cache_paths_configured() -> None:
+    """
+    Ensure the global cache and manifest paths are initialized.
+    Invokes configure_data_cache with default settings if not already configured.
+    """
     global _CACHE_CONFIGURED
     if not _CACHE_CONFIGURED:
         configure_data_cache()
@@ -190,6 +194,13 @@ class _ManifestProcessFileLock:
     """Cross-process lock implemented using an atomic lock directory with stale-lock cleanup."""
 
     def __init__(self, lock_dir: Path, timeout_s: float = _MANIFEST_LOCK_TIMEOUT_SEC) -> None:
+        """
+        Initialize the process-level file lock.
+
+        Args:
+            lock_dir (Path): The directory to use as an atomic lock sentinel.
+            timeout_s (float): Maximum seconds to wait for lock acquisition.
+        """
         self._lock_dir = lock_dir
         self._timeout_s = timeout_s
         self._owner_file = lock_dir / "owner"
@@ -224,6 +235,16 @@ class _ManifestProcessFileLock:
             return True
 
     def _lock_age_is_stale(self, path: Path, stale_threshold: float) -> bool:
+        """
+        Check if a file's modification time exceeds a stale threshold.
+
+        Args:
+            path (Path): Path to the file or directory to check.
+            stale_threshold (float): Age in seconds considered stale.
+
+        Returns:
+            bool: True if the asset is older than the threshold.
+        """
         try:
             stat_info = path.stat()
             lock_age = time.time() - stat_info.st_mtime
@@ -233,6 +254,16 @@ class _ManifestProcessFileLock:
             return False
 
     def _wait_for_owner_file(self, max_wait: float, wait_step: float) -> bool:
+        """
+        Poll for the existence of the lock owner file.
+
+        Args:
+            max_wait (float): Maximum total seconds to poll.
+            wait_step (float): Seconds to sleep between polls.
+
+        Returns:
+            bool: True if the file appeared before the timeout.
+        """
         try:
             elapsed = 0.0
             while elapsed < max_wait:
@@ -249,6 +280,15 @@ class _ManifestProcessFileLock:
 
     @staticmethod
     def _parse_owner_pid(content: str) -> Optional[int]:
+        """
+        Extract the process ID from the manifest lock owner file content.
+
+        Args:
+            content (str): Raw string content from the owner file (e.g., 'pid=1234 ...').
+
+        Returns:
+            Optional[int]: The parsed PID or None if unparseable.
+        """
         for part in content.split():
             if part.startswith("pid="):
                 try:
@@ -327,6 +367,16 @@ class _ManifestProcessFileLock:
             return self._lock_age_is_stale(self._owner_file, stale_threshold)
 
     def _try_acquire_once(self) -> bool:
+        """
+        Attempt to atomically create the lock directory and write the owner file.
+
+        Returns:
+            bool: True if acquisition succeeded.
+
+        Raises:
+            FileExistsError: If the directory already exists.
+            OSError: On IO or permission failures.
+        """
         self._lock_dir.mkdir(parents=False, exist_ok=False)
         try:
             self._owner_file.write_text(
@@ -347,8 +397,10 @@ class _ManifestProcessFileLock:
     def _remove_stale_lock(self) -> bool:
         """
         Attempt to remove a stale lock directory and owner file.
-        Returns True if removal succeeded, False otherwise.
         Uses try/except to guard against races with live lockers.
+
+        Returns:
+            bool: True if removal succeeded or lock was already gone.
         """
         try:
             # Try to remove owner file first
@@ -422,18 +474,16 @@ class _ManifestProcessFileLock:
                 time.sleep(_MANIFEST_LOCK_POLL_SEC)
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        """__exit__ operation.
-        
+        """
+        Release the manifest lock by atomically renaming and removing the lock directory.
+
         Args:
-            exc_type (Any): Input parameter.
-            exc (Any): Input parameter.
-            tb (Any): Input parameter.
-        
+            exc_type (Any): The type of the exception raised in the with-block, if any.
+            exc (Any): The exception instance raised, if any.
+            tb (Any): The traceback object, if any.
+
         Returns:
-            None: Result of this operation.
-        
-        Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            None: Always returns None.
         """
         try:
             # Atomically rename the lock directory to prevent race conditions
@@ -502,6 +552,9 @@ class DataProvider(ABC):
 
         Returns:
             Optional[pd.DataFrame]: Multi-indexed OHLCV dataframe, or None on failure.
+
+        Raises:
+            NotImplementedError: If the subclass does not implement this method.
         """
         raise NotImplementedError
 
@@ -524,10 +577,20 @@ class GrowwProvider(DataProvider):
     _GROWW_SLEEP_SECS = 0.2
 
     def __init__(self, api_token: Optional[str] = None) -> None:
+        """
+        Initialize the Groww provider.
+
+        Args:
+            api_token (Optional[str]): Groww API bearer token. If None, pulled from GROWW_API_TOKEN env var.
+        """
         self.api_token = api_token or os.getenv("GROWW_API_TOKEN", "").strip()
         self._session: Optional[requests.Session] = None
 
     def close(self) -> None:
+        """
+        Close the persistent HTTP session and release pooled connections.
+        Ensures sockets are returned to the OS promptly.
+        """
         # FIX-GROWW-SESSION-LEAK: close the session deterministically so pooled
         # sockets are released promptly in long-running processes/tests.
         if self._session is not None:
@@ -914,18 +977,20 @@ class GrowwProvider(DataProvider):
 class YFinanceProvider(DataProvider):
     """YFinanceProvider type used by the backtesting system."""
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """download operation.
+        """
+        Download historical data from yfinance for a list of tickers.
+        Implements a batch-then-individual fallback strategy to handle partial outages.
         
         Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
+            tickers (List[str]): Standardized symbol names (e.g. ['RELIANCE.NS']).
+            start (str): Start date string (YYYY-MM-DD).
+            end (str): End date string (YYYY-MM-DD).
+
         Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
+            Optional[pd.DataFrame]: Multi-indexed dataframe or None if all fetches failed.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Exception: Propagates runtime or connection errors from yf.download.
         """
         result = self._download_batch(tickers, start, end)
         if result is None:
@@ -991,22 +1056,29 @@ class SecondaryProvider(DataProvider):
     _URL = "https://www.alphavantage.co/query"
 
     def __init__(self) -> None:
+        """
+        Initialize the Groww fallback provider with API credentials.
+
+        Loads the API key and rate-limiting settings from the environment.
+        """
         self.api_key      = os.getenv("FALLBACK_API_KEY", "").strip()
         self.min_interval = float(os.getenv("FALLBACK_MIN_INTERVAL_SEC", "12"))
 
     def download(self, tickers: List[str], start: str, end: str) -> Optional[pd.DataFrame]:
-        """download operation.
-        
+        """
+        Download historical data from AlphaVantage for a list of tickers.
+        Enforces a mandatory inter-call delay to respect free-tier API rate limits.
+
         Args:
-            tickers (List[str]): Input parameter.
-            start (str): Input parameter.
-            end (str): Input parameter.
-        
+            tickers (List[str]): Standardized symbol names.
+            start (str): Start date string (YYYY-MM-DD).
+            end (str): End date string (YYYY-MM-DD).
+
         Returns:
-            Optional[pd.DataFrame]: Result of this operation.
-        
+            Optional[pd.DataFrame]: Combined multi-indexed dataframe or None if failed.
+
         Raises:
-            Exception: Propagates runtime, validation, I/O, or provider errors.
+            Exception: Propagates API or network errors.
         """
         if not self.api_key:
             # This path is retained for direct unit use of SecondaryProvider.
@@ -1105,6 +1177,15 @@ class SecondaryProvider(DataProvider):
 
     @staticmethod
     def _map_symbol(ticker: str) -> str:
+        """
+        Map a standardized .NS ticker to an AlphaVantage-compatible .NSE symbol.
+
+        Args:
+            ticker (str): The standardized ticker name.
+
+        Returns:
+            str: The mapped symbol for the AlphaVantage API.
+        """
         if ticker.startswith("^"):
             return ticker
         bare = ticker[:-3] if ticker.endswith(".NS") else ticker
@@ -1260,6 +1341,15 @@ def invalidate_cache() -> None:
 
 
 def _minimum_history_rows(cfg: Any) -> int:
+    """
+    Determine the minimum number of history bars required for a valid result.
+
+    Args:
+        cfg (Any): System configuration with HISTORY_GATE attribute.
+
+    Returns:
+        int: Minimum required rows (default 5).
+    """
     if cfg is None:
         return 5
     history_gate_raw = getattr(cfg, "HISTORY_GATE", None)
@@ -1267,6 +1357,15 @@ def _minimum_history_rows(cfg: Any) -> int:
 
 
 def _has_required_index_shape(df: pd.DataFrame) -> bool:
+    """
+    Verify the DataFrame index meets structural and temporal requirements.
+
+    Args:
+        df (pd.DataFrame): The history dataframe to validate.
+
+    Returns:
+        bool: True if index is a unique, strictly increasing DatetimeIndex.
+    """
     if not isinstance(df.index, pd.DatetimeIndex):
         return False
     if not df.index.is_unique:
@@ -1277,6 +1376,16 @@ def _has_required_index_shape(df: pd.DataFrame) -> bool:
 
 
 def _has_required_ohlcv_columns(df: pd.DataFrame, ticker: Optional[str]) -> bool:
+    """
+    Check for the presence and non-nullity of critical OHLCV columns.
+
+    Args:
+        df (pd.DataFrame): The history dataframe to validate.
+        ticker (Optional[str]): The symbol name; used to skip volume checks for indices.
+
+    Returns:
+        bool: True if critical price/volume data is present.
+    """
     if "Close" not in df.columns or df["Close"].isnull().all():
         return False
     if COLUMN_ADJ_CLOSE not in df.columns or df[COLUMN_ADJ_CLOSE].isnull().all():

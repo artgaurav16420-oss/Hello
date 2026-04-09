@@ -299,8 +299,18 @@ def _symbols_from_nse_csv(df: pd.DataFrame) -> list[str]:
 
 def fetch_nifty500_wayback(start_year: int = 2015) -> tuple[list[tuple[str, list[str]]], bool]:
     """
-    Download all monthly Wayback snapshots across ALL 3 known NSE CSV URLs.
-    Returns merged (date_str, [tickers]) pairs sorted by date.
+    Download all monthly Wayback snapshots across ALL known NSE CSV URLs.
+
+    Queries the Internet Archive for historical captures of the Nifty 500
+    constituent list. Merges snapshots from multiple URL variants to
+    maximize point-in-time coverage.
+
+    Args:
+        start_year (int): The earliest year to include in the search.
+
+    Returns:
+        tuple: (all_snapshots, success_flag) where all_snapshots is a
+            list of (date_str, tickers) tuples sorted chronologically.
     """
     all_snapshots: dict[str, list[str]] = {}
 
@@ -718,6 +728,20 @@ def _write_snapshot_outputs(universe_type: str, snapshot_df: pd.DataFrame) -> Pa
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
 def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
+    """
+    Execute the full historical fallback generation process.
+
+    Downloads Wayback Machine snapshots for Nifty 500 and NSE Total,
+    merges them with current lists, and builds the final survivorship-safe
+    parquets in the data directory.
+
+    Args:
+        universe_arg (str): One of 'nifty500', 'nse_total', or 'both'.
+        start_date (str): YYYY-MM-DD cutoff for historical search.
+
+    Returns:
+        None (writes files to disk).
+    """
     TODAY_UTC = pd.Timestamp.now("UTC").tz_convert(None).normalize()  # FIX-4
     want_nifty500  = universe_arg in ("both", "nifty500")
     want_nse_total = universe_arg in ("both", "nse_total")
@@ -1013,6 +1037,15 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
 
 
 def _parse_args(argv=None):
+    """
+    Parse command-line arguments for the historical builder script.
+
+    Args:
+        argv (List[str]): Optional list of arguments (defaults to sys.argv).
+
+    Returns:
+        argparse.Namespace: Parsed arguments.
+    """
     p = argparse.ArgumentParser(description="Fallback historical universe builder for Ultimate Momentum.")
     p.add_argument(
         "--universe",

@@ -77,6 +77,12 @@ SECTOR_CONSTRUCTION_MATERIALS = "Construction Materials"
 class UniverseFetchError(RuntimeError):
     """Raised when primary and secondary universe data sources fail."""
     def __init__(self, message: str):
+        """
+        Initialize the universe fetch error.
+
+        Args:
+            message (str): Descriptive error message.
+        """
         super().__init__(message)
         self.fallback_universe: List[str] = []
 
@@ -386,12 +392,22 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
     Attempts to load the exact constituents for a specific historical date.
 
     Load order:
-    1) Historical parquet snapshots.
-    2) Point-in-time CSV snapshots.
+    1) Historical parquet snapshots (highest priority, survivorship-safe).
+    2) Point-in-time CSV snapshots (legacy fallback).
 
     FIX-MB-UM-02: Logs a warning when constituents is returned as a pd.Series
     (indicating a duplicate-index parquet) so operators are aware rather than
     the structural issue being silently absorbed.
+
+    Args:
+        universe_type (str): Key for the universe (e.g. 'nifty500', 'nse_total').
+        date (pd.Timestamp): Evaluation date to look for.
+
+    Returns:
+        List[str]: Constituents active on or before the given date.
+
+    Raises:
+        Exception: Propagates unexpected runtime or data access failures.
     """
     if universe_type.lower() == "custom":
         logger.warning(
@@ -528,6 +544,12 @@ def _save_universe_cache(data: dict) -> None:
         logger.error("[Universe] Failed to save cache: %s", exc)
 
 def invalidate_universe_cache() -> None:
+    """
+    Force-delete the local universe cache file.
+
+    This should be used when upstream metadata has changed or if the
+    local cache is suspected of being corrupt.
+    """
     if UNIVERSE_CACHE_FILE.exists():
         try:
             UNIVERSE_CACHE_FILE.unlink()
@@ -736,10 +758,21 @@ def _fetch_cached_universe(
 def fetch_nse_equity_universe(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     """
     Retrieve the full list of equities listed on the NSE master.
-    
+
+    This function attempts to fetch the EQUITY_L.csv from NSE archives,
+    extracts all symbols in the 'EQ' series, and optionally filters them
+    by liquidity (Average Daily Value). Results are cached locally for
+    72 hours.
+
     Args:
-        cfg (Any): Optional strategy config.
+        cfg (Any): Optional strategy config for ADV thresholds.
         apply_adv_filter (bool): If True, run liquidity gate on the results.
+
+    Returns:
+        List[str]: List of bare ticker symbols (e.g., 'RELIANCE').
+
+    Raises:
+        UniverseFetchError: If the source is unreachable and no stale cache is available.
     """
     return _fetch_cached_universe(
         "total_equity",
@@ -757,9 +790,19 @@ def get_nifty500(cfg=None, apply_adv_filter: bool = False) -> List[str]:
     """
     Retrieve current constituents of the Nifty 500 index.
 
+    This function attempts to fetch the ind_nifty500list.csv from NSE
+    archives and optionally filters them by liquidity. Results are
+    cached locally for 72 hours.
+
     Args:
-        cfg (Any): Optional strategy config.
+        cfg (Any): Optional strategy config for ADV thresholds.
         apply_adv_filter (bool): If True, run liquidity gate on the results.
+
+    Returns:
+        List[str]: List of bare ticker symbols in the index.
+
+    Raises:
+        UniverseFetchError: If the source is unreachable and no stale cache is available.
     """
     return _fetch_cached_universe(
         "nifty500",
