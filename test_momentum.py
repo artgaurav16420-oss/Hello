@@ -6,6 +6,7 @@ Every test either asserts a real invariant or does not exist.
 
 from __future__ import annotations
 
+import osqp_preimport  # MUST be first to prevent Windows Access Violation
 import json
 import logging
 import os
@@ -2047,3 +2048,43 @@ class TestWorkflowAndUtilities:
         assert not bt.state.shares, "Positions must be fully liquidated on decay exhaustion."
         assert bt.state.decay_rounds == 0, "decay_rounds must reset to 0."
         assert bt.state.consecutive_failures == 0, "consecutive_failures must reset to 0."
+
+    @staticmethod
+    def test_collect_force_close_no_symbols():
+        from momentum_engine import _collect_force_close_symbols, PortfolioState, UltimateConfig
+        state = PortfolioState(cash=100.0)
+        state.shares = {"A": 10, "B": 20}
+        prices = {"A": 10.0, "B": 20.0}
+        cfg = UltimateConfig()
+        
+        to_close = _collect_force_close_symbols(state, prices, cfg, 3)
+        assert not to_close
+        # absent_periods won't be modified because they are present in prices
+        assert state.absent_periods == {}
+
+    @staticmethod
+    def test_collect_force_close_partial():
+        from momentum_engine import _collect_force_close_symbols, PortfolioState, UltimateConfig
+        state = PortfolioState(cash=100.0)
+        state.shares = {"A": 10, "B": 20, "C": 30}
+        state.absent_periods = {"C": 2}
+        prices = {"A": 10.0}
+        cfg = UltimateConfig()
+        
+        to_close = _collect_force_close_symbols(state, prices, cfg, 3)
+        assert to_close == {"C"}
+        assert state.absent_periods.get("B") == 1
+        assert state.absent_periods.get("C") == 3
+
+    @staticmethod
+    def test_collect_force_close_boundary_conditions():
+        from momentum_engine import _collect_force_close_symbols, PortfolioState, UltimateConfig
+        state = PortfolioState(cash=100.0)
+        state.shares = {"A": 10}
+        prices = {}
+        cfg = UltimateConfig()
+        
+        to_close = _collect_force_close_symbols(state, prices, cfg, 1)
+        assert to_close == {"A"}
+        assert state.absent_periods.get("A") == 1
+

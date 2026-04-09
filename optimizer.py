@@ -263,14 +263,63 @@ def _compute_turnover_drag(turnover: float) -> tuple[float, float, float]:
     return base_friction_drag, churn_penalty, base_friction_drag + churn_penalty
 
 
+def _calculate_penalty_multipliers(
+    avg_positions: float,
+    avg_exposure: float,
+    avg_cvar: float,
+    max_dd: float,
+) -> tuple[float, float, float]:
+    """Calculate score multipliers for concentration, risk, and structural under-exposure."""
+    _pos_deficit       = max(0.0, 6.0 - avg_positions)
+    concentration_mult = 1.0 + _pos_deficit * 0.30
+
+    risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
+
+    exposure_penalty = 0.0 if avg_exposure >= 0.25 else (0.25 - avg_exposure) * 2.0
+    if avg_positions < 1.0:
+        exposure_penalty += 0.5
+
+    return concentration_mult, risk_penalty, exposure_penalty
+
+
+def _build_diagnostics_dict(
+    cagr: float, max_dd: float, turnover: float, final_multiple: float,
+    cagr_net: float, avg_cvar: float, avg_exposure: float, avg_positions: float,
+    n_rebalances: int, concentration_mult: float, sortino_quality: float,
+    risk_penalty: float, exposure_penalty: float, dd_penalty: float,
+    forced_cash_penalty: float, raw: float, score: float,
+    ceiling_hit: bool, dd_gate_hit: bool, anomaly_hit: bool,
+    cagr_is_near_zero: bool, max_dd_is_near_zero: bool,
+) -> dict:
+    """Construct the standardized dictionary of diagnostic metrics."""
+    return {
+        "cagr":                round(cagr,    2),
+        "max_dd":              round(-max_dd,  2),
+        "turnover":            round(turnover, 4),
+        "final_multiple":      round(final_multiple,  4),
+        "cagr_net":            round(cagr_net,        2),
+        "avg_cvar_pct":        round(avg_cvar * 100.0, 4),
+        "avg_exposure":        round(avg_exposure,    4),
+        "avg_positions":       round(avg_positions,   2),
+        "n_rebalances":        n_rebalances,
+        "concentration_mult":  round(concentration_mult, 4),
+        "sortino_quality":     round(sortino_quality, 4),
+        "risk_penalty":        round(risk_penalty,    4),
+        "exposure_penalty":    round(exposure_penalty, 4),
+        "dd_penalty":          round(dd_penalty,      4),
+        "forced_cash_penalty": round(forced_cash_penalty, 4),
+        "raw_score":           round(raw, 6) if not (cagr_is_near_zero and max_dd_is_near_zero) else 0.0,
+        "score":               round(score, 6),
+        "ceiling_hit":         ceiling_hit,
+        "dd_gate_hit":         dd_gate_hit,
+        "anomaly_hit":         anomaly_hit,
+    }
+
+
 def _fitness_from_metrics(
     metrics: dict,
     rebal_log: pd.DataFrame,
 ) -> tuple[float, float, dict]:
-    """
-    Compute the scalar fitness score for an optimization trial.
-    Combines Risk-Adjusted Return, Drawdown Penalties, and Exposure Constraints.
-    """
     """
     Compute a scalar fitness score plus a diagnostics dict for logging.
 
@@ -300,120 +349,81 @@ def _fitness_from_metrics(
     final_equity = float(metrics.get("final", BASE_INITIAL_CAPITAL) or BASE_INITIAL_CAPITAL)
     final_multiple = final_equity / max(BASE_INITIAL_CAPITAL, 1e-9)
 
-    # Base friction: 30 bps round-trip cost (15 bps per side for slippage/STT/fees).
-    # Nonlinear churn penalty: heavily penalizes turnover beyond ~18 round-trips/year.
     _, _, turnover_drag = _compute_turnover_drag(turnover)
     cagr_net = cagr - turnover_drag
 
     avg_cvar, avg_exposure, avg_positions, n_rebalances = _extract_rebalance_summary(rebal_log)
-    # forced_cash_penalty is dead code (always 0.0) per BUG-OPT-05; preserved for log-parser and test compatibility
     forced_cash_penalty = 0.0
 
-    _pos_deficit       = max(0.0, 6.0 - avg_positions)
-    concentration_mult = 1.0 + _pos_deficit * 0.30
+    concentration_mult, risk_penalty, exposure_penalty = _calculate_penalty_multipliers(
+        avg_positions, avg_exposure, avg_cvar, max_dd
+    )
 
     import math as _math
     if sortino is None or not _math.isfinite(sortino):
-        sortino_quality = 1.0   # NaN = no downside data, not bad Sortino
+        sortino_quality = 1.0
     else:
         sortino_quality = min(max(sortino / 2.5, 0.50), 1.15)
 
-    risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
-
-    # IS_DD_GATE = 40%: kept at original. See docstring for reasoning.
-    # Do NOT lower this to match OOS_MAX_DD_CAP — they are different concepts.
     IS_DD_GATE        = 40.0
-    # IS_DD_PENALTY_PCT = 12%: lowered from original 15%.
     IS_DD_PENALTY_PCT = 12.0
+
+    dd_penalty = 0.0
 
     if max_dd > IS_DD_GATE:
         raw   = -(max_dd / 5.0)
         score = max(raw, -2.0)
-        diag  = {
-            "cagr": round(cagr, 2), "max_dd": round(-max_dd, 2),
-            "turnover": round(turnover, 4), "final_multiple": round(final_multiple, 4),
-            "cagr_net": round(cagr_net, 2), "avg_cvar_pct": round(avg_cvar * 100.0, 4),
-            "avg_exposure": round(avg_exposure, 4), "avg_positions": round(avg_positions, 2),
-            "n_rebalances": n_rebalances, "concentration_mult": round(concentration_mult, 4),
-            "sortino_quality": round(sortino_quality, 4), "risk_penalty": round(risk_penalty, 4),
-            "exposure_penalty": 0.0, "dd_penalty": 0.0,
-            "forced_cash_penalty": round(forced_cash_penalty, 4),
-            "raw_score": round(raw, 6), "score": round(score, 6),
-            "ceiling_hit": False, "dd_gate_hit": True, "anomaly_hit": False,
-        }
-        calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
-        return score, calmar_score, diag
-
-    dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
-    dd_penalty = (dd_excess ** 2) / 100.0
-
-    exposure_penalty = 0.0 if avg_exposure >= 0.25 else (0.25 - avg_exposure) * 2.0
-    if avg_positions < 1.0:
-        exposure_penalty += 0.5
-
-    anomaly_hit = (
-        cagr > MAX_REASONABLE_CAGR_PCT
-        or final_multiple > MAX_REASONABLE_FINAL_MULTIPLE
-    )
-
-    cagr_is_near_zero = math.isfinite(cagr) and math.isclose(cagr, 0.0, rel_tol=1e-9, abs_tol=1e-12)
-    max_dd_is_near_zero = math.isfinite(max_dd) and math.isclose(max_dd, 0.0, rel_tol=1e-9, abs_tol=1e-12)
-
-    if anomaly_hit:
-        raw         = -(
-            max(cagr - MAX_REASONABLE_CAGR_PCT, 0.0) / 50.0
-            + max(final_multiple - MAX_REASONABLE_FINAL_MULTIPLE, 0.0)
-        )
-        score       = max(raw, -2.0)
         ceiling_hit = False
-        dd_gate_hit = False
-    elif cagr_is_near_zero and max_dd_is_near_zero:
-        raw         = 0.0
-        score       = 0.0
-        ceiling_hit = False
-        dd_gate_hit = False
+        dd_gate_hit = True
+        anomaly_hit = False
     else:
-        raw = (
-            (cagr_net / risk_penalty) * sortino_quality
-            - exposure_penalty
-            - dd_penalty
+        dd_excess  = max(0.0, max_dd - IS_DD_PENALTY_PCT)
+        dd_penalty = (dd_excess ** 2) / 100.0
+
+        anomaly_hit = (
+            cagr > MAX_REASONABLE_CAGR_PCT
+            or final_multiple > MAX_REASONABLE_FINAL_MULTIPLE
         )
-        # ARCH-FIX-6: symmetric log-modulus transform removes the raw>0 discontinuity.
-        score = math.copysign(math.log1p(abs(raw)), raw)
-        ceiling_hit = False
-        score = max(score, -2.0)
-        dd_gate_hit = False
 
-    # forced_cash_penalty is logged for observability but no longer affects
-    # the fitness score — see BUG-OPT-05.  Always emit 0.0 so downstream
-    # test assertions and log parsers remain stable.
-    # Intentional redundant reassignment for observability stability: downstream logs/tests
-    # expect forced_cash_penalty to be emitted from this point as a stable 0.0 field.
-    forced_cash_penalty = 0.0
+        cagr_is_near_zero = _math.isfinite(cagr) and _math.isclose(cagr, 0.0, rel_tol=1e-9, abs_tol=1e-12)
+        max_dd_is_near_zero = _math.isfinite(max_dd) and _math.isclose(max_dd, 0.0, rel_tol=1e-9, abs_tol=1e-12)
 
-    diag = {
-        "cagr":                round(cagr,    2),
-        "max_dd":              round(-max_dd,  2),
-        "turnover":            round(turnover, 4),
-        "final_multiple":      round(final_multiple,  4),
-        "cagr_net":            round(cagr_net,        2),
-        "avg_cvar_pct":        round(avg_cvar * 100.0, 4),
-        "avg_exposure":        round(avg_exposure,    4),
-        "avg_positions":       round(avg_positions,   2),
-        "n_rebalances":        n_rebalances,
-        "concentration_mult":  round(concentration_mult, 4),
-        "sortino_quality":     round(sortino_quality, 4),
-        "risk_penalty":        round(risk_penalty,    4),
-        "exposure_penalty":    round(exposure_penalty, 4),
-        "dd_penalty":          round(dd_penalty,      4),
-        "forced_cash_penalty": round(forced_cash_penalty, 4),
-        "raw_score":           round(raw, 6) if not (cagr_is_near_zero and max_dd_is_near_zero) else 0.0,
-        "score":               round(score, 6),
-        "ceiling_hit":         ceiling_hit,
-        "dd_gate_hit":         dd_gate_hit,
-        "anomaly_hit":         anomaly_hit,
-    }
-    calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)  # ARCH-FIX-2
+        if anomaly_hit:
+            raw         = -(
+                max(cagr - MAX_REASONABLE_CAGR_PCT, 0.0) / 50.0
+                + max(final_multiple - MAX_REASONABLE_FINAL_MULTIPLE, 0.0)
+            )
+            score       = max(raw, -2.0)
+            ceiling_hit = False
+            dd_gate_hit = False
+        elif cagr_is_near_zero and max_dd_is_near_zero:
+            raw         = 0.0
+            score       = 0.0
+            ceiling_hit = False
+            dd_gate_hit = False
+        else:
+            raw = (
+                (cagr_net / risk_penalty) * sortino_quality
+                - exposure_penalty
+                - dd_penalty
+            )
+            score = _math.copysign(_math.log1p(abs(raw)), raw)
+            ceiling_hit = False
+            score = max(score, -2.0)
+            dd_gate_hit = False
+
+    cagr_is_near_zero = _math.isfinite(cagr) and _math.isclose(cagr, 0.0, rel_tol=1e-9, abs_tol=1e-12)
+    max_dd_is_near_zero = _math.isfinite(max_dd) and _math.isclose(max_dd, 0.0, rel_tol=1e-9, abs_tol=1e-12)
+
+    diag = _build_diagnostics_dict(
+        cagr, max_dd, turnover, final_multiple, cagr_net, avg_cvar,
+        avg_exposure, avg_positions, n_rebalances, concentration_mult,
+        sortino_quality, risk_penalty, exposure_penalty, dd_penalty,
+        forced_cash_penalty, raw, score, ceiling_hit, dd_gate_hit, anomaly_hit,
+        cagr_is_near_zero, max_dd_is_near_zero
+    )
+    
+    calmar_score = cagr_net / max(abs(max_dd), DRAWDOWN_FLOOR)
     return score, calmar_score, diag
 
 
@@ -1040,6 +1050,61 @@ def _deterministic_best_trials(study: optuna.Study) -> list[optuna.trial.FrozenT
     return sorted(study.best_trials, key=lambda t: _pareto_sort_key(study, t), reverse=True)
 
 
+class BestTrialCallbackHandler:
+    """Callable handler to log formatted summaries when new historically 'best' trials emerge."""
+    
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+        ranked_best = _deterministic_best_trials(study)
+        if not ranked_best:
+            return
+        if ranked_best[0].number != trial.number:
+            return
+        diags = trial.user_attrs.get("slice_diags", [])
+        hdr = (
+            f"\n\033[1;33m{'─'*72}\033[0m"
+            f"\n\033[1;33m  NEW BEST  Trial #{trial.number}  "
+            f"Aggregate={trial.values[0]:.4f} Calmar={trial.values[1]:.4f}\033[0m"
+            f"\n\033[1;33m{'─'*72}\033[0m"
+        )
+        logger.info(hdr)
+        logger.info("  Parameters:")
+        for k, v in trial.params.items():
+            logger.info("    %-28s %s", k, v)
+        logger.info("")
+        logger.info(
+            "  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %-10s  %s",
+            "Year","CAGR%","DD%","Turn","AvgPos","AvgExp","ForcedCash","Score","Flags",
+        )
+        logger.info(f"  {'-' * 82}")
+        for d in diags:
+            flags = []
+            if d.get("ceiling_hit"):
+                flags.append("CEIL")
+            if d.get("dd_gate_hit"):
+                flags.append("DD-GATE")
+            if d.get("anomaly_hit"):
+                flags.append("ANOM")
+            logger.info(
+                "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %9.4f  %s",
+                d["year"],
+                d["cagr"], abs(d["max_dd"]), d["turnover"],
+                d["avg_positions"], d["avg_exposure"],
+                d.get("forced_cash_penalty", 0.0),
+                d["score"], " ".join(flags) if flags else "—",
+            )
+        logger.info(f"  {'-' * 82}")
+        if diags:
+            avg_cagr = sum(d["cagr"]       for d in diags) / len(diags)
+            avg_dd   = sum(abs(d["max_dd"]) for d in diags) / len(diags)
+            ceil_n   = sum(1 for d in diags if d.get("ceiling_hit"))
+            logger.info(
+                "  %-6s  %+7.1f%%  %6.1f%%  %54s  ceiling_hits=%d/%d",
+                "AVG", avg_cagr, avg_dd, "", ceil_n, len(diags),
+            )
+        logger.info("")
+
 def _error_class_from_trial(trial: optuna.trial.FrozenTrial) -> str:
     """Extract a high-level error category from a failed trial's system attributes."""
     fail_reason = trial.system_attrs.get("fail_reason")
@@ -1293,59 +1358,6 @@ def run_optimization(
 
     logger.info("Starting %d Bayesian Trials (This may take a while)...", N_TRIALS)
 
-    def _best_trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        """Log a formatted summary whenever a new historically 'best' trial is identified."""
-        if trial.state != optuna.trial.TrialState.COMPLETE:
-            return
-        ranked_best = _deterministic_best_trials(study)
-        if not ranked_best:
-            return
-        if ranked_best[0].number != trial.number:
-            return
-        diags = trial.user_attrs.get("slice_diags", [])
-        hdr = (
-            f"\n\033[1;33m{'─'*72}\033[0m"
-            f"\n\033[1;33m  NEW BEST  Trial #{trial.number}  "
-            f"Aggregate={trial.values[0]:.4f} Calmar={trial.values[1]:.4f}\033[0m"
-            f"\n\033[1;33m{'─'*72}\033[0m"
-        )
-        logger.info(hdr)
-        logger.info("  Parameters:")
-        for k, v in trial.params.items():
-            logger.info("    %-28s %s", k, v)
-        logger.info("")
-        logger.info(
-            "  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %-10s  %s",
-            "Year","CAGR%","DD%","Turn","AvgPos","AvgExp","ForcedCash","Score","Flags",
-        )
-        logger.info(f"  {'-' * 82}")
-        for d in diags:
-            flags = []
-            if d.get("ceiling_hit"):
-                flags.append("CEIL")
-            if d.get("dd_gate_hit"):
-                flags.append("DD-GATE")
-            if d.get("anomaly_hit"):
-                flags.append("ANOM")
-            logger.info(
-                "  %-6s  %+7.1f%%  %6.1f%%  %6.2fx  %6.1f  %7.3f  %9.4f  %9.4f  %s",
-                d["year"],
-                d["cagr"], abs(d["max_dd"]), d["turnover"],
-                d["avg_positions"], d["avg_exposure"],
-                d.get("forced_cash_penalty", 0.0),
-                d["score"], " ".join(flags) if flags else "—",
-            )
-        logger.info(f"  {'-' * 82}")
-        if diags:
-            avg_cagr = sum(d["cagr"]       for d in diags) / len(diags)
-            avg_dd   = sum(abs(d["max_dd"]) for d in diags) / len(diags)
-            ceil_n   = sum(1 for d in diags if d.get("ceiling_hit"))
-            logger.info(
-                "  %-6s  %+7.1f%%  %6.1f%%  %54s  ceiling_hits=%d/%d",
-                "AVG", avg_cagr, avg_dd, "", ceil_n, len(diags),
-            )
-        logger.info("")
-
     try:
         study.optimize(
             objective,
@@ -1353,7 +1365,7 @@ def run_optimization(
             show_progress_bar = True,
             n_jobs            = effective_n_jobs,
             catch             = (Exception,),
-            callbacks         = [_error_triage_callback_factory(), _best_trial_callback],
+            callbacks         = [_error_triage_callback_factory(), BestTrialCallbackHandler()],
         )
     except Exception:
         # Broad catch is intentional: this is the top-level optimizer guardrail

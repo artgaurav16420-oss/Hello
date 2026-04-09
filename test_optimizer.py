@@ -1,3 +1,4 @@
+import osqp_preimport  # MUST be first to prevent Windows Access Violation
 import importlib
 import json
 import logging
@@ -1335,3 +1336,40 @@ def test_fitness_calmar_uses_drawdown_floor():
         pd.DataFrame(),
     )
     assert calmar == pytest.approx(10.0 / optimizer.DRAWDOWN_FLOOR)
+
+
+def test_best_trial_callback_handler_returns_if_not_complete():
+    import optuna
+    from optimizer import BestTrialCallbackHandler
+
+    handler = BestTrialCallbackHandler()
+    
+    class MockTrial:
+        state = optuna.trial.TrialState.RUNNING
+        
+    handler(None, MockTrial())
+
+
+def test_best_trial_callback_logs_best_trial(caplog):
+    import optuna
+    from optimizer import BestTrialCallbackHandler
+
+    handler = BestTrialCallbackHandler()
+
+    class MockTrial:
+        state = optuna.trial.TrialState.COMPLETE
+        number = 5
+        values = [1.5, 2.0]
+        params = {"P1": 100}
+        user_attrs = {"slice_diags": []}
+
+    trial = MockTrial()
+
+    class MockStudy:
+        best_trials = [trial]
+        directions = [optuna.study.StudyDirection.MAXIMIZE, optuna.study.StudyDirection.MAXIMIZE]
+
+    with caplog.at_level("INFO"):
+        handler(MockStudy(), trial)
+
+    assert "NEW BEST  Trial #5" in caplog.text

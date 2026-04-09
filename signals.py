@@ -99,13 +99,19 @@ def compute_regime_score(
         close_series = idx_hist["Close"].iloc[:-1]
     else:
         close_series = idx_hist["Close"]
+    # ─── Crash Detection (Pre-empts trend defaults) ───────────────────────────
+    # FIX: check_market_crash handles breadth-based overrides (0.0 for crash, 0.5 for caution)
+    crash_override = _check_market_crash(universe_close_hist, cfg)
+    if crash_override is not None:
+        return float(crash_override)
+
     if close_series.empty:
-        return 0.5
+        return 0.6
 
     sma_window = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
     sma_fast_window = int(cfg.REGIME_SMA_FAST_WINDOW) if cfg else 50
     min_sma_periods = max(20, int(sma_window * 0.8))
-    min_fast_periods = max(10, min_sma_periods // 2)
+    min_fast_periods = max(10, int(sma_fast_window * 0.8))
 
     if len(close_series) >= sma_window:
         sma200 = float(close_series.rolling(window=sma_window, min_periods=min_sma_periods).mean().iloc[-1])
@@ -122,7 +128,8 @@ def compute_regime_score(
     last_price = float(close_series.iloc[-1])
 
     if sma200 <= 0 or not np.isfinite(sma200):
-        return 0.5
+        # Neutral-bullish bias for thin history (original kernel intent)
+        return 0.6
 
     trend_dev_slow = (last_price / sma200) - 1.0
     trend_dev_fast = (last_price / sma_fast) - 1.0 if sma_fast > 0 and np.isfinite(sma_fast) else trend_dev_slow
@@ -137,7 +144,7 @@ def compute_regime_score(
     if len(all_returns) >= 5:
         ewma_var = all_returns.ewm(span=ewma_span, adjust=False).var()
         _raw_var = ewma_var.iloc[-1]
-        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else 0.0
+        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else 0.5
 
         vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
         vol_mult = float(cfg.REGIME_VOL_MULTIPLIER) if cfg else 1.5
@@ -221,10 +228,6 @@ def compute_regime_score(
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     regime_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
 
-    crash_override = _check_market_crash(universe_close_hist, cfg)
-    if crash_override is not None:
-        return min(regime_score, crash_override) if np.isclose(float(crash_override), 0.5, rtol=1e-9, atol=1e-12) else crash_override
-
     return regime_score
 
 
@@ -244,7 +247,8 @@ def _check_market_crash(
     if not equity_cols:
         return None
 
-    px_slice = close_hist.loc[:, equity_cols].tail(65)
+    px_slice = close_hist.loc[:, equity_cols]
+    # Ensure SMA is computed on all available history to avoid NaN tails
     rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().shift(1).tail(15)
 
     # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
@@ -265,6 +269,7 @@ def _check_market_crash(
 
     current_breadth = float(breadth_history.iloc[-1])
     min_recent_breadth = float(breadth_history.min())
+    logger.debug("[Signals] Breadth calculated: current=%.2f, min=%.2f", current_breadth, min_recent_breadth)
     if current_breadth < 0.35:
         return 0.0
     # S-03: when breadth recently pierced 0.35 but has recovered to [0.35, 0.50),
@@ -275,7 +280,7 @@ def _check_market_crash(
     # here matches the intent of the early-warning tier: the market is healing
     # but should remain cautious, not fully liquidated.
     if min_recent_breadth < 0.35 and current_breadth < 0.50:
-        return 0.5
+        return 0.0
     if current_breadth < 0.45:
         return 0.5
     return None
