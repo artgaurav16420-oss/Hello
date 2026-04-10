@@ -60,7 +60,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -841,10 +841,40 @@ def compute_one_way_slip_rate(
         if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0)
         else portfolio_value
     )
+    return _compute_one_way_slip_rate_from_trade_value(cfg, float(adv_notional), float(trade_value))
+
+
+def _compute_one_way_slip_rate_from_trade_value(
+    cfg: UltimateConfig,
+    adv_notional: Union[float, np.ndarray],
+    trade_value: Union[float, np.ndarray],
+) -> Union[float, np.ndarray]:
+    """Compute one-way slippage rate from already-resolved trade notional(s)."""
     base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
-    impact = cfg.IMPACT_COEFF * trade_value / adv_notional
-    impact = min(max(impact, 0.0), 0.05)
-    return max(base_rate, impact)
+    adv_arr = np.asarray(adv_notional, dtype=float)
+    trade_arr = np.asarray(trade_value, dtype=float)
+    valid_adv = np.isfinite(adv_arr) & (adv_arr > 0)
+    impact = np.zeros_like(trade_arr, dtype=float)
+    np.divide(cfg.IMPACT_COEFF * trade_arr, adv_arr, out=impact, where=valid_adv)
+    impact = np.clip(impact, 0.0, 0.05)
+    rates = np.where(valid_adv, np.maximum(base_rate, impact), base_rate)
+    if np.ndim(rates) == 0:
+        return float(rates)
+    return rates
+
+
+def _resolve_trade_notional(
+    portfolio_value: float,
+    trade_notional: Optional[Union[float, np.ndarray]],
+) -> Union[float, np.ndarray]:
+    """Return provided trade notional when valid/positive, otherwise fall back to portfolio value."""
+    if trade_notional is None:
+        return float(portfolio_value)
+    trade_arr = np.asarray(trade_notional, dtype=float)
+    resolved = np.where(np.isfinite(trade_arr) & (trade_arr > 0), trade_arr, float(portfolio_value))
+    if np.ndim(resolved) == 0:
+        return float(resolved)
+    return resolved
 
 
 def _compute_one_way_slip_rate_vectorized(
@@ -865,15 +895,8 @@ def _compute_one_way_slip_rate_vectorized(
     Returns:
         np.ndarray: Matrix of calculated one-way slippage rates.
     """
-    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
-    adv_arr = np.asarray(adv_notional, dtype=float)
-    trade_arr = np.asarray(trade_notional, dtype=float)
-    numerator = np.where(np.isfinite(trade_arr) & (trade_arr > 0), trade_arr, float(portfolio_value))
-    valid_adv = np.isfinite(adv_arr) & (adv_arr > 0)
-    impact = np.zeros_like(numerator, dtype=float)
-    impact[valid_adv] = cfg.IMPACT_COEFF * numerator[valid_adv] / adv_arr[valid_adv]
-    impact = np.clip(impact, 0.0, 0.05)
-    return np.where(valid_adv, np.maximum(base_rate, impact), base_rate)
+    trade_values = _resolve_trade_notional(portfolio_value, trade_notional)
+    return _compute_one_way_slip_rate_from_trade_value(cfg, adv_notional, trade_values)
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────
