@@ -352,7 +352,7 @@ class UltimateConfig:
     AUTO_ADJUST_PRICES:       bool  = True         # Enables implicit backward price adjustment.
     EQUITY_HIST_CAP:          int   = 500          # Hard cap on number of periods maintained in historical equity curves to prevent O(N) CVaR scale-outs.
 
-    SLIPPAGE_BPS:             float = 20.0         # Backward-compatible alias for round-trip friction in basis points.
+    SLIPPAGE_BPS:             float = field(default=20.0, init=False)  # Backward-compatible alias for round-trip friction in basis points.
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Keep slippage aliases synchronized and validated."""
