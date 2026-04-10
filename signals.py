@@ -100,10 +100,12 @@ def compute_regime_score(
     else:
         close_series = idx_hist["Close"]
     # ─── Crash Detection (Pre-empts trend defaults) ───────────────────────────
-    # FIX: check_market_crash handles breadth-based overrides (0.0 for crash, 0.5 for caution)
+    # Full crash (0.0) short-circuits immediately.
+    # Caution override (>0.0, typically 0.5) is applied as a ceiling after the
+    # base regime score is computed so it never lifts a more-bearish base score.
     crash_override = _check_market_crash(universe_close_hist, cfg)
-    if crash_override is not None:
-        return float(crash_override)
+    if crash_override == 0.0:
+        return 0.0
 
     if close_series.empty:
         return 0.6
@@ -146,7 +148,11 @@ def compute_regime_score(
         _raw_var = ewma_var.iloc[-1]
         
         vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
-        vol_ewma = float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252)) if pd.notna(_raw_var) else vol_floor
+        vol_ewma = (
+            float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252))
+            if pd.notna(_raw_var)
+            else None
+        )
         vol_mult = float(cfg.REGIME_VOL_MULTIPLIER) if cfg else 1.5
 
         lt_ewma_span = int(cfg.REGIME_LT_VOL_EWMA_SPAN) if cfg else 1260
@@ -159,15 +165,18 @@ def compute_regime_score(
             long_term_vol = vol_floor
 
         dynamic_threshold = max(vol_floor, long_term_vol * vol_mult)
-        vol_20d = vol_ewma
-        if vol_20d > dynamic_threshold:
-            logger.debug(
-                "[Signals] Regime Volatility Spike detected (EWMA=%.2f > threshold=%.2f). Applying penalty.",
-                vol_20d,
-                dynamic_threshold,
-            )
-            base_score *= 0.85
-        vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
+        if vol_ewma is None:
+            vol_component = 0.5
+        else:
+            vol_20d = vol_ewma
+            if vol_20d > dynamic_threshold:
+                logger.debug(
+                    "[Signals] Regime Volatility Spike detected (EWMA=%.2f > threshold=%.2f). Applying penalty.",
+                    vol_20d,
+                    dynamic_threshold,
+                )
+                base_score *= 0.85
+            vol_component = float(np.clip(1.0 - (vol_20d / max(dynamic_threshold * 1.5, 1e-6)), 0.0, 1.0))
 
     breadth_component = 0.5
     _sma_win = int(cfg.REGIME_SMA_WINDOW) if cfg else 200
@@ -228,6 +237,9 @@ def compute_regime_score(
     composite = 0.5 * base_score + 0.3 * breadth_component + 0.2 * vol_component
     regime_score = round(float(np.clip(composite, 0.0, 1.0)), 10)
 
+    if crash_override is not None and crash_override > 0.0:
+        return min(regime_score, float(crash_override))
+
     return regime_score
 
 
@@ -247,8 +259,9 @@ def _check_market_crash(
     if not equity_cols:
         return None
 
-    px_slice = close_hist.loc[:, equity_cols]
-    # Ensure SMA is computed on all available history to avoid NaN tails
+    # Only the most recent 65 sessions are required for this calculation:
+    # 50-day SMA window plus 15-day breadth tail.
+    px_slice = close_hist.tail(65).loc[:, equity_cols]
     rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().shift(1).tail(15)
 
     # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
@@ -272,15 +285,10 @@ def _check_market_crash(
     logger.debug("[Signals] Breadth calculated: current=%.2f, min=%.2f", current_breadth, min_recent_breadth)
     if current_breadth < 0.35:
         return 0.0
-    # S-03: when breadth recently pierced 0.35 but has recovered to [0.35, 0.50),
-    # return 0.5 (early-warning cap) rather than 0.0 (full shutdown).  A single
-    # historical spike below 0.35 in the 15-day window previously kept the
-    # portfolio at zero exposure even after breadth fully recovered, because the
-    # condition returned 0.0 regardless of the recovery trajectory.  Using 0.5
-    # here matches the intent of the early-warning tier: the market is healing
-    # but should remain cautious, not fully liquidated.
+    # S-03: When min_recent_breadth < 0.35 AND current_breadth < 0.50,
+    # return 0.0 (full regime shutdown — not caution cap).
     if min_recent_breadth < 0.35 and current_breadth < 0.50:
-        return 0.5
+        return 0.0
     if current_breadth < 0.45:
         return 0.5
     return None

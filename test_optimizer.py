@@ -13,8 +13,9 @@ optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
 from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
-# Globally relax train start for history gating tests
-optimizer.TRAIN_START = "2018-01-01"
+@pytest.fixture
+def relaxed_train_start(monkeypatch):
+    monkeypatch.setattr(optimizer, "TRAIN_START", "2018-01-01")
 
 def _fixed_trial_params(**overrides):
     params = {
@@ -1060,7 +1061,7 @@ def test_objective_cvar_lookback_min_scales_with_dimensionality(monkeypatch):
     assert trial.bounds["CVAR_LOOKBACK"][0] == 60
 
 
-def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch):
+def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch, relaxed_train_start):
     # For pruning: effective_cvar_lb_min = max(cvar_lb_min, MAX_POSITIONS * DIM_MULT)
     # must exceed cvar_lb_max.  With MAX_POSITIONS=120, DIM_MULT=3:
     # effective_min = max(200, 360) = 360 > 300 → TrialPruned.
@@ -1080,8 +1081,6 @@ def test_objective_prunes_when_cvar_lookback_bounds_are_infeasible(monkeypatch):
             self.REBALANCE_FREQ = "QE"
 
     monkeypatch.setattr(optimizer, "UltimateConfig", _DummyCfg)
-    monkeypatch.setattr(optimizer, "TRAIN_START", "2018-01-01")
-
     idx = pd.date_range("2016-01-01", periods=1000, freq="B")
     ss = dict(optimizer.SEARCH_SPACE_BOUNDS)
     ss["CVAR_LOOKBACK"] = (200, 300, 10)
@@ -1289,7 +1288,8 @@ def test_best_trial_callback_handler_returns_if_not_complete(caplog):
     class MockTrial:
         state = optuna.trial.TrialState.RUNNING
 
-    handler(None, MockTrial())
+    with caplog.at_level("INFO", logger="Optimizer"):
+        handler(None, MockTrial())
     assert "NEW BEST" not in caplog.text
 
 
