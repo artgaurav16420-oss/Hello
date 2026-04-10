@@ -287,7 +287,8 @@ def _check_market_crash(
         return 0.0
     # S-03: When min_recent_breadth < 0.35 AND current_breadth < 0.50,
     # return 0.0 (full regime shutdown — not caution cap).
-    if min_recent_breadth < 0.35 and current_breadth < 0.50:
+    valid_days = denominator > 0
+    if valid_days.any() and float(breadth_history[valid_days].min()) < 0.35 and current_breadth < 0.50:
         return 0.0
     if current_breadth < 0.45:
         return 0.5
