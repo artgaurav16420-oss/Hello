@@ -352,23 +352,23 @@ class UltimateConfig:
     AUTO_ADJUST_PRICES:       bool  = True         # Enables implicit backward price adjustment.
     EQUITY_HIST_CAP:          int   = 500          # Hard cap on number of periods maintained in historical equity curves to prevent O(N) CVaR scale-outs.
 
-    @property
-    def SLIPPAGE_BPS(self) -> float:
-        """Backward-compatible alias for round-trip slippage (bps)."""
-        return float(self.ROUND_TRIP_SLIPPAGE_BPS)
+    SLIPPAGE_BPS:             float = 20.0         # Backward-compatible alias for round-trip friction in basis points.
 
-    @SLIPPAGE_BPS.setter
-    def SLIPPAGE_BPS(self, value: Any) -> None:
-        """Validate and write through to ROUND_TRIP_SLIPPAGE_BPS."""
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("SLIPPAGE_BPS must be numeric") from exc
-        if not np.isfinite(parsed) or parsed < 0:
-            raise ValueError(
-                f"SLIPPAGE_BPS must be a finite non-negative number, got {parsed}"
-            )
-        self.ROUND_TRIP_SLIPPAGE_BPS = parsed
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep slippage aliases synchronized and validated."""
+        if name in {"SLIPPAGE_BPS", "ROUND_TRIP_SLIPPAGE_BPS"}:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be numeric") from exc
+            if not np.isfinite(parsed) or parsed < 0:
+                raise ValueError(
+                    f"{name} must be a finite non-negative number, got {parsed}"
+                )
+            object.__setattr__(self, "ROUND_TRIP_SLIPPAGE_BPS", parsed)
+            object.__setattr__(self, "SLIPPAGE_BPS", parsed)
+            return
+        object.__setattr__(self, name, value)
 
 
 @dataclass
