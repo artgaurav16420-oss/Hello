@@ -1777,7 +1777,7 @@ class TestWorkflowAndUtilities:
             live_shares = live_state.shares.get(sym, 0)
             bt_shares = bt.state.shares.get(sym, 0)
             ref = max(abs(live_shares), abs(bt_shares), 1)
-            assert abs(live_shares - bt_shares) / ref < 0.30, (
+            assert abs(live_shares - bt_shares) / ref < 0.10, (
                 f"Share count parity violation for {sym}: live={live_shares}, bt={bt_shares}"
             )
         assert live_state.entry_prices == pytest.approx(bt.state.entry_prices, rel=0.15)
@@ -2087,4 +2087,3 @@ class TestWorkflowAndUtilities:
         to_close = _collect_force_close_symbols(state, prices, cfg, 1)
         assert to_close == {"A"}
         assert state.absent_periods.get("A") == 1
-

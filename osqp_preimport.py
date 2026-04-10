@@ -1,20 +1,14 @@
 """
-osqp_preimport.py — Windows DLL Load Order Patch
-================================================
-Early import of OSQP to ensure it owns the math ABI before other 
-heavy numeric libraries like Scipy/Pandas are initialized.
+Windows-first OSQP import guard for Python 3.12+ processes.
 
-RATIONALE:
-On Windows with Python 3.12+, standard libraries (like Scipy) and OSQP 
-may link to different math backends (e.g., MKL vs. OpenBLAS). If 
-initialization order is not strictly controlled, C-extension loading 
-can trigger process-level Access Violations (0xC0000005). Importing 
-OSQP first ensures its binary dependencies are prioritized in the 
-process address space.
+On Windows, OSQP and scientific stacks such as NumPy/SciPy/Pandas can load
+different BLAS/LAPACK runtimes when imported in an unsafe order. Under Python
+3.12+ this can manifest as process-level access violations during extension
+module initialization. Importing OSQP first pins its native dependency chain
+before NumPy/Pandas-heavy modules initialize.
 
-MANDATORY: 
-This module must be imported before any other numeric library in the 
-entry point of the application.
+This module must be the very first import in every entrypoint and test module
+that can transitively import numeric libraries.
 """
 import sys
 import logging

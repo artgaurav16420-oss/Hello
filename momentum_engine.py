@@ -354,16 +354,21 @@ class UltimateConfig:
 
     @property
     def SLIPPAGE_BPS(self) -> float:
-        """Legacy alias for ROUND_TRIP_SLIPPAGE_BPS."""
-        return self.ROUND_TRIP_SLIPPAGE_BPS
+        """Backward-compatible alias for round-trip slippage (bps)."""
+        return float(self.ROUND_TRIP_SLIPPAGE_BPS)
 
     @SLIPPAGE_BPS.setter
     def SLIPPAGE_BPS(self, value: Any) -> None:
-        """Setter with numeric validation for SLIPPAGE_BPS."""
+        """Validate and write through to ROUND_TRIP_SLIPPAGE_BPS."""
         try:
-            self.ROUND_TRIP_SLIPPAGE_BPS = float(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"SLIPPAGE_BPS must be numeric, got {type(value).__name__}") from exc
+            parsed = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SLIPPAGE_BPS must be numeric") from exc
+        if not np.isfinite(parsed) or parsed < 0:
+            raise ValueError(
+                f"SLIPPAGE_BPS must be a finite non-negative number, got {parsed}"
+            )
+        self.ROUND_TRIP_SLIPPAGE_BPS = parsed
 
 
 @dataclass

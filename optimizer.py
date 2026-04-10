@@ -96,7 +96,8 @@ def configure_optimizer_logging(color: bool = True) -> None:
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
 TRAIN_START = "2019-01-01"
-TRAIN_END   = "2025-12-31"
+# IS (train) window is clamped through 2023-12-31; true holdout OOS begins 2024-01-01.
+TRAIN_END   = "2023-12-31"
 TEST_START   = "2024-01-01"
 TEST_END     = "2024-12-31"
 TRAIN_END_STALENESS_THRESHOLD_MONTHS = 6
@@ -172,14 +173,14 @@ def _build_sampler() -> TPESampler:
         return TPESampler(n_ei_candidates=24, multivariate=True)
 
     try:
-        seed_val = int(str(OPTUNA_SEED))
-        return TPESampler(seed=seed_val, n_ei_candidates=24, multivariate=True)
-    except (ValueError, TypeError) as exc:
+        seed = int(str(OPTUNA_SEED))
+    except (TypeError, ValueError):
         logger.warning(
-            "Malformed OPTUNA_SEED %r: %s. Returning unseeded TPESampler.", 
-            OPTUNA_SEED, exc
+            "Invalid OPTUNA_SEED=%r; falling back to unseeded TPESampler.",
+            OPTUNA_SEED,
         )
         return TPESampler(n_ei_candidates=24, multivariate=True)
+    return TPESampler(seed=seed, n_ei_candidates=24, multivariate=True)
 
 
 def _normalize_universe_type(universe_type: str | None) -> str:
@@ -197,13 +198,14 @@ def _normalize_universe_type(universe_type: str | None) -> str:
 def _iter_wfo_slices(train_start: str, train_end: str):
     """
     Walk-forward folds with a fixed 2-year IS window and 1-year OOS window,
-    stepping annually.
+    stepping annually and emitting only full calendar-year OOS folds.
 
     Fixed-length IS prevents later folds from having a data advantage over
     earlier ones — a known cause of TPE convergence to parameters that only
     work with more history (i.e. later in time).
 
-    With TRAIN_START="2019-01-01" the yielded OOS years are 2021, 2022, 2023.
+    With TRAIN_START="2019-01-01" and TRAIN_END constrained to 2023-12-31,
+    the yielded OOS years are 2021, 2022, 2023.
     The 2019 and 2020 OOS folds from the old expanding window are intentionally
     dropped — 3 independent folds are more diagnostic than 4 correlated ones.
     """
@@ -217,10 +219,15 @@ def _iter_wfo_slices(train_start: str, train_end: str):
         end,
         pd.Timestamp(TEST_START) - pd.Timedelta(days=1)
     )
+    last_full_oos_year = (
+        effective_end.year
+        if (effective_end.month, effective_end.day) == (12, 31)
+        else effective_end.year - 1
+    )
 
-    for y in range(start.year + IS_YEARS, effective_end.year + 1):
+    for y in range(start.year + IS_YEARS, last_full_oos_year + 1):
         oos_start = pd.Timestamp(f"{y}-01-01")
-        oos_end   = min(pd.Timestamp(f"{y}-12-31"), effective_end)
+        oos_end   = pd.Timestamp(f"{y}-12-31")
         is_start  = oos_start - pd.DateOffset(years=IS_YEARS)
         is_end    = oos_start - pd.Timedelta(days=1)
 
@@ -875,8 +882,9 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     historical_union: set[str] = set()
     try:
-        # Expand universe to cover both the full training window and the holdout period.
-        expansion_end = max(pd.Timestamp(TRAIN_END), pd.Timestamp(TEST_END))
+        # Keep expansion bounded by TEST_END to avoid pulling future-only symbols
+        # that have no usable history in the requested period.
+        expansion_end = pd.Timestamp(TEST_END)
         for target_date in pd.date_range(TRAIN_START, expansion_end, freq="QE"):
             historical_union.update(
                 get_historical_universe(normalized_universe, pd.Timestamp(target_date))
@@ -898,7 +906,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     _pre_load_cfg        = cfg if cfg is not None else UltimateConfig()
     _actual_warmup_start = _compute_warmup_start(TRAIN_START, _pre_load_cfg)
-    _fetch_end           = TEST_END
+    _fetch_end           = max(pd.Timestamp(TRAIN_END), pd.Timestamp(TEST_END)).strftime("%Y-%m-%d")
     logger.info(
         "Fetching %d symbols from %s (warmup) to %s...",
         len(symbols_to_fetch), _actual_warmup_start, _fetch_end,

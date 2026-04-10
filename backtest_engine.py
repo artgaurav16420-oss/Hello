@@ -960,11 +960,11 @@ def _execution_prices(
 
     if open_px is not None and date in open_px.index:
         opens = open_px.loc[date].reindex(symbols).values.astype(float)
-        open_fallback_mask = ~np.isfinite(opens)
+        open_fallback_mask = (~np.isfinite(opens)) | (opens <= 0)
         if open_fallback_mask.any():
             bad_syms = [sym for sym, bad in zip(symbols, open_fallback_mask, strict=True) if bad]
             logger.warning(
-                "[Backtest] Non-finite open prices on %s for %s; falling back to close prices.",
+                "[Backtest] Non-finite/non-positive open prices on %s for %s; falling back to close prices.",
                 date,
                 bad_syms,
             )
@@ -1517,6 +1517,7 @@ def run_backtest(
     """
     The primary entry point for executing a standalone backtest.
     Orchestrates data preparation, universe resolution, and engine execution.
+    Honors cfg.SIMULATE_HALTS by applying halt-gap simulation prior to matrix prep.
 
     Args:
         market_data (dict): Dictionary mapping symbols to DataFrames.
@@ -1544,6 +1545,8 @@ def run_backtest(
 
     if cfg is None:
         cfg = UltimateConfig()
+    if getattr(cfg, "SIMULATE_HALTS", False):
+        market_data = apply_halt_simulation(market_data)
 
     warmup_start = _compute_warmup_start(start_date, cfg)
     all_target_dates = pd.date_range(start_date, end_date, freq=cfg.REBALANCE_FREQ)
