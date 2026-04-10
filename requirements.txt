@@ -5,6 +5,7 @@ scikit-learn
 osqp
 yfinance
 requests>=2.33.0
+filelock
 beautifulsoup4
 pyarrow
 optuna

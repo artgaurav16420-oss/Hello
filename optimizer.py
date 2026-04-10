@@ -293,10 +293,11 @@ def _calculate_penalty_multipliers(
     avg_exposure: float,
     avg_cvar: float,
     max_dd: float,
+    cfg: UltimateConfig,
 ) -> tuple[float, float, float]:
     """Calculate score multipliers for concentration, risk, and structural under-exposure."""
-    _pos_deficit       = max(0.0, 6.0 - avg_positions)
-    concentration_mult = 1.0 + _pos_deficit * 0.30
+    _pos_deficit = max(0.0, float(cfg.CONCENTRATION_MIN_POSITIONS) - avg_positions)
+    concentration_mult = 1.0 + _pos_deficit * float(cfg.CONCENTRATION_PENALTY_WEIGHT)
 
     risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
 
@@ -344,6 +345,7 @@ def _build_diagnostics_dict(
 def _fitness_from_metrics(
     metrics: dict,
     rebal_log: pd.DataFrame,
+    cfg: UltimateConfig | None = None,
 ) -> tuple[float, float, dict]:
     """
     Compute a scalar fitness score plus a diagnostics dict for logging.
@@ -380,18 +382,19 @@ def _fitness_from_metrics(
     avg_cvar, avg_exposure, avg_positions, n_rebalances = _extract_rebalance_summary(rebal_log)
     forced_cash_penalty = 0.0
 
+    cfg = cfg or UltimateConfig()
     concentration_mult, risk_penalty, exposure_penalty = _calculate_penalty_multipliers(
-        avg_positions, avg_exposure, avg_cvar, max_dd
+        avg_positions, avg_exposure, avg_cvar, max_dd, cfg
     )
 
     import math as _math
     if sortino is None or not _math.isfinite(sortino):
         sortino_quality = 1.0
     else:
-        sortino_quality = min(max(sortino / 2.5, 0.50), 1.15)
+        sortino_quality = min(max(sortino / float(cfg.SORTINO_QUALITY_TARGET), 0.50), 1.15)
 
-    IS_DD_GATE        = 40.0
-    IS_DD_PENALTY_PCT = 12.0
+    IS_DD_GATE = float(cfg.IS_DD_GATE)
+    IS_DD_PENALTY_PCT = float(cfg.IS_DD_PENALTY_PCT)
 
     dd_penalty = 0.0
 
@@ -599,7 +602,7 @@ def _execute_objective_fold(
         end_date=wf_oos_end,
         cfg=cfg,
     )
-    return _fitness_from_metrics(oos.metrics, getattr(oos, "rebal_log", pd.DataFrame()))
+    return _fitness_from_metrics(oos.metrics, getattr(oos, "rebal_log", pd.DataFrame()), cfg)
 
 
 def _log_objective_fold_diag(trial_id: int, oos_year: int, diag: dict) -> None:

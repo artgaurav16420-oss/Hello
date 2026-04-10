@@ -149,7 +149,7 @@ def compute_regime_score(
         
         vol_floor = float(cfg.REGIME_VOL_FLOOR) if cfg else 0.18
         vol_ewma = (
-            float(max(float(_raw_var), 0.0) ** 0.5 * np.sqrt(252))
+            float(max(float(_raw_var), 1e-8) ** 0.5 * np.sqrt(252))
             if pd.notna(_raw_var)
             else None
         )
@@ -549,11 +549,9 @@ def generate_signals(
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
         dispersion_floor = cfg.CONTINUITY_DISPERSION_FLOOR
-        # FIX-DISPERSION-SCALE: Intended behavior is to attenuate continuity
-        # bonus in low-dispersion markets (std_cross < floor => scale < 1.0)
-        # and cap it at full configured strength in high-dispersion regimes
-        # (scale = 1.0). High dispersion receiving the full (capped) bonus is
-        # correct; only low-dispersion conditions should reduce it.
+        # FIX-DISPERSION-SCALE: Scales the bonus UP in high-dispersion markets,
+        # capping at 1.0. In low-dispersion markets (std_cross < floor), the
+        # bonus is proportionally reduced.
         dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
         base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
 

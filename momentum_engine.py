@@ -73,6 +73,18 @@ warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 logger = logging.getLogger(__name__)
 EPSILON = 1e-6
 DEFAULT_MAX_ABSENT_PERIODS = 12
+
+
+def _get_adaptive_cvar_min_obs(cfg: "UltimateConfig") -> int:
+    """Adapt CVaR min-history threshold to configured rebalance frequency."""
+    freq_map = {
+        "D": 252,
+        "W-FRI": 52,
+        "W-MON": 52,
+        "M": 12,
+    }
+    periods_per_year = freq_map.get(str(getattr(cfg, "REBALANCE_FREQ", "D")).upper(), 252)
+    return max(5, int(cfg.CVAR_MIN_HISTORY * periods_per_year / 252))
 DEFAULT_MAX_DECAY_ROUNDS = 3
 DEFAULT_GHOST_VOL_FALLBACK = 0.04
 
@@ -275,7 +287,7 @@ class UltimateConfig:
     MAX_POSITIONS:            int   = 10           # Maximum active line items allowed.
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20         # Maximum aggregate CVaR allowed.
     MAX_SINGLE_NAME_WEIGHT:   float = 0.25         # Hard cap on individual stock weights.
-    MAX_SECTOR_WEIGHT:        float = 0.35         # Limit any single sector to 35% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.35) can bind.
+    MAX_SECTOR_WEIGHT:        float = 0.40         # Limit any single sector to 40% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.40) can bind.
 
     # --- Liquidity & Execution ---
     MAX_ADV_PCT:              float = 0.05         # Maximum participation rate of Average Daily Volume.
@@ -298,6 +310,11 @@ class UltimateConfig:
     MIN_EXPOSURE_FLOOR:          float = 0.05      # Minimum cash usage unless fully deleveraged.
     CAPITAL_ELASTICITY:          float = 0.15      # Sensitivity of target weight to current cash.
     DRIFT_TOLERANCE:             float = 0.02      # Tolerable weight drift before forcing trades.
+    IS_DD_GATE:                  float = 40.0      # Hard in-sample max drawdown gate (%) used by optimizer fitness.
+    IS_DD_PENALTY_PCT:           float = 12.0      # Drawdown level (%) where quadratic fitness penalty starts.
+    CONCENTRATION_MIN_POSITIONS: float = 6.0       # Position-count target before concentration multiplier increases.
+    CONCENTRATION_PENALTY_WEIGHT: float = 0.30     # Per-position concentration multiplier weight in optimizer fitness.
+    SORTINO_QUALITY_TARGET:      float = 2.5       # Sortino normalization target used in optimizer fitness scaling.
 
     # --- Signal Generation & Optimization ---
     SIGNAL_ANNUAL_FACTOR:     int   = 252          # Trading days in a year for signal scaling.
