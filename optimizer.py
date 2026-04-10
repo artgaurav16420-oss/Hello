@@ -906,7 +906,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
 
     _pre_load_cfg        = cfg if cfg is not None else UltimateConfig()
     _actual_warmup_start = _compute_warmup_start(TRAIN_START, _pre_load_cfg)
-    _fetch_end           = max(pd.Timestamp(TRAIN_END), pd.Timestamp(TEST_END)).strftime("%Y-%m-%d")
+    _fetch_end           = pd.Timestamp(TEST_END).strftime("%Y-%m-%d")
     logger.info(
         "Fetching %d symbols from %s (warmup) to %s...",
         len(symbols_to_fetch), _actual_warmup_start, _fetch_end,
