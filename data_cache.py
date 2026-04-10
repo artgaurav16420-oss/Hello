@@ -377,7 +377,7 @@ class _ManifestProcessFileLock:
             FileExistsError: If the directory already exists.
             OSError: On IO or permission failures.
         """
-        self._lock_dir.mkdir(parents=False, exist_ok=False)
+        self._lock_dir.mkdir(parents=True, exist_ok=False)
         try:
             self._owner_file.write_text(
                 f"pid={os.getpid()} token={uuid.uuid4().hex}\n",

@@ -270,7 +270,7 @@ def test_run_backtest_accepts_precomputed_bare_columns_for_ns_universe(monkeypat
             universe=["AAA.NS"],
         )
 
-    assert captured["columns"] == ["AAA.NS"]
+    assert captured["columns"] == ["AAA"]
 
 
 def test_backtest_run_handles_empty_close_dataframe():

@@ -85,13 +85,14 @@ def configure_optimizer_logging(color: bool = True) -> None:
     _train_end_ts = pd.Timestamp(TRAIN_END)
     _days_stale = (_today - _train_end_ts).days
     if _today > _train_end_ts + pd.DateOffset(months=TRAIN_END_STALENESS_THRESHOLD_MONTHS):
-        logger.warning(
-            "TRAIN_END=%s is %d days behind today. Optimizer results remain "
-            "reproducible but exclude recent data. Update TRAIN_END in "
-            "optimizer.py to include it.",
-            TRAIN_END,
-            _days_stale,
-        )
+        if logger.handlers:
+            logger.warning(
+                "TRAIN_END=%s is %d days behind today. Optimizer results remain "
+                "reproducible but exclude recent data. Update TRAIN_END in "
+                "optimizer.py to include it.",
+                TRAIN_END,
+                _days_stale,
+            )
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 
@@ -1029,7 +1030,12 @@ def save_optimal_config(best_params: dict, filepath: str = "data/optimal_cfg.jso
         dir=resolved_dir or ".",
         delete=False,
     ) as tmp_file:
-        json.dump(best_params, tmp_file, indent=4)
+        json.dump(
+            best_params,
+            tmp_file,
+            indent=4,
+            default=lambda o: o.item() if hasattr(o, "item") else str(o),
+        )
         tmp_file.flush()
         os.fsync(tmp_file.fileno())
         temp_path = tmp_file.name

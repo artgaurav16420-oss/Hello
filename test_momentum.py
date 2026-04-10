@@ -1959,7 +1959,9 @@ class TestWorkflowAndUtilities:
             scenario_losses=np.array([[1.0], [1.0], [1.0]]),
         )
     
-        expected_gross = 100.0 + (2 * 50.0)
+        # Force-close symbol is at MAX_ABSENT_PERIODS, so liquidation proceeds
+        # should use the same absent_symbol_effective_price haircut as pv_exec.
+        expected_gross = 100.0
         expected_cash = expected_gross - total_slip
         assert state.shares == {}
         assert state.cash == pytest.approx(expected_cash)

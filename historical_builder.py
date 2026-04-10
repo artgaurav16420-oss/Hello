@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import logging
 import time
+import warnings
 from datetime import date
 from pathlib import Path
 
@@ -786,12 +787,24 @@ def build_historical_csv(universe_type: str, output_path: str) -> Path:
 
 def _build_historical_csv_network_fallback(universe_type: str, output_path: str) -> Path:
     """
-    Legacy network-first PIT builder kept for manual/offline-recovery workflows.
+    DEPRECATED: This function is not called by any production path. Use
+    `build_historical_fallback.py` for network-based PIT construction.
 
-    This path is intentionally not called by build_historical_csv(), which now
-    enforces the deterministic local-archive-first pipeline used by production
-    and tests.
+    Legacy network-first PIT builder kept only for manual/offline-recovery
+    workflows. build_historical_csv() intentionally enforces the deterministic
+    local-archive-first pipeline used by production and tests.
     """
+    # =========================================================================
+    # DEPRECATION NOTICE
+    # This helper is intentionally orphaned from production control flow.
+    # Keep only as emergency/manual scaffolding until fully retired.
+    # =========================================================================
+    warnings.warn(
+        "_build_historical_csv_network_fallback() is deprecated and not used by "
+        "production paths. Use build_historical_fallback.py instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     output = Path(output_path)
     start_year = 2015
     current_year = date.today().year

@@ -549,10 +549,11 @@ def generate_signals(
         # UltimateConfig was defined but never used, and tests that expected
         # dispersion-scaled bonus values would fail.
         dispersion_floor = cfg.CONTINUITY_DISPERSION_FLOOR
-        # FIX-DISPERSION-SCALE: scale bonus DOWN in low-dispersion markets.
-        # Previous code multiplied by max(std_cross, floor) which both inverted
-        # the direction (high-dispersion got bigger bonus) and produced a unit
-        # mismatch (raw-return std multiplied onto a dimensionless config param).
+        # FIX-DISPERSION-SCALE: Intended behavior is to attenuate continuity
+        # bonus in low-dispersion markets (std_cross < floor => scale < 1.0)
+        # and cap it at full configured strength in high-dispersion regimes
+        # (scale = 1.0). High dispersion receiving the full (capped) bonus is
+        # correct; only low-dispersion conditions should reduce it.
         dispersion_scale = min(1.0, std_cross / max(dispersion_floor, 1e-12))
         base_bonus = min(cfg.CONTINUITY_BONUS, cap) * dispersion_scale
 

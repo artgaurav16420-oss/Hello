@@ -1180,12 +1180,18 @@ def load_portfolio_state(name: str) -> PortfolioState:
     return PortfolioState()
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
+# SCAFFOLDING NOTE:
+# The _scan_phase_* helpers below are intentional no-op stubs for a planned
+# decomposition of _scan_body() into isolated, testable execution phases.
+# They currently preserve shape and sequencing contracts only; behavior remains
+# implemented in the monolithic path until migration is completed.
 def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
     """
     [Draft] Phase 1: Universe assembly and market data retrieval.
     
     Resolves session date range and populates ctx["market_data"] via load_or_fetch.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1195,6 +1201,7 @@ def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Detects/applies splits, builds close matrix, and computes regime metrics.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1204,6 +1211,7 @@ def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Updates exposure multiplier and evaluates book CVaR hard/soft breach flags.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1213,6 +1221,7 @@ def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Generates momentum signals and calls the solver for target weights.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1222,6 +1231,7 @@ def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Computes passive liquidation targets if the optimizer fails to provide a solution.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1231,6 +1241,7 @@ def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Checks for stale session prices and locks weights for halted symbols.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1240,6 +1251,7 @@ def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Claims the rebalance sentinel and invokes execute_rebalance.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 
@@ -1249,6 +1261,7 @@ def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
     
     Records history, updates absent trackers, and emits UI summary tables.
     """
+    # SCAFFOLDING: No-op until _scan_body logic is migrated
     return ctx
 
 def _run_scan(

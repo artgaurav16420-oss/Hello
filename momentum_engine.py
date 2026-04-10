@@ -275,7 +275,7 @@ class UltimateConfig:
     MAX_POSITIONS:            int   = 10           # Maximum active line items allowed.
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20         # Maximum aggregate CVaR allowed.
     MAX_SINGLE_NAME_WEIGHT:   float = 0.25         # Hard cap on individual stock weights.
-    MAX_SECTOR_WEIGHT:        float = 1.0          # Cap on total sector exposure.
+    MAX_SECTOR_WEIGHT:        float = 0.35         # Limit any single sector to 35% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.35) can bind.
 
     # --- Liquidity & Execution ---
     MAX_ADV_PCT:              float = 0.05         # Maximum participation rate of Average Daily Volume.
@@ -1269,7 +1269,11 @@ def execute_rebalance(
                 exit_slip_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0
                 for sym, n_shares in state.shares.items():
                     if sym in symbols_to_force_close:
-                        px_exec = float(state.last_known_prices.get(sym, 0.0))
+                        px_exec = absent_symbol_effective_price(
+                            float(state.last_known_prices.get(sym, 0.0)),
+                            state.absent_periods.get(sym, 0),
+                            cfg.MAX_ABSENT_PERIODS,
+                        )
                     elif sym in active_idx:
                         px_exec = float(local_prices[active_idx[sym]])
                     else:
@@ -1969,7 +1973,7 @@ class InstitutionalRiskEngine:
         sector_labels: Optional[np.ndarray],
         m: int,
         T: int,
-    ) -> tuple[Any, np.ndarray, Any, list, list, int, float, float, float, np.ndarray]:
+    ) -> tuple[Any, np.ndarray, Any, list, list, int, float, float, float, np.ndarray, Any]:
         import scipy.sparse as sp
         from sklearn.covariance import LedoitWolf
 
@@ -2100,7 +2104,7 @@ class InstitutionalRiskEngine:
         A, lower, upper = builder.build()
         P_upper = sp.triu(P, format="csc")
 
-        return P_upper, q, A, lower, upper, T_cvar, gamma, l_gamma, u_gamma, adv_limit
+        return P_upper, q, A, lower, upper, T_cvar, gamma, l_gamma, u_gamma, adv_limit, Sigma_reg
 
     def _invoke_solver(
         self,
@@ -2336,7 +2340,7 @@ class InstitutionalRiskEngine:
             prev_w, exposure_multiplier, sector_labels, execution_date
         )
 
-        P_upper, q, A, lower, upper, T_cvar, gamma, l_gamma, u_gamma, adv_limit = self._build_optimization_constraints(
+        P_upper, q, A, lower, upper, T_cvar, gamma, l_gamma, u_gamma, adv_limit, Sigma_reg = self._build_optimization_constraints(
             clean_rets, expected_returns_sub, adv_shares_sub, portfolio_value, prev_w_sub,
             exposure_multiplier, sector_labels_sub, m, T
         )
@@ -2345,11 +2349,6 @@ class InstitutionalRiskEngine:
             P_upper, q, A, lower, upper, m, prev_w_sub, portfolio_value, adv_shares_sub, T_cvar
         )
 
-        import sklearn.covariance
-        lw = sklearn.covariance.LedoitWolf()
-        lw.fit(np.expm1(clean_rets))
-        Sigma_reg = lw.covariance_
-        
         full_w_opt = self._extract_optimization_results(
             res, clean_rets, m, T_cvar, gamma, l_gamma, u_gamma, adv_limit,
             Sigma_reg, 0.0, kept_indices, original_m
