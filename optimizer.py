@@ -884,7 +884,7 @@ def pre_load_data(universe_type: str, cfg: UltimateConfig | None = None) -> dict
     try:
         # Keep expansion bounded by TEST_END to avoid pulling future-only symbols
         # that have no usable history in the requested period.
-        expansion_end = pd.Timestamp(TEST_END)
+        expansion_end = max(pd.Timestamp(TRAIN_END), pd.Timestamp(TEST_END))
         for target_date in pd.date_range(TRAIN_START, expansion_end, freq="QE"):
             historical_union.update(
                 get_historical_universe(normalized_universe, pd.Timestamp(target_date))
