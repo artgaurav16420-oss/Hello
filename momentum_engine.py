@@ -834,26 +834,21 @@ def compute_one_way_slip_rate(
     """
     Compute per-name one-way slippage rate including flat commission and market impact.
     """
-    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
     if adv_notional is None or not np.isfinite(adv_notional) or adv_notional <= 0:
-        return base_rate
-
-    # FIX-MB-ME-02: prefer trade_notional for impact scaling; fall back to
-    # portfolio_value when trade_notional is unavailable (legacy call sites).
-    numerator = trade_notional if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0) \
+        return cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    trade_value = (
+        trade_notional
+        if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0)
         else portfolio_value
-
-    impact_rate = (cfg.IMPACT_COEFF * numerator) / float(adv_notional)
-    # [PHASE 2 FIX] H-02: Log when the 5% market-impact cap is binding.
-    if impact_rate >= 0.05:
-        logger.debug(
-            "[Slippage] Impact cap binding: raw impact=%.4f%% capped to 5.00%% "
-            "(trade_notional=%.0f adv_notional=%.0f)",
-            impact_rate * 100,
-            numerator if numerator else 0.0,
-            adv_notional,
-        )
-    return max(base_rate, min(0.05, impact_rate))
+    )
+    return float(
+        _compute_one_way_slip_rate_vectorized(
+            cfg,
+            portfolio_value,
+            np.array([adv_notional], dtype=float),
+            np.array([trade_value], dtype=float),
+        )[0]
+    )
 
 
 def _compute_one_way_slip_rate_vectorized(
