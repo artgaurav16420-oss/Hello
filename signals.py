@@ -261,7 +261,7 @@ def _check_market_crash(
 
     # Only the most recent 65 sessions are required for this calculation:
     # 50-day SMA window plus 15-day breadth tail.
-    px_slice = close_hist.loc[:, equity_cols].tail(65)
+    px_slice = close_hist.tail(65).loc[:, equity_cols]
     rolling_sma50 = px_slice.rolling(window=50, min_periods=20).mean().shift(1).tail(15)
 
     # BUG-SIG-04: if rolling_sma50 is entirely NaN (e.g. insufficient
