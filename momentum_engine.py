@@ -841,14 +841,10 @@ def compute_one_way_slip_rate(
         if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0)
         else portfolio_value
     )
-    return float(
-        _compute_one_way_slip_rate_vectorized(
-            cfg,
-            portfolio_value,
-            np.array([adv_notional], dtype=float),
-            np.array([trade_value], dtype=float),
-        )[0]
-    )
+    base_rate = cfg.ROUND_TRIP_SLIPPAGE_BPS / 20_000.0
+    impact = cfg.IMPACT_COEFF * trade_value / adv_notional
+    impact = min(max(impact, 0.0), 0.05)
+    return max(base_rate, impact)
 
 
 def _compute_one_way_slip_rate_vectorized(
