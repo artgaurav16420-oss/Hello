@@ -60,6 +60,7 @@ BUG FIXES (murder board):
 """
 from __future__ import annotations
 
+import osqp_preimport  # MUST be first to prevent Windows Access Violation
 import argparse
 import copy
 import hashlib
@@ -76,11 +77,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-
-# OSQP must be imported BEFORE numpy/pandas on Python 3.13/Windows to avoid
-# a silent ABI crash (exit code 0xC0000005). momentum_engine imports osqp,
-# but by the time Python resolves that import numpy is already loaded — too late.
-import osqp  # noqa: F401
 
 import numpy as np
 import pandas as pd
