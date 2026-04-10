@@ -865,9 +865,11 @@ def _compute_one_way_slip_rate_from_trade_value(
 
 def _resolve_trade_notional(
     portfolio_value: float,
-    trade_notional: Union[float, np.ndarray],
+    trade_notional: Optional[Union[float, np.ndarray]],
 ) -> Union[float, np.ndarray]:
     """Return provided trade notional when valid/positive, otherwise fall back to portfolio value."""
+    if trade_notional is None:
+        return float(portfolio_value)
     trade_arr = np.asarray(trade_notional, dtype=float)
     resolved = np.where(np.isfinite(trade_arr) & (trade_arr > 0), trade_arr, float(portfolio_value))
     if np.ndim(resolved) == 0:
