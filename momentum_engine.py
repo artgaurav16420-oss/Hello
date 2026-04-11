@@ -1245,19 +1245,7 @@ def execute_rebalance(
 
     if apply_decay and scenario_losses is not None:
         decay_check_w = np.maximum(target_weights[:len(active_symbols)], 0.0).astype(float)
-        if symbols_to_force_close:
-            force_weights = []
-            for sym in symbols_to_force_close:
-                n_shares = state.shares.get(sym, 0)
-                px = absent_symbol_effective_price(
-                    float(state.last_known_prices.get(sym, 0.0)),
-                    state.absent_periods.get(sym, 0),
-                    cfg.MAX_ABSENT_PERIODS,
-                )
-                force_weights.append((n_shares * px) / max(pv_exec, 1.0))
         gross_w = float(np.sum(decay_check_w))
-        if symbols_to_force_close and force_weights:
-            gross_w += float(np.sum(force_weights))
 
         if gross_w > 1e-6 and scenario_losses.shape[1] == len(active_symbols):
             # FIX-NEW-ME-05: normalise decay_check_w to unit sum before computing

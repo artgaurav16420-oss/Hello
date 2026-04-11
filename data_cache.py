@@ -79,8 +79,14 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
             while True:
                 try:
                     self._path.parent.mkdir(parents=True, exist_ok=True)
-                    self._fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    os.write(self._fd, str(os.getpid()).encode("utf-8"))
+                    fd = os.open(str(self._path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    try:
+                        os.write(fd, str(os.getpid()).encode("utf-8"))
+                    except OSError:
+                        os.close(fd)
+                        self._path.unlink(missing_ok=True)
+                        raise
+                    self._fd = fd
                     return
                 except FileExistsError:
                     if time.monotonic() >= deadline:
@@ -200,7 +206,7 @@ def configure_data_cache(
     resolved_cache_dir = cache_dir or os.environ.get("DATA_CACHE_DIR") or "data/cache"
     CACHE_DIR = Path(resolved_cache_dir).expanduser().resolve()
     MANIFEST_FILE = CACHE_DIR / "_manifest.json"
-    _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
+    _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lockfile"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     _CACHE_CONFIGURED = True
 
