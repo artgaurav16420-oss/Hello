@@ -732,6 +732,9 @@ class RebalanceContext:
     state: PortfolioState
     rebalance_date: pd.Timestamp
     scenario_losses: Optional[np.ndarray] = None
+    engine: Optional["InstitutionalRiskEngine"] = None
+    trade_log: Optional[List["Trade"]] = None
+    first_day_exclude_mask: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -741,6 +744,8 @@ class RebalancePipelineResult:
     optimization_succeeded: bool
     soft_cvar_breach: bool
     target_weights: np.ndarray
+    forced_to_cash: bool = False
+    force_cash_reason: str = ""
 
 
 def _build_scenario_losses(log_rets: pd.DataFrame, active_symbols: List[str], cfg: UltimateConfig) -> np.ndarray:
@@ -890,7 +895,7 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
             state.consecutive_failures += 1
             activate_override_on_stress(state, cfg)
         elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
-            soft_cvar_breach = book_cvar > cfg.CVAR_SOFT_LIMIT if hasattr(cfg, "CVAR_SOFT_LIMIT") else True
+            soft_cvar_breach = True
 
     apply_decay_on_error = False
     if not force_full_cash:
@@ -900,8 +905,8 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
             if sel_idx:
                 sel_symbols = [ctx.active_symbols[i] for i in sel_idx]
                 prev_w = np.array([ctx.prev_weights.get(sym, 0.0) for sym in ctx.active_symbols])
-                engine = InstitutionalRiskEngine(cfg)
-                weights_sel = engine.optimize(
+                _engine = ctx.engine if ctx.engine is not None else InstitutionalRiskEngine(cfg)
+                weights_sel = _engine.optimize(
                     expected_returns=raw_daily[sel_idx],
                     historical_returns=ctx.log_rets[sel_symbols],
                     execution_date=ctx.rebalance_date,
@@ -933,9 +938,22 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
             if np.all(np.abs(target_weights) < 1e-12):
                 exhaust_decay = True
 
+    # Apply first-day exclusion mask: zero out target weights for newly listed
+    # symbols that have no valid open price, preventing erroneous entry trades.
+    if ctx.first_day_exclude_mask is not None and ctx.first_day_exclude_mask.any():
+        target_weights = target_weights.copy()
+        target_weights[ctx.first_day_exclude_mask] = 0.0
+
     scenario_losses = ctx.scenario_losses
     if not exhaust_decay and scenario_losses is None:
         scenario_losses = _build_scenario_losses(ctx.log_rets, ctx.active_symbols, cfg)
+
+    forced_to_cash = bool(force_full_cash or exhaust_decay)
+    force_cash_reason = (
+        "book_cvar_breach" if force_full_cash else
+        "max_decay_rounds" if exhaust_decay else
+        ""
+    )
 
     total_slippage = execute_rebalance(
         state,
@@ -945,6 +963,7 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
         cfg,
         adv_shares=ctx.adv_vector,
         date_context=ctx.rebalance_date,
+        trade_log=ctx.trade_log,
         apply_decay=apply_decay and not exhaust_decay,
         scenario_losses=None if exhaust_decay else scenario_losses,
         force_rebalance_trades=soft_cvar_breach,
@@ -956,6 +975,8 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
         optimization_succeeded=optimization_succeeded,
         soft_cvar_breach=soft_cvar_breach,
         target_weights=target_weights,
+        forced_to_cash=forced_to_cash,
+        force_cash_reason=force_cash_reason,
     )
 
 

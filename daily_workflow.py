@@ -1449,6 +1449,27 @@ def _run_scan(
             _write_pending_sentinel(name=name, token=token, date_str=today.strftime("%Y-%m-%d"))
 
             sector_map = get_sector_map(active, cfg=cfg)
+            # Compute current market-value weights from shares * price / pv,
+            # applying absent-period haircuts for delisted/suspended symbols.
+            # This is more accurate than state.weights, which stores the last
+            # rebalance's target weights and drifts as prices move.
+            _prev_weights: Dict[str, float] = {}
+            if pv > 0:
+                for _sym, _n in state.shares.items():
+                    if _n <= 0:
+                        continue
+                    _raw_px = (
+                        prices[active_idx[_sym]]
+                        if _sym in active_idx
+                        else state.last_known_prices.get(_sym, 0.0)
+                    )
+                    _absent_n = int(state.absent_periods.get(_sym, 0))
+                    if _absent_n > 0:
+                        _px = float(absent_symbol_effective_price(float(_raw_px), _absent_n, cfg.MAX_ABSENT_PERIODS))
+                    else:
+                        _px = float(_raw_px)
+                    if _px > 0:
+                        _prev_weights[_sym] = (_n * _px) / pv
             ctx = RebalanceContext(
                 active_symbols=active,
                 log_rets=log_rets,
@@ -1456,7 +1477,7 @@ def _run_scan(
                 exec_prices=prices,
                 pv=pv,
                 adv_vector=adv_arr,
-                prev_weights=dict(state.weights),
+                prev_weights=_prev_weights,
                 regime_score=regime_score,
                 gross_exposure=initial_gross_exposure,
                 sector_labels=_build_sector_labels(active, sector_map),
