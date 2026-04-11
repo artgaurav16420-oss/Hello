@@ -85,14 +85,13 @@ def configure_optimizer_logging(color: bool = True) -> None:
     _train_end_ts = pd.Timestamp(TRAIN_END)
     _days_stale = (_today - _train_end_ts).days
     if _today > _train_end_ts + pd.DateOffset(months=TRAIN_END_STALENESS_THRESHOLD_MONTHS):
-        if logger.handlers:
-            logger.warning(
-                "TRAIN_END=%s is %d days behind today. Optimizer results remain "
-                "reproducible but exclude recent data. Update TRAIN_END in "
-                "optimizer.py to include it.",
-                TRAIN_END,
-                _days_stale,
-            )
+        logger.warning(
+            "TRAIN_END=%s is %d days behind today. Optimizer results remain "
+            "reproducible but exclude recent data. Update TRAIN_END in "
+            "optimizer.py to include it.",
+            TRAIN_END,
+            _days_stale,
+        )
 
 # ─── Optimization Configuration ───────────────────────────────────────────────
 

@@ -278,9 +278,12 @@ def _is_claim_stale(
         except (json.JSONDecodeError, OSError):
             claim_date_str = ""
 
+    age_seconds = (datetime.now() - mtime).total_seconds()
+    if not claim_date_str:
+        return age_seconds > (max_age_hours * 3600)
     return (
         claim_date_str != current_date_str
-        or (datetime.now() - mtime).total_seconds() > (max_age_hours * 3600)
+        or age_seconds > (max_age_hours * 3600)
     )
 
 
@@ -318,7 +321,7 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
                     # Malformed claim (not a dict) — treat as stale
                     claim_date_str = ""
             except (json.JSONDecodeError, OSError):
-                # Corrupted or unreadable claim — treat as stale
+                # Corrupted or unreadable claim — rely on age-only stale check.
                 claim_date_str = ""
 
             is_stale = _is_claim_stale(
@@ -1302,7 +1305,8 @@ def _run_scan(
 
         use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
 
-        close_d = _build_close_series(universe, market_data, use_adj)
+        scan_symbols = list(dict.fromkeys([*universe, *state.shares.keys()]))
+        close_d = _build_close_series(scan_symbols, market_data, use_adj)
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.

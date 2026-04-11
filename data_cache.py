@@ -93,8 +93,8 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
                 self._fd = None
             try:
                 self._path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except (PermissionError, OSError) as exc:
+                logger.warning("[Lock] Failed to unlink lock file %s during release: %s", self._path, exc)
 
 import numpy as np
 import pandas as pd
@@ -198,7 +198,7 @@ def configure_data_cache(
     load_dotenv_safe(dotenv_path)
     # After load_dotenv_safe, honor DATA_CACHE_DIR from .env if set
     resolved_cache_dir = cache_dir or os.environ.get("DATA_CACHE_DIR") or "data/cache"
-    CACHE_DIR = Path(resolved_cache_dir)
+    CACHE_DIR = Path(resolved_cache_dir).expanduser().resolve()
     MANIFEST_FILE = CACHE_DIR / "_manifest.json"
     _MANIFEST_LOCK_DIR = CACHE_DIR / "_manifest.lock"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

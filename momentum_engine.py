@@ -76,15 +76,8 @@ DEFAULT_MAX_ABSENT_PERIODS = 12
 
 
 def _get_adaptive_cvar_min_obs(cfg: "UltimateConfig") -> int:
-    """Adapt CVaR min-history threshold to configured rebalance frequency."""
-    freq_map = {
-        "D": 252,
-        "W-FRI": 52,
-        "W-MON": 52,
-        "M": 12,
-    }
-    periods_per_year = freq_map.get(str(getattr(cfg, "REBALANCE_FREQ", "D")).upper(), 252)
-    return max(5, int(cfg.CVAR_MIN_HISTORY * periods_per_year / 252))
+    """Return CVaR min-history threshold with a sensible floor."""
+    return max(5, int(cfg.CVAR_MIN_HISTORY))
 DEFAULT_MAX_DECAY_ROUNDS = 3
 DEFAULT_GHOST_VOL_FALLBACK = 0.04
 
@@ -287,7 +280,7 @@ class UltimateConfig:
     MAX_POSITIONS:            int   = 10           # Maximum active line items allowed.
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20         # Maximum aggregate CVaR allowed.
     MAX_SINGLE_NAME_WEIGHT:   float = 0.25         # Hard cap on individual stock weights.
-    MAX_SECTOR_WEIGHT:        float = 0.40         # Limit any single sector to 40% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.40) can bind.
+    MAX_SECTOR_WEIGHT:        float = 0.35         # Limit any single sector to 35% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.35) can bind.
 
     # --- Liquidity & Execution ---
     MAX_ADV_PCT:              float = 0.05         # Maximum participation rate of Average Daily Volume.
@@ -1256,7 +1249,11 @@ def execute_rebalance(
             force_weights = []
             for sym in symbols_to_force_close:
                 n_shares = state.shares.get(sym, 0)
-                px = float(state.last_known_prices.get(sym, 0.0))
+                px = absent_symbol_effective_price(
+                    float(state.last_known_prices.get(sym, 0.0)),
+                    state.absent_periods.get(sym, 0),
+                    cfg.MAX_ABSENT_PERIODS,
+                )
                 force_weights.append((n_shares * px) / max(pv_exec, 1.0))
         gross_w = float(np.sum(decay_check_w))
         if symbols_to_force_close and force_weights:
