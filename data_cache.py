@@ -88,9 +88,9 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
                         raise
                     self._fd = fd
                     return
-                except FileExistsError:
+                except FileExistsError as exc:
                     if time.monotonic() >= deadline:
-                        raise FileLockTimeout(f"Timed out waiting for lock {self._path}")
+                        raise FileLockTimeout(f"Timed out waiting for lock {self._path}") from exc
                     time.sleep(_MANIFEST_LOCK_POLL_SEC)
 
         def release(self) -> None:
@@ -253,6 +253,9 @@ class _ManifestProcessFileLock:
                 cleanup_exc,
                 exc_info=True,
             )
+            # Re-raise cleanup exception only if the with-block succeeded
+            if exc_type is None:
+                raise
 
 
 class DataProvider(ABC):
