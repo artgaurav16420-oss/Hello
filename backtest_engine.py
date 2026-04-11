@@ -131,6 +131,7 @@ class BacktestEngine:
         self._eq_dates: list       = []
         self._eq_vals:  list       = []
         self._rebal_rows: list     = []
+        self._sector_map: Optional[dict] = None
 
     def _reset_run_state(self) -> None:
         """Clear session-level buffers but preserve state.shares/cash/etc."""
@@ -549,10 +550,11 @@ class BacktestEngine:
         prev_idx: int,
         date_pos: int,
         target_weights: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         exec_prices, open_fallback_mask = _execution_prices(
             active_symbols, date, active_prices, open_px, high_px, low_px, return_open_fallback_mask=True
         )
+        first_day_mask = np.zeros(len(active_symbols), dtype=bool)
         if open_fallback_mask.any():
             sig_px_arr = close.values[prev_idx, active_col_indices]
             cur_px_arr = close.values[date_pos, active_col_indices]
@@ -570,7 +572,7 @@ class BacktestEngine:
                     skipped_syms,
                 )
                 target_weights[first_day_mask] = 0.0
-        return exec_prices, target_weights
+        return exec_prices, target_weights, first_day_mask
 
     def _execute_and_log_trades(
         self,
@@ -695,7 +697,7 @@ class BacktestEngine:
         else:
             realised_cvar = 0.0
 
-        exec_prices, _ = self._select_execution_prices(
+        exec_prices, _, first_day_mask = self._select_execution_prices(
             date, active_symbols, active_prices, close, open_px, high_px, low_px,
             active_col_indices, prev_idx, date_pos, np.zeros(len(active_symbols), dtype=float)
         )
@@ -714,6 +716,9 @@ class BacktestEngine:
             cfg=cfg,
             state=self.state,
             rebalance_date=date,
+            engine=self.engine,
+            trade_log=self.trades,
+            first_day_exclude_mask=first_day_mask if first_day_mask.any() else None,
         )
         result = run_rebalance_pipeline(ctx)
 
@@ -726,8 +731,8 @@ class BacktestEngine:
                 "override_active":    self.state.override_active,
                 "n_positions":        len(self.state.shares),
                 "apply_decay":        result.applied_decay,
-                "forced_to_cash":     False,
-                "force_cash_reason":  "",
+                "forced_to_cash":     result.forced_to_cash,
+                "force_cash_reason":  result.force_cash_reason,
             })
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
