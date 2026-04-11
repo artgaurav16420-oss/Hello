@@ -1478,7 +1478,7 @@ def _run_scan(
                 pv=pv,
                 adv_vector=adv_arr,
                 prev_weights=_prev_weights,
-                regime_score=regime_score,
+                trade_log=trade_log,
                 gross_exposure=initial_gross_exposure,
                 sector_labels=_build_sector_labels(active, sector_map),
                 cfg=cfg,
