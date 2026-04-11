@@ -95,6 +95,7 @@ from momentum_engine import (
     to_bare,
     Trade,
     activate_override_on_stress,
+    _get_adaptive_cvar_min_obs,
 )
 from universe_manager import (
     fetch_nse_equity_universe,
@@ -277,9 +278,12 @@ def _is_claim_stale(
         except (json.JSONDecodeError, OSError):
             claim_date_str = ""
 
+    age_seconds = (datetime.now() - mtime).total_seconds()
+    if not claim_date_str:
+        return age_seconds > (max_age_hours * 3600)
     return (
         claim_date_str != current_date_str
-        or (datetime.now() - mtime).total_seconds() > (max_age_hours * 3600)
+        or age_seconds > (max_age_hours * 3600)
     )
 
 
@@ -317,7 +321,7 @@ def _try_claim_pending_sentinel(name: str, token: str, date_str: str) -> bool:
                     # Malformed claim (not a dict) — treat as stale
                     claim_date_str = ""
             except (json.JSONDecodeError, OSError):
-                # Corrupted or unreadable claim — treat as stale
+                # Corrupted or unreadable claim — rely on age-only stale check.
                 claim_date_str = ""
 
             is_stale = _is_claim_stale(
@@ -1180,76 +1184,6 @@ def load_portfolio_state(name: str) -> PortfolioState:
     return PortfolioState()
 
 # ─── Core scan logic ──────────────────────────────────────────────────────────
-def _scan_phase_download_data(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 1: Universe assembly and market data retrieval.
-    
-    Resolves session date range and populates ctx["market_data"] via load_or_fetch.
-    """
-    return ctx
-
-
-def _scan_phase_regime_prep(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 2: Market regime and return calculation.
-    
-    Detects/applies splits, builds close matrix, and computes regime metrics.
-    """
-    return ctx
-
-
-def _scan_phase_exposure_cvar(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 3: Risk and exposure assessment.
-    
-    Updates exposure multiplier and evaluates book CVaR hard/soft breach flags.
-    """
-    return ctx
-
-
-def _scan_phase_optimization(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 4: Signal generation and portfolio optimization.
-    
-    Generates momentum signals and calls the solver for target weights.
-    """
-    return ctx
-
-
-def _scan_phase_decay_targeting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 5: Fallback decay targeting.
-    
-    Computes passive liquidation targets if the optimizer fails to provide a solution.
-    """
-    return ctx
-
-
-def _scan_phase_stale_price_gate(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 6: Operational data quality gate.
-    
-    Checks for stale session prices and locks weights for halted symbols.
-    """
-    return ctx
-
-
-def _scan_phase_execution(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 7: Order execution and settlement.
-    
-    Claims the rebalance sentinel and invokes execute_rebalance.
-    """
-    return ctx
-
-
-def _scan_phase_eod_accounting(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    [Draft] Phase 8: Post-scan reporting and state finalization.
-    
-    Records history, updates absent trackers, and emits UI summary tables.
-    """
-    return ctx
 
 def _run_scan(
     universe: List[str],
@@ -1300,16 +1234,6 @@ def _run_scan(
         Returns:
             tuple: (modified_state, market_data_dict)
         """
-        phase_ctx: Dict[str, Any] = {}
-        _scan_phase_download_data(phase_ctx)
-        _scan_phase_regime_prep(phase_ctx)
-        _scan_phase_exposure_cvar(phase_ctx)
-        _scan_phase_optimization(phase_ctx)
-        _scan_phase_decay_targeting(phase_ctx)
-        _scan_phase_stale_price_gate(phase_ctx)
-        _scan_phase_execution(phase_ctx)
-        _scan_phase_eod_accounting(phase_ctx)
-
         def _build_close_series(universe_symbols: list[str], mkt_data: dict, use_adjusted: bool) -> Dict[str, pd.Series]:
             """Build a map of bare symbols to close-price series.
 
@@ -1381,7 +1305,8 @@ def _run_scan(
 
         use_adj = getattr(cfg, "AUTO_ADJUST_PRICES", True)
 
-        close_d = _build_close_series(universe, market_data, use_adj)
+        scan_symbols = list(dict.fromkeys([*universe, *state.shares.keys()]))
+        close_d = _build_close_series(scan_symbols, market_data, use_adj)
 
         if not close_d:
             # PROD-FIX-3: Circuit breaker — count consecutive empty-universe scans.
@@ -1497,9 +1422,10 @@ def _run_scan(
         prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
         _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
     
+        adaptive_cvar_min_obs = _get_adaptive_cvar_min_obs(cfg)
         state.update_exposure(
             regime_score,
-            state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY),
+            state.realised_cvar(min_obs=adaptive_cvar_min_obs),
             cfg,
             gross_exposure=initial_gross_exposure,
         )
@@ -1792,7 +1718,7 @@ def _run_scan(
             "Equity: %s₹%s%s | Slippage: %s₹%s%s",
             C.BLU, label, C.RST,
             regime_score,
-            state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY) * 100,
+            state.realised_cvar(min_obs=adaptive_cvar_min_obs) * 100,
             state.consecutive_failures,
             C.GRN, f"{final_pv:,.0f}", C.RST,
             C.RED, f"{total_slippage:,.0f}", C.RST,
@@ -1911,7 +1837,7 @@ def _render_portfolio_diagnostics(state: PortfolioState, cfg: UltimateConfig) ->
     Returns:
         str: ANSI-formatted diagnostic block.
     """
-    cvar = state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
+    cvar = state.realised_cvar(min_obs=_get_adaptive_cvar_min_obs(cfg))
     cvar_color = C.RED if cvar > cfg.CVAR_DAILY_LIMIT else C.GRN
     return "\n".join([
         f"\n  {C.BLD}Portfolio Diagnostics:{C.RST}",
@@ -2455,4 +2381,3 @@ if __name__ == "__main__":
     if PAPER_MODE:
         logger.warning("[!] Paper mode active. State will not be saved.")
     main_menu()
-

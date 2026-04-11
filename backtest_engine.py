@@ -66,6 +66,7 @@ from momentum_engine import (
     Trade,
     activate_override_on_stress,
     absent_symbol_effective_price,
+    _get_adaptive_cvar_min_obs,
 )
 from signals import (
     generate_signals,
@@ -681,8 +682,9 @@ class BacktestEngine:
         idx_slice    = idx_df.loc[:signal_date] if idx_df is not None and not getattr(idx_df, "empty", False) else None
         regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date])
 
-        if len(self.state.equity_hist) >= cfg.CVAR_MIN_HISTORY:
-            realised_cvar = self.state.realised_cvar(min_obs=cfg.CVAR_MIN_HISTORY)
+        adaptive_cvar_min_obs = _get_adaptive_cvar_min_obs(cfg)
+        if len(self.state.equity_hist) >= adaptive_cvar_min_obs:
+            realised_cvar = self.state.realised_cvar(min_obs=adaptive_cvar_min_obs)
         else:
             realised_cvar = 0.0
 
