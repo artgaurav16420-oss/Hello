@@ -67,6 +67,9 @@ from momentum_engine import (
     activate_override_on_stress,
     absent_symbol_effective_price,
     _get_adaptive_cvar_min_obs,
+    RebalanceContext,
+    run_rebalance_pipeline,
+    _build_sector_labels as _me_build_sector_labels,
 )
 from signals import (
     generate_signals,
@@ -155,6 +158,9 @@ class BacktestEngine:
         gross_exposure = invested_notional / max(pv, 1e-6)
         return pv, gross_exposure
 
+    def _build_prev_weights(self, symbols: List[str], pv: float) -> Dict[str, float]:
+        return _build_prev_weights(self.state, symbols, pv)
+
     def run(
         self,
         close:           pd.DataFrame,
@@ -214,6 +220,7 @@ class BacktestEngine:
         start_dt = pd.Timestamp(start_date)
         end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
         symbols  = close.columns.tolist()
+        self._sector_map = sector_map
         close_arr = close.values
         date_to_pos = {d: i for i, d in enumerate(close.index)}
 
@@ -684,45 +691,44 @@ class BacktestEngine:
 
         adaptive_cvar_min_obs = _get_adaptive_cvar_min_obs(cfg)
         if len(self.state.equity_hist) >= adaptive_cvar_min_obs:
-            realised_cvar = self.state.realised_cvar(min_obs=adaptive_cvar_min_obs)
+            realised_cvar = self.state.realised_cvar(cfg=cfg)
         else:
             realised_cvar = 0.0
 
-        self.state.update_exposure(regime_score, realised_cvar, cfg, gross_exposure=gross_exposure)
-
-        apply_decay, _force_full_cash, soft_cvar_breach = self._check_cvar_breach(
-            date, valuation_prices, active_symbols, hist_log_rets, cfg
+        exec_prices, _ = self._select_execution_prices(
+            date, active_symbols, active_prices, close, open_px, high_px, low_px,
+            active_col_indices, prev_idx, date_pos, np.zeros(len(active_symbols), dtype=float)
         )
 
-        optimization_succeeded = False
-        target_weights = np.zeros(len(active_symbols))
-        sel_idx: List[int] = []
+        ctx = RebalanceContext(
+            active_symbols=active_symbols,
+            log_rets=hist_log_rets,
+            valuation_prices=valuation_prices,
+            exec_prices=exec_prices,
+            pv=pv,
+            adv_vector=adv_vector,
+            prev_weights=self._build_prev_weights(active_symbols, pv),
+            regime_score=regime_score,
+            gross_exposure=gross_exposure,
+            sector_labels=_me_build_sector_labels(active_symbols, self._sector_map),
+            cfg=cfg,
+            state=self.state,
+            rebalance_date=date,
+        )
+        result = run_rebalance_pipeline(ctx)
 
-        if not _force_full_cash:
-            target_weights, optimization_succeeded, apply_decay, sel_idx, abort = self._generate_rebalance_signals(
-                date, active_symbols, hist_log_rets, adv_vector, valuation_prices,
-                pv, prev_w_dict, sector_map, soft_cvar_breach, apply_decay, cfg
-            )
-            if abort:
-                return
-
-        _exhaust_decay = False
-        if apply_decay and not optimization_succeeded:
-            target_weights, _exhaust_decay = self._compute_position_decay(
-                date, active_symbols, valuation_prices, pv, target_weights, sel_idx, _force_full_cash, cfg
-            )
-
-        if optimization_succeeded or apply_decay:
-            exec_prices, target_weights = self._select_execution_prices(
-                date, active_symbols, active_prices, close, open_px, high_px, low_px,
-                active_col_indices, prev_idx, date_pos, target_weights
-            )
-            
-            self._execute_and_log_trades(
-                date, target_weights, exec_prices, active_symbols, adv_vector, apply_decay,
-                _exhaust_decay, soft_cvar_breach, _force_full_cash, hist_log_rets,
-                regime_score, realised_cvar, cfg
-            )
+        if result.optimization_succeeded or result.applied_decay:
+            self._rebal_rows.append({
+                "date":               date,
+                "regime_score":       round(regime_score, 4),
+                "realised_cvar":      round(realised_cvar, 6),
+                "exposure_multiplier":round(self.state.exposure_multiplier, 4),
+                "override_active":    self.state.override_active,
+                "n_positions":        len(self.state.shares),
+                "apply_decay":        result.applied_decay,
+                "forced_to_cash":     False,
+                "force_cash_reason":  "",
+            })
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 

@@ -74,10 +74,6 @@ logger = logging.getLogger(__name__)
 EPSILON = 1e-6
 DEFAULT_MAX_ABSENT_PERIODS = 12
 
-
-def _get_adaptive_cvar_min_obs(cfg: "UltimateConfig") -> int:
-    """Return CVaR min-history threshold with a sensible floor."""
-    return max(5, int(cfg.CVAR_MIN_HISTORY))
 DEFAULT_MAX_DECAY_ROUNDS = 3
 DEFAULT_GHOST_VOL_FALLBACK = 0.04
 
@@ -280,7 +276,7 @@ class UltimateConfig:
     MAX_POSITIONS:            int   = 10           # Maximum active line items allowed.
     MAX_PORTFOLIO_RISK_PCT:   float = 0.20         # Maximum aggregate CVaR allowed.
     MAX_SINGLE_NAME_WEIGHT:   float = 0.25         # Hard cap on individual stock weights.
-    MAX_SECTOR_WEIGHT:        float = 0.35         # Limit any single sector to 35% of gross exposure so OSQP rows (0 ≤ Σw_sector ≤ 0.35) can bind.
+    MAX_SECTOR_WEIGHT:        float = 0.40         # Cap on total sector exposure; 40% limits concentration while allowing sector bets.
 
     # --- Liquidity & Execution ---
     MAX_ADV_PCT:              float = 0.05         # Maximum participation rate of Average Daily Volume.
@@ -379,6 +375,22 @@ class UltimateConfig:
             object.__setattr__(self, "SLIPPAGE_BPS", parsed)
             return
         object.__setattr__(self, name, value)
+
+
+def _get_adaptive_cvar_min_obs(cfg: UltimateConfig) -> int:
+    """Scale CVaR minimum history to rebalance frequency."""
+    freq_to_periods_per_year = {
+        "D": 252,
+        "W-FRI": 52,
+        "W-MON": 52,
+        "W-TUE": 52,
+        "W-WED": 52,
+        "W-THU": 52,
+        "M": 12,
+    }
+    periods_per_year = freq_to_periods_per_year.get(str(cfg.REBALANCE_FREQ), 252)
+    adaptive_min = int(cfg.CVAR_MIN_HISTORY * periods_per_year / 252)
+    return max(5, adaptive_min)
 
 
 @dataclass
@@ -499,12 +511,15 @@ class PortfolioState:
             np.clip(self.exposure_multiplier, cfg.MIN_EXPOSURE_FLOOR, 1.0)
         )
 
-    def realised_cvar(self, min_obs: int = 30) -> float:
+    def realised_cvar(self, min_obs: int = 30, cfg: Optional["UltimateConfig"] = None) -> float:
         """Return realised portfolio CVaR from recent equity history.
 
         CVaR is computed over a rolling window capped at `equity_hist_cap` bars.
         History older than this cap is discarded.
         """
+        if cfg is not None:
+            min_obs = _get_adaptive_cvar_min_obs(cfg)
+
         n = len(self.equity_hist)
         if n < min_obs:
             if n > 1:
@@ -699,6 +714,249 @@ class PortfolioState:
                 risk_errors,
             )
         return ps
+
+
+@dataclass
+class RebalanceContext:
+    active_symbols: List[str]
+    log_rets: pd.DataFrame
+    valuation_prices: np.ndarray
+    exec_prices: np.ndarray
+    pv: float
+    adv_vector: np.ndarray
+    prev_weights: Dict[str, float]
+    regime_score: float
+    gross_exposure: float
+    sector_labels: Optional[np.ndarray]
+    cfg: UltimateConfig
+    state: PortfolioState
+    rebalance_date: pd.Timestamp
+    scenario_losses: Optional[np.ndarray] = None
+
+
+@dataclass
+class RebalancePipelineResult:
+    total_slippage: float
+    applied_decay: bool
+    optimization_succeeded: bool
+    soft_cvar_breach: bool
+    target_weights: np.ndarray
+
+
+def _build_scenario_losses(log_rets: pd.DataFrame, active_symbols: List[str], cfg: UltimateConfig) -> np.ndarray:
+    window = min(len(log_rets), cfg.CVAR_LOOKBACK)
+    return -(log_rets.iloc[-window:].reindex(columns=active_symbols, fill_value=0.0).values)
+
+
+def _build_sector_labels(active_symbols: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
+    if sector_map is None:
+        return None
+    return np.array([sector_map.get(sym, -1) for sym in active_symbols], dtype=int)
+
+
+def resolve_target_shares(
+    target_weights: np.ndarray,
+    pv_exec: float,
+    prices: np.ndarray,
+    adv_shares: Optional[np.ndarray],
+    current_shares: Dict[str, int],
+    cfg: UltimateConfig,
+    active_symbols: List[str],
+    valid_targets: List[Tuple[int, str, float, float]],
+    force_rebalance_trades: bool,
+    conviction_scores: Optional[np.ndarray] = None,
+) -> Dict[str, int]:
+    desired_shares, _ = _compute_desired_shares(
+        target_weights=target_weights,
+        prices=prices,
+        pv_exec=pv_exec,
+        adv_shares=adv_shares,
+        cfg=cfg,
+        active_symbols=active_symbols,
+        current_shares=current_shares,
+        conviction_scores=conviction_scores,
+    )
+    if not force_rebalance_trades:
+        desired_shares, drift_gated_syms = _apply_drift_gate(
+            desired_shares=desired_shares,
+            current_shares=current_shares,
+            target_weights=target_weights,
+            prices=prices,
+            pv_exec=pv_exec,
+            cfg=cfg,
+            active_symbols=active_symbols,
+        )
+        if drift_gated_syms:
+            valid_targets[:] = [vt for vt in valid_targets if vt[1] not in drift_gated_syms]
+    residual_cash = max(
+        0.0,
+        pv_exec - sum(desired_shares.get(sym, 0) * max(float(prices[i]), 1e-6) for i, sym in enumerate(active_symbols)),
+    )
+    residual_allocations = _allocate_residual_cash(
+        residual_budget=residual_cash,
+        valid_targets=valid_targets,
+        conviction_scores=conviction_scores,
+        prices=prices,
+        cfg=cfg,
+    )
+    for sym, extra in residual_allocations.items():
+        desired_shares[sym] = desired_shares.get(sym, 0) + int(extra)
+    return desired_shares
+
+
+def simulate_fills(
+    desired_shares: Dict[str, int],
+    active_symbols: List[str],
+    prices: np.ndarray,
+    pv_exec: float,
+    adv_shares: Optional[np.ndarray],
+    symbols_to_force_close: set[str],
+    state: PortfolioState,
+    cfg: UltimateConfig,
+    trade_log: Optional[List[Trade]],
+    rebalance_date: pd.Timestamp,
+) -> Tuple[Dict[str, float], Dict[str, int], Dict[str, float], float, float]:
+    active_idx = {sym: i for i, sym in enumerate(active_symbols)}
+    new_weights: Dict[str, float] = {}
+    new_shares: Dict[str, int] = {}
+    new_entry_prices: Dict[str, float] = dict(state.entry_prices)
+    total_slippage = 0.0
+    actual_notional = 0.0
+
+    for i, sym in enumerate(active_symbols):
+        price = max(float(prices[i]), 1e-6)
+        old_s = state.shares.get(sym, 0)
+        s = desired_shares.get(sym, 0)
+        if s > 0 or old_s > 0:
+            delta = s - old_s
+            trade_not = abs(delta) * price
+            slip_rate = compute_one_way_slip_rate(cfg=cfg, portfolio_value=pv_exec, adv_notional=float(adv_shares[i]) if adv_shares is not None else None, trade_notional=trade_not)
+            slip = abs(delta) * price * slip_rate
+            total_slippage += slip
+            actual_notional += s * price
+            if s > 0:
+                new_weights[sym] = (s * price) / max(pv_exec, 1.0)
+                new_shares[sym] = s
+                if delta > 0:
+                    if old_s == 0:
+                        new_entry_prices[sym] = price * (1.0 + slip_rate)
+                        state.dividend_ledger[sym] = f"{pd.Timestamp(rebalance_date).strftime('%Y-%m-%d')}:0.00000000"
+                    else:
+                        old_basis = new_entry_prices.get(sym, price)
+                        new_entry_prices[sym] = (old_basis * old_s + price * (1.0 + slip_rate) * delta) / s
+            if delta != 0 and trade_log is not None:
+                trade_log.append(Trade(sym, pd.Timestamp(rebalance_date), delta, price, slip, "BUY" if delta > 0 else "SELL"))
+
+    for sym in state.shares:
+        if sym not in active_idx and sym not in symbols_to_force_close:
+            new_shares[sym] = state.shares[sym]
+            new_weights[sym] = state.weights.get(sym, 0.0)
+            new_entry_prices[sym] = state.entry_prices.get(sym, 0.0)
+            actual_notional += new_shares[sym] * absent_symbol_effective_price(state.last_known_prices.get(sym, 0.0), state.absent_periods.get(sym, 0), cfg.MAX_ABSENT_PERIODS)
+
+    for sym in symbols_to_force_close:
+        close_price = absent_symbol_effective_price(float(state.last_known_prices.get(sym, 0.0)), state.absent_periods.get(sym, 0), cfg.MAX_ABSENT_PERIODS)
+        n_shares = state.shares.get(sym, 0)
+        if n_shares > 0:
+            slip = n_shares * close_price * (cfg.ROUND_TRIP_SLIPPAGE_BPS / 20000.0)
+            total_slippage += slip
+            actual_notional -= n_shares * close_price
+            if trade_log is not None:
+                trade_log.append(Trade(sym, pd.Timestamp(rebalance_date), -n_shares, close_price, slip, "SELL"))
+
+    return new_weights, new_shares, new_entry_prices, total_slippage, actual_notional
+
+
+def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
+    cfg = ctx.cfg
+    state = ctx.state
+    apply_decay = False
+    force_full_cash = False
+    soft_cvar_breach = False
+    optimization_succeeded = False
+    target_weights = np.zeros(len(ctx.active_symbols), dtype=float)
+    sel_idx: List[int] = []
+
+    adaptive_min = _get_adaptive_cvar_min_obs(cfg)
+    realised_cvar = state.realised_cvar(cfg=cfg) if len(state.equity_hist) >= adaptive_min else 0.0
+    state.update_exposure(ctx.regime_score, realised_cvar, cfg, gross_exposure=ctx.gross_exposure)
+
+    if state.shares:
+        book_cvar = compute_book_cvar(state, ctx.valuation_prices, ctx.active_symbols, ctx.log_rets, cfg)
+        hard_threshold = cfg.CVAR_DAILY_LIMIT * getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+        if book_cvar > hard_threshold:
+            apply_decay = True
+            force_full_cash = True
+            state.consecutive_failures += 1
+            activate_override_on_stress(state, cfg)
+        elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
+            soft_cvar_breach = book_cvar > cfg.CVAR_SOFT_LIMIT if hasattr(cfg, "CVAR_SOFT_LIMIT") else True
+
+    apply_decay_on_error = False
+    if not force_full_cash:
+        from signals import generate_signals, SignalGenerationError
+        try:
+            raw_daily, _adj_scores, sel_idx, _gate_counts = generate_signals(ctx.log_rets, ctx.adv_vector, cfg, prev_weights=ctx.prev_weights)
+            if sel_idx:
+                sel_symbols = [ctx.active_symbols[i] for i in sel_idx]
+                prev_w = np.array([ctx.prev_weights.get(sym, 0.0) for sym in ctx.active_symbols])
+                engine = InstitutionalRiskEngine(cfg)
+                weights_sel = engine.optimize(
+                    expected_returns=raw_daily[sel_idx],
+                    historical_returns=ctx.log_rets[sel_symbols],
+                    execution_date=ctx.rebalance_date,
+                    adv_shares=ctx.adv_vector[sel_idx],
+                    prices=ctx.valuation_prices[sel_idx],
+                    portfolio_value=ctx.pv,
+                    prev_w=prev_w[sel_idx],
+                    exposure_multiplier=state.exposure_multiplier,
+                    sector_labels=ctx.sector_labels[sel_idx] if ctx.sector_labels is not None else None,
+                )
+                target_weights[sel_idx] = weights_sel
+                optimization_succeeded = True
+                state.consecutive_failures = 0
+                state.decay_rounds = 0
+            elif state.shares:
+                apply_decay = True
+        except (OptimizationError, SignalGenerationError, ValueError):
+            apply_decay_on_error = True
+    if apply_decay_on_error:
+        apply_decay = True
+
+    exhaust_decay = False
+    if apply_decay and not optimization_succeeded:
+        if force_full_cash or state.decay_rounds >= cfg.MAX_DECAY_ROUNDS:
+            target_weights = np.zeros(len(ctx.active_symbols), dtype=float)
+            exhaust_decay = True
+        else:
+            target_weights = compute_decay_targets(state, sel_idx, ctx.active_symbols, cfg, current_prices=ctx.valuation_prices, pv=ctx.pv)
+            if np.all(np.abs(target_weights) < 1e-12):
+                exhaust_decay = True
+
+    scenario_losses = ctx.scenario_losses
+    if not exhaust_decay and scenario_losses is None:
+        scenario_losses = _build_scenario_losses(ctx.log_rets, ctx.active_symbols, cfg)
+
+    total_slippage = execute_rebalance(
+        state,
+        target_weights,
+        ctx.exec_prices,
+        ctx.active_symbols,
+        cfg,
+        adv_shares=ctx.adv_vector,
+        date_context=ctx.rebalance_date,
+        apply_decay=apply_decay and not exhaust_decay,
+        scenario_losses=None if exhaust_decay else scenario_losses,
+        force_rebalance_trades=soft_cvar_breach,
+    ) if (optimization_succeeded or apply_decay) else 0.0
+
+    return RebalancePipelineResult(
+        total_slippage=total_slippage,
+        applied_decay=apply_decay,
+        optimization_succeeded=optimization_succeeded,
+        soft_cvar_breach=soft_cvar_breach,
+        target_weights=target_weights,
+    )
 
 
 def _as_bool_flag(value: Any) -> bool:
