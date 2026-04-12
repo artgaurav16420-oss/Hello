@@ -177,6 +177,8 @@ except when the input equals `RESUME`. When the input is `RESUME`, the agent emi
 
 > **IMPORTANT:** This repository uses a dynamic skill system located in `.agent/skills/`. You MUST prioritize loading and following the `SKILL.md` instructions for any relevant skill via `view_file` BEFORE executing the abbreviated summaries below. The external skill files are the source of truth for complex workflows.
 
+### Skill A — Design (Phase 1)
+
 Ask targeted clarifying questions. Do not assume unstated requirements.
 
 Draft `design.md` containing:
@@ -273,6 +275,7 @@ The agent then stops and waits. On `REOPEN execution`:
 - On re-entry to Phase 4 after `REOPEN execution` resolves, the agent resumes the existing review record — all prior findings, waivers, and open items are retained. Only the newly fixed task is subject to fresh review scrutiny.
 
 Do not accept `APPROVE review` if any `[CRITICAL]` is open, or any `[MAJOR]` is neither resolved nor formally waived.
+
 ---
 ### Skill F — Final Verification (Phase 5)
 
@@ -330,6 +333,7 @@ Produce a Verification Table mapping every Success Criterion from `design.md` to
 | `RESUME` | Exit paused state; agent confirms restored state and awaits input |
 
 > **Note:** Entire command strings are strictly case-sensitive — not just the prefix/verb (e.g., `APPROVE design`, not `approve design` or `Approve Design`).
+
 ---
 ## VII. INITIALIZATION
 
@@ -351,6 +355,7 @@ Existing relevant files or code (paste here):
 Known constraints or explicit non-goals:
 ```
 Turn counter starts at 1. Emit no code until the form is filled.
+
 ---
 ## VIII. TERMINATION PROTOCOL
 
