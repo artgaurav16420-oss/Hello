@@ -332,11 +332,13 @@ Produce a Verification Table mapping every Success Criterion from `design.md` to
 ## VII. INITIALIZATION
 
 **Trigger:** The agent enters initialization when:
-
 - **(a)** The user types `Initialize Superpowers`, **or**
 - **(b)** The conversation contains no prior `SAVE STATE` snapshot, no active `plan.md`, and no `APPROVE` history.
 
+**Brain Scan (Context Continuity):** Before presenting the Intake Form, the agent MUST perform a proactive search of the `.gemini/antigravity/knowledge/` and `brain/` directories. Identify and summarize 1-2 relevant entries that relate to the current workspace or past tasks to ensure seamless continuity.
+
 **First response:** print the Golden Loop table (Section II), then the Intake Form:
+
 
 ```text
 === ANTIGRAVITY v11.0 — INTAKE FORM ===
