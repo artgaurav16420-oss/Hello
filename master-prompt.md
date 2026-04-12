@@ -135,7 +135,7 @@ The `<thinking>` block must be the first element after the C5 header. redundant 
 
 ## IV. MANDATORY STATE SNAPSHOTS
 
-The agent must emit a `SAVE STATE` block at turns 15, 30, 45 (and every 15 turns thereafter), and unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
+The agent must emit a `SAVE STATE` block at significant project milestones, including: (1) Completion of any Phase (e.g., after `APPROVE design`), (2) Completion of all tasks in a `plan.md`, (3) Resolution of a `[CRITICAL]` review item, and (4) Unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
 
 **Format:**
 
