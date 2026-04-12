@@ -95,7 +95,6 @@ from momentum_engine import (
     to_bare,
     Trade,
     activate_override_on_stress,
-    _get_adaptive_cvar_min_obs,
     RebalanceContext,
     run_rebalance_pipeline,
     _build_sector_labels,
@@ -1374,6 +1373,10 @@ def _run_scan(
         # record_eod).  compute_book_cvar does not guard against NaN in its prices
         # argument — a NaN propagates into notional → pv → weights → CVaR, producing
         # an incorrect (often zero) CVaR that suppresses the risk gate.
+        # FIX-STALE-PRICE: also track which held symbols have stale prices so the
+        # rebalance gate can suppress non-forced rebalances when held positions have
+        # no valid current price data (e.g. provider outage).
+        _stale_held_syms: set[str] = set()
         for _sym, _i in active_idx.items():
             if not np.isfinite(prices[_i]) or prices[_i] <= 0:
                 _lkp = state.last_known_prices.get(_sym, 0.0)
@@ -1384,6 +1387,8 @@ def _run_scan(
                     reason="stale_price" if (np.isfinite(_lkp) and _lkp > 0) else "no_price",
                     detail=f"last_known={_lkp:.4f}" if np.isfinite(_lkp) else "no_last_known",
                 )
+                if state.shares.get(_sym, 0) > 0:
+                    _stale_held_syms.add(_sym)
     
         mtm_notional = 0.0
         for sym in state.shares:
@@ -1425,7 +1430,6 @@ def _run_scan(
         prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
         _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
     
-        adaptive_cvar_min_obs = _get_adaptive_cvar_min_obs(cfg)
         state.update_exposure(
             regime_score,
             state.realised_cvar(cfg=cfg),
@@ -1436,6 +1440,20 @@ def _run_scan(
         total_slippage       = 0.0
         trade_log: List[Trade] = []
         rebalanced_this_scan = False
+
+        # FIX-STALE-PRICE: suppress non-forced rebalances when any held symbol has
+        # a stale price.  Trading against stale prices produces incorrect position
+        # sizing and may result in large unintended trades during provider outages.
+        # Forced liquidations (triggered inside run_rebalance_pipeline on a hard
+        # CVaR breach) are exempt — they proceed regardless of stale prices.
+        if _stale_held_syms and rebalance_allowed:
+            logger.warning(
+                "[Scan] Suppressing rebalance: %d held symbol(s) have stale price data: %s. "
+                "Rebalance skipped to prevent incorrect sizing. Will retry next scan.",
+                len(_stale_held_syms),
+                sorted(_stale_held_syms),
+            )
+            rebalance_allowed = False
 
         if rebalance_allowed:
             pending = _load_pending_sentinel(name=name)
@@ -1470,6 +1488,25 @@ def _run_scan(
                         _px = float(_raw_px)
                     if _px > 0:
                         _prev_weights[_sym] = (_n * _px) / pv
+
+            # FIX-DW-FIRSTDAY: skip newly listed symbols on their first rebalance.
+            # A symbol appearing in `active` but with no valid close in close_hist
+            # (all NaN or absent) has no history for signal generation and no usable
+            # open price, so we zero its target weight to prevent erroneous entry.
+            _first_day_mask: Optional[np.ndarray] = None
+            if not close_hist.empty and close_hist.shape[0] > 0:
+                _active_hist = close_hist.reindex(columns=active)
+                _first_day_flags = _active_hist.isna().all(axis=0)
+                if _first_day_flags.any():
+                    _first_day_syms = [s for s, v in _first_day_flags.items() if v]
+                    logger.warning(
+                        "[Scan] Excluding %d first-day listing(s) from rebalance on %s: %s",
+                        len(_first_day_syms),
+                        today.strftime("%Y-%m-%d"),
+                        _first_day_syms,
+                    )
+                    _first_day_mask = _first_day_flags.values.astype(bool)
+
             ctx = RebalanceContext(
                 active_symbols=active,
                 log_rets=log_rets,
@@ -1484,6 +1521,8 @@ def _run_scan(
                 cfg=cfg,
                 state=state,
                 rebalance_date=pd.Timestamp.now(tz="UTC"),
+                engine=engine,
+                first_day_exclude_mask=_first_day_mask,
             )
             result = run_rebalance_pipeline(ctx)
             total_slippage = result.total_slippage
