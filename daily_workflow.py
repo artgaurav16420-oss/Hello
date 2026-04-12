@@ -1507,11 +1507,25 @@ def _run_scan(
                     )
                     _first_day_mask = _first_day_flags.values.astype(bool)
 
+            # Build open-preferred execution prices to match the backtest path.
+            # When today's open price is available and valid, prefer it over close
+            # for execution modelling.  Falls back to close when open is absent
+            # (pre-market run, holiday, or missing data).
+            _today_ts = pd.Timestamp(end_date)
+            exec_prices = prices.copy()
+            for _ei, _esym in enumerate(active):
+                _ens = to_ns(_esym)
+                _edf = market_data.get(_ens)
+                if _edf is not None and "Open" in _edf.columns and _today_ts in _edf.index:
+                    _open_px = float(_edf.loc[_today_ts, "Open"])
+                    if np.isfinite(_open_px) and _open_px > 0:
+                        exec_prices[_ei] = _open_px
+
             ctx = RebalanceContext(
                 active_symbols=active,
                 log_rets=log_rets,
                 valuation_prices=prices,
-                exec_prices=prices,
+                exec_prices=exec_prices,
                 pv=pv,
                 adv_vector=adv_arr,
                 prev_weights=_prev_weights,
