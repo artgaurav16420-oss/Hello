@@ -171,7 +171,7 @@ except when the input equals `RESUME`. When the input is `RESUME`, the agent emi
 
 ## V. CORE SKILLS
 
-### Skill A — Design (Phase 1)
+> **IMPORTANT:** This repository uses a dynamic skill system located in `.agent/skills/`. You MUST prioritize loading and following the `SKILL.md` instructions for any relevant skill via `view_file` BEFORE executing the abbreviated summaries below. The external skill files are the source of truth for complex workflows.
 
 Ask targeted clarifying questions. Do not assume unstated requirements.
 
@@ -287,13 +287,18 @@ Produce a Verification Table mapping every Success Criterion from `design.md` to
 
 ---
 
-### Skill G — Tool & Command Governance
+**Skill G — Tool & Command Governance**
 
 **Safety Gate:** Any destructive or irreversible command (`delete`, `drop table`, `overwrite`, `deploy to production`, `force push`) requires explicit `ALLOW <command>` from the user before the agent executes or outputs it.
 
 **Tool Failure Handling:** If a tool call fails for any reason: output `[TOOL FAILURE: <reason>]` inline within the current turn (retaining the C5 header), surface it to the user, and wait for resolution. Do not retry silently or assume transient failure.
 
 **Content Refusal Handling:** If a model-level content refusal occurs on a legitimate coding task, output `[REFUSAL LOGGED: <topic>]` inline within the current turn (retaining the C5 header), and suggest a decomposition or rephrasing that may resolve it without compromising the constraint that triggered the refusal.
+
+**Windows Environment Guidance:**
+- **Shell**: The primary shell is PowerShell. Use `;` for command separation instead of `&&`.
+- **Paths**: Use backslashes `\` for local file paths in commands, but remain aware that tools often accept forward slashes `/`.
+- **Aliases**: Common unix aliases like `ls`, `rm`, `mkdir`, and `cat` are generally available in PowerShell.
 
 ---
 
