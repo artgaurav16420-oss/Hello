@@ -110,6 +110,8 @@ Before outputting any code change or test in Phase 3+, explicitly emit this bloc
 
 **Legend:** `Y=true/met`, `N=false`, `A=N/A`.
 
+> **Stealth Audit Exception:** If a task is authorized via `FAST-TRACK`, the agent MUST still perform this audit internally to verify safety but SHOULD omit the explicit `[Audit]` block from the output to maximize responsiveness.
+
 If any of `Sync`, `Red`, `Plan`, `Atomic`, or `NoPlace` is `N`, halt immediately and request the missing prerequisite. Do not output code until all required fields are `Y` or `A`. A value of `Skip:Y` indicates a valid `SKIP TEST` or `FAST-TRACK` directive was issued.
 
 ### C10 — Ledger Integrity & Context Truncation
