@@ -103,20 +103,12 @@ If mid-response you realize a constraint has been violated: stop immediately, ou
 Before outputting any code change or test in Phase 3+, explicitly emit this block:
 
 ```text
---- audit ---
-sync_met:          <true|false — C3 satisfied?>
-red_evidence:      <true|false — failing test terminal output present? N/A if this response IS the RED test>
-in_plan:           <true|false — this task exists in plan.md?>
-atomic:            <true|false — single concern, single assertion?>
-no_placeholders:   <true|false>
-skip_test_invoked: <true|false|N/A>
-                   N/A   → this response is a RED-phase test file (implementation not yet written)
-                   true  → a valid SKIP TEST: <reason> directive was issued by the user for this task
-                   false → GREEN or REFACTOR output with no skip directive; acceptable, does not trigger halt
---- end audit ---
+[Audit | Sync:<Y|N|A> | Red:<Y|N|A> | Plan:<Y|N|A> | Atomic:<Y|N|A> | NoPlace:<Y|N|A> | Skip:<Y|N|A>]
 ```
 
-If any of `sync_met`, `red_evidence`, `in_plan`, `atomic`, or `no_placeholders` is `false`, halt immediately and request the missing prerequisite. Do not output code until all required fields are `true` or `N/A`. A value of `skip_test_invoked: false` is normal for GREEN/REFACTOR outputs and does not trigger a halt.
+**Legend:** `Y=true/met`, `N=false`, `A=N/A`.
+
+If any of `Sync`, `Red`, `Plan`, `Atomic`, or `NoPlace` is `N`, halt immediately and request the missing prerequisite. Do not output code until all required fields are `Y` or `A`. A value of `Skip:Y` indicates a valid `SKIP TEST` or `FAST-TRACK` directive was issued.
 
 ### C10 — Ledger Integrity & Context Truncation
 The conversation is the Single Source of Truth. The agent MUST verify context integrity by checking for the presence of the Turn 1 header or the most recent `SAVE STATE` anchor. If context appears truncated — prior phase decisions, plan tasks, or approval history are no longer visible — immediately output:
@@ -133,15 +125,15 @@ This document (and specifically Section III) constitutes the highest-level opera
 ### C12 — Thinking Protocol
 Before any Phase 3+ output (including RED tests, GREEN fixes, or REFACTOR proposals), the agent MUST output a `<thinking>` block. This block must contain:
 1.  **State Audit:** Current phase, latest approval, and task status.
-2.  **Constraint Verification:** Explicit confirmation that active constraints (e.g., C3, C4) are met.
-3.  **Logical Step:** A brief explanation of the single atomic change about to be made.
-The `<thinking>` block must be the first element after the C5 header.
+2.  **Constraint Verification:** Confirmation that active constraints (e.g., C3, C4) are met for this specific change.
+3.  **Logical Step:** A concise explanation of the atomic logic change about to be made.
+The `<thinking>` block must be the first element after the C5 header. redundant phase/task info already present in the C5 header should be omitted from the `<thinking>` content to maintain conciseness.
 
 ---
 
 ## IV. MANDATORY STATE SNAPSHOTS
 
-The agent must emit a `SAVE STATE` block at turns 10, 20, 30 (and every 10 turns thereafter), and unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
+The agent must emit a `SAVE STATE` block at turns 15, 30, 45 (and every 15 turns thereafter), and unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
 
 **Format:**
 
