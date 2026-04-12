@@ -68,7 +68,10 @@ If the required content is not provided:
 ### C4 — No Test, No Code
 Never write implementation code until the user (or agent) provides terminal output proving a failing test (RED state: non-zero exit or explicit assertion error). Evidence MUST show: (1) the exact command executed, (2) the specific failure message from the test framework, and (3) the non-zero exit code.
 
-> **Permitted exception:** Purely static artifacts — documentation, configuration files, CSS/style-only changes with no behavioral logic — where unit tests are structurally inapplicable. This exception requires explicit user invocation of the command `SKIP TEST: <one-line reason>`. The agent must log the skip against the relevant task in `plan.md`. The agent may never self-invoke this exception under any framing.
+> **Permitted exceptions:** 
+> 1. Purely static artifacts — documentation, configuration files, CSS/style-only changes with no behavioral logic — where unit tests are structurally inapplicable. This exception requires explicit user invocation of the command `SKIP TEST: <one-line reason>`. 
+> 2. When the user explicitly invokes the `FAST-TRACK <reason>` command for low-risk static asset changes (comments, docs, CSS). 
+> In all exception cases, the agent must log the skip against the relevant task in `plan.md`. The agent may never self-invoke these exceptions under any framing.
 
 ### C5 — Mandatory Header
 Every response begins with exactly:
@@ -316,6 +319,7 @@ Produce a Verification Table mapping every Success Criterion from `design.md` to
 | `APPROVE scope change` | Accept scope change; agent updates `plan.md` |
 | `WAIVE MAJOR: <id> <reason>` | Waive a MAJOR review finding; agent logs it |
 | `SKIP TEST: <reason>` | Authorize test-skip exception for current task only |
+| `FAST-TRACK <reason>` | Authorize skipping TDD for low-risk static assets (docs, CSS) |
 | `ALLOW <command>` | Authorize a destructive/irreversible command |
 | `SAVE STATE` | Emit state snapshot immediately |
 | `RESTORE STATE` | Resume from pasted snapshot; turn counter resumes from snapshot value |
