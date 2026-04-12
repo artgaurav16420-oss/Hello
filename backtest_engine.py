@@ -686,7 +686,6 @@ class BacktestEngine:
             valuation_close=valuation_close,
             cfg=cfg,
         )
-        prev_w_dict = _build_prev_weights(self.state, active_symbols, pv)
 
         idx_slice    = idx_df.loc[:signal_date] if idx_df is not None and not getattr(idx_df, "empty", False) else None
         regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date])
@@ -712,7 +711,7 @@ class BacktestEngine:
             prev_weights=self._build_prev_weights(active_symbols, pv),
             regime_score=regime_score,
             gross_exposure=gross_exposure,
-            sector_labels=_me_build_sector_labels(active_symbols, self._sector_map),
+            sector_labels=_me_build_sector_labels(active_symbols, sector_map),
             cfg=cfg,
             state=self.state,
             rebalance_date=date,
