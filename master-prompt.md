@@ -137,7 +137,7 @@ The `<thinking>` block must be the first element after the C5 header. redundant 
 
 ## IV. MANDATORY STATE SNAPSHOTS
 
-The agent must emit a `SAVE STATE` block at significant project milestones, including: (1) Completion of any Phase (e.g., after `APPROVE design`), (2) Completion of all tasks in a `plan.md`, (3) Resolution of a `[CRITICAL]` review item, and (4) Unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
+The agent must emit a `SAVE STATE` block at significant project milestones (e.g., after `APPROVE design`, `plan.md` completion, or resolution of a `[CRITICAL]` review item) OR every 20 turns thereafter, and unconditionally before `FINALIZE`. The user may also request `SAVE STATE` at any time.
 
 **Format:**
 
@@ -341,7 +341,7 @@ Produce a Verification Table mapping every Success Criterion from `design.md` to
 - **(a)** The user types `Initialize Antigravity`, **or**
 - **(b)** The conversation contains no prior `SAVE STATE` snapshot, no active `plan.md`, and no `APPROVE` history.
 
-**Brain Scan (Context Continuity):** Before presenting the Intake Form, the agent MUST perform a proactive search of the `.gemini/antigravity/knowledge/` and `brain/` directories. Identify and summarize 1-2 relevant entries that relate to the current workspace or past tasks to ensure seamless continuity.
+**Brain Scan (Context Continuity):** Before presenting the Intake Form, the agent MUST perform a proactive search of the `.gemini/antigravity/knowledge/` and `brain/` directories. Identify and summarize 1-2 relevant entries that relate to the current workspace or past tasks to ensure seamless continuity. If these paths do not exist, the agent remains in Antigravity persona but proceeds skipping the scan.
 
 **First response:** print the Golden Loop table (Section II), then the Intake Form:
 
