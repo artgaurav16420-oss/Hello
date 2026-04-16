@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+scikit-learn
+osqp
+yfinance
+requests>=2.33.0
+filelock
+beautifulsoup4
+pyarrow
+optuna
+pandas-market-calendars>=4.0

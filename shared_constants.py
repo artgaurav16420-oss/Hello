@@ -1,0 +1,18 @@
+"""Shared string constants used across engines and workflows."""
+
+COLUMN_OPEN = "Open"
+COLUMN_HIGH = "High"
+COLUMN_LOW = "Low"
+COLUMN_CLOSE = "Close"
+COLUMN_ADJ_CLOSE = "Adj Close"
+COLUMN_VOLUME = "Volume"
+COLUMN_DIVIDENDS = "Dividends"
+COLUMN_STOCK_SPLITS = "Stock Splits"
+TIMEZONE_IST = "Asia/Kolkata"
+
+MARKET_INDEX_NSEI = "^NSEI"
+MARKET_INDEX_CRSLDX = "^CRSLDX"
+
+LABEL_NSE_TOTAL = "NSE TOTAL"
+LABEL_NIFTY_500 = "NIFTY 500"
+LABEL_CUSTOM_SCREENER = "CUSTOM SCREENER"
