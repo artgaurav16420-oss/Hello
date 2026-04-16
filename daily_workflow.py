@@ -60,7 +60,7 @@ BUG FIXES (murder board):
 """
 from __future__ import annotations
 
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401
 import argparse
 import copy
 import hashlib
@@ -75,7 +75,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import numpy as np
@@ -84,17 +84,12 @@ import pandas as pd
 from momentum_engine import (
     InstitutionalRiskEngine,
     UltimateConfig,
-    OptimizationError,
-    OptimizationErrorType,
     PortfolioState,
-    execute_rebalance,
     compute_book_cvar,
-    compute_decay_targets,
     absent_symbol_effective_price,
     to_ns,
     to_bare,
     Trade,
-    activate_override_on_stress,
     RebalanceContext,
     run_rebalance_pipeline,
     _build_sector_labels,
@@ -108,7 +103,7 @@ from universe_manager import (
 )
 from data_cache import load_or_fetch
 from backtest_engine import run_backtest, print_backtest_results
-from signals import generate_signals, compute_adv, compute_regime_score
+from signals import compute_adv, compute_regime_score
 from log_config import ScanContext, DeadLetterTracker
 from shared_utils import atomic_write_file
 from shared_constants import (
@@ -126,7 +121,6 @@ __version__ = "11.48"
 BACKUP_GENERATIONS = 3
 PAPER_MODE = False
 DEFAULT_INITIAL_CAPITAL = float(PortfolioState().cash)
-
 
 
 # PROD-FIX-3: Circuit-breaker counter for consecutive scans that return an
@@ -711,7 +705,6 @@ def _check_and_prompt_initial_capital(state: PortfolioState, label: str, name: s
             print(f"  {C.RED}Invalid input. Using default ₹10,00,000.{C.RST}\n")
 
 
-
 def _sweep_dividends(state: PortfolioState, sym: str, row: pd.DataFrame, cfg: UltimateConfig) -> None:
     """
     Check for unrecorded dividends and add them to the cash ledger.
@@ -785,6 +778,28 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
             if COLUMN_STOCK_SPLITS in row.columns:
                 split_series = row[COLUMN_STOCK_SPLITS].fillna(0.0)
                 positive_splits = split_series[split_series > 0].sort_index()
+
+                # FIX-SPLIT-FIRST-RUN-ADJ: apply the same temporal anchor logic
+                # used in the non-adjusted path to avoid over-applying historical
+                # splits on the first live scan.
+                split_start_date = None
+                if state.last_rebalance_date:
+                    try:
+                        split_start_date = pd.Timestamp(state.last_rebalance_date)
+                    except (ValueError, TypeError):
+                        split_start_date = None
+                if split_start_date is None:
+                    # Prefer position entry marker (stored under 'sym'), 
+                    # fall back to split-specific markers (stored under 'split:sym').
+                    marker = state.dividend_ledger.get(sym, state.dividend_ledger.get(f"split:{sym}", ""))
+                    marker_date = marker.split(":", 1)[0] if marker else ""
+                    if marker_date:
+                        try:
+                            # Use first marker (earliest date) as the anchor
+                            split_start_date = pd.Timestamp(marker_date.split("|")[0])
+                        except (ValueError, TypeError):
+                            split_start_date = None
+
                 if not positive_splits.empty and sym in state.shares:
                     marker_key = f"split:{sym}"
                     raw_markers = state.dividend_ledger.get(marker_key, "")
@@ -796,6 +811,22 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                         raw = str(raw_markers or "")
                         applied_event_ids = {m for m in raw.split("|") if m}
                     for split_date, split_val in positive_splits.items():
+                        # Temporal anchor check
+                        if split_start_date is not None:
+                            # Align timezones for comparison
+                            s_idx_tz = getattr(split_series.index, "tz", None)
+                            s_start_tz = split_start_date
+                            if s_idx_tz is not None:
+                                if s_start_tz.tzinfo is None:
+                                    s_start_tz = s_start_tz.tz_localize(s_idx_tz)
+                                else:
+                                    s_start_tz = s_start_tz.tz_convert(s_idx_tz)
+                            elif s_start_tz.tzinfo is not None:
+                                s_start_tz = s_start_tz.tz_localize(None)
+                            
+                            if pd.Timestamp(split_date) <= s_start_tz:
+                                continue
+
                         split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
                         event_id = f"{split_date_str}:{split_val:.8f}"
                         if event_id in applied_event_ids:
@@ -961,7 +992,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
     if PAPER_MODE:
         print(f"  {C.YLW}[!] Paper mode active. Trades not saved; risk metadata persisted.{C.RST}")
         os.makedirs("data", exist_ok=True)
-        risk_file = f"data/portfolio_risk_{name}.json"
+        risk_file = pathlib.Path(f"data/portfolio_risk_{name}.json")
         risk_payload = {
             "consecutive_failures": state.consecutive_failures,
             "override_active": state.override_active,
@@ -971,14 +1002,14 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             "last_rebalance_date": state.last_rebalance_date,
         }
         try:
-            tmp = f"{risk_file}.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            tmp = pathlib.Path(f"{risk_file}.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
                 json.dump(risk_payload, f, indent=2, sort_keys=True)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, risk_file)
             if os.name == "posix":
-                dir_path = os.path.dirname(risk_file) or "."
+                dir_path = risk_file.parent
                 dir_fd = os.open(dir_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
                 try:
                     os.fsync(dir_fd)
@@ -986,7 +1017,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                     os.close(dir_fd)
         except (OSError, IOError, TypeError, ValueError) as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
-            if os.path.exists(tmp):
+            if tmp.exists():
                 try:
                     os.remove(tmp)
                 except OSError:
@@ -1128,24 +1159,24 @@ def load_portfolio_state(name: str) -> PortfolioState:
     Returns:
         PortfolioState: Loaded state, or a fresh zero-balance state if no files exist.
     """
-    state_file = f"data/portfolio_state_{name}.json"
-    risk_file = f"data/portfolio_risk_{name}.json"
+    state_file = pathlib.Path(f"data/portfolio_state_{name}.json")
+    risk_file = pathlib.Path(f"data/portfolio_risk_{name}.json")
     # FIX-NEW-DW-03: backups list covers the primary file plus all BACKUP_GENERATIONS
     # rotation slots (bak.0 … bak.{BACKUP_GENERATIONS-1}).  All slots are tried in
     # order; only files that exist AND parse successfully are returned.  Files that
     # exist but fail JSON parsing are recorded in corrupted_paths — a RuntimeError
     # is raised only when every *existing* file is corrupted, not when some slots
     # are simply absent (normal on a fresh installation).
-    backups    = [state_file] + [f"{state_file}.bak.{i}" for i in range(BACKUP_GENERATIONS)]
+    backups    = [state_file] + [pathlib.Path(f"{state_file}.bak.{i}") for i in range(BACKUP_GENERATIONS)]
     corrupted_paths = []
     found_any_state_file = False
-    found_risk_overlay = os.path.exists(risk_file)
+    found_risk_overlay = risk_file.exists()
 
     for path in backups:
-        if os.path.exists(path):
+        if path.exists():
             found_any_state_file = True
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with path.open("r", encoding="utf-8") as f:
                     ps = PortfolioState.from_dict(json.load(f))
                 if PAPER_MODE:
                     return _apply_risk_overlay(ps, name)
@@ -1377,18 +1408,25 @@ def _run_scan(
         # rebalance gate can suppress non-forced rebalances when held positions have
         # no valid current price data (e.g. provider outage).
         _stale_held_syms: set[str] = set()
-        for _sym, _i in active_idx.items():
-            if not np.isfinite(prices[_i]) or prices[_i] <= 0:
+        for _sym in state.shares:
+            if state.shares[_sym] <= 0:
+                continue
+            # Check if this held symbol is finite in the latest row.
+            # latest_row contains all symbols from scan_symbols (universe + held).
+            _px = latest_row.get(_sym, np.nan)
+            if not np.isfinite(_px) or _px <= 0:
                 _lkp = state.last_known_prices.get(_sym, 0.0)
-                prices[_i] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
+                # If it's in active_idx, update prices array with fallback
+                if _sym in active_idx:
+                    prices[active_idx[_sym]] = float(_lkp) if np.isfinite(_lkp) and _lkp > 0 else 0.0
+                
                 # PROD-FIX-5: accumulate stale-price symbols for dead-letter report
                 _dead_letter.add(
                     _sym,
                     reason="stale_price" if (np.isfinite(_lkp) and _lkp > 0) else "no_price",
                     detail=f"last_known={_lkp:.4f}" if np.isfinite(_lkp) else "no_last_known",
                 )
-                if state.shares.get(_sym, 0) > 0:
-                    _stale_held_syms.add(_sym)
+                _stale_held_syms.add(_sym)
     
         mtm_notional = 0.0
         for sym in state.shares:
@@ -1427,7 +1465,6 @@ def _run_scan(
         regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close_hist)
         log_rets      = np.log1p(close_hist.pct_change(fill_method=None).clip(lower=-0.99)).replace([np.inf, -np.inf], np.nan)
         adv_arr       = compute_adv(market_data, active, cfg=cfg)
-        prev_w_arr    = np.array([state.weights.get(sym, 0.0) for sym in active])
         _print_stage_status("Analysis", 0.55, "Running momentum iterations, liquidity filters, and risk gates...")
     
         state.update_exposure(
@@ -1436,7 +1473,21 @@ def _run_scan(
             cfg,
             gross_exposure=initial_gross_exposure,
         )
-    
+
+        # ARCH-FIX-8: Pre-calculate book CVaR to allow hard-breach override of
+        # cadence and staleness gates. Forced liquidations must proceed even when
+        # data is stale or the rebalance clock hasn't ticked.
+        hard_cvar_breach = False
+        if state.shares:
+            _book_cvar = compute_book_cvar(state, prices, active, log_rets, cfg)
+            _hard_limit = cfg.CVAR_DAILY_LIMIT * getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
+            if _book_cvar > _hard_limit:
+                hard_cvar_breach = True
+                logger.warning(
+                    "[Scan] HARD CVAR BREACH DETECTED (%.4f > %.4f). Overriding rebalance gates for forced liquidation.",
+                    _book_cvar, _hard_limit
+                )
+
         total_slippage       = 0.0
         trade_log: List[Trade] = []
         rebalanced_this_scan = False
@@ -1446,7 +1497,7 @@ def _run_scan(
         # sizing and may result in large unintended trades during provider outages.
         # Forced liquidations (triggered inside run_rebalance_pipeline on a hard
         # CVaR breach) are exempt — they proceed regardless of stale prices.
-        if _stale_held_syms and rebalance_allowed:
+        if _stale_held_syms and rebalance_allowed and not hard_cvar_breach:
             logger.warning(
                 "[Scan] Suppressing rebalance: %d held symbol(s) have stale price data: %s. "
                 "Rebalance skipped to prevent incorrect sizing. Will retry next scan.",
@@ -1455,7 +1506,7 @@ def _run_scan(
             )
             rebalance_allowed = False
 
-        if rebalance_allowed:
+        if rebalance_allowed or hard_cvar_breach:
             pending = _load_pending_sentinel(name=name)
             if pending and pending.get("date") == session_date.strftime("%Y-%m-%d"):
                 logger.warning("Rebalance already committed for today, skipping")
@@ -1940,20 +1991,21 @@ def _handle_nse_total_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -
         universe = _prompt_survival_mode(e, "NSE Total")
         if universe is None:
             return
-    _preview_scan_and_maybe_save(states, mkt_cache, "nse_total", LABEL_NSE_TOTAL, universe, cfg)
+    _preview_scan_and_maybe_save(states, mkt_cache, "nse_total", LABEL_NSE_TOTAL, cast(List[str], universe), cfg)
 
 
 def _handle_nifty500_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:
     """CLI Handler: Perform a scan on the Nifty 500 universe."""
     _check_and_prompt_initial_capital(states["nifty"], LABEL_NIFTY_500, "nifty")
     cfg = load_optimized_config()
+    universe: Optional[List[str]]
     try:
         universe = get_nifty500()
     except UniverseFetchError as e:
         universe = _prompt_survival_mode(e, "Nifty 500")
         if universe is None:
             return
-    _preview_scan_and_maybe_save(states, mkt_cache, "nifty", LABEL_NIFTY_500, universe, cfg)
+    _preview_scan_and_maybe_save(states, mkt_cache, "nifty", LABEL_NIFTY_500, cast(List[str], universe), cfg)
 
 
 def _handle_custom_scan(states: Dict[str, PortfolioState], mkt_cache: dict) -> None:

@@ -65,10 +65,10 @@ from typing import Any, Dict, List, Optional
 try:
     from filelock import FileLock, Timeout as FileLockTimeout
 except ImportError:  # pragma: no cover - fallback for minimal test envs
-    class FileLockTimeout(Exception):
+    class FileLockTimeout(Exception):  # type: ignore[no-redef]
         pass
 
-    class FileLock:  # minimal compatibility shim
+    class FileLock(Any):  # minimal compatibility shim  # type: ignore[no-redef]
         def __init__(self, lock_file: str, timeout: float = 30.0) -> None:
             self._path = Path(lock_file)
             self._timeout = float(timeout)
@@ -1594,10 +1594,11 @@ def _save_dataframe_atomic(df: pd.DataFrame, parquet_path: Path) -> None:
     assert CACHE_DIR is not None
     tmp_path = CACHE_DIR / f"{parquet_path.name}.tmp.{uuid.uuid4().hex}"
     try:
-        df.to_parquet(tmp_path)
-        # Best-effort durability before atomic replace.
-        with tmp_path.open("rb") as fh:
-            os.fsync(fh.fileno())
+        # Open in binary write mode, then write to it
+        with open(tmp_path, "wb") as fh:
+            df.to_parquet(fh)  # Pass the file handle to to_parquet
+            fh.flush()  # Ensure all buffered data is written to the OS
+            os.fsync(fh.fileno())  # Ensure OS flushes to disk
         tmp_path.replace(parquet_path)
     except Exception:
         if tmp_path.exists():

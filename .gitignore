@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and Secrets
+.env
+venv/
+env/
+
+# Data and Logs
+data/
+logs/
+*.log
+*.csv
+*.parquet
+*.db
+
+# Static Analysis & Tests
+.mypy_cache/
+.pytest_cache/
+.coverage
+flake8_report*.txt
+mypy_report*.txt
+pytest_output.txt
+
+# Auxiliary/Local Folders
+.agent/
+scratch/
+docs/
+env_setup.bat
+requirements-lock.txt
+
+# OS specific
+.DS_Store
+Thumbs.db

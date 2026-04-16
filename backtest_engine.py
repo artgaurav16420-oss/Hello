@@ -43,10 +43,9 @@ BUG FIXES (murder board):
 
 from __future__ import annotations
 
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401 # MUST be first to prevent Windows Access Violation
 import logging
 import hashlib
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -78,13 +77,9 @@ from signals import (
 )
 from universe_manager import get_historical_universe
 from shared_constants import (
-    COLUMN_OPEN,
-    COLUMN_HIGH,
-    COLUMN_LOW,
     COLUMN_CLOSE,
     COLUMN_ADJ_CLOSE,
     COLUMN_VOLUME,
-    COLUMN_STOCK_SPLITS,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,15 +95,18 @@ class BacktestResults:
     Container for backtest execution results.
 
     Attributes:
-        equity_curve (pd.Series): Time series of portfolio equity values, typically at rebalance frequency.
+        equity_curve (pd.Series): Time series of portfolio equity values,
+            typically at rebalance frequency.
         trades (List[Trade]): List of all executed trades during the backtest.
-        metrics (Dict): Dictionary of computed performance metrics (CAGR, Sharpe, etc.).
-        rebal_log (pd.DataFrame): Log of rebalance events including regime scores and exposures.
+        metrics (Dict): Dictionary of computed performance metrics
+            (CAGR, Sharpe, etc.).
+        rebal_log (pd.DataFrame): Log of rebalance events including regime scores
+            and exposures.
     """
     equity_curve: pd.Series
-    trades:       List[Trade]
-    metrics:      Dict
-    rebal_log:    pd.DataFrame
+    trades: List[Trade]
+    metrics: Dict
+    rebal_log: pd.DataFrame
 
 
 # ─── Engine ───────────────────────────────────────────────────────────────────
@@ -123,22 +121,22 @@ class BacktestEngine:
             engine (InstitutionalRiskEngine): The core risk/optimization engine to use.
             initial_cash (float): Initial cash balance for the portfolio. Defaults to 1,000,000.
         """
-        self.engine              = engine
-        self.state               = PortfolioState(cash=initial_cash)
+        self.engine = engine
+        self.state = PortfolioState(cash=initial_cash)
         self.state.equity_hist_cap = engine.cfg.EQUITY_HIST_CAP
         self.state.max_absent_periods = engine.cfg.MAX_ABSENT_PERIODS
-        self.trades:  List[Trade]  = []
-        self._eq_dates: list       = []
-        self._eq_vals:  list       = []
-        self._rebal_rows: list     = []
+        self.trades: List[Trade] = []
+        self._eq_dates: list = []
+        self._eq_vals: list = []
+        self._rebal_rows: list = []
         self._sector_map: Optional[dict] = None
 
     def _reset_run_state(self) -> None:
         """Clear session-level buffers but preserve state.shares/cash/etc."""
         self._eq_dates = []
-        self._eq_vals  = []
+        self._eq_vals = []
         self._rebal_rows = []
-        self.trades      = []
+        self.trades = []
         self.engine.reset_solver()
 
     def _compute_portfolio_value_and_gross_exposure(
@@ -164,21 +162,21 @@ class BacktestEngine:
 
     def run(
         self,
-        close:           pd.DataFrame,
-        volume:          pd.DataFrame,
-        returns:         pd.DataFrame,
+        close: pd.DataFrame,
+        volume: pd.DataFrame,
+        returns: pd.DataFrame,
         rebalance_dates: pd.DatetimeIndex,
-        start_date:      str,
-        end_date:        Optional[str] = None,
-        idx_df:          Optional[pd.DataFrame] = None,
-        sector_map:      Optional[dict]         = None,
-        open_px:         Optional[pd.DataFrame] = None,
-        high_px:         Optional[pd.DataFrame] = None,
-        low_px:          Optional[pd.DataFrame] = None,
-        dividends:       Optional[pd.DataFrame] = None,
-        splits:          Optional[pd.DataFrame] = None,
+        start_date: str,
+        end_date: Optional[str] = None,
+        idx_df: Optional[pd.DataFrame] = None,
+        sector_map: Optional[dict] = None,
+        open_px: Optional[pd.DataFrame] = None,
+        high_px: Optional[pd.DataFrame] = None,
+        low_px: Optional[pd.DataFrame] = None,
+        dividends: Optional[pd.DataFrame] = None,
+        splits: Optional[pd.DataFrame] = None,
         universe_by_rebalance_date: Optional[Dict[pd.Timestamp, set[str]]] = None,
-        log_rets_arr:    Optional[np.ndarray] = None,
+        log_rets_arr: Optional[np.ndarray] = None,
     ) -> pd.DataFrame:
         # FIX-BE-STATE-RESET: BacktestEngine instances can be reused across
         # runs; without clearing per-run buffers, equity/trade/rebalance state
@@ -194,14 +192,14 @@ class BacktestEngine:
             start_date (str): Backtest evaluation start date (YYYY-MM-DD).
             end_date (Optional[str]): Backtest evaluation end date (YYYY-MM-DD).
             idx_df (Optional[pd.DataFrame]): Benchmark index data for regime detection.
-            sector_map (Optional[dict]): Mapping of symbols to their respective sectors.
+            sector_map (Optional[dict]): Mapping of symbols to their sectors.
             open_px (Optional[pd.DataFrame]): Daily open prices for execution modeling.
             high_px (Optional[pd.DataFrame]): Daily high prices.
             low_px (Optional[pd.DataFrame]): Daily low prices.
             dividends (Optional[pd.DataFrame]): Dividend cash payments (Date x Symbol).
             splits (Optional[pd.DataFrame]): Stock split ratios (Date x Symbol).
-            universe_by_rebalance_date (Optional[Dict]): Point-in-time universe membership.
-            log_rets_arr (Optional[np.ndarray]): Pre-computed log returns for CVaR logic.
+            universe_by_rebalance_date (Optional[Dict]): P-I-T universe membership.
+            log_rets_arr (Optional[np.ndarray]): Pre-computed log returns.
 
         Returns:
             pd.DataFrame: A dataframe containing the daily 'equity' curve.
@@ -219,13 +217,13 @@ class BacktestEngine:
             log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
 
         start_dt = pd.Timestamp(start_date)
-        end_dt   = pd.Timestamp(end_date) if end_date else close.index[-1]
-        symbols  = close.columns.tolist()
+        end_dt = pd.Timestamp(end_date) if end_date else close.index[-1]
+        symbols = close.columns.tolist()
         self._sector_map = sector_map
         close_arr = close.values
         date_to_pos = {d: i for i, d in enumerate(close.index)}
 
-        rebal_set  = set(rebalance_dates)
+        rebal_set = set(rebalance_dates)
         active_idx = {sym: i for i, sym in enumerate(symbols)}
         pending_splits: Dict[str, float] = {}
 
@@ -237,7 +235,9 @@ class BacktestEngine:
             close_t = close_arr[date_pos]
             prices_t = close_t.astype(float)
 
-            if splits is not None and not self.engine.cfg.AUTO_ADJUST_PRICES and (date in splits.index or pending_splits):
+            if splits is not None and not self.engine.cfg.AUTO_ADJUST_PRICES and (
+                date in splits.index or pending_splits
+            ):
                 if date in splits.index:
                     split_row = splits.loc[date]
                     for sym in split_row.index:
@@ -259,7 +259,8 @@ class BacktestEngine:
                     price_now = float(sym_px) if pd.notna(sym_px) else 0.0
                     if price_now <= 0:
                         logger.warning(
-                            "[Backtest] Split adjustment deferred for %s on %s due to invalid price %.4f.",
+                            "[Backtest] Split adjustment deferred for %s on %s "
+                            "due to invalid price %.4f.",
                             sym, date, price_now,
                         )
                         continue
@@ -268,8 +269,12 @@ class BacktestEngine:
                         # fractional-share liquidation.  Previously the cash
                         # credit was at the raw price with zero transaction cost,
                         # slightly overstating CAGR in split-heavy environments.
-                        _frac_slip_rate = (self.engine.cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
-                        _frac_proceeds = fractional_shares * price_now * (1.0 - _frac_slip_rate)
+                        _frac_slip_rate = (
+                            (self.engine.cfg.ROUND_TRIP_SLIPPAGE_BPS / 2) / 10_000
+                        )
+                        _frac_proceeds = (
+                            fractional_shares * price_now * (1.0 - _frac_slip_rate)
+                        )
                         self.state.cash = round(self.state.cash + _frac_proceeds, 10)
 
                     self.state.shares[sym] = new_shares
@@ -279,8 +284,8 @@ class BacktestEngine:
                         self.state.entry_prices[sym] = round(old_entry / split_denom, 4)
                     else:
                         logger.warning(
-                            "[Backtest] Missing entry price for %s during split adjustment on %s; "
-                            "using current price as fallback instead of inferring a pre-split entry.",
+                            "[Backtest] Missing entry price for %s during split "
+                            "adjustment on %s; using current price as fallback.",
                             sym,
                             date,
                         )
@@ -293,8 +298,11 @@ class BacktestEngine:
             if date in rebal_set:
                 self._run_rebalance(
                     date, close, volume, returns, symbols, prices_t,
-                    idx_df, sector_map, open_px=open_px, high_px=high_px, low_px=low_px,
-                    member_universe=(universe_by_rebalance_date or {}).get(pd.Timestamp(date)),
+                    idx_df, sector_map, open_px=open_px, high_px=high_px,
+                    low_px=low_px,
+                    member_universe=(universe_by_rebalance_date or {}).get(
+                        pd.Timestamp(date)
+                    ),
                     date_pos=date_pos, log_rets_arr=log_rets_arr,
                 )
 
@@ -354,22 +362,32 @@ class BacktestEngine:
     ) -> None:
         _adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
         for _adv_i, _adv_sym in enumerate(active_symbols):
-            if np.isclose(float(adv_vector[_adv_i]), 0.0, rtol=1e-9, atol=1e-12) and self.state.shares.get(_adv_sym, 0) > 0:
+            if (
+                np.isclose(float(adv_vector[_adv_i]), 0.0, rtol=1e-9, atol=1e-12)
+                and self.state.shares.get(_adv_sym, 0) > 0
+            ):
                 if _adv_sym in close.columns and _adv_sym in volume.columns:
                     try:
-                        _trail = close_notional[_adv_sym].iloc[-_adv_lookback:].clip(lower=0).dropna()
+                        _trail = (
+                            close_notional[_adv_sym]
+                            .iloc[-_adv_lookback:]
+                            .clip(lower=0)
+                            .dropna()
+                        )
                         if not _trail.empty:
                             _fallback_adv = float(_trail.mean())
                             if _fallback_adv > 0:
                                 adv_vector[_adv_i] = _fallback_adv
                                 logger.debug(
-                                    "[Backtest] ADV glitch: using trailing fallback "
-                                    "ADV=%.0f for held position %s on %s.",
+                                    "[Backtest] ADV glitch: using trailing "
+                                    "fallback ADV=%.0f for held position %s "
+                                    "on %s.",
                                     _fallback_adv, _adv_sym, date,
                                 )
                     except (KeyError, TypeError, ValueError, AttributeError, IndexError):
                         logger.debug(
-                            "[Backtest] ADV fallback failed for %s on %s; keeping ADV=0.",
+                            "[Backtest] ADV fallback failed for %s on %s; "
+                            "keeping ADV=0.",
                             _adv_sym,
                             date,
                         )
@@ -388,27 +406,30 @@ class BacktestEngine:
         soft_cvar_breach = False
 
         if self.state.shares:
-            book_cvar = compute_book_cvar(self.state, valuation_prices, active_symbols, hist_log_rets, cfg)
+            book_cvar = compute_book_cvar(
+                self.state, valuation_prices, active_symbols, hist_log_rets, cfg
+            )
             hard_multiplier = getattr(cfg, "CVAR_HARD_BREACH_MULTIPLIER", 1.5)
             hard_breach_threshold = cfg.CVAR_DAILY_LIMIT * hard_multiplier
 
             if book_cvar > hard_breach_threshold:
                 logger.warning(
-                    "[Backtest] Book CVaR %.4f%% exceeds HARD limit %.4f%% (%.1fx) on %s — "
-                    "skipping optimization, forcing immediate liquidation.",
+                    "[Backtest] Book CVaR %.4f%% exceeds HARD limit %.4f%% "
+                    "(%.1fx) on %s — skipping optimization, forcing liquidation.",
                     book_cvar * 100, hard_breach_threshold * 100, hard_multiplier, date,
                 )
                 self.state.consecutive_failures += 1
-                apply_decay      = True
+                apply_decay = True
                 _force_full_cash = True
                 activate_override_on_stress(self.state, cfg)
 
             elif book_cvar > cfg.CVAR_DAILY_LIMIT + 1e-6:
                 soft_cvar_breach = True
                 logger.info(
-                    "[Backtest] Book CVaR soft breach %.4f%% (limit %.4f%%, hard %.4f%%) on %s — "
-                    "running optimizer with CVaR constraint active.",
-                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100, hard_breach_threshold * 100, date,
+                    "[Backtest] Book CVaR soft breach %.4f%% (limit %.4f%%, "
+                    "hard %.4f%%) on %s — running optimizer with CVaR constraint.",
+                    book_cvar * 100, cfg.CVAR_DAILY_LIMIT * 100,
+                    hard_breach_threshold * 100, date,
                 )
         return apply_decay, _force_full_cash, soft_cvar_breach
 
@@ -443,31 +464,35 @@ class BacktestEngine:
                 "treating as empty universe for this bar.",
                 date, ve,
             )
-            self.state.decay_rounds         = 0
+            self.state.decay_rounds = 0
             self.state.consecutive_failures = 0
             return target_weights, optimization_succeeded, apply_decay, sel_idx, True
 
         if sel_idx:
-            sel_syms      = [active_symbols[i] for i in sel_idx]
+            sel_syms = [active_symbols[i] for i in sel_idx]
             sector_labels = _build_sector_labels(sel_syms, sector_map)
-            prev_weights  = np.array([prev_w_dict.get(sym, 0.0) for sym in active_symbols])
+            prev_weights = np.array(
+                [prev_w_dict.get(sym, 0.0) for sym in active_symbols]
+            )
 
             try:
                 weights_sel = self.engine.optimize(
-                    expected_returns    = raw_daily[sel_idx],
-                    historical_returns  = hist_log_rets[[active_symbols[i] for i in sel_idx]],
-                    execution_date      = date,
-                    adv_shares          = adv_vector[sel_idx],
-                    prices              = valuation_prices[sel_idx],
-                    portfolio_value     = pv,
-                    prev_w              = prev_weights[sel_idx],
+                    expected_returns = raw_daily[sel_idx],
+                    historical_returns = hist_log_rets[
+                        [active_symbols[i] for i in sel_idx]
+                    ],
+                    execution_date = date,
+                    adv_shares = adv_vector[sel_idx],
+                    prices = valuation_prices[sel_idx],
+                    portfolio_value = pv,
+                    prev_w = prev_weights[sel_idx],
                     exposure_multiplier = self.state.exposure_multiplier,
-                    sector_labels       = sector_labels,
+                    sector_labels = sector_labels,
                 )
-                target_weights[sel_idx]  = weights_sel
+                target_weights[sel_idx] = weights_sel
                 self.state.consecutive_failures = 0
-                self.state.decay_rounds  = 0
-                optimization_succeeded   = True
+                self.state.decay_rounds = 0
+                optimization_succeeded = True
 
             except OptimizationError as oe:
                 if oe.error_type != OptimizationErrorType.DATA:
@@ -494,10 +519,12 @@ class BacktestEngine:
         elif self.state.shares:
             apply_decay = True
         else:
-            self.state.decay_rounds         = 0
+            self.state.decay_rounds = 0
             self.state.consecutive_failures = 0
 
-        return target_weights, optimization_succeeded, apply_decay, sel_idx, False
+        return (
+            target_weights, optimization_succeeded, apply_decay, sel_idx, False
+        )
 
     def _compute_position_decay(
         self,
@@ -522,9 +549,12 @@ class BacktestEngine:
             _exhaust_decay = True
             activate_override_on_stress(self.state, cfg)
         else:
-            target_weights = compute_decay_targets(self.state, sel_idx, active_symbols, cfg, current_prices=valuation_prices, pv=pv)
+            target_weights = compute_decay_targets(
+                self.state, sel_idx, active_symbols, cfg,
+                current_prices=valuation_prices, pv=pv
+            )
             sel_idx_set = set(sel_idx)
-            sym_to_pos  = {s: i for i, s in enumerate(active_symbols)}
+            sym_to_pos = {s: i for i, s in enumerate(active_symbols)}
             n_gated = sum(
                 1 for s in self.state.shares
                 if s in sym_to_pos and sym_to_pos[s] not in sel_idx_set
@@ -552,7 +582,8 @@ class BacktestEngine:
         target_weights: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         exec_prices, open_fallback_mask = _execution_prices(
-            active_symbols, date, active_prices, open_px, high_px, low_px, return_open_fallback_mask=True
+            active_symbols, date, active_prices, open_px,
+            high_px, low_px, return_open_fallback_mask=True
         )
         first_day_mask = np.zeros(len(active_symbols), dtype=bool)
         if open_fallback_mask.any():
@@ -565,9 +596,14 @@ class BacktestEngine:
                 & (sig_px_arr == cur_px_arr)
             )
             if first_day_mask.any():
-                skipped_syms = [sym for sym, bad in zip(active_symbols, first_day_mask, strict=True) if bad]
+                skipped_syms = [
+                    sym for sym, bad in zip(
+                        active_symbols, first_day_mask, strict=True
+                    ) if bad
+                ]
                 logger.warning(
-                    "[Backtest] Skipping first-day symbols with NaN open fallback on %s: %s",
+                    "[Backtest] Skipping first-day symbols with NaN open "
+                    "fallback on %s: %s",
                     date,
                     skipped_syms,
                 )
@@ -591,14 +627,18 @@ class BacktestEngine:
         cfg: UltimateConfig,
     ) -> None:
         _T = min(len(hist_log_rets), cfg.CVAR_LOOKBACK)
-        _L = -(hist_log_rets.iloc[-_T:].reindex(columns=active_symbols, fill_value=0.0).values)
+        _L = -(
+            hist_log_rets.iloc[-_T:]
+            .reindex(columns=active_symbols, fill_value=0.0)
+            .values
+        )
 
         execute_rebalance(
             self.state, target_weights, exec_prices, active_symbols, cfg,
-            adv_shares     = adv_vector,
-            date_context   = date,
-            trade_log      = self.trades,
-            apply_decay    = apply_decay and not _exhaust_decay,
+            adv_shares = adv_vector,
+            date_context = date,
+            trade_log = self.trades,
+            apply_decay = apply_decay and not _exhaust_decay,
             scenario_losses = None if _exhaust_decay else _L,
             force_rebalance_trades = soft_cvar_breach,
         )
@@ -607,15 +647,15 @@ class BacktestEngine:
             self.state.consecutive_failures = 0
 
         self._rebal_rows.append({
-            "date":               date,
-            "regime_score":       round(regime_score, 4),
-            "realised_cvar":      round(realised_cvar, 6),
-            "exposure_multiplier":round(self.state.exposure_multiplier, 4),
-            "override_active":    self.state.override_active,
-            "n_positions":        len(self.state.shares),
-            "apply_decay":        apply_decay,
-            "forced_to_cash":     bool(_force_full_cash or _exhaust_decay),
-            "force_cash_reason":  (
+            "date": date,
+            "regime_score": round(regime_score, 4),
+            "realised_cvar": round(realised_cvar, 6),
+            "exposure_multiplier": round(self.state.exposure_multiplier, 4),
+            "override_active": self.state.override_active,
+            "n_positions": len(self.state.shares),
+            "apply_decay": apply_decay,
+            "forced_to_cash": bool(_force_full_cash or _exhaust_decay),
+            "force_cash_reason": (
                 "book_cvar_breach" if _force_full_cash else
                 "max_decay_rounds" if _exhaust_decay else
                 ""
@@ -624,24 +664,26 @@ class BacktestEngine:
 
     def _run_rebalance(
         self,
-        date:       pd.Timestamp,
-        close:      pd.DataFrame,
-        volume:     pd.DataFrame,
-        returns:    pd.DataFrame,
-        symbols:    List[str],
-        prices_t:   np.ndarray,
-        idx_df:     Optional[pd.DataFrame],
+        date: pd.Timestamp,
+        close: pd.DataFrame,
+        volume: pd.DataFrame,
+        returns: pd.DataFrame,
+        symbols: List[str],
+        prices_t: np.ndarray,
+        idx_df: Optional[pd.DataFrame],
         sector_map: Optional[dict],
-        open_px:    Optional[pd.DataFrame] = None,
-        high_px:    Optional[pd.DataFrame] = None,
-        low_px:     Optional[pd.DataFrame] = None,
+        open_px: Optional[pd.DataFrame] = None,
+        high_px: Optional[pd.DataFrame] = None,
+        low_px: Optional[pd.DataFrame] = None,
         member_universe: Optional[set[str]] = None,
         date_pos: Optional[int] = None,
         log_rets_arr: Optional[np.ndarray] = None,
     ) -> None:
         cfg = self.engine.cfg
 
-        active_symbols, active_prices, _ = self._filter_rebalance_universe(symbols, prices_t, member_universe)
+        active_symbols, active_prices, _ = self._filter_rebalance_universe(
+            symbols, prices_t, member_universe
+        )
         if not active_symbols:
             return
 
@@ -650,18 +692,25 @@ class BacktestEngine:
             if not isinstance(_loc, (int, np.integer)):
                 raise ValueError(
                     f"Duplicate timestamp {date} detected in close index. "
-                    "Deduplicate the index in build_precomputed_matrices before running backtest."
+                    "Deduplicate the index in build_precomputed_matrices "
+                    "before running backtest."
                 )
             date_pos = int(_loc)
         if log_rets_arr is None:
-            log_rets_arr = np.log1p(returns).replace([np.inf, -np.inf], np.nan).values
+            log_rets_arr = (
+                np.log1p(returns)
+                .replace([np.inf, -np.inf], np.nan)
+                .values
+            )
 
         col_to_idx = {sym: i for i, sym in enumerate(close.columns)}
         prev_idx = date_pos - 1
         if prev_idx < 0:
             return
         signal_date = close.index[prev_idx]
-        active_col_indices = np.array([col_to_idx[sym] for sym in active_symbols], dtype=int)
+        active_col_indices = np.array(
+            [col_to_idx[sym] for sym in active_symbols], dtype=int
+        )
         hist_log_rets = pd.DataFrame(
             log_rets_arr[:prev_idx + 1, active_col_indices],
             index=returns.index[:prev_idx + 1],
@@ -672,13 +721,16 @@ class BacktestEngine:
             active_symbols, close, volume, date, cfg=cfg, return_notional=True
         )
 
-        self._correct_adv_glitches(active_symbols, adv_vector, close, volume, close_notional, date, cfg)
+        self._correct_adv_glitches(
+            active_symbols, adv_vector, close, volume, close_notional, date, cfg
+        )
 
         valuation_close = close.loc[signal_date]
 
         valuation_prices = np.array([
-            float(valuation_close[sym]) if (sym in valuation_close.index and pd.notna(valuation_close[sym]))
-            else _ffill_price(self.state, sym, cfg)
+            float(valuation_close[sym]) if (
+                sym in valuation_close.index and pd.notna(valuation_close[sym])
+            ) else _ffill_price(self.state, sym, cfg)
             for sym in active_symbols
         ])
 
@@ -687,8 +739,14 @@ class BacktestEngine:
             cfg=cfg,
         )
 
-        idx_slice    = idx_df.loc[:signal_date] if idx_df is not None and not getattr(idx_df, "empty", False) else None
-        regime_score = compute_regime_score(idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date])
+        idx_slice = (
+            idx_df.loc[:signal_date]
+            if idx_df is not None and not getattr(idx_df, "empty", False)
+            else None
+        )
+        regime_score = compute_regime_score(
+            idx_slice, cfg=cfg, universe_close_hist=close.loc[:signal_date]
+        )
 
         adaptive_cvar_min_obs = _get_adaptive_cvar_min_obs(cfg)
         if len(self.state.equity_hist) >= adaptive_cvar_min_obs:
@@ -697,8 +755,9 @@ class BacktestEngine:
             realised_cvar = 0.0
 
         exec_prices, _, first_day_mask = self._select_execution_prices(
-            date, active_symbols, active_prices, close, open_px, high_px, low_px,
-            active_col_indices, prev_idx, date_pos, np.zeros(len(active_symbols), dtype=float)
+            date, active_symbols, active_prices, close, open_px, high_px,
+            low_px, active_col_indices, prev_idx, date_pos,
+            np.zeros(len(active_symbols), dtype=float)
         )
 
         ctx = RebalanceContext(
@@ -723,15 +782,15 @@ class BacktestEngine:
 
         if result.optimization_succeeded or result.applied_decay:
             self._rebal_rows.append({
-                "date":               date,
-                "regime_score":       round(regime_score, 4),
-                "realised_cvar":      round(realised_cvar, 6),
-                "exposure_multiplier":round(self.state.exposure_multiplier, 4),
-                "override_active":    self.state.override_active,
-                "n_positions":        len(self.state.shares),
-                "apply_decay":        result.applied_decay,
-                "forced_to_cash":     result.forced_to_cash,
-                "force_cash_reason":  result.force_cash_reason,
+                "date": date,
+                "regime_score": round(regime_score, 4),
+                "realised_cvar": round(realised_cvar, 6),
+                "exposure_multiplier": round(self.state.exposure_multiplier, 4),
+                "override_active": self.state.override_active,
+                "n_positions": len(self.state.shares),
+                "apply_decay": result.applied_decay,
+                "forced_to_cash": result.forced_to_cash,
+                "force_cash_reason": result.force_cash_reason,
             })
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -750,11 +809,11 @@ def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
     """
     halflife_slow = int(getattr(cfg, "HALFLIFE_SLOW", 63))
     cvar_lookback = int(getattr(cfg, "CVAR_LOOKBACK", 90))
-    history_gate  = int(getattr(cfg, "HISTORY_GATE",  90))
+    history_gate = int(getattr(cfg, "HISTORY_GATE", 90))
 
     required_trading_days = max(halflife_slow * 4, cvar_lookback, history_gate)
     required_calendar_days = int(required_trading_days * 1.4) + 30
-    warmup_calendar_days   = max(400, required_calendar_days)
+    warmup_calendar_days = max(400, required_calendar_days)
 
     warmup_start = (
         pd.Timestamp(start_date) - pd.Timedelta(days=warmup_calendar_days)
@@ -768,7 +827,9 @@ def _compute_warmup_start(start_date: str, cfg: UltimateConfig) -> str:
     return warmup_start
 
 
-def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) -> Dict[str, float]:
+def _build_prev_weights(
+    state: PortfolioState, symbols: List[str], pv: float
+) -> Dict[str, float]:
     """
     Compute previous portfolio weights from current share counts and prices.
 
@@ -792,7 +853,11 @@ def _build_prev_weights(state: PortfolioState, symbols: List[str], pv: float) ->
                 if state.max_absent_periods is not None
                 else DEFAULT_MAX_ABSENT_PERIODS
             )
-            px = float(absent_symbol_effective_price(raw_px, absent_n, state_max_absent_periods))
+            px = float(
+                absent_symbol_effective_price(
+                    raw_px, absent_n, state_max_absent_periods
+                )
+            )
         else:
             px = float(raw_px)
         if px <= 0:
@@ -819,7 +884,7 @@ def _build_adv_vector(
         volume (pd.DataFrame): Daily volumes.
         date (pd.Timestamp): Target rebalance date (ADV is computed up to T-1).
         cfg (Optional[UltimateConfig]): Config for ADV_LOOKBACK.
-        return_notional (bool): If True, also returns the underlying daily notional matrix.
+        return_notional (bool): If True, also returns the notional matrix.
 
     Returns:
         np.ndarray | tuple: ADV vector, or (ADV vector, notional DataFrame).
@@ -848,31 +913,39 @@ def _build_adv_vector(
                 signal_date = idx[pos - 1]
             else:
                 # FIX-NEW-BE-05: date is the first entry in the volume index, so
-                # there is no prior bar to use as the ADV signal date.  All symbols
-                # will receive ADV=0 and fail the liquidity gate, producing a
-                # zero-position portfolio on this bar.  Log a warning so operators
-                # can distinguish this intentional guard from a data problem.
+                # there is no prior bar to use as the ADV signal date.
                 signal_date = None
                 logger.warning(
-                    "[Backtest] ADV signal_date is None on %s (first bar in volume index). "
-                    "All symbols receive ADV=0; liquidity gate will suppress all positions "
-                    "on this rebalance. Consider advancing start_date by one bar.",
+                    "[Backtest] ADV signal_date is None on %s (first bar). "
+                    "All symbols receive ADV=0; liquidity gate will suppress.",
                     date,
                 )
 
-    close_notional = pd.DataFrame(index=close.index if signal_date is None else close.loc[:signal_date].index)
+    notional_idx = close.index if signal_date is None else close.loc[:signal_date].index
+    close_notional = pd.DataFrame(index=notional_idx)
     adv = np.zeros(len(symbols), dtype=float)
     if signal_date is not None:
         close_sub = close.loc[:signal_date]
         volume_sub = volume.loc[:signal_date]
-        common_cols = [s for s in symbols if s in close_sub.columns and s in volume_sub.columns]
+        common_cols = [
+            s for s in symbols
+            if s in close_sub.columns and s in volume_sub.columns
+        ]
         if common_cols:
             close_slice = close_sub[common_cols]
             volume_aligned = volume_sub[common_cols].reindex(close_slice.index)
             close_notional = (close_slice * volume_aligned).clip(lower=0)
-            adv_lookback = int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
-            adv_vector = close_notional.iloc[-adv_lookback:].mean(axis=0, skipna=True)
-            adv_fallback = float(getattr(cfg, "ADV_FALLBACK", 0.0)) if cfg is not None else 0.0
+            adv_lookback = (
+                int(getattr(cfg, "ADV_LOOKBACK", 20)) if cfg is not None else 20
+            )
+            adv_vector = (
+                close_notional.iloc[-adv_lookback:]
+                .mean(axis=0, skipna=True)
+            )
+            adv_fallback = (
+                float(getattr(cfg, "ADV_FALLBACK", 0.0))
+                if cfg is not None else 0.0
+            )
             for i, sym in enumerate(symbols):
                 if sym in adv_vector.index:
                     val = float(adv_vector[sym])
@@ -904,22 +977,26 @@ def _build_adv_vector(
     return adv_out
 
 
-def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Optional[np.ndarray]:
+def _build_sector_labels(
+    sel_syms: List[str], sector_map: Optional[dict]
+) -> Optional[np.ndarray]:
     """
     Map symbols to integer indices representing their respective sectors.
     Used for sector concentration constraints in the optimizer.
 
     Args:
         sel_syms (List[str]): List of selected symbols for the optimizer.
-        sector_map (Optional[dict]): Dictionary mapping symbols to sector strings.
+        sector_map (Optional[dict]): Dictionary mapping symbols to sectors.
 
     Returns:
-        Optional[np.ndarray]: Integer array of sector labels, or None if no map provided.
+        Optional[np.ndarray]: Integer array of sector labels, or None.
     """
     if not sector_map:
         return None
-    known_sectors = sorted(s for s in set(sector_map.get(sym, "Unknown") for sym in sel_syms)
-                           if s != "Unknown")
+    known_sectors = sorted(
+        s for s in set(sector_map.get(sym, "Unknown") for sym in sel_syms)
+        if s != "Unknown"
+    )
     sec_idx = {s: i for i, s in enumerate(known_sectors)}
     return np.array(
         [sec_idx.get(sector_map.get(sym, "Unknown"), -1) for sym in sel_syms],
@@ -930,13 +1007,17 @@ def _build_sector_labels(sel_syms: List[str], sector_map: Optional[dict]) -> Opt
 def _ffill_price(state: PortfolioState, sym: str, cfg: UltimateConfig) -> float:
     """
     Perform a forward-fill of prices for symbols with data gaps.
-    Applies a haircut to the last known price based on the duration of the absence.
+    Applies a haircut based on the duration of the absence.
     """
     px = state.last_known_prices.get(sym)
     if px is None or not np.isfinite(px):
         return 0.0
     absent_n = int(state.absent_periods.get(sym, 0))
-    return float(absent_symbol_effective_price(float(px), absent_n, cfg.MAX_ABSENT_PERIODS))
+    return float(
+        absent_symbol_effective_price(
+            float(px), absent_n, cfg.MAX_ABSENT_PERIODS
+        )
+    )
 
 
 def _execution_prices(
@@ -949,23 +1030,20 @@ def _execution_prices(
     return_open_fallback_mask: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
-    Determine the optimal execution price for a set of symbols on a given date.
+    Determine the optimal execution price for a set of symbols.
     Prefers Open price if available, otherwise falls back to Close.
 
     Args:
         symbols (List[str]): Standardized symbol names.
         date (pd.Timestamp): Target execution date.
-        close_prices (np.ndarray): Close prices for all symbols for the current date.
-        open_px (Optional[pd.DataFrame]): Complete matrix of daily open prices.
-        high_px (Optional[pd.DataFrame]): Complete matrix of daily high prices.
-        low_px (Optional[pd.DataFrame]): Complete matrix of daily low prices.
-        return_open_fallback_mask (bool): If True, returns a boolean mask indicating where Close was used.
+        close_prices (np.ndarray): Close prices for all symbols.
+        open_px (Optional[pd.DataFrame]): Daily open prices.
+        high_px (Optional[pd.DataFrame]): Daily high prices.
+        low_px (Optional[pd.DataFrame]): Daily low prices.
+        return_open_fallback_mask (bool): Indicating where Close was used.
 
     Returns:
-        np.ndarray | tuple: execution价格向量, or (prices, mask).
-
-    Raises:
-        Exception: Propagates unexpected indexing or data access errors.
+        np.ndarray | tuple: execution prices, or (prices, mask).
     """
     exec_px = close_prices.copy()
     open_fallback_mask = np.zeros(len(symbols), dtype=bool)
@@ -974,9 +1052,14 @@ def _execution_prices(
         opens = open_px.loc[date].reindex(symbols).values.astype(float)
         open_fallback_mask = (~np.isfinite(opens)) | (opens <= 0)
         if open_fallback_mask.any():
-            bad_syms = [sym for sym, bad in zip(symbols, open_fallback_mask, strict=True) if bad]
+            bad_syms = [
+                sym for sym, bad in zip(
+                    symbols, open_fallback_mask, strict=True
+                ) if bad
+            ]
             logger.warning(
-                "[Backtest] Non-finite/non-positive open prices on %s for %s; falling back to close prices.",
+                "[Backtest] Non-finite/non-positive open prices on %s "
+                "for %s; falling back to close prices.",
                 date,
                 bad_syms,
             )
@@ -987,7 +1070,9 @@ def _execution_prices(
     return exec_px
 
 
-def _detect_suspension_gaps(df: pd.DataFrame, threshold_days: int) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+def _detect_suspension_gaps(
+    df: pd.DataFrame, threshold_days: int
+) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
     """
     Identify prolonged gaps in time series data exceeding a threshold.
     Used to trigger synthetic holiday/halt simulations.
@@ -1026,7 +1111,7 @@ def _generate_synthetic_fill(
 ) -> pd.DataFrame:
     """
     Generate synthetic price history for a trading halt using Brownian motion.
-    Maintains statistical continuity of the price path during delistings or suspensions.
+    Maintains statistical continuity of the price path.
 
     Args:
         ticker (str): Symbol being processed.
@@ -1039,7 +1124,10 @@ def _generate_synthetic_fill(
         pd.DataFrame: Synthetic OHLCV rows to fill the gap.
     """
     gap_idx = pd.bdate_range(gap_start, gap_end)
-    synth_idx = gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)].difference(pre_gap_df.index)
+    synth_idx = (
+        gap_idx[(gap_idx > gap_start) & (gap_idx < gap_end)]
+        .difference(pre_gap_df.index)
+    )
     if len(synth_idx) == 0:
         return pd.DataFrame()
 
@@ -1074,19 +1162,13 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     FIX-MB-H-02: All gap fills are computed against the original df (before any
     synthetic rows are added), then all synthetic DataFrames are concatenated at
-    once.  The previous approach grew 'out' incrementally, which caused:
-      (a) gap_idx.difference(out.index) for a second gap to exclude dates that
-          were already filled synthetically by gap 1, silently truncating the
-          second gap's noise array;
-      (b) the random walk for gap 2 to be seeded from gap_start_2 but only
-          generate len(synth_idx_2) draws, where synth_idx_2 < full gap_idx_2
-          if any dates coincided with gap 1 synthetics.
-    Processing against the original df guarantees each gap's synth_idx equals
-    the full business-day range (gap_start, gap_end), making the price path
-    deterministic and length-consistent with the seed.
+    once.
     """
     gaps = _detect_suspension_gaps(df=df, threshold_days=_SUSPENSION_GAP_DAYS)
-    max_gap = int(df.index.to_series().diff().dt.days.max()) if len(df) > 1 else 0
+    max_gap = (
+        int(df.index.to_series().diff().dt.days.max())
+        if len(df) > 1 else 0
+    )
     if max_gap <= _SUSPENSION_GAP_DAYS:
         return df.copy()
 
@@ -1122,8 +1204,8 @@ def _repair_suspension_gaps(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
 def apply_halt_simulation(market_data: dict) -> dict:
     """
-    Apply in-memory suspension repairs to all symbols in a market data dictionary.
-    Ensures backtests don't 'look ahead' through data gaps or benefit from delistings.
+    Apply in-memory suspension repairs to all symbols in a market data dict.
+    Ensures backtests don't 'look ahead' through data gaps.
     """
     return {k: _repair_suspension_gaps(v, k) for k, v in market_data.items()}
 
@@ -1135,9 +1217,11 @@ def _deduplicate_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: UltimateConfig) -> pd.Series:
+def _extract_series_for_symbol(
+    market_data: dict, sym: str, column: str, cfg: UltimateConfig
+) -> pd.Series:
     """
-    Extract a specific data column for a symbol, applying forward-fills and price adjustments.
+    Extract a data column for a symbol, applying forward-fills.
 
     Args:
         market_data (dict): Source dictionary of DataFrames.
@@ -1146,7 +1230,7 @@ def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: Ul
         cfg (UltimateConfig): Config for price adjustment settings.
 
     Returns:
-        pd.Series: Cleaned and aligned time series for the requested attribute.
+        pd.Series: Cleaned and aligned time series.
     """
     key = sym if sym.endswith(".NS") else f"{sym}.NS"
     row = market_data.get(key)
@@ -1157,10 +1241,16 @@ def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: Ul
 
     max_absent_periods = max(0, int(getattr(cfg, "MAX_ABSENT_PERIODS", 10)))
     if column == "close":
-        valuation_series = row.get(COLUMN_ADJ_CLOSE, row["Close"]) if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        valuation_series = (
+            row.get(COLUMN_ADJ_CLOSE, row["Close"])
+            if cfg.AUTO_ADJUST_PRICES else row["Close"]
+        )
         return valuation_series.ffill(limit=max_absent_periods)
     if column == "close_adj":
-        return row.get(COLUMN_ADJ_CLOSE, row["Close"]).ffill(limit=max_absent_periods)
+        return (
+            row.get(COLUMN_ADJ_CLOSE, row["Close"])
+            .ffill(limit=max_absent_periods)
+        )
     if column == "open":
         return row.get("Open", row["Close"]).ffill(limit=max_absent_periods)
     if column == "high":
@@ -1170,7 +1260,9 @@ def _extract_series_for_symbol(market_data: dict, sym: str, column: str, cfg: Ul
     if column == "dividends":
         return row.get("Dividends", pd.Series(0.0, index=row.index)).fillna(0.0)
     if column == "splits":
-        return row.get("Stock Splits", pd.Series(0.0, index=row.index)).fillna(0.0)
+        return row.get(
+            "Stock Splits", pd.Series(0.0, index=row.index)
+        ).fillna(0.0)
     if column == "volume":
         return row["Volume"]
     raise ValueError(f"Unsupported column kind: {column}")
@@ -1191,19 +1283,22 @@ def build_precomputed_matrices(
         symbols (Optional[set]): Subset of symbols to include.
 
     Returns:
-        dict: Mapping of matrix names (close, volume, etc.) to aligned DataFrames.
+        dict: Mapping of matrix names (close, volume, etc.) to DataFrames.
     """
     if cfg is None:
         cfg = UltimateConfig()
 
-    # FIX-MB-BE-05: strip .NS suffix so caller-supplied symbols with the suffix
-    # match the bare-symbol keys used internally throughout the engine.
-    target_symbols = {s[:-3] if s.endswith(".NS") else s for s in (symbols or set())}
+    # FIX-MB-BE-05: strip .NS suffix so caller-supplied symbols match.
+    target_symbols = {
+        s[:-3] if s.endswith(".NS") else s for s in (symbols or set())
+    }
     if not target_symbols:
         for key in market_data.keys():
             if isinstance(key, str) and key.endswith(".NS"):
                 target_symbols.add(key[:-3])
-    close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = {}, {}, {}, {}, {}, {}, {}, {}
+    close_d, close_adj_d, open_d, high_d, low_d, div_d, split_d, volume_d = (
+        {}, {}, {}, {}, {}, {}, {}, {}
+    )
 
     for sym in target_symbols:
         if not sym:
@@ -1212,13 +1307,19 @@ def build_precomputed_matrices(
         if close_s.empty:
             continue
         close_d[sym] = close_s
-        close_adj_d[sym] = _extract_series_for_symbol(market_data, sym, "close_adj", cfg)
+        close_adj_d[sym] = _extract_series_for_symbol(
+            market_data, sym, "close_adj", cfg
+        )
         open_d[sym] = _extract_series_for_symbol(market_data, sym, "open", cfg)
         high_d[sym] = _extract_series_for_symbol(market_data, sym, "high", cfg)
         low_d[sym] = _extract_series_for_symbol(market_data, sym, "low", cfg)
-        div_d[sym] = _extract_series_for_symbol(market_data, sym, "dividends", cfg)
+        div_d[sym] = _extract_series_for_symbol(
+            market_data, sym, "dividends", cfg
+        )
         split_d[sym] = _extract_series_for_symbol(market_data, sym, "splits", cfg)
-        volume_d[sym] = _extract_series_for_symbol(market_data, sym, "volume", cfg)
+        volume_d[sym] = _extract_series_for_symbol(
+            market_data, sym, "volume", cfg
+        )
 
     if not close_d:
         return {}
@@ -1241,7 +1342,7 @@ def build_precomputed_matrices(
     splits_df = splits_df.reindex(shared_index).fillna(0.0)
     volume_df = volume_df.reindex(shared_index)
 
-    # FIX-MB-BE-02: returns derived from close (valuation_series) not always close_adj.
+    # FIX-MB-BE-02: returns derived from close (valuation_series).
     returns_base = close if not cfg.AUTO_ADJUST_PRICES else close_adj
 
     returns = returns_base.pct_change(fill_method=None).clip(lower=-0.99)
@@ -1272,6 +1373,7 @@ def build_precomputed_matrices(
         "returns": returns,
     }
 
+
 def _resolve_universe_by_date(
     market_data: dict,
     universe_type: Optional[str],
@@ -1280,25 +1382,27 @@ def _resolve_universe_by_date(
     cfg: UltimateConfig,
 ) -> Tuple[set[str], Dict[pd.Timestamp, set[str]], str]:
     """
-    Resolve the constituent symbols for each rebalance date in the backtest.
-    Supports either a static universe or dynamic historical snapshots.
+    Resolve the constituent symbols for each rebalance date.
+    Supports either a static universe or dynamic snapshots.
 
     Args:
-        market_data (dict): Source market data to check for history availability.
+        market_data (dict): Source market data.
         universe_type (Optional[str]): Name of the universe (e.g., 'nse500').
-        universe (Optional[List[str]]): Explicit list of symbols (overrides universe_type).
-        all_target_dates (pd.DatetimeIndex): Rebalance dates to resolve symbols for.
+        universe (Optional[List[str]]): Explicit list of symbols.
+        all_target_dates (pd.DatetimeIndex): Rebalance dates.
         cfg (UltimateConfig): Config for HISTORY_GATE gating.
 
     Returns:
-        Tuple: (union of all symbols, constituents per date, selected universe type string).
+        Tuple: (union of symbols, constituents per date, universe type string).
     """
     def _normalize_symbol(sym: str) -> str:
-        """Strip suffixes and ensure uppercase formatting for consistency."""
+        """Strip suffixes and ensure uppercase formatting."""
         s = str(sym).strip().upper()
         return s[:-3] if s.endswith(".NS") else s
 
-    union_universe = {_normalize_symbol(sym) for sym in (universe or []) if str(sym).strip()}
+    union_universe = {
+        _normalize_symbol(sym) for sym in (universe or []) if str(sym).strip()
+    }
     universe_by_rebalance_date: Dict[pd.Timestamp, set[str]] = {}
     selected_universe_type = universe_type or "nse_total"
 
@@ -1311,8 +1415,10 @@ def _resolve_universe_by_date(
             if row is None:
                 row = market_data.get(sym)
             if row is not None and not row.empty and "Volume" in row.columns:
-                valid_volume = row["Volume"].replace(0, np.nan).notna().astype(float)
-                vol_dict[sym] = valid_volume.rolling(history_gate, min_periods=history_gate).sum()
+                valid_vol = row["Volume"].replace(0, np.nan).notna().astype(float)
+                vol_dict[sym] = valid_vol.rolling(
+                    history_gate, min_periods=history_gate
+                ).sum()
 
         if vol_dict:
             cum_vol_df = pd.DataFrame(vol_dict).sort_index()
@@ -1338,7 +1444,10 @@ def _resolve_universe_by_date(
     else:
         for d in all_target_dates:
             historical_members = get_historical_universe(selected_universe_type, d)
-            member_set = {_normalize_symbol(sym) for sym in (historical_members or []) if str(sym).strip()}
+            member_set = {
+                _normalize_symbol(sym) for sym in (historical_members or [])
+                if str(sym).strip()
+            }
             universe_by_rebalance_date[pd.Timestamp(d)] = member_set
             union_universe.update(member_set)
 

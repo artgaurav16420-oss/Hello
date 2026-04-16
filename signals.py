@@ -97,8 +97,11 @@ def compute_regime_score(
         last_is_today = idx_hist.index[-1].date() == reference_date
     if last_is_today and len(idx_hist.index) > 1:
         close_series = idx_hist["Close"].iloc[:-1]
+        if universe_close_hist is not None and not universe_close_hist.empty:
+            universe_close_hist = universe_close_hist.iloc[:-1]
     else:
         close_series = idx_hist["Close"]
+
     # ─── Crash Detection (Pre-empts trend defaults) ───────────────────────────
     # Full crash (0.0) short-circuits immediately.
     # Caution override (>0.0, typically 0.5) is applied as a ceiling after the

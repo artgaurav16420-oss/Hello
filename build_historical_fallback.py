@@ -42,6 +42,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from data_cache import load_or_fetch
+from momentum_engine import UltimateConfig
 from shared_utils import (
     NSE_DEFAULT_HEADERS,
     NSE_URL_EQUITY_MASTER_CSV,
@@ -66,8 +68,6 @@ def _bootstrap_env() -> None:
 
 _bootstrap_env()
 
-from data_cache import load_or_fetch
-from momentum_engine import UltimateConfig
 
 # ── Wayback Machine constants ─────────────────────────────────────────────────
 _WBM_CDX_URL          = "https://web.archive.org/cdx/search/cdx"
@@ -164,8 +164,8 @@ def _fetch_with_retry(url: str, retries: int = 3, delay: float = 2.0) -> Optiona
             _invalidate_nse_session()
             if attempt < retries - 1:
                 session = _get_nse_session()
-        except Exception as exc:
-            logger.warning("  [%s] %s, attempt %d/%d", url[:60], exc, attempt + 1, retries, exc_info=True)
+        except Exception as _:
+            logger.warning("  [%s] %s, attempt %d/%d", url[:60], _, attempt + 1, retries, exc_info=True)
         if attempt < retries - 1:
             time.sleep(delay * (2 ** attempt) + random.uniform(0, 0.5))  # FIX-2
     return None
