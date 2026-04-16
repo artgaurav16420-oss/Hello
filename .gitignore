@@ -24,6 +24,13 @@ flake8_report*.txt
 mypy_report*.txt
 pytest_output.txt
 
+# Auxiliary/Local Folders
+.agent/
+scratch/
+docs/
+env_setup.bat
+requirements-lock.txt
+
 # OS specific
 .DS_Store
 Thumbs.db
