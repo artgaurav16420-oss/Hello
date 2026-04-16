@@ -24,7 +24,6 @@ import argparse
 import inspect
 import json
 import logging
-import math
 import os
 import re
 import sqlite3
@@ -45,12 +44,14 @@ from typing import Any
 from optuna.samplers import TPESampler
 
 
-from log_config import load_dotenv_safe
-load_dotenv_safe()
 from momentum_engine import UltimateConfig, OptimizationError, OptimizationErrorType
 from backtest_engine import run_backtest, apply_halt_simulation, build_precomputed_matrices, _compute_warmup_start
 from data_cache import load_or_fetch
 from universe_manager import get_nifty500, fetch_nse_equity_universe, get_historical_universe
+
+from log_config import load_dotenv_safe
+load_dotenv_safe()
+
 
 warnings.filterwarnings("ignore")
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -99,7 +100,7 @@ TRAIN_START = "2019-01-01"
 # IS (train) window is clamped through 2023-12-31; true holdout OOS begins 2024-01-01.
 TRAIN_END   = "2023-12-31"
 TEST_START   = "2024-01-01"
-TEST_END     = "2024-12-31"
+TEST_END: str     = "2024-12-31"
 TRAIN_END_STALENESS_THRESHOLD_MONTHS = 6
 
 N_TRIALS = 400
@@ -1110,7 +1111,7 @@ class BestTrialCallbackHandler:
         logger.info("")
         logger.info(
             "  %-6s  %-8s  %-8s  %-8s  %-8s  %-8s  %-10s  %-10s  %s",
-            "Year","CAGR%","DD%","Turn","AvgPos","AvgExp","ForcedCash","Score","Flags",
+            "Year", "CAGR%", "DD%", "Turn", "AvgPos", "AvgExp", "ForcedCash", "Score", "Flags",
         )
         logger.info(f"  {'-' * 82}")
         for d in diags:
@@ -1337,7 +1338,7 @@ def _clip_oos_matrices(
         return {}
     clipped_matrices: dict = {}
     for k, v in precomputed_matrices.items():
-        if hasattr(v, "loc"):
+        if isinstance(v, (pd.DataFrame, pd.Series)):
             clipped_matrices[k] = v.loc[warmup_start:TEST_END]
         else:
             clipped_matrices[k] = v

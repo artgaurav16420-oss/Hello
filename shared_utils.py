@@ -154,7 +154,9 @@ def atomic_write_file(
         os.close(fd)
         writer(tmp_path)
 
-        if fsync_file:
+        if fsync_file and os.name == "posix":
+            # Running fsync on a file handle opened in text mode can fail on
+            # some platforms. Open in binary mode ('rb') for maximum portability.
             with tmp_path.open("rb") as fh:
                 os.fsync(fh.fileno())
 

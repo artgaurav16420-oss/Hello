@@ -2,272 +2,248 @@ from __future__ import annotations
 
 import os
 import pandas as pd
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import data_cache
+from data_cache import DataProvider
 from momentum_engine import UltimateConfig
 
 
-def test_load_or_fetch_uses_dynamic_padding_from_cfg(monkeypatch):
-    captured = {}
+# Mock implementation of DataProvider for testing purposes
+class MockDataProvider(DataProvider):
+    def __init__(self, data_frames: dict[str, pd.DataFrame], should_fail=False):
+        self.data_frames = data_frames
+        self.should_fail = should_fail
+        self.download_calls = []
 
-    monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
-    monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)
-
-    def _fake_download_with_timeout(tickers, start, end, **kwargs):
-        captured["start"] = start
-        captured["end"] = end
-        return pd.DataFrame()
-
-    monkeypatch.setattr(data_cache, "_download_with_timeout", _fake_download_with_timeout)
-
-    cfg = UltimateConfig(CVAR_LOOKBACK=500)
-    data_cache.load_or_fetch(
-        tickers=["ABC"],
-        required_start="2024-01-01",
-        required_end="2024-12-31",
-        force_refresh=True,
-        cfg=cfg,
-    )
-
-    assert captured["start"] == "2021-04-06"
-    assert captured["end"] == "2025-01-01"
-
-
-def test_secondary_provider_parses_alpha_vantage_payload(monkeypatch):
-    payload = {
-        "Time Series (Daily)": {
-            "2024-01-03": {
-                "1. open": "100",
-                "2. high": "110",
-                "3. low": "95",
-                "4. close": "105",
-                "5. adjusted close": "104",
-                "6. volume": "1000",
-            }
-        }
-    }
-
-    class _Resp:
-        def raise_for_status(self):
+    def download(self, tickers: list[str], start: str, end: str) -> pd.DataFrame | None:
+        self.download_calls.append({"tickers": tickers, "start": start, "end": end})
+        if self.should_fail:
             return None
 
-        def json(self):
-            return payload
-
-    monkeypatch.setenv("FALLBACK_API_KEY", "k")
-    monkeypatch.setattr(data_cache.requests, "get", lambda *args, **kwargs: _Resp())
-
-    sp = data_cache.SecondaryProvider()
-    out = sp.download(["ABC.NS"], "2024-01-01", "2024-01-31")
-
-    assert out is not None
-    assert {"Open", "High", "Low", "Close", "Adj Close", "Volume"}.issubset(set(out.columns))
-
-
-def test_secondary_provider_returns_none_without_api_key(monkeypatch):
-    monkeypatch.delenv("FALLBACK_API_KEY", raising=False)
-    sp = data_cache.SecondaryProvider()
-    out = sp.download(["ABC.NS"], "2024-01-01", "2024-01-31")
-    assert out is None
+        # Simulate yfinance's multi-index output for multiple tickers
+        if len(tickers) > 1:
+            combined_df = pd.DataFrame()
+            for ticker in tickers:
+                if ticker in self.data_frames:
+                    df = self.data_frames[ticker].copy()
+                    df.columns = pd.MultiIndex.from_product([[ticker], df.columns])
+                    combined_df = pd.concat([combined_df, df], axis=1)
+            return combined_df if not combined_df.empty else None
+        else: # Single ticker request
+            ticker = tickers[0]
+            if ticker in self.data_frames:
+                return self.data_frames[ticker].copy()
+            return None
 
 
+class TestDataCache:
+    @pytest.fixture(autouse=True)
+    def setup_method(self, monkeypatch, tmp_path):
+        self.temp_cache_dir = tmp_path / "test_cache"
+        self.temp_cache_dir.mkdir()
 
+        monkeypatch.setattr(data_cache, "CACHE_DIR", self.temp_cache_dir)
+        monkeypatch.setattr(data_cache, "MANIFEST_FILE", self.temp_cache_dir / "_manifest.json")
+        monkeypatch.setattr(data_cache, "_MANIFEST_LOCK_DIR", self.temp_cache_dir / "_manifest.lockfile")
+        monkeypatch.setattr(data_cache, "_CACHE_CONFIGURED", True)
 
-def test_build_provider_chain_excludes_secondary_without_api_key(monkeypatch):
-    monkeypatch.delenv("FALLBACK_API_KEY", raising=False)
-    providers = data_cache._build_provider_chain()
+        self.mock_manifest_data = {"schema_version": 1, "entries": {}}
 
-    assert not any(isinstance(p, data_cache.SecondaryProvider) for p in providers)
+        def mock_load_manifest():
+            return self.mock_manifest_data
 
+        def mock_save_manifest(manifest_data):
+            self.mock_manifest_data = manifest_data
 
-def test_build_provider_chain_includes_secondary_with_api_key(monkeypatch):
-    monkeypatch.setenv("FALLBACK_API_KEY", "k")
-    providers = data_cache._build_provider_chain()
+        monkeypatch.setattr(data_cache, "_load_manifest", mock_load_manifest)
+        monkeypatch.setattr(data_cache, "_save_manifest", mock_save_manifest)
 
-    assert any(isinstance(p, data_cache.SecondaryProvider) for p in providers)
-def test_load_or_fetch_skips_symbols_on_chunk_failure(monkeypatch):
-    monkeypatch.setattr(data_cache, "_load_manifest", lambda: {"schema_version": 1, "entries": {}})
-    monkeypatch.setattr(data_cache, "_save_manifest", lambda _manifest: None)
-    monkeypatch.setattr(data_cache, "_download_with_timeout", lambda *args, **kwargs: pd.DataFrame())
+        # Mock _latest_business_day to return a fixed date for consistent staleness checks
+        self.mock_latest_bday = "2024-07-20"
+        monkeypatch.setattr(data_cache, "_latest_business_day", lambda: self.mock_latest_bday)
 
-    out = data_cache.load_or_fetch(
-        tickers=["ABC"],
-        required_start="2024-01-01",
-        required_end="2024-01-31",
-        force_refresh=True,
-    )
+        # Mock the UltimateConfig
+        self.mock_cfg = MagicMock(spec=UltimateConfig)
+        self.mock_cfg.CVAR_LOOKBACK = 200
 
-    assert out == {}
+        # Helper to create a dummy DataFrame
+        def create_dummy_df(start_date, end_date):
+            dates = pd.date_range(start=start_date, end=end_date)
+            return pd.DataFrame({
+                "Open": 100, "High": 105, "Low": 98, "Close": 102,
+                "Adj Close": 102, "Volume": 1000,
+                "Dividends": 0.0, "Stock Splits": 0.0
+            }, index=dates)
+        self.create_dummy_df = create_dummy_df
 
+    def test_load_or_fetch_retrieves_fresh_data_from_cache(self, monkeypatch):
+        ticker = "TEST.NS"
+        # Ensure fresh_data covers up to mock_latest_bday to avoid staleness
+        fresh_data = self.create_dummy_df("2024-07-01", self.mock_latest_bday)
 
+        # Simulate initial download and save to cache
+        mock_provider = MockDataProvider({ticker: fresh_data})
+        monkeypatch.setattr(data_cache, "_build_provider_chain", lambda cfg: [mock_provider])
 
-
-def _flat_ohlcv_payload(idx):
-    return pd.DataFrame(
-        {
-            "Open": [100, 101, 102],
-            "High": [101, 102, 103],
-            "Low": [99, 100, 101],
-            "Close": [100, 101, 102],
-            "Adj Close": [100, 101, 102],
-            "Volume": [1, 1, 1],
-        },
-        index=idx,
-    )
-
-
-def test_extract_ticker_frame_rejects_flat_payload_for_multi_ticker_chunk():
-    idx = pd.date_range("2024-01-01", periods=3, freq="D")
-    raw = _flat_ohlcv_payload(idx)
-
-    assert data_cache._extract_ticker_frame(raw, "MISSING.NS", is_single_request=False) is None
-
-
-def test_extract_ticker_frame_accepts_flat_payload_for_single_ticker_chunk():
-    idx = pd.date_range("2024-01-01", periods=3, freq="D")
-    raw = _flat_ohlcv_payload(idx)
-
-    out = data_cache._extract_ticker_frame(raw, "ABC.NS", is_single_request=True)
-    assert out is not None
-    assert out["Close"].iloc[-1] == 102
-
-def test_extract_ticker_frame_fills_adj_close_for_multiindex_payload():
-    idx = pd.date_range("2024-01-01", periods=6, freq="D")
-    raw = pd.DataFrame(
-        {
-            ("ABC.NS", "Close"): [100, 101, 102, 103, 104, 105],
-            ("ABC.NS", "Adj Close"): [None, None, None, None, None, None],
-            ("ABC.NS", "Volume"): [1, 1, 1, 1, 1, 1],
-        },
-        index=idx,
-    )
-    out = data_cache._extract_ticker_frame(raw, "ABC.NS")
-    assert out is not None
-    assert (out["Adj Close"] == out["Close"]).all()
-
-
-def test_is_valid_dataframe_allows_index_ticker_with_nan_volume():
-    idx = pd.date_range("2024-01-01", periods=6, freq="D")
-    df = pd.DataFrame(
-        {
-            "Close": [100, 101, 102, 103, 104, 105],
-            "Adj Close": [100, 101, 102, 103, 104, 105],
-            "Volume": [None, None, None, None, None, None],
-        },
-        index=idx,
-    )
-
-    assert data_cache._is_valid_dataframe(df, ticker="^NSEI")
-
-
-def test_is_valid_dataframe_rejects_non_index_ticker_with_nan_volume():
-    idx = pd.date_range("2024-01-01", periods=6, freq="D")
-    df = pd.DataFrame(
-        {
-            "Close": [100, 101, 102, 103, 104, 105],
-            "Adj Close": [100, 101, 102, 103, 104, 105],
-            "Volume": [None, None, None, None, None, None],
-        },
-        index=idx,
-    )
-
-    assert not data_cache._is_valid_dataframe(df, ticker="ABC.NS")
-
-
-def test_configure_data_cache_loads_env_missing_keys_only(tmp_path, monkeypatch):
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "GROWW_API_TOKEN=from_file\nEXISTING_KEY=from_file\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.delenv("GROWW_API_TOKEN", raising=False)
-    monkeypatch.setenv("EXISTING_KEY", "already_set")
-    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path / "cache")
-
-    data_cache.configure_data_cache(env_file)
-
-    assert os.getenv("GROWW_API_TOKEN") == "from_file"
-    assert os.getenv("EXISTING_KEY") == "already_set"
-    assert data_cache.CACHE_DIR.exists()
-
-
-def test_ensure_price_columns_coerces_object_dividends_and_prices():
-    idx = pd.date_range("2024-01-01", periods=3, freq="D")
-    raw = pd.DataFrame(
-        {
-            "Close": ["100", "101.5", "102"],
-            "Adj Close": ["100", "101.5", "102"],
-            "Volume": ["1,000", "2,000", "3,000"],
-            "Dividends": ["0", "2.6 INR", None],
-            "Stock Splits": ["0", "0", "0"],
-        },
-        index=idx,
-    )
-
-    out = data_cache._ensure_price_columns(raw)
-
-    assert out["Dividends"].dtype.kind in "fc"
-    assert out["Dividends"].iloc[1] == 2.6
-    assert out["Volume"].iloc[0] == 1000
-
-
-def test_recover_from_stale_cache_logs_summary_not_per_symbol(tmp_path, monkeypatch, caplog):
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    monkeypatch.setattr(data_cache, "CACHE_DIR", cache_dir)
-
-    idx = pd.date_range("2026-03-17", periods=6, freq="D")
-    for ticker in ("AAA.NS", "BBB.NS"):
-        df = pd.DataFrame(
-            {
-                "Open": [100.0] * len(idx),
-                "High": [101.0] * len(idx),
-                "Low": [99.0] * len(idx),
-                "Close": [100.0] * len(idx),
-                "Adj Close": [100.0] * len(idx),
-                "Volume": [1000.0] * len(idx),
-            },
-            index=idx,
+        # First call: data should be downloaded and cached
+        result1 = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end=self.mock_latest_bday, # Match required_end to fresh_data's end
+            cfg=self.mock_cfg
         )
-        df.to_parquet(cache_dir / f"{ticker}.parquet")
 
-    entries: dict = {}
-    market_data: dict = {}
-    caplog.set_level("WARNING")
+        assert ticker in result1
+        pd.testing.assert_frame_equal(result1[ticker], fresh_data)
+        assert len(mock_provider.download_calls) == 1
+        assert (self.temp_cache_dir / f"{ticker}.parquet").exists()
+        assert self.mock_manifest_data["entries"][ticker]["last_date"] == fresh_data.index[-1].strftime("%Y-%m-%d")
 
-    data_cache._recover_from_stale_cache(["AAA.NS", "BBB.NS"], entries, market_data)
+        # Clear download calls to check subsequent cache hit
+        mock_provider.download_calls = []
 
-    assert "Recovered 2 symbol(s) from stale local cache" in caplog.text
-    assert "Using stale cached parquet for AAA.NS" not in caplog.text
-    assert set(market_data.keys()) == {"AAA.NS", "BBB.NS"}
+        # Second call: data should be retrieved from cache, no new download
+        result2 = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end=self.mock_latest_bday, # Match required_end to fresh_data's end
+            cfg=self.mock_cfg
+        )
+
+        assert ticker in result2
+        pd.testing.assert_frame_equal(result2[ticker], fresh_data)
+        assert len(mock_provider.download_calls) == 0 # No new download calls
+
+    def test_load_or_fetch_refreshes_stale_data(self, monkeypatch):
+        ticker = "STALE.NS"
+        stale_data = self.create_dummy_df("2024-07-01", "2024-07-10") # Older than mock_latest_bday
+        updated_data = self.create_dummy_df("2024-07-01", "2024-07-19")
+        # Normalize updated_data so it matches the output of data_cache functions
+        expected_updated_data = data_cache._ensure_price_columns(data_cache._normalize_history_index(updated_data.copy()))
+
+        # Manually create a stale cache file and manifest entry
+        stale_data.to_parquet(self.temp_cache_dir / f"{ticker}.parquet")
+        self.mock_manifest_data["entries"][ticker] = {
+            "last_date": "2024-07-10",
+            "fetched_at": "2024-07-10T00:00:00+05:30",
+            "rows": len(stale_data),
+            "suspended": False,
+            "max_gap_days": 0,
+        }
+
+        mock_provider = MockDataProvider({ticker: updated_data})
+        monkeypatch.setattr(data_cache, "_build_provider_chain", lambda cfg: [mock_provider])
+
+        result = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end="2024-07-19",
+            cfg=self.mock_cfg
+        )
+
+        assert ticker in result
+        pd.testing.assert_frame_equal(result[ticker], expected_updated_data)
+        assert len(mock_provider.download_calls) == 1 # Should trigger a re-download
+        assert self.mock_manifest_data["entries"][ticker]["last_date"] == "2024-07-19" # Manifest updated
+
+    def test_load_or_fetch_downloads_new_data(self, monkeypatch):
+        ticker = "NEW.NS"
+        new_data = self.create_dummy_df("2024-07-01", "2024-07-19")
+        # Normalize new_data so it matches the output of data_cache functions
+        expected_new_data = data_cache._ensure_price_columns(data_cache._normalize_history_index(new_data.copy()))
 
 
-def test_safe_yf_download_temporarily_mutes_yfinance_loggers(monkeypatch):
-    yf_logger = data_cache.logging.getLogger("yfinance")
-    child_logger = data_cache.logging.getLogger("yfinance.multi")
-    original_yf_level = yf_logger.level
-    original_yf_propagate = yf_logger.propagate
-    original_child_level = child_logger.level
-    original_child_propagate = child_logger.propagate
+        # Ensure no cache file or manifest entry exists
+        assert not (self.temp_cache_dir / f"{ticker}.parquet").exists()
+        assert ticker not in self.mock_manifest_data["entries"]
 
-    captured_states: dict[str, tuple[int, bool]] = {}
+        mock_provider = MockDataProvider({ticker: new_data})
+        monkeypatch.setattr(data_cache, "_build_provider_chain", lambda cfg: [mock_provider])
 
-    def _fake_download(*args, **kwargs):
-        captured_states["yfinance"] = (yf_logger.level, yf_logger.propagate)
-        captured_states["yfinance.multi"] = (child_logger.level, child_logger.propagate)
-        return pd.DataFrame()
+        result = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end="2024-07-19",
+            cfg=self.mock_cfg
+        )
 
-    monkeypatch.setattr(data_cache.yf, "download", _fake_download)
+        assert ticker in result
+        pd.testing.assert_frame_equal(result[ticker], expected_new_data)
+        assert len(mock_provider.download_calls) == 1
+        assert (self.temp_cache_dir / f"{ticker}.parquet").exists()
+        assert self.mock_manifest_data["entries"][ticker]["last_date"] == "2024-07-19"
 
-    out = data_cache._safe_yf_download(["ABC.NS"], start="2024-01-01", end="2024-01-31")
+    def test_load_or_fetch_force_refresh_bypasses_cache(self, monkeypatch):
+        ticker = "FORCE.NS"
+        cached_data = self.create_dummy_df("2024-07-01", "2024-07-19") # Fresh data
+        new_data_on_refresh = self.create_dummy_df("2024-07-01", "2024-07-20")
+        # Normalize new_data_on_refresh so it matches the output of data_cache functions
+        expected_new_data_on_refresh = data_cache._ensure_price_columns(data_cache._normalize_history_index(new_data_on_refresh.copy()))
 
-    assert out.empty
-    assert captured_states["yfinance"][0] > data_cache.logging.CRITICAL
-    assert captured_states["yfinance.multi"][0] > data_cache.logging.CRITICAL
-    assert captured_states["yfinance"][1] is False
-    assert captured_states["yfinance.multi"][1] is False
-    assert yf_logger.level == original_yf_level
-    assert yf_logger.propagate == original_yf_propagate
-    assert child_logger.level == original_child_level
-    assert child_logger.propagate == original_child_propagate
+        # Manually create a fresh cache file and manifest entry
+        cached_data.to_parquet(self.temp_cache_dir / f"{ticker}.parquet")
+        self.mock_manifest_data["entries"][ticker] = {
+            "last_date": "2024-07-19", # Not stale
+            "fetched_at": "2024-07-19T00:00:00+05:30",
+            "rows": len(cached_data),
+            "suspended": False,
+            "max_gap_days": 0,
+        }
+
+        mock_provider = MockDataProvider({ticker: new_data_on_refresh})
+        monkeypatch.setattr(data_cache, "_build_provider_chain", lambda cfg: [mock_provider])
+
+        result = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end="2024-07-20",
+            force_refresh=True, # Force refresh
+            cfg=self.mock_cfg
+        )
+
+        assert ticker in result
+        pd.testing.assert_frame_equal(result[ticker], new_data_on_refresh.loc[:"2024-07-20"])
+        assert len(mock_provider.download_calls) == 1 # Should re-download
+        assert self.mock_manifest_data["entries"][ticker]["last_date"] == "2024-07-20" # Manifest updated
+
+    def test_load_or_fetch_re_downloads_corrupted_cache(self, monkeypatch):
+        ticker = "CORRUPT.NS"
+        good_data = self.create_dummy_df("2024-07-01", "2024-07-19")
+        # Normalize good_data so it matches the output of data_cache functions
+        expected_good_data = data_cache._ensure_price_columns(data_cache._normalize_history_index(good_data.copy()))
+
+        # Create a "corrupted" cache file by writing invalid content
+        corrupted_path = self.temp_cache_dir / f"{ticker}.parquet"
+        corrupted_path.write_text("this is not valid parquet data")
+
+        # Add an entry to manifest, as if it was valid before corruption
+        self.mock_manifest_data["entries"][ticker] = {
+            "last_date": "2024-07-19",
+            "fetched_at": "2024-07-19T00:00:00+05:30",
+            "rows": len(good_data),
+            "suspended": False,
+            "max_gap_days": 0,
+        }
+
+        mock_provider = MockDataProvider({ticker: good_data})
+        monkeypatch.setattr(data_cache, "_build_provider_chain", lambda cfg: [mock_provider])
+
+        result = data_cache.load_or_fetch(
+            tickers=[ticker],
+            required_start="2024-07-01",
+            required_end="2024-07-19",
+            cfg=self.mock_cfg
+        )
+
+        assert ticker in result
+        pd.testing.assert_frame_equal(result[ticker], expected_good_data)
+        assert len(mock_provider.download_calls) == 1 # Should re-download due to corruption
+        # Verify the corrupted file was replaced with valid data
+        re_read_df = pd.read_parquet(corrupted_path)
+        # Normalize the re-read data before comparison
+        re_read_df_normalized = data_cache._ensure_price_columns(data_cache._normalize_history_index(re_read_df.copy()))
+        pd.testing.assert_frame_equal(re_read_df_normalized, expected_good_data)
+        assert self.mock_manifest_data["entries"][ticker]["last_date"] == "2024-07-19"

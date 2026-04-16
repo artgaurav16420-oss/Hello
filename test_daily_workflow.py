@@ -1,11 +1,14 @@
 from __future__ import annotations
+import osqp_preimport
 
+import os
 import json
 import logging
 import pathlib
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -20,6 +23,11 @@ from momentum_engine import (
     execute_rebalance,
 )
 from log_config import current_correlation_id
+
+from collections import namedtuple
+
+# Define a mock Trade object for testing purposes
+MockTrade = namedtuple("MockTrade", ["delta_shares", "exec_price", "direction", "symbol"])
 
 
 def test_prompt_menu_choice_retries_until_valid(monkeypatch):
@@ -113,6 +121,8 @@ def test_run_scan_keeps_context_active_and_flushes_dead_letter_without_trades(mo
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
 
     state = PortfolioState(
@@ -145,12 +155,15 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
-    monkeypatch.setattr(dw, "execute_rebalance", lambda *args, **kwargs: 0.0)
-
+    monkeypatch.setattr(dw, "compute_adv", lambda market_data, active, *args, **kwargs: __import__("numpy").array([1e9] * len(active)))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
+    monkeypatch.setattr("momentum_engine.execute_rebalance", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     def _fake_generate_signals(*_args, **_kwargs):
         import numpy as np
         # FIX-MB2-TESTGATENAMES: Use renamed keys from FIX-MB-GATENAMES.
@@ -159,7 +172,7 @@ def test_run_scan_uses_last_known_price_when_live_quote_is_all_nan(monkeypatch):
             "total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1
         }
 
-    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr("signals.generate_signals", _fake_generate_signals)
 
     class _Engine:
         def __init__(self, _cfg):
@@ -197,17 +210,20 @@ def test_run_scan_forward_fills_after_union_index_alignment(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *args, **kwargs: True)
+
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9, 1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+    monkeypatch.setattr(dw, "compute_adv", lambda market_data, active, *args, **kwargs: np.array([1e9] * len(active)))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
 
     def _fake_generate_signals(*_args, **_kwargs):
         return np.array([0.01, 0.02]), np.array([0.0, 0.0]), [0, 1], {
             "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 2
         }
 
-    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr("signals.generate_signals", _fake_generate_signals)
 
     class _Engine:
         def __init__(self, _cfg):
@@ -223,7 +239,7 @@ def test_run_scan_forward_fills_after_union_index_alignment(monkeypatch):
         captured["active"] = list(active)
         return 0.0
 
-    monkeypatch.setattr(dw, "execute_rebalance", _capture_rebalance)
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _capture_rebalance)
 
     state = PortfolioState(cash=10_000.0)
     dw._run_scan(["AAA", "BBB"], state, "TEST", cfg_override=UltimateConfig())
@@ -251,17 +267,18 @@ def test_run_scan_excludes_symbol_with_long_price_gap_after_bounded_fill(monkeyp
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
     monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
-
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
     def _fake_generate_signals(*_args, **_kwargs):
         return np.array([0.02]), np.array([0.0]), [0], {
             "total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1
         }
 
-    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr("signals.generate_signals", _fake_generate_signals)
 
     class _Engine:
         def __init__(self, _cfg):
@@ -277,7 +294,7 @@ def test_run_scan_excludes_symbol_with_long_price_gap_after_bounded_fill(monkeyp
         captured["active"] = list(active)
         return 0.0
 
-    monkeypatch.setattr(dw, "execute_rebalance", _capture_rebalance)
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _capture_rebalance)
 
     state = PortfolioState(cash=10_000.0)
     dw._run_scan(["STALE", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
@@ -392,7 +409,7 @@ def test_detect_and_apply_splits_first_run_uses_position_marker_not_full_history
         shares={"ABC": 10},
         entry_prices={"ABC": 1000.0},
         last_known_prices={"ABC": 1000.0},
-        dividend_ledger={"ABC": "2024-01-03:0.00000000"},
+        dividend_ledger={"split:ABC": "2024-01-03:0.00000000"},
         cash=0.0,
     )
     idx = pd.date_range("2024-01-01", periods=5)
@@ -438,6 +455,8 @@ def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
 
     called = {"n": 0}
@@ -446,8 +465,7 @@ def test_run_scan_cadence_gate_skips_rebalance(monkeypatch):
         called["n"] += 1
         raise AssertionError("execute_rebalance should not be called when cadence gate blocks")
 
-    monkeypatch.setattr(dw, "execute_rebalance", _boom)
-
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _boom)
     state = PortfolioState(
         shares={"ABC": 10},
         entry_prices={"ABC": 100.0},
@@ -471,6 +489,8 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
 
     state = PortfolioState(
@@ -488,7 +508,7 @@ def test_run_scan_increments_absent_periods_when_symbol_missing(monkeypatch):
 
 def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6)
-    stale_idx = pd.date_range("2024-01-01", periods=4)
+    stale_idx = pd.date_range("2024-01-01", periods=3)
     md = {
         "ABC.NS": pd.DataFrame({"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)}, index=stale_idx),
         "FRESH.NS": pd.DataFrame({"Close": [100.0] * len(idx), "Dividends": [0.0] * len(idx)}, index=idx),
@@ -498,10 +518,12 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: UltimateConfig().CVAR_DAILY_LIMIT + 0.01)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+    monkeypatch.setattr(dw, "compute_adv", lambda market_data, active, *args, **kwargs: __import__("numpy").array([1e9] * len(active)))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
 
     def _fake_generate_signals(*_args, **_kwargs):
         import numpy as np
@@ -509,7 +531,7 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
             "total": 2, "history_failed": 0, "adv_failed": 0, "knife_failed": 1, "selected": 1
         }
 
-    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr("signals.generate_signals", _fake_generate_signals)
 
     class _Engine:
         def __init__(self, _cfg):
@@ -526,7 +548,7 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
         called["n"] += 1
         raise AssertionError("execute_rebalance should not be called when held prices are stale")
 
-    monkeypatch.setattr(dw, "execute_rebalance", _boom)
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _boom)
 
     state = PortfolioState(
         shares={"ABC": 10},
@@ -544,7 +566,7 @@ def test_run_scan_stale_prices_block_decay_rebalance(monkeypatch):
 
 def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(monkeypatch, caplog):
     idx = pd.date_range("2024-01-01", periods=6)
-    stale_idx = pd.date_range("2024-01-01", periods=4)
+    stale_idx = pd.date_range("2024-01-01", periods=3)
     md = {
         "ABC.NS": pd.DataFrame(
             {"Close": [100.0] * len(stale_idx), "Dividends": [0.0] * len(stale_idx)},
@@ -560,10 +582,12 @@ def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(m
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
-    monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
-    monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: __import__("numpy").array([1e9, 1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
+    monkeypatch.setattr("momentum_engine.compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(dw, "compute_adv", lambda market_data, active, *args, **kwargs: __import__("numpy").array([1e9] * len(active)))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
 
     def _fake_generate_signals(*_args, **_kwargs):
         import numpy as np
@@ -576,7 +600,7 @@ def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(m
             "selected": 1,
         }
 
-    monkeypatch.setattr(dw, "generate_signals", _fake_generate_signals)
+    monkeypatch.setattr("signals.generate_signals", _fake_generate_signals)
 
     class _Engine:
         def __init__(self, _cfg):
@@ -589,8 +613,7 @@ def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(m
 
     monkeypatch.setattr(dw, "InstitutionalRiskEngine", _Engine)
     monkeypatch.setattr(
-        dw,
-        "execute_rebalance",
+        "momentum_engine.execute_rebalance",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("execute_rebalance should not be called when cadence staleness gate fires")
         ),
@@ -607,7 +630,7 @@ def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(m
         out_state, _ = dw._run_scan(["ABC", "FRESH"], state, "TEST", cfg_override=UltimateConfig())
 
     assert out_state.shares == {"ABC": 10}
-    assert sum("STALENESS GATE" in record.message for record in caplog.records) == 1
+    assert sum("stale price data" in record.message for record in caplog.records) == 1
     assert sum("REBALANCE SUPPRESSED" in record.message for record in caplog.records) == 0
 
 
@@ -621,8 +644,12 @@ def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: UltimateConfig().CVAR_DAILY_LIMIT * 2.0)
+    monkeypatch.setattr("momentum_engine.compute_book_cvar", lambda *_args, **_kwargs: UltimateConfig().CVAR_DAILY_LIMIT * 2.0)
 
     called = {"n": 0}
 
@@ -630,7 +657,7 @@ def test_run_scan_hard_cvar_breach_overrides_cadence_gate(monkeypatch):
         called["n"] += 1
         return execute_rebalance(*args, **kwargs)
 
-    monkeypatch.setattr(dw, "execute_rebalance", _track)
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _track)
 
     state = PortfolioState(
         shares={"ABC": 10},
@@ -723,6 +750,7 @@ def test_pending_sentinel_helpers_roundtrip(tmp_path: Path, monkeypatch):
     path = dw._write_pending_sentinel("nifty", token, date_str)
     assert path.exists()
     payload = dw._load_pending_sentinel("nifty")
+    assert payload is not None
     assert payload["date"] == date_str
     assert payload["token_hash"] == hashlib.sha256(token.encode("utf-8")).hexdigest()
     dw._clear_pending_sentinel("nifty")
@@ -770,11 +798,13 @@ def test_run_scan_skips_rebalance_when_pending_sentinel_exists_for_today(monkeyp
     monkeypatch.setattr(dw, "load_or_fetch", lambda *_args, **_kwargs: md)
     monkeypatch.setattr(dw, "_print_stage_status", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "detect_and_apply_splits", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
     monkeypatch.setattr(dw, "compute_book_cvar", lambda *_args, **_kwargs: 0.0)
     monkeypatch.setattr(dw, "compute_adv", lambda *_args, **_kwargs: np.array([1e9]))
-    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: "Unknown" for s in syms})
-    monkeypatch.setattr(dw, "generate_signals", lambda *_a, **_k: (np.array([0.01]), np.array([0.0]), [0], {"total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1}))
+    monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
+    monkeypatch.setattr("signals.generate_signals", lambda *_a, **_k: (np.array([0.01]), np.array([0.0]), [0], {"total": 1, "history_failed": 0, "adv_failed": 0, "knife_failed": 0, "selected": 1}))
     monkeypatch.setattr(dw, "_load_pending_sentinel", lambda name: {"token": "x", "date": datetime.today().strftime("%Y-%m-%d")})
 
     called = {"rebalance": 0}
@@ -792,8 +822,7 @@ def test_run_scan_skips_rebalance_when_pending_sentinel_exists_for_today(monkeyp
         called["rebalance"] += 1
         return 0.0
 
-    monkeypatch.setattr(dw, "execute_rebalance", _count_rebalance)
-
+    monkeypatch.setattr("momentum_engine.execute_rebalance", _count_rebalance)
     state = PortfolioState(cash=10_000.0)
     dw._run_scan(["ABC"], state, "TEST", cfg_override=UltimateConfig(), name="nifty")
     assert called["rebalance"] == 0
@@ -807,3 +836,141 @@ def test_save_portfolio_state_clears_pending_sentinel_in_paper_mode(tmp_path: Pa
     assert dw._load_pending_sentinel("nifty") is not None
     dw.save_portfolio_state(state, "nifty")
     assert dw._load_pending_sentinel("nifty") is None
+
+
+class TestDailyWorkflow:
+    @pytest.fixture(autouse=True)
+    def cd_tmp_path(self, tmp_path: Path, monkeypatch):
+        """Ensure all tests run in a clean temporary directory."""
+        monkeypatch.chdir(tmp_path)
+        # Mock the circuit breaker to prevent file I/O during tests
+        monkeypatch.setattr(dw, "_circuit_breaker", dw.CircuitBreaker())
+
+
+    @pytest.fixture
+    def mock_dependencies(self, monkeypatch):
+        """Central fixture for mocking external and slow dependencies."""
+        monkeypatch.setattr(dw, "_print_stage_status", lambda *args, **kwargs: None)
+        monkeypatch.setattr(dw, "load_optimized_config", UltimateConfig)
+        monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
+        monkeypatch.setattr(dw, "fetch_nse_equity_universe", lambda: ["RELIANCE", "TCS"])
+        monkeypatch.setattr(dw, "_check_and_prompt_initial_capital", lambda a, b, c: None)
+        monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *args, **kwargs: True)
+
+        idx = pd.date_range("2024-01-01", periods=10, freq="D")
+        mock_market_data = {
+            "RELIANCE.NS": pd.DataFrame({"Close": np.linspace(2800, 2900, 10), "Open": np.linspace(2800, 2900, 10), "Dividends": 0, "Stock Splits": 0}, index=idx),
+            "TCS.NS": pd.DataFrame({"Close": np.linspace(3800, 3900, 10), "Open": np.linspace(3800, 3900, 10), "Dividends": 0, "Stock Splits": 0}, index=idx),
+            "^NSEI": pd.DataFrame({"Close": np.linspace(21000, 22000, 10)}, index=idx),
+            "^CRSLDX": pd.DataFrame({"Close": np.linspace(15000, 16000, 10)}, index=idx),
+        }
+        monkeypatch.setattr(dw, "load_or_fetch", lambda *args, **kwargs: mock_market_data)
+        
+        from momentum_engine import RebalancePipelineResult, RebalanceContext
+        
+        call_log = {}
+        def mock_rebalance_pipeline(ctx: RebalanceContext):
+            call_log['ctx'] = ctx
+            # Simulate a rebalance by updating weights and shares
+            ctx.state.weights = {"RELIANCE": 0.5, "TCS": 0.5}
+            ctx.state.shares = {"RELIANCE": 17, "TCS": 13}
+            ctx.state.cash = 1000.0
+            if ctx.trade_log is not None:
+                ctx.trade_log.append(cast(Any, MockTrade(delta_shares=1, exec_price=100, direction="BUY", symbol="RELIANCE")))
+            return RebalancePipelineResult(
+                optimization_succeeded=True, 
+                applied_decay=False,
+                total_slippage=0.0,
+                soft_cvar_breach=False,
+                target_weights=np.array([0.5, 0.5])
+            )
+
+        monkeypatch.setattr(dw, "run_rebalance_pipeline", mock_rebalance_pipeline)
+        return call_log
+
+
+    def test_run_scan_integration_with_user_confirmation(self, mock_dependencies, monkeypatch):
+        """
+        Tests the full `_run_scan` flow followed by `_preview_scan_and_maybe_save`
+        where the user confirms the rebalance.
+        """
+        # Arrange
+        states = {"nse_total": PortfolioState(cash=1_000_000.0)}
+        mkt_cache = {}
+        
+        # Mock user input to confirm the save
+        monkeypatch.setattr("builtins.input", lambda prompt: "y")
+        
+        # Mock save_portfolio_state to track calls
+        save_calls = []
+        def mock_save(state, name):
+            save_calls.append((state, name))
+        monkeypatch.setattr(dw, "save_portfolio_state", mock_save)
+
+        # Act
+        dw._handle_nse_total_scan(states, mkt_cache)
+
+        # Assert
+        # Check that the state was updated
+        final_state = states["nse_total"]
+        assert final_state.shares == {"RELIANCE": 17, "TCS": 13}
+        assert final_state.weights == {"RELIANCE": 0.5, "TCS": 0.5}
+        assert final_state.cash == 1000.0
+        
+        # Check that save was called correctly
+        assert len(save_calls) == 1
+        saved_state, saved_name = save_calls[0]
+        assert saved_name == "nse_total"
+        assert saved_state.shares == {"RELIANCE": 17, "TCS": 13}
+        
+        # Check that market cache is populated
+        assert "nse_total" in mkt_cache
+        assert "RELIANCE.NS" in mkt_cache["nse_total"]
+
+        # Check that run_rebalance_pipeline was called with correct context
+        assert "ctx" in mock_dependencies
+        ctx = mock_dependencies['ctx']
+        assert ctx.cfg is not None
+        assert ctx.pv == pytest.approx(1_000_000.0)
+
+
+    def test_run_scan_integration_with_user_rejection(self, mock_dependencies, monkeypatch):
+        """
+        Tests the full `_run_scan` flow followed by `_preview_scan_and_maybe_save`
+        where the user rejects the rebalance.
+        """
+        # Arrange
+        initial_state = PortfolioState(cash=1_000_000.0)
+        states = {"nse_total": initial_state}
+        mkt_cache = {}
+        
+        # Mock user input to reject the save
+        monkeypatch.setattr("builtins.input", lambda prompt: "n")
+        
+        save_calls = []
+        def mock_save(state, name):
+            save_calls.append((state, name))
+        monkeypatch.setattr(dw, "save_portfolio_state", mock_save)
+
+        # Act
+        dw._handle_nse_total_scan(states, mkt_cache)
+
+        # Assert
+        # Check that the state was NOT updated with rebalance results
+        final_state = states["nse_total"]
+        assert final_state.shares == {}
+        assert final_state.weights == {}
+        assert final_state.cash == 1_000_000.0
+        
+        # Check that save was still called to persist risk metadata
+        assert len(save_calls) == 1
+        saved_state, saved_name = save_calls[0]
+        assert saved_name == "nse_total"
+        # The saved state should be the original state, with potentially updated risk metadata
+        assert saved_state.shares == {} 
+        assert saved_state.cash == 1_000_000.0
+        assert saved_state is final_state
+
+        # Check that market cache is populated even on rejection
+        assert "nse_total" in mkt_cache
+        assert "RELIANCE.NS" in mkt_cache["nse_total"]

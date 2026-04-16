@@ -60,12 +60,11 @@ import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.covariance import LedoitWolf
 
 from shared_utils import normalize_ns_ticker
 
@@ -313,7 +312,7 @@ class UltimateConfig:
     SIGNAL_LAG_DAYS:          int   = 21           # Lag applied between fast/slow signals.
     RISK_AVERSION:            float = 5.0          # Target lambda parameter in objective function.
     SLACK_PENALTY:            float = 1000.0       # Penalty parameter for OSQP soft constraints.
-    DIMENSIONALITY_MULTIPLIER:int   = 3            # Factor determining history requirements vs positions.
+    DIMENSIONALITY_MULTIPLIER: int   = 3            # Factor determining history requirements vs positions.
 
     # --- Continuity & Gate Logic ---
     Z_SCORE_CLIP:             float = 3.0          # Caps normalized signals to prevent extreme outliers.
@@ -421,7 +420,7 @@ class PortfolioState:
     max_absent_periods:   Optional[int]    = None
     absent_periods:       Dict[str, int]   = field(default_factory=dict)
     last_known_prices:    Dict[str, float] = field(default_factory=dict)
-    last_known_volatility:Dict[str, float] = field(default_factory=dict)
+    last_known_volatility: Dict[str, float] = field(default_factory=dict)
     vol_hist:             Dict[str, deque] = field(default_factory=dict)
     decay_rounds:         int              = 0
     dividend_ledger:      Dict[str, str]   = field(default_factory=dict)
@@ -462,7 +461,7 @@ class PortfolioState:
         # FIX: Align breach detection with the daily ceiling used by the risk engine
         risk_threshold = max(cfg.CVAR_DAILY_LIMIT, cfg.MAX_PORTFOLIO_RISK_PCT)
         if cfg.CVAR_DAILY_LIMIT > 0:
-             risk_threshold = cfg.CVAR_DAILY_LIMIT
+            risk_threshold = cfg.CVAR_DAILY_LIMIT
         breach = normalised_cvar > risk_threshold
 
         if gross_exposure < 0.01:
@@ -647,7 +646,7 @@ class PortfolioState:
             "max_absent_periods":   self.max_absent_periods,
             "absent_periods":       dict(sorted(self.absent_periods.items())),
             "last_known_prices":    _r(self.last_known_prices),
-            "last_known_volatility":_r(self.last_known_volatility),
+            "last_known_volatility": _r(self.last_known_volatility),
             "vol_hist":             {
                 k: {
                     "maxlen": vals.maxlen,
@@ -969,6 +968,9 @@ def run_rebalance_pipeline(ctx: RebalanceContext) -> RebalancePipelineResult:
         force_rebalance_trades=soft_cvar_breach,
     ) if (optimization_succeeded or apply_decay) else 0.0
 
+    if forced_to_cash:
+        state.decay_rounds = 0
+
     return RebalancePipelineResult(
         total_slippage=total_slippage,
         applied_decay=apply_decay,
@@ -1130,7 +1132,7 @@ def compute_one_way_slip_rate(
         if (trade_notional is not None and np.isfinite(trade_notional) and trade_notional > 0)
         else portfolio_value
     )
-    return _compute_one_way_slip_rate_from_trade_value(cfg, float(adv_notional), float(trade_value))
+    return float(_compute_one_way_slip_rate_from_trade_value(cfg, float(adv_notional), float(trade_value)))
 
 
 def _compute_one_way_slip_rate_from_trade_value(
@@ -1185,7 +1187,8 @@ def _compute_one_way_slip_rate_vectorized(
         np.ndarray: Matrix of calculated one-way slippage rates.
     """
     trade_values = _resolve_trade_notional(portfolio_value, trade_notional)
-    return _compute_one_way_slip_rate_from_trade_value(cfg, adv_notional, trade_values)
+    res = _compute_one_way_slip_rate_from_trade_value(cfg, adv_notional, trade_values)
+    return np.asarray(res, dtype=float)
 
 
 # ─── Execution ────────────────────────────────────────────────────────────────
@@ -2175,8 +2178,7 @@ class InstitutionalRiskEngine:
         exposure_multiplier: float,
         sector_labels: Optional[np.ndarray],
         execution_date: Optional[pd.Timestamp],
-    ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], int, int]:
-        original_m = len(expected_returns)
+    ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray, int, int]:
         if execution_date is not None and not historical_returns.empty:
             if historical_returns.index.max() > pd.Timestamp(execution_date):
                 raise OptimizationError(
@@ -2254,7 +2256,7 @@ class InstitutionalRiskEngine:
         sector_labels: Optional[np.ndarray],
         m: int,
         T: int,
-    ) -> tuple[Any, np.ndarray, Any, list, list, int, float, float, float, np.ndarray, Any]:
+    ) -> tuple[Any, np.ndarray, Any, np.ndarray, np.ndarray, int, float, float, float, np.ndarray, Any]:
         import scipy.sparse as sp
         from sklearn.covariance import LedoitWolf
 
@@ -2262,7 +2264,6 @@ class InstitutionalRiskEngine:
         lw = LedoitWolf()
         lw.fit(simple_rets)
         Sigma_reg = lw.covariance_
-        ridge     = 0.0
 
         gamma = float(np.clip(exposure_multiplier, self.cfg.MIN_EXPOSURE_FLOOR, 1.0))
 
@@ -2392,8 +2393,8 @@ class InstitutionalRiskEngine:
         P_upper: Any,
         q: np.ndarray,
         A: Any,
-        lower: list,
-        upper: list,
+        lower: np.ndarray,
+        upper: np.ndarray,
         m: int,
         prev_w: Optional[np.ndarray],
         portfolio_value: float,
@@ -2456,7 +2457,8 @@ class InstitutionalRiskEngine:
                     Px=P_upper.data, Ax=A.data,
                 )
 
-            res = self._handle_solver_fallback(lambda: self._solver.solve(), "first-pass")
+            assert self._solver is not None
+            res = self._handle_solver_fallback(lambda: self._solver.solve() if self._solver else None, "first-pass")
             
             # Turnover iteration
             w_opt = np.maximum(res.x[:m], 0.0)
@@ -2474,10 +2476,10 @@ class InstitutionalRiskEngine:
             self._solver.update(q=q)
             self._solver.warm_start(x=res.x)
 
-            res = self._handle_solver_fallback(lambda: self._solver.solve(), "second-pass")
+            res = self._handle_solver_fallback(lambda: self._solver.solve() if self._solver else None, "second-pass")
         return res
 
-    def _handle_solver_fallback(self, solve_func: callable, stage: str) -> Any:
+    def _handle_solver_fallback(self, solve_func: Callable, stage: str) -> Any:
         try:
             res = solve_func()
         except Exception as exc:

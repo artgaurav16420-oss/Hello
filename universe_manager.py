@@ -26,13 +26,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -40,16 +39,24 @@ import requests
 import data_cache
 from shared_constants import TIMEZONE_IST
 from shared_utils import (
-    NSE_URL_EQUITY_MASTER_CSV,
-    NSE_URL_NIFTY500_CSV,
     atomic_write_file,
     compute_notional_volume,
     fetch_nse_csv,
     normalize_ns_ticker,
 )
 
-data_cache.configure_data_cache()
-CACHE_DIR = data_cache.CACHE_DIR
+
+def _get_cache_dir() -> Path:
+    """Return the data cache directory, ensuring it's initialized."""
+    if data_cache.CACHE_DIR is None:
+        data_cache.configure_data_cache()
+    # Now we know it is not None (configure_data_cache sets it)
+    cache_dir = cast(Path, data_cache.CACHE_DIR)
+    return cache_dir
+
+
+CACHE_DIR = _get_cache_dir()
+
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +588,7 @@ def _apply_adv_filter(tickers: List[str], cfg=None) -> List[str]:
     adv_lookback_raw = getattr(cfg, "ADV_LOOKBACK", None)
     lookback = 20 if adv_lookback_raw is None else int(adv_lookback_raw)
 
+    tz_ist: "datetime.tzinfo"
     try:
         tz_ist = ZoneInfo(TIMEZONE_IST)
     except ZoneInfoNotFoundError:

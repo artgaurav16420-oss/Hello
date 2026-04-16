@@ -1025,18 +1025,76 @@ def test_optimizer_osqp_setup_falls_back_to_polish_keyword(monkeypatch):
 def test_objective_cvar_lookback_min_scales_with_dimensionality(monkeypatch):
     class _DummyCfg:
         def __init__(self, **kwargs):
+            self.INITIAL_CAPITAL = 1_000_000.0
+            self.MAX_POSITIONS = 10
+            self.MAX_PORTFOLIO_RISK_PCT = 0.20
+            self.MAX_SINGLE_NAME_WEIGHT = 0.25
+            self.MAX_SECTOR_WEIGHT = 0.40
+            self.MAX_ADV_PCT = 0.05
+            self.MIN_ADV_CRORES = 100.0
+            self.IMPACT_COEFF = 5e-4
+            self.ROUND_TRIP_SLIPPAGE_BPS = 20.0
+            self.REBALANCE_FREQ = "W-FRI"
+            self.CVAR_DAILY_LIMIT = 0.055
+            self.CVAR_ALPHA = 0.95
+            self.CVAR_LOOKBACK = 90
+            self.ADV_LOOKBACK = 90
+            self.CVAR_SENTINEL_MULTIPLIER = 2.5
+            self.CVAR_MIN_HISTORY = 20
+            self.CVAR_HARD_BREACH_MULTIPLIER = 1.5
+            self.DELEVERAGING_LIMIT = 0.20
+            self.MIN_EXPOSURE_FLOOR = 0.05
+            self.CAPITAL_ELASTICITY = 0.15
+            self.DRIFT_TOLERANCE = 0.02
+            self.IS_DD_GATE = 40.0
+            self.IS_DD_PENALTY_PCT = 12.0
+            self.CONCENTRATION_MIN_POSITIONS = 6.0
+            self.CONCENTRATION_PENALTY_WEIGHT = 0.30
+            self.SORTINO_QUALITY_TARGET = 2.5
+            self.SIGNAL_ANNUAL_FACTOR = 252
+            self.HISTORY_GATE = 90
             self.HALFLIFE_FAST = 21
             self.HALFLIFE_SLOW = 63
-            self.CONTINUITY_BONUS = 0.15
+            self.SIGNAL_LAG_DAYS = 21
             self.RISK_AVERSION = 5.0
-            self.CVAR_DAILY_LIMIT = 0.9
-            self.SIGNAL_LAG_DAYS = 0
-            self.MIN_EXPOSURE_FLOOR = 0.0
-            self.CVAR_LOOKBACK = 60
+            self.SLACK_PENALTY = 1000.0
             self.DIMENSIONALITY_MULTIPLIER = 3
-            self.MAX_POSITIONS = 20
-            self.MAX_SINGLE_NAME_WEIGHT = 1.0
-            self.REBALANCE_FREQ = "QE"
+            self.Z_SCORE_CLIP = 3.0
+            self.CONTINUITY_BONUS = 0.15
+            self.CONTINUITY_DISPERSION_FLOOR = 0.1
+            self.CONTINUITY_MAX_SCALAR = 0.20
+            self.CONTINUITY_MAX_HOLD_WEIGHT = 0.10
+            self.CONTINUITY_ACTIVITY_WINDOW = 5
+            self.CONTINUITY_STALE_SESSIONS = 10
+            self.CONTINUITY_FLAT_RET_EPS = 1e-12
+            self.CONTINUITY_MIN_ADV_NOTIONAL = 0.0
+            self.KNIFE_WINDOW = 20
+            self.KNIFE_THRESHOLD = -0.15
+            self.MAX_ABSENT_PERIODS = 12
+            self.MAX_DECAY_ROUNDS = 3
+            self.DECAY_FACTOR = 0.5
+            self.GHOST_VOL_LOOKBACK = 20
+            self.GHOST_RET_DRIFT = -0.02
+            self.GHOST_VOL_FALLBACK = 0.04
+            self.YF_BATCH_TIMEOUT = 120.0
+            self.YF_CHUNK_TIMEOUT = 90.0
+            self.YF_ADV_TIMEOUT = 60.0
+            self.SECTOR_FETCH_TIMEOUT = 8.0
+            self.REGIME_VOL_FLOOR = 0.18
+            self.REGIME_VOL_MULTIPLIER = 1.5
+            self.REGIME_SIGMOID_STEEPNESS = 10.0
+            self.REGIME_SMA_FAST_WINDOW = 50
+            self.REGIME_SMA_WINDOW = 200
+            self.REGIME_VOL_EWMA_SPAN = 20
+            self.REGIME_LT_VOL_EWMA_SPAN = 1260
+            self.SIMULATE_HALTS = False
+            self.DIVIDEND_SWEEP = True
+            self.SPLIT_TOLERANCE = 0.005
+            self.AUTO_ADJUST_PRICES = True
+            self.EQUITY_HIST_CAP = 500
+            self.SLIPPAGE_BPS = 20.0
+            for k, v in kwargs.items():
+                setattr(self, k, v)
 
     class _RecordingTrial:
         params = {}
@@ -1341,3 +1399,382 @@ def _objective_diag(*, score, dd_gate_hit=False, anomaly_hit=False):
             "ceiling_hit": False,
         },
     )
+
+class TestOptimizer:
+    @pytest.fixture
+    def mock_cfg(self):
+        return UltimateConfig()
+
+    @pytest.fixture
+    def basic_metrics(self):
+        return {"cagr": 20.0, "max_dd": -15.0, "turnover": 5.0, "sortino": 2.0, "final": 1.2 * UltimateConfig().INITIAL_CAPITAL}
+
+    @pytest.fixture
+    def empty_rebal_log(self):
+        return pd.DataFrame()
+
+    @pytest.fixture
+    def basic_rebal_log(self):
+        return pd.DataFrame({
+            "realised_cvar": [0.01, 0.02, 0.03],
+            "exposure_multiplier": [0.9, 1.0, 1.1],
+            "n_positions": [8, 9, 10],
+        })
+
+    def test_fitness_function_calculates_score(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests that the objective function correctly calculates the metric to be optimized.
+        """
+        score, calmar, diag = optimizer._fitness_from_metrics(basic_metrics, empty_rebal_log, mock_cfg)
+        
+        assert isinstance(score, float)
+        assert isinstance(calmar, float)
+        assert isinstance(diag, dict)
+        assert diag["raw_score"] != 0
+        assert not diag["dd_gate_hit"]
+        assert not diag["anomaly_hit"]
+
+    def test_fitness_function_handles_dd_gate(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests that the objective function correctly handles the drawdown gate.
+        """
+        metrics = basic_metrics.copy()
+        metrics["max_dd"] = -45.0  # Above the 40% gate
+        
+        score, _, diag = optimizer._fitness_from_metrics(metrics, empty_rebal_log, mock_cfg)
+        
+        assert diag["dd_gate_hit"]
+        assert score == -2.0
+
+    def test_fitness_function_handles_anomaly(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests that the objective function correctly handles anomalous CAGR.
+        """
+        metrics = basic_metrics.copy()
+        metrics["cagr"] = optimizer.MAX_REASONABLE_CAGR_PCT + 50
+        
+        score, _, diag = optimizer._fitness_from_metrics(metrics, empty_rebal_log, mock_cfg)
+        
+        assert diag["anomaly_hit"]
+        assert score < 0
+
+    def test_fitness_near_zero_cagr_maxdd(self, mock_cfg, empty_rebal_log):
+        """
+        Tests that the score is 0 when both cagr and max_dd are near zero.
+        """
+        metrics = {"cagr": 0.0, "max_dd": 0.0, "turnover": 0.0, "sortino": 0.0, "final": mock_cfg.INITIAL_CAPITAL}
+        score, calmar, diag = optimizer._fitness_from_metrics(metrics, empty_rebal_log, mock_cfg)
+
+        assert score == 0.0
+        assert calmar == 0.0
+        assert diag["raw_score"] == 0.0
+
+    def test_fitness_turnover_drag_calculation(self, mock_cfg, empty_rebal_log):
+        """
+        Tests the calculation of cagr_net with different turnover values.
+        """
+        metrics_low_turnover = {"cagr": 20.0, "max_dd": -10.0, "turnover": 1.0, "sortino": 2.0, "final": 1.2 * mock_cfg.INITIAL_CAPITAL}
+        metrics_high_turnover = {"cagr": 20.0, "max_dd": -10.0, "turnover": 25.0, "sortino": 2.0, "final": 1.2 * mock_cfg.INITIAL_CAPITAL}
+
+        _, _, diag_low = optimizer._fitness_from_metrics(metrics_low_turnover, empty_rebal_log, mock_cfg)
+        _, _, diag_high = optimizer._fitness_from_metrics(metrics_high_turnover, empty_rebal_log, mock_cfg)
+        
+        # Turnover drag at 1.0x turnover: 1.0 * 0.30 = 0.30, churn_penalty = 0.0
+        assert diag_low["cagr_net"] == pytest.approx(20.0 - 0.30)
+        
+        # Turnover drag at 25.0x turnover: base_friction_drag = 25 * 0.3 = 7.5
+        # churn_penalty = ((25 - 18)^2) / 10 = (7^2) / 10 = 4.9
+        # Total drag = 7.5 + 4.9 = 12.4
+        assert diag_high["cagr_net"] == pytest.approx(20.0 - 12.4)
+        assert diag_high["cagr_net"] < diag_low["cagr_net"]
+
+    def test_fitness_low_avg_positions_penalty(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests that concentration_mult increases when avg_positions is low.
+        """
+        rebal_log_low_pos = pd.DataFrame({
+            "realised_cvar": [0.01], "exposure_multiplier": [1.0], "n_positions": [1],
+        }) # Avg pos = 1
+        
+        # Default CONCENTRATION_MIN_POSITIONS = 6.0, CONCENTRATION_PENALTY_WEIGHT = 0.30
+        # _pos_deficit = max(0.0, 6.0 - 1.0) = 5.0
+        # concentration_mult = 1.0 + 5.0 * 0.30 = 2.5
+
+        _, _, diag = optimizer._fitness_from_metrics(basic_metrics, rebal_log_low_pos, mock_cfg)
+        assert diag["concentration_mult"] == pytest.approx(2.5)
+
+    def test_fitness_low_exposure_penalty(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests exposure_penalty when avg_exposure is low or avg_positions is zero.
+        """
+        # Case 1: avg_exposure < 0.25
+        rebal_log_low_exposure = pd.DataFrame({
+            "realised_cvar": [0.01], "exposure_multiplier": [0.1], "n_positions": [8],
+        }) # Avg exp = 0.1
+        # exposure_penalty = (0.25 - 0.1) * 2.0 = 0.3
+
+        _, _, diag_low_exp = optimizer._fitness_from_metrics(basic_metrics, rebal_log_low_exposure, mock_cfg)
+        assert diag_low_exp["exposure_penalty"] == pytest.approx(0.3)
+
+        # Case 2: avg_positions < 1.0 (empty rebal log)
+        # Should add 0.5 to exposure_penalty if avg_positions is effectively zero.
+        # avg_exposure will be 1.0 (fallback) from empty rebal log.
+        # But if we force avg_positions to 0.0 via rebal_log
+        rebal_log_zero_pos = pd.DataFrame({
+            "realised_cvar": [0.0], "exposure_multiplier": [1.0], "n_positions": [0],
+        })
+        _, _, diag_zero_pos = optimizer._fitness_from_metrics(basic_metrics, rebal_log_zero_pos, mock_cfg)
+        # exposure_penalty should be 0.5 (from avg_positions < 1.0) + (0.25 - 1.0) * 2.0 (if avg_exposure was < 0.25)
+        # But here avg_exposure is 1.0, so only 0.5 from avg_positions.
+        assert diag_zero_pos["exposure_penalty"] == pytest.approx(0.5)
+
+    def test_fitness_sortino_quality_variations(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests different sortino values and their impact on sortino_quality.
+        """
+        # Default SORTINO_QUALITY_TARGET = 2.5
+
+        # Sortino < target, but > 0.5 * target
+        metrics_low_sortino = basic_metrics.copy()
+        metrics_low_sortino["sortino"] = 1.0 # 1.0 / 2.5 = 0.4, but min is 0.5, so 0.5
+        _, _, diag_low = optimizer._fitness_from_metrics(metrics_low_sortino, empty_rebal_log, mock_cfg)
+        assert diag_low["sortino_quality"] == pytest.approx(0.5)
+
+        # Sortino == target
+        metrics_target_sortino = basic_metrics.copy()
+        metrics_target_sortino["sortino"] = 2.5
+        _, _, diag_target = optimizer._fitness_from_metrics(metrics_target_sortino, empty_rebal_log, mock_cfg)
+        assert diag_target["sortino_quality"] == pytest.approx(1.0)
+
+        # Sortino > target, but capped at 1.15
+        metrics_high_sortino = basic_metrics.copy()
+        metrics_high_sortino["sortino"] = 5.0 # 5.0 / 2.5 = 2.0, but max is 1.15, so 1.15
+        _, _, diag_high = optimizer._fitness_from_metrics(metrics_high_sortino, empty_rebal_log, mock_cfg)
+        assert diag_high["sortino_quality"] == pytest.approx(1.15)
+
+    def test_fitness_dd_penalty_between_thresholds(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests the quadratic dd_penalty when max_dd is between IS_DD_PENALTY_PCT and IS_DD_GATE.
+        IS_DD_GATE = 40.0, IS_DD_PENALTY_PCT = 12.0
+        """
+        metrics = basic_metrics.copy()
+        metrics["max_dd"] = -22.0 # Between 12.0 and 40.0
+        # dd_excess = max(0.0, 22.0 - 12.0) = 10.0
+        # dd_penalty = (10.0 ** 2) / 100.0 = 1.0
+
+        _, _, diag = optimizer._fitness_from_metrics(metrics, empty_rebal_log, mock_cfg)
+        assert diag["dd_penalty"] == pytest.approx(1.0)
+        assert not diag["dd_gate_hit"]
+
+    def test_fitness_log1p_transform_behavior(self, mock_cfg, basic_metrics, empty_rebal_log):
+        """
+        Tests log1p and copysign transformation for raw scores.
+        """
+        metrics_positive_raw = basic_metrics.copy() # Will result in positive raw
+        metrics_positive_raw["cagr"] = 100.0
+        metrics_positive_raw["max_dd"] = -5.0
+        metrics_positive_raw["turnover"] = 0.0
+        metrics_positive_raw["sortino"] = 2.5
+        
+        _, _, diag_pos = optimizer._fitness_from_metrics(metrics_positive_raw, empty_rebal_log, mock_cfg)
+        expected_raw_pos = (100.0 / ((5.0 + (0.01 * 100.0 * 2.0) + 1.0) * 1.0)) * 1.0 - 0.0 - 0.0
+        # Assuming defaults for penalties etc. for a clean calculation
+        # risk_penalty = (abs(max_dd) + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
+        # With empty rebal_log, avg_cvar=0, avg_exposure=1, avg_positions=0, concentration_mult=2.5 (from _pos_deficit 6)
+        # risk_penalty = (5.0 + 0 + 1.0) * 2.5 = 15.0
+        # raw = (100.0 / 15.0) * 1.0 - 0.0 - 0.0 = 6.666...
+        # score = log1p(raw)
+        
+        # Recalculating with actual constants used in _fitness_from_metrics and _calculate_penalty_multipliers
+        cagr         = 100.0
+        max_dd       = 5.0
+        turnover     = 0.0
+        sortino      = 2.5
+        
+        cfg = mock_cfg
+        turnover_drag = 0.0 # From _compute_turnover_drag
+        cagr_net = cagr - turnover_drag # 100.0
+
+        avg_cvar = 0.0
+        avg_exposure = 1.0
+        avg_positions = 0.0
+        
+        _pos_deficit = max(0.0, float(cfg.CONCENTRATION_MIN_POSITIONS) - avg_positions) # 6.0 - 0.0 = 6.0
+        concentration_mult = 1.0 + _pos_deficit * float(cfg.CONCENTRATION_PENALTY_WEIGHT) # 1.0 + 6.0 * 0.30 = 2.8
+
+        risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult # (5.0 + 0 + 1.0) * 2.8 = 16.8
+        exposure_penalty = 0.5 # from avg_positions < 1.0
+        
+        sortino_quality = min(max(sortino / float(cfg.SORTINO_QUALITY_TARGET), 0.50), 1.15) # min(max(2.5/2.5, 0.5), 1.15) = 1.0
+
+        dd_penalty = 0.0
+        
+        raw_pos = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty
+        expected_score_pos = np.copysign(np.log1p(abs(raw_pos)), raw_pos)
+        
+        assert diag_pos["raw_score"] == pytest.approx(raw_pos)
+        assert diag_pos["score"] == pytest.approx(expected_score_pos)
+        assert diag_pos["score"] > 0
+
+        metrics_negative_raw = basic_metrics.copy()
+        metrics_negative_raw["cagr"] = -5.0
+        metrics_negative_raw["max_dd"] = -10.0
+        metrics_negative_raw["turnover"] = 0.0
+        metrics_negative_raw["sortino"] = 0.1 # This should lead to a very low score
+        
+        _, _, diag_neg = optimizer._fitness_from_metrics(metrics_negative_raw, empty_rebal_log, mock_cfg)
+        
+        cagr         = -5.0
+        max_dd       = 10.0
+        turnover     = 0.0
+        sortino      = 0.1
+        
+        cagr_net = cagr - turnover_drag # -5.0
+        
+        # Remaining penalty multipliers are similar assuming same empty_rebal_log
+        _pos_deficit = max(0.0, float(cfg.CONCENTRATION_MIN_POSITIONS) - avg_positions) # 6.0 - 0.0 = 6.0
+        concentration_mult = 1.0 + _pos_deficit * float(cfg.CONCENTRATION_PENALTY_WEIGHT) # 1.0 + 6.0 * 0.30 = 2.8
+        risk_penalty = (max_dd + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult # (10.0 + 0 + 1.0) * 2.8 = 30.8
+        exposure_penalty = 0.5
+        sortino_quality = min(max(sortino / float(cfg.SORTINO_QUALITY_TARGET), 0.50), 1.15) # min(max(0.1/2.5, 0.5), 1.15) = 0.5
+
+        raw_neg = (cagr_net / risk_penalty) * sortino_quality - exposure_penalty - dd_penalty
+        expected_score_neg = np.copysign(np.log1p(abs(raw_neg)), raw_neg)
+
+        assert diag_neg["raw_score"] == pytest.approx(raw_neg)
+        assert diag_neg["score"] == pytest.approx(expected_score_neg)
+        assert diag_neg["score"] < 0
+        assert diag_neg["score"] > -2.0 # Should not hit the hard floor unless very negative
+
+    def test_extract_rebalance_summary_with_data(self, basic_rebal_log):
+        """
+        Tests _extract_rebalance_summary with a populated rebalance log.
+        """
+        avg_cvar, avg_exposure, avg_positions, n_rebalances = optimizer._extract_rebalance_summary(basic_rebal_log)
+
+        assert avg_cvar == pytest.approx(0.02)
+        assert avg_exposure == pytest.approx(1.0)
+        assert avg_positions == pytest.approx(9.0)
+        assert n_rebalances == 3
+
+    def test_extract_rebalance_summary_empty_dataframe(self, empty_rebal_log):
+        """
+        Tests _extract_rebalance_summary with an empty rebalance log.
+        """
+        avg_cvar, avg_exposure, avg_positions, n_rebalances = optimizer._extract_rebalance_summary(empty_rebal_log)
+        
+        assert avg_cvar == pytest.approx(0.0)
+        assert avg_exposure == pytest.approx(1.0) # Fallback to 1.0
+        assert avg_positions == pytest.approx(0.0)
+        assert n_rebalances == 0
+
+    def test_calculate_penalty_multipliers_no_penalties(self, mock_cfg):
+        """
+        Tests that penalty multipliers are 1.0 or 0.0 when conditions are not met.
+        """
+        avg_positions = 10.0 # Above CONCENTRATION_MIN_POSITIONS (6.0)
+        avg_exposure = 0.5 # Above 0.25 threshold
+        avg_cvar = 0.01
+        max_dd = 10.0
+
+        concentration_mult, risk_penalty, exposure_penalty = optimizer._calculate_penalty_multipliers(
+            avg_positions, avg_exposure, avg_cvar, max_dd, mock_cfg
+        )
+        
+        assert concentration_mult == pytest.approx(1.0)
+        # risk_penalty = (10.0 + (0.01 * 100.0 * 2.0) + 1.0) * 1.0 = (10.0 + 2.0 + 1.0) = 13.0
+        assert risk_penalty == pytest.approx(13.0)
+        assert exposure_penalty == pytest.approx(0.0)
+
+    def test_momentum_objective_propagates_numerical_error(self, monkeypatch):
+        """
+        Tests that the MomentumObjective propagates OptimizationErrorType.NUMERICAL.
+        """
+        monkeypatch.setattr(
+            optimizer,
+            "run_backtest",
+            lambda **kwargs: (_ for _ in ()).throw(
+                optimizer.OptimizationError(
+                    "Numerical instability",
+                    error_type=optimizer.OptimizationErrorType.NUMERICAL,
+                )
+            ),
+        )
+
+        objective = optimizer.MomentumObjective(
+            market_data={
+                "DUMMY": pd.DataFrame(
+                    {"Close": [1.0] * 510, "Volume": [1e6] * 510},
+                    index=pd.date_range("2017-01-01", periods=510, freq="B"),
+                )
+            },
+            universe_type="nifty500",
+        )
+        trial = _fixed_trial_params()
+
+        with pytest.raises(optimizer.OptimizationError) as exc_info:
+            objective(trial)
+        assert exc_info.value.error_type == optimizer.OptimizationErrorType.NUMERICAL
+        assert "Numerical instability" in str(exc_info.value)
+
+    def test_momentum_objective_propagates_infeasible_error(self, monkeypatch):
+        """
+        Tests that the MomentumObjective propagates OptimizationErrorType.INFEASIBLE.
+        """
+        monkeypatch.setattr(
+            optimizer,
+            "run_backtest",
+            lambda **kwargs: (_ for _ in ()).throw(
+                optimizer.OptimizationError(
+                    "Infeasible solution",
+                    error_type=optimizer.OptimizationErrorType.INFEASIBLE,
+                )
+            ),
+        )
+
+        objective = optimizer.MomentumObjective(
+            market_data={
+                "DUMMY": pd.DataFrame(
+                    {"Close": [1.0] * 510, "Volume": [1e6] * 510},
+                    index=pd.date_range("2017-01-01", periods=510, freq="B"),
+                )
+            },
+            universe_type="nifty500",
+        )
+        trial = _fixed_trial_params()
+
+        with pytest.raises(optimizer.OptimizationError) as exc_info:
+            objective(trial)
+        assert exc_info.value.error_type == optimizer.OptimizationErrorType.INFEASIBLE
+        assert "Infeasible solution" in str(exc_info.value)
+
+    def test_momentum_objective_propagates_data_error(self, monkeypatch):
+        """
+        Tests that the MomentumObjective propagates OptimizationErrorType.DATA.
+        """
+        monkeypatch.setattr(
+            optimizer,
+            "run_backtest",
+            lambda **kwargs: (_ for _ in ()).throw(
+                optimizer.OptimizationError(
+                    "Missing data", error_type=optimizer.OptimizationErrorType.DATA
+                )
+            ),
+        )
+
+        objective = optimizer.MomentumObjective(
+            market_data={
+                "DUMMY": pd.DataFrame(
+                    {"Close": [1.0] * 510, "Volume": [1e6] * 510},
+                    index=pd.date_range("2017-01-01", periods=510, freq="B"),
+                )
+            },
+            universe_type="nifty500",
+        )
+        trial = _fixed_trial_params()
+
+        with pytest.raises(optimizer.OptimizationError) as exc_info:
+            objective(trial)
+        assert exc_info.value.error_type == optimizer.OptimizationErrorType.DATA
+        assert "Missing data" in str(exc_info.value)
+

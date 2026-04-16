@@ -359,6 +359,15 @@ def bootstrap_historical_parquet(
 # PARQUET VERIFICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _to_list(val) -> list:
+    """Coerce parquet-loaded tickers (list or numpy array) to a Python list."""
+    import numpy as np
+    if isinstance(val, (list, np.ndarray)):
+        return list(val)
+    if hasattr(val, "tolist"):
+        return val.tolist()
+    return [val] if val else []
+
 def verify_parquet(parquet_path: str) -> bool:
     """
     Print a diagnostic summary of the parquet file and return True if it
@@ -391,15 +400,6 @@ def verify_parquet(parquet_path: str) -> bool:
 
     # Sample sizes
     sample_dates = [d for d in dates if pd.Timestamp("2019-01-01") <= d <= pd.Timestamp("2022-12-31")]
-    def _to_list(val) -> list:
-        """Coerce parquet-loaded tickers (list or numpy array) to a Python list."""
-        import numpy as np
-        if isinstance(val, (list, np.ndarray)):
-            return list(val)
-        if hasattr(val, "tolist"):
-            return val.tolist()
-        return [val] if val else []
-
     if sample_dates:
         sizes = []
         for d in sample_dates[:8]:
@@ -414,7 +414,7 @@ def verify_parquet(parquet_path: str) -> bool:
     # Sanity checks
     issues = []
 
-    if n_dates < 10:
+    if n_dates < 20:
         issues.append(f"Too few snapshots ({n_dates}), expected 20+")
 
     if dates[-1] < pd.Timestamp.today() - pd.Timedelta(days=365):
@@ -435,18 +435,21 @@ def verify_parquet(parquet_path: str) -> bool:
                     "(classic sign of current-list back-fill, i.e. survivorship bias)"
                 )
 
-    # Check 2021 universe for known late-joiners
+    # Check pre-2021 snapshots for known late-joiners
     late_joiners = {"ZOMATO.NS", "NYKAA.NS", "PAYTM.NS", "POLICYBAZAAR.NS", "IREDA.NS"}
     pre_2021_dates = [d for d in dates if d < pd.Timestamp("2021-07-01")]
-    if pre_2021_dates:
-        pre_date = max(pre_2021_dates)
+    found_late_all: set[str] = set()
+    for pre_date in pre_2021_dates:
         pre_members = set(_to_list(df.loc[pre_date, "tickers"]))
         found_late = late_joiners & pre_members
         if found_late:
-            issues.append(
-                f"Pre-2021 snapshot contains post-2021 IPOs: {found_late} "
-                "(CONFIRMS survivorship bias — these stocks didn't exist then)"
-            )
+            found_late_all.update(found_late)
+    
+    if found_late_all:
+        issues.append(
+            f"Pre-2021 snapshot contains post-2021 IPOs: {found_late_all} "
+            "(CONFIRMS survivorship bias — these stocks didn't exist then)"
+        )
 
     if issues:
         print("\n  ⚠ ISSUES FOUND:")
