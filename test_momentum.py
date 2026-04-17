@@ -6,7 +6,7 @@ Every test either asserts a real invariant or does not exist.
 
 from __future__ import annotations
 
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401 # MUST be first to prevent Windows Access Violation
 import json
 import logging
 import os
@@ -1806,7 +1806,7 @@ class TestMomentumEngine:
         scenario_losses = np.full((100, 1), 0.1) # 10% loss scenario
 
         trade_log = []
-        total_slippage = execute_rebalance(
+        execute_rebalance(
             state,
             target_weights,
             prices,

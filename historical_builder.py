@@ -35,7 +35,6 @@ import requests
 
 from shared_utils import (
     NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
-    fetch_nse_csv,
     normalize_ns_ticker,
 )
 

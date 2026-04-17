@@ -4,12 +4,11 @@ test_signals.py — Tests for signal generation logic v11.48
 """
 
 from __future__ import annotations
-import osqp_preimport
+import osqp_preimport  # noqa: F401
 
 import numpy as np
 import pandas as pd
 import pytest
-import logging
 
 from signals import generate_signals, compute_adv, compute_regime_score
 from momentum_engine import UltimateConfig
@@ -535,7 +534,7 @@ class TestSignalsCoverage:
         universe = pd.DataFrame({"A": [np.nan] * 250}, index=idx.index)
         
         with caplog.at_level("DEBUG"):
-            score = compute_regime_score(idx, universe_close_hist=universe)
+            compute_regime_score(idx, universe_close_hist=universe)
         
         assert "no symbols passed validity filter" in caplog.text
 

@@ -1,17 +1,16 @@
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401 # MUST be first to prevent Windows Access Violation
 import importlib
 import json
-import re
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
-from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 @pytest.fixture
 def relaxed_train_start(monkeypatch):
