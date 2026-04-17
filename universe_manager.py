@@ -558,12 +558,12 @@ def invalidate_universe_cache() -> None:
     This should be used when upstream metadata has changed or if the
     local cache is suspected of being corrupt.
     """
-    if _get_universe_cache_file().exists():
-        try:
-            _get_universe_cache_file().unlink()
-            logger.info("[Universe] Cache invalidated.")
-        except OSError as e:
-            logger.error("[Universe] Failed to invalidate cache: %s", e)
+    try:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            _get_universe_cache_file().unlink(missing_ok=True)
+        logger.info("[Universe] Cache invalidated.")
+    except OSError as e:
+        logger.error("[Universe] Failed to invalidate cache: %s", e)
 
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 

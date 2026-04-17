@@ -96,9 +96,14 @@ def compute_regime_score(
     if isinstance(idx_hist.index, pd.DatetimeIndex) and len(idx_hist.index) > 0:
         last_is_today = idx_hist.index[-1].date() == reference_date
     if last_is_today and len(idx_hist.index) > 1:
-        close_series = idx_hist["Close"].iloc[:-1]
+        cutoff = pd.Timestamp(reference_date)
+        if idx_hist.index.tz is not None and cutoff.tzinfo is None:
+            cutoff = cutoff.tz_localize(idx_hist.index.tz)
+        close_series = idx_hist.loc[idx_hist.index < cutoff, "Close"]
         if universe_close_hist is not None and not universe_close_hist.empty:
-            universe_close_hist = universe_close_hist.loc[universe_close_hist.index < pd.Timestamp(reference_date)]
+            idx_tz = getattr(universe_close_hist.index, "tz", None)
+            cutoff = pd.Timestamp(reference_date).tz_localize(idx_tz) if idx_tz is not None else pd.Timestamp(reference_date)
+            universe_close_hist = universe_close_hist.loc[universe_close_hist.index < cutoff]
     else:
         close_series = idx_hist["Close"]
 

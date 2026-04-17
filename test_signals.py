@@ -492,6 +492,30 @@ class TestSignalsCoverage:
         assert score_today == score_no_today
 
     @staticmethod
+    def test_compute_regime_score_last_is_today_trims_universe_history_with_tz():
+        """Verifies universe_close_hist is date-trimmed safely for tz-aware indices."""
+        today = pd.Timestamp("2024-01-11")
+        idx_dates = pd.date_range(today - pd.Timedelta(days=10), periods=11, freq="D")
+        idx = pd.DataFrame({"Close": np.linspace(100, 110, 11)}, index=idx_dates)
+
+        tz_dates = pd.date_range("2024-01-01 00:00:00+05:30", periods=11, freq="D")
+        universe_with_today = pd.DataFrame({"A": np.linspace(50, 60, 11)}, index=tz_dates)
+        universe_without_today = universe_with_today.iloc[:-1]
+
+        score_with_today = compute_regime_score(
+            idx,
+            universe_close_hist=universe_with_today,
+            as_of_date=today,
+        )
+        score_without_today = compute_regime_score(
+            idx,
+            universe_close_hist=universe_without_today,
+            as_of_date=today,
+        )
+
+        assert score_with_today == score_without_today
+
+    @staticmethod
     def test_compute_regime_score_benchmark_only_universe(caplog):
         """Breadth component should default to 0.5 if only benchmarks are provided."""
         idx = pd.DataFrame({"Close": [100.0] * 250}, index=pd.date_range("2020-01-01", periods=250))

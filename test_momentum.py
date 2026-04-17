@@ -1713,7 +1713,7 @@ class TestWorkflowAndUtilities:
         assert bt.state.decay_rounds == 0, "BacktestEngine run loop must correctly zero decay_rounds upon optimization success."
 
     @staticmethod
-    def test_consecutive_failures_reset_on_empty_universe():
+    def test_consecutive_failures_reset_on_empty_universe(monkeypatch):
         cfg = UltimateConfig(HISTORY_GATE=5, INITIAL_CAPITAL=1_000_000)
         n_days, n_syms = 50, 2
         close = _make_close(n_days, n_syms)
@@ -1726,8 +1726,6 @@ class TestWorkflowAndUtilities:
 
         import backtest_engine as _be
 
-        original = _be.generate_signals
-
         def _empty_generate_signals(*_args, **_kwargs):
             return np.array([]), np.array([]), [], {
                 "total": 0,
@@ -1737,12 +1735,9 @@ class TestWorkflowAndUtilities:
                 "selected": 0,
             }
 
-        _be.generate_signals = _empty_generate_signals
-        try:
-            rebal_dates = close.index[20:25]
-            bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
-        finally:
-            _be.generate_signals = original
+        monkeypatch.setattr(_be, "generate_signals", _empty_generate_signals)
+        rebal_dates = close.index[20:25]
+        bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
 
         assert bt.state.consecutive_failures == 0
 

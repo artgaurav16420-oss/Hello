@@ -789,8 +789,9 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                     except (ValueError, TypeError):
                         split_start_date = None
                 if split_start_date is None:
-                    # Prefer position entry marker (stored under 'sym'), 
-                    # fall back to split-specific markers (stored under 'split:sym').
+                    # Prefer split-specific markers (stored under 'split:sym') so we
+                    # resume from the most recently applied split; fall back to the
+                    # position entry marker (stored under 'sym') on first run.
                     marker = state.dividend_ledger.get(f"split:{sym}", state.dividend_ledger.get(sym, ""))
                     marker_date = marker.split(":", 1)[0] if marker else ""
                     if marker_date:
