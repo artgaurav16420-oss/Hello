@@ -98,7 +98,7 @@ def compute_regime_score(
     if last_is_today and len(idx_hist.index) > 1:
         close_series = idx_hist["Close"].iloc[:-1]
         if universe_close_hist is not None and not universe_close_hist.empty:
-            universe_close_hist = universe_close_hist.iloc[:-1]
+            universe_close_hist = universe_close_hist.loc[universe_close_hist.index < pd.Timestamp(reference_date)]
     else:
         close_series = idx_hist["Close"]
 

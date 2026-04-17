@@ -816,6 +816,7 @@ def run(universe_arg: str = "both", start_date: str = "2015-01-01") -> None:
             wfo_years = [2019, 2020, 2021, 2022]
             print()
             print("  WFO year coverage after hybrid merge:")
+            anchor = None
             for yr in wfo_years:
                 ref = pd.Timestamp(f"{yr}-01-01")
                 eligible = [d for d in wbm_dates if d <= ref]

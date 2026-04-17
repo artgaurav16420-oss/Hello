@@ -1,10 +1,8 @@
 from __future__ import annotations
-import osqp_preimport
+import osqp_preimport  # noqa: F401
 
-import os
 import json
 import logging
-import pathlib
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -585,7 +583,7 @@ def test_run_scan_cadence_stale_gate_does_not_emit_duplicate_rebalance_warning(m
     monkeypatch.setattr(dw, "_load_pending_sentinel", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(dw, "_try_claim_pending_sentinel", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(dw, "compute_regime_score", lambda *_args, **_kwargs: 0.5)
-    monkeypatch.setattr("momentum_engine.compute_book_cvar", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr("daily_workflow.compute_book_cvar", lambda *_args, **_kwargs: 0.0)
     monkeypatch.setattr(dw, "compute_adv", lambda market_data, active, *args, **kwargs: __import__("numpy").array([1e9] * len(active)))
     monkeypatch.setattr(dw, "get_sector_map", lambda syms, cfg=None: {s: 0 for s in syms})
 

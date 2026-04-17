@@ -478,7 +478,7 @@ class TestSignalsCoverage:
     @staticmethod
     def test_compute_regime_score_last_is_today():
         """Verifies that the last bar is excluded if it matches today's date."""
-        today = pd.Timestamp.today().normalize()
+        today = pd.Timestamp("2024-01-11")
         dates = pd.date_range(today - pd.Timedelta(days=10), periods=11, freq="D")
         idx = pd.DataFrame({"Close": np.linspace(100, 110, 11)}, index=dates)
         

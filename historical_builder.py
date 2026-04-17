@@ -365,7 +365,8 @@ def _to_list(val) -> list:
     if isinstance(val, (list, np.ndarray)):
         return list(val)
     if hasattr(val, "tolist"):
-        return val.tolist()
+        out = val.tolist()
+        return out if isinstance(out, list) else [out]
     return [val] if val else []
 
 def verify_parquet(parquet_path: str) -> bool:
@@ -404,6 +405,11 @@ def verify_parquet(parquet_path: str) -> bool:
         sizes = []
         for d in sample_dates[:8]:
             row = df.loc[d, "tickers"]
+            if isinstance(row, pd.Series):
+                flattened: list = []
+                for item in row.tolist():
+                    flattened.extend(_to_list(item))
+                row = flattened
             n = len(_to_list(row))
             sizes.append((d.date(), n))
         print("  Sample sizes (2019-2022):")
@@ -440,7 +446,13 @@ def verify_parquet(parquet_path: str) -> bool:
     pre_2021_dates = [d for d in dates if d < pd.Timestamp("2021-07-01")]
     found_late_all: set[str] = set()
     for pre_date in pre_2021_dates:
-        pre_members = set(_to_list(df.loc[pre_date, "tickers"]))
+        pre_row = df.loc[pre_date, "tickers"]
+        if isinstance(pre_row, pd.Series):
+            flattened: list = []
+            for item in pre_row.tolist():
+                flattened.extend(_to_list(item))
+            pre_row = flattened
+        pre_members = set(_to_list(pre_row))
         found_late = late_joiners & pre_members
         if found_late:
             found_late_all.update(found_late)
