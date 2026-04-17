@@ -122,13 +122,13 @@ def test_main_downloads_archives_when_missing(tmp_path, monkeypatch):
             return {}
 
     def _fake_get(url, *args, **kwargs):
+        # Handle Wayback CDX query
+        if "cdx" in url:
+            return _Resp('[["timestamp","statuscode"], ["20200131120000","200"]]')
         if "nifty" in url:
             return _Resp(sample_by_universe["nifty500"])
         if "nse_total" in url:
             return _Resp(sample_by_universe["nse_total"])
-        # Handle Wayback CDX query
-        if "cdx" in url:
-            return _Resp('[["timestamp","statuscode"], ["20200131120000","200"]]')
         return _Resp("")
 
     class _FakeSession:

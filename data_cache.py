@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover - fallback for minimal test envs
     class FileLockTimeout(Exception):  # type: ignore[no-redef]
         pass
 
-    class FileLock(Any):  # minimal compatibility shim  # type: ignore[no-redef]
+    class FileLock:  # minimal compatibility shim  # type: ignore[no-redef]
         def __init__(self, lock_file: str, timeout: float = 30.0) -> None:
             self._path = Path(lock_file)
             self._timeout = float(timeout)

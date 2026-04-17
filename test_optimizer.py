@@ -1,17 +1,16 @@
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401 # MUST be first to prevent Windows Access Violation
 import importlib
 import json
-import re
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 optuna = pytest.importorskip("optuna")
 optimizer = pytest.importorskip("optimizer")
-from momentum_engine import InstitutionalRiskEngine, UltimateConfig
 
 @pytest.fixture
 def relaxed_train_start(monkeypatch):
@@ -1577,7 +1576,6 @@ class TestOptimizer:
         metrics_positive_raw["sortino"] = 2.5
         
         _, _, diag_pos = optimizer._fitness_from_metrics(metrics_positive_raw, empty_rebal_log, mock_cfg)
-        expected_raw_pos = (100.0 / ((5.0 + (0.01 * 100.0 * 2.0) + 1.0) * 1.0)) * 1.0 - 0.0 - 0.0
         # Assuming defaults for penalties etc. for a clean calculation
         # risk_penalty = (abs(max_dd) + (avg_cvar * 100.0 * 2.0) + 1.0) * concentration_mult
         # With empty rebal_log, avg_cvar=0, avg_exposure=1, avg_positions=0, concentration_mult=2.5 (from _pos_deficit 6)
@@ -1588,7 +1586,6 @@ class TestOptimizer:
         # Recalculating with actual constants used in _fitness_from_metrics and _calculate_penalty_multipliers
         cagr         = 100.0
         max_dd       = 5.0
-        turnover     = 0.0
         sortino      = 2.5
         
         cfg = mock_cfg
@@ -1596,7 +1593,6 @@ class TestOptimizer:
         cagr_net = cagr - turnover_drag # 100.0
 
         avg_cvar = 0.0
-        avg_exposure = 1.0
         avg_positions = 0.0
         
         _pos_deficit = max(0.0, float(cfg.CONCENTRATION_MIN_POSITIONS) - avg_positions) # 6.0 - 0.0 = 6.0
@@ -1626,7 +1622,6 @@ class TestOptimizer:
         
         cagr         = -5.0
         max_dd       = 10.0
-        turnover     = 0.0
         sortino      = 0.1
         
         cagr_net = cagr - turnover_drag # -5.0
@@ -1777,4 +1772,3 @@ class TestOptimizer:
             objective(trial)
         assert exc_info.value.error_type == optimizer.OptimizationErrorType.DATA
         assert "Missing data" in str(exc_info.value)
-

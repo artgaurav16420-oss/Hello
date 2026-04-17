@@ -35,7 +35,6 @@ import requests
 
 from shared_utils import (
     NSE_URL_NIFTY500_INDEX_CONSTITUENT_CSV,
-    fetch_nse_csv,
     normalize_ns_ticker,
 )
 
@@ -365,8 +364,19 @@ def _to_list(val) -> list:
     if isinstance(val, (list, np.ndarray)):
         return list(val)
     if hasattr(val, "tolist"):
-        return val.tolist()
+        out = val.tolist()
+        return out if isinstance(out, list) else [out]
     return [val] if val else []
+
+
+def _flatten_tickers_cell(val) -> list:
+    """Flatten a parquet tickers cell, handling duplicate-index Series rows."""
+    if isinstance(val, pd.Series):
+        flattened: list = []
+        for item in val.tolist():
+            flattened.extend(_to_list(item))
+        return flattened
+    return _to_list(val)
 
 def verify_parquet(parquet_path: str) -> bool:
     """
@@ -404,7 +414,7 @@ def verify_parquet(parquet_path: str) -> bool:
         sizes = []
         for d in sample_dates[:8]:
             row = df.loc[d, "tickers"]
-            n = len(_to_list(row))
+            n = len(_flatten_tickers_cell(row))
             sizes.append((d.date(), n))
         print("  Sample sizes (2019-2022):")
         for d, n in sizes:
@@ -440,7 +450,7 @@ def verify_parquet(parquet_path: str) -> bool:
     pre_2021_dates = [d for d in dates if d < pd.Timestamp("2021-07-01")]
     found_late_all: set[str] = set()
     for pre_date in pre_2021_dates:
-        pre_members = set(_to_list(df.loc[pre_date, "tickers"]))
+        pre_members = set(_flatten_tickers_cell(df.loc[pre_date, "tickers"]))
         found_late = late_joiners & pre_members
         if found_late:
             found_late_all.update(found_late)

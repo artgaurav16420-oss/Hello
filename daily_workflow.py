@@ -789,9 +789,10 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                     except (ValueError, TypeError):
                         split_start_date = None
                 if split_start_date is None:
-                    # Prefer position entry marker (stored under 'sym'), 
-                    # fall back to split-specific markers (stored under 'split:sym').
-                    marker = state.dividend_ledger.get(sym, state.dividend_ledger.get(f"split:{sym}", ""))
+                    # Prefer split-specific markers (stored under 'split:sym') so we
+                    # resume from the most recently applied split; fall back to the
+                    # position entry marker (stored under 'sym') on first run.
+                    marker = state.dividend_ledger.get(f"split:{sym}", state.dividend_ledger.get(sym, ""))
                     marker_date = marker.split(":", 1)[0] if marker else ""
                     if marker_date:
                         try:
@@ -810,22 +811,23 @@ def detect_and_apply_splits(state: PortfolioState, market_data: dict, cfg: Ultim
                     else:
                         raw = str(raw_markers or "")
                         applied_event_ids = {m for m in raw.split("|") if m}
+
+                    aligned_split_start = split_start_date
+                    if aligned_split_start is not None:
+                        # Align timezones for comparison
+                        s_idx_tz = getattr(split_series.index, "tz", None)
+                        if s_idx_tz is not None:
+                            if aligned_split_start.tzinfo is None:
+                                aligned_split_start = aligned_split_start.tz_localize(s_idx_tz)
+                            else:
+                                aligned_split_start = aligned_split_start.tz_convert(s_idx_tz)
+                        elif aligned_split_start.tzinfo is not None:
+                            aligned_split_start = aligned_split_start.tz_localize(None)
+
                     for split_date, split_val in positive_splits.items():
                         # Temporal anchor check
-                        if split_start_date is not None:
-                            # Align timezones for comparison
-                            s_idx_tz = getattr(split_series.index, "tz", None)
-                            s_start_tz = split_start_date
-                            if s_idx_tz is not None:
-                                if s_start_tz.tzinfo is None:
-                                    s_start_tz = s_start_tz.tz_localize(s_idx_tz)
-                                else:
-                                    s_start_tz = s_start_tz.tz_convert(s_idx_tz)
-                            elif s_start_tz.tzinfo is not None:
-                                s_start_tz = s_start_tz.tz_localize(None)
-                            
-                            if pd.Timestamp(split_date) <= s_start_tz:
-                                continue
+                        if aligned_split_start is not None and pd.Timestamp(split_date) <= aligned_split_start:
+                            continue
 
                         split_date_str = pd.Timestamp(split_date).strftime("%Y-%m-%d")
                         event_id = f"{split_date_str}:{split_val:.8f}"
@@ -1001,6 +1003,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
             "absent_periods": dict(sorted(state.absent_periods.items())),
             "last_rebalance_date": state.last_rebalance_date,
         }
+        tmp = None
         try:
             tmp = pathlib.Path(f"{risk_file}.tmp")
             with tmp.open("w", encoding="utf-8") as f:
@@ -1017,7 +1020,7 @@ def save_portfolio_state(state: PortfolioState, name: str) -> None:
                     os.close(dir_fd)
         except (OSError, IOError, TypeError, ValueError) as exc:
             logger.warning("Paper-mode risk metadata save failed for '%s': %s", name, exc)
-            if tmp.exists():
+            if tmp is not None and tmp.exists():
                 try:
                     os.remove(tmp)
                 except OSError:

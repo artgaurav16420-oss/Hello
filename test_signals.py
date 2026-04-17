@@ -4,12 +4,11 @@ test_signals.py — Tests for signal generation logic v11.48
 """
 
 from __future__ import annotations
-import osqp_preimport
+import osqp_preimport  # noqa: F401
 
 import numpy as np
 import pandas as pd
 import pytest
-import logging
 
 from signals import generate_signals, compute_adv, compute_regime_score
 from momentum_engine import UltimateConfig
@@ -478,7 +477,7 @@ class TestSignalsCoverage:
     @staticmethod
     def test_compute_regime_score_last_is_today():
         """Verifies that the last bar is excluded if it matches today's date."""
-        today = pd.Timestamp.today().normalize()
+        today = pd.Timestamp("2024-01-11")
         dates = pd.date_range(today - pd.Timedelta(days=10), periods=11, freq="D")
         idx = pd.DataFrame({"Close": np.linspace(100, 110, 11)}, index=dates)
         
@@ -490,6 +489,30 @@ class TestSignalsCoverage:
         score_no_today = compute_regime_score(idx_no_today, as_of_date=today)
         
         assert score_today == score_no_today
+
+    @staticmethod
+    def test_compute_regime_score_last_is_today_trims_universe_history_with_tz():
+        """Verifies universe_close_hist is date-trimmed safely for tz-aware indices."""
+        today = pd.Timestamp("2024-01-11")
+        idx_dates = pd.date_range(today - pd.Timedelta(days=10), periods=11, freq="D")
+        idx = pd.DataFrame({"Close": np.linspace(100, 110, 11)}, index=idx_dates)
+
+        tz_dates = pd.date_range("2024-01-01 00:00:00+05:30", periods=11, freq="D")
+        universe_with_today = pd.DataFrame({"A": np.linspace(50, 60, 11)}, index=tz_dates)
+        universe_without_today = universe_with_today.iloc[:-1]
+
+        score_with_today = compute_regime_score(
+            idx,
+            universe_close_hist=universe_with_today,
+            as_of_date=today,
+        )
+        score_without_today = compute_regime_score(
+            idx,
+            universe_close_hist=universe_without_today,
+            as_of_date=today,
+        )
+
+        assert score_with_today == score_without_today
 
     @staticmethod
     def test_compute_regime_score_benchmark_only_universe(caplog):
@@ -511,7 +534,7 @@ class TestSignalsCoverage:
         universe = pd.DataFrame({"A": [np.nan] * 250}, index=idx.index)
         
         with caplog.at_level("DEBUG"):
-            score = compute_regime_score(idx, universe_close_hist=universe)
+            compute_regime_score(idx, universe_close_hist=universe)
         
         assert "no symbols passed validity filter" in caplog.text
 

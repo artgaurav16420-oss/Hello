@@ -6,7 +6,7 @@ Every test either asserts a real invariant or does not exist.
 
 from __future__ import annotations
 
-import osqp_preimport  # MUST be first to prevent Windows Access Violation
+import osqp_preimport  # noqa: F401 # MUST be first to prevent Windows Access Violation
 import json
 import logging
 import os
@@ -1071,6 +1071,7 @@ class TestWorkflowAndUtilities:
         )
         assert engine.last_diag is not None
         assert isinstance(engine.last_diag.adv_binding_count, int)
+        assert engine.last_diag.adv_binding_count > 0
 
     @staticmethod
     def test_update_exposure_regime_bull():
@@ -1712,20 +1713,33 @@ class TestWorkflowAndUtilities:
         assert bt.state.decay_rounds == 0, "BacktestEngine run loop must correctly zero decay_rounds upon optimization success."
 
     @staticmethod
-    def test_consecutive_failures_reset_on_empty_universe():
+    def test_consecutive_failures_reset_on_empty_universe(monkeypatch):
         cfg = UltimateConfig(HISTORY_GATE=5, INITIAL_CAPITAL=1_000_000)
         n_days, n_syms = 50, 2
-        close   = _make_close(n_days, n_syms)
-        volume  = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
+        close = _make_close(n_days, n_syms)
+        volume = pd.DataFrame(np.ones((n_days, n_syms)) * 1e6, index=close.index, columns=close.columns)
         returns = close.pct_change(fill_method=None).clip(lower=-0.99)
-    
+
         engine = InstitutionalRiskEngine(cfg)
-        bt     = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
+        bt = BacktestEngine(engine, initial_cash=cfg.INITIAL_CAPITAL)
         bt.state.consecutive_failures = 2
-    
+
         import backtest_engine as _be
-        original = _be.generate_signals
-        pass
+
+        def _empty_generate_signals(*_args, **_kwargs):
+            return np.array([]), np.array([]), [], {
+                "total": 0,
+                "history_failed": 0,
+                "adv_failed": 0,
+                "knife_failed": 0,
+                "selected": 0,
+            }
+
+        monkeypatch.setattr(_be, "generate_signals", _empty_generate_signals)
+        rebal_dates = close.index[20:25]
+        bt.run(close, volume, returns, rebal_dates, close.index[0].strftime("%Y-%m-%d"))
+
+        assert bt.state.consecutive_failures == 0
 
 
 class TestMomentumEngine:
@@ -1792,7 +1806,7 @@ class TestMomentumEngine:
         scenario_losses = np.full((100, 1), 0.1) # 10% loss scenario
 
         trade_log = []
-        total_slippage = execute_rebalance(
+        execute_rebalance(
             state,
             target_weights,
             prices,

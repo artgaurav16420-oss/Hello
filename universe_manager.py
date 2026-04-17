@@ -55,13 +55,14 @@ def _get_cache_dir() -> Path:
     return cache_dir
 
 
-CACHE_DIR = _get_cache_dir()
+def _get_universe_cache_file() -> Path:
+    """Return the universe cache file path using the current cache directory."""
+    return _get_cache_dir() / "_universe_cache.json"
 
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR             = Path("data")
-UNIVERSE_CACHE_FILE  = CACHE_DIR / "_universe_cache.json"
 UNIVERSE_CACHE_TTL_H = 72
 _ADV_CHUNK_SIZE      = 75
 
@@ -527,10 +528,10 @@ def get_historical_universe(universe_type: str, date: pd.Timestamp) -> List[str]
 
 def _load_universe_cache() -> dict:
     """Load the JSON universe cache from disk."""
-    if not UNIVERSE_CACHE_FILE.exists():
+    if not _get_universe_cache_file().exists():
         return {}
     try:
-        with UNIVERSE_CACHE_FILE.open("r", encoding="utf-8") as file:
+        with _get_universe_cache_file().open("r", encoding="utf-8") as file:
             return json.load(file)
     except Exception as exc:
         logger.warning("[Universe] Cache load failed, starting fresh: %s", exc)
@@ -538,10 +539,10 @@ def _load_universe_cache() -> dict:
 
 def _save_universe_cache(data: dict) -> None:
     """Atomically write the universe cache to disk."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _get_cache_dir().mkdir(parents=True, exist_ok=True)
     try:
         atomic_write_file(
-            UNIVERSE_CACHE_FILE,
+            _get_universe_cache_file(),
             lambda tmp: tmp.write_text(json.dumps(data, indent=2), encoding="utf-8"),
             suffix=".tmp.json",
             fsync_file=True,
@@ -557,12 +558,12 @@ def invalidate_universe_cache() -> None:
     This should be used when upstream metadata has changed or if the
     local cache is suspected of being corrupt.
     """
-    if UNIVERSE_CACHE_FILE.exists():
-        try:
-            UNIVERSE_CACHE_FILE.unlink()
-            logger.info("[Universe] Cache invalidated.")
-        except OSError as e:
-            logger.error("[Universe] Failed to invalidate cache: %s", e)
+    try:
+        with _UNIVERSE_CACHE_FILE_LOCK:
+            _get_universe_cache_file().unlink(missing_ok=True)
+        logger.info("[Universe] Cache invalidated.")
+    except OSError as e:
+        logger.error("[Universe] Failed to invalidate cache: %s", e)
 
 # ─── ADV Liquidity Filter ─────────────────────────────────────────────────────
 
